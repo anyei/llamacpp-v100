@@ -104,8 +104,27 @@ baseline (fresh-server and cached-prompt paths).
 | `LLAMA_BATCH_DEBUG=1/2` | ubatch composition per split (needs `-lv 5`) |
 | `GGML_META_DEBUG=1` | tensor-parallel split states per node (needs `-lv 5`) |
 
+## Which split mode per architecture
+
+| Architecture | Examples | `-sm tensor` | Recommendation |
+|---|---|---|---|
+| Dense / GQA | Qwen3.x dense, Kimi-Dev-72B, Llama-family | ✅ supported, tuned | tensor (2 GPU) |
+| Hybrid recurrent | Qwen3.5/3.6 (DeltaNet layers) | ✅ supported, tuned | tensor (2 GPU) |
+| MoE w/ GQA | Qwen3.x-A3B MoE | ✅ supported | single GPU if it fits (light active set), else tensor |
+| **MLA (`deepseek2`)** | DeepSeek V2/V3/R1, Kimi K2, GLM-4.7-Flash | ⚠️ WIP (task 13): pre-`9b2162ae6` crashes at KV write; with the WIP runs but corrupts output | **single GPU** if ≤ ~30 GB (as fast as TP for MoE-light models), else `-sm layer` |
+
+MLA background: `deepseek2` models keep a single shared latent KV head
+(e.g. GLM-4.7-Flash: `n_head_kv = 1`, 576-dim latent, ~1.1 KB/token) — there is
+no head dimension to split, so the head-based tensor-split policy breaks.
+The proper scheme (mirror the latent cache, split the query heads) is the
+remaining work in TASKS.md item 13; it matters mainly for the 4x V100 future
+if a large MLA model becomes a daily driver. Measured on GLM-4.7-Flash-REAP
+(23B-A3B, 14 GB Q4): single V100 = 79 t/s coherent; the WIP tensor mode is
+no faster (79.8) and incorrect.
+
 ## Remaining roadmap
 
+- Task 13: correct MLA tensor-parallelism (see above).
 - Distributed inference (coordinator + N workers) for the future 4x V100
   setup — design in `docs/distributed-inference-plan.md`, implementation
   deferred by choice.
