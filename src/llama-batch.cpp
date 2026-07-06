@@ -505,7 +505,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, bool full_seqs) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -546,6 +546,32 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential)
                 break;
             }
         }
+    }
+
+    if (full_seqs && !cur_seq_set.empty()) {
+        // count the remaining unused tokens of each collected sequence set
+        auto count_unused = [&](const seq_set_t & ss) -> uint32_t {
+            uint32_t ret = 0;
+            for (const int32_t idx : seq_set_map.at(ss)) {
+                ret += used[idx] ? 0 : 1;
+            }
+            return ret;
+        };
+
+        const uint32_t n_first = count_unused(cur_seq_set[0]);
+
+        // keep only the leading run of sequence sets with the same token count as the first one
+        size_t keep = 1;
+        while (keep < cur_seq_set.size() && count_unused(cur_seq_set[keep]) == n_first) {
+            keep++;
+        }
+
+        // respect the token budget - drop trailing sequence sets rather than splitting sequences
+        while (keep > 1 && n_first*keep > n_ubatch) {
+            keep--;
+        }
+
+        cur_seq_set.resize(keep);
     }
 
     const uint32_t n_seqs = cur_seq_set.size();

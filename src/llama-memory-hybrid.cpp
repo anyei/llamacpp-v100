@@ -80,8 +80,9 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             } else {
                 if (mem_recr->n_rs_seq > 0) {
                     // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                    // TODO: recurrent state rollback does not support equal splits
-                    ubatch = balloc.split_seq(n_ubatch);
+                    // rollback snapshots require each sequence to be fully contained in one ubatch
+                    const bool unified = (mem_attn->get_n_stream() == 1);
+                    ubatch = balloc.split_equal(n_ubatch, !unified, /*full_seqs =*/ true);
                 } else {
                     // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                     const bool unified = (mem_attn->get_n_stream() == 1);

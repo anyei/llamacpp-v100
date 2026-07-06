@@ -104,7 +104,10 @@ public:
 
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential);
+    // if full_seqs == true, only group sequence sets whose full remaining token count is identical,
+    //   so that no sequence is split across ubatches (required by recurrent-state rollback; a single
+    //   sequence longer than n_ubatch still splits, same as split_seq)
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, bool full_seqs = false);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
