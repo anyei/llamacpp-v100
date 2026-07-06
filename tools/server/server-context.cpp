@@ -3513,9 +3513,21 @@ private:
 
                         slot.n_prompt_tokens_processed++;
 
-                        // stop the prompt batch exactly before a user message
+                        // stop the prompt batch exactly before a user message, but only where a
+                        // checkpoint can actually be created (last user message, or far enough from
+                        // the previous checkpoint) - breaking at every message would fragment long
+                        // chat-history prefills into tiny batches and halve prompt throughput
                         if (spans.is_user_start(slot.prompt.n_tokens())) {
-                            break;
+                            const auto n_next  = slot.prompt.n_tokens();
+                            const bool is_last = n_next == last_user_pos;
+
+                            const bool ckpt_useful = do_checkpoint &&
+                                (slot.prompt.checkpoints.empty() || is_last ||
+                                 n_next > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+
+                            if (is_last || ckpt_useful) {
+                                break;
+                            }
                         }
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
