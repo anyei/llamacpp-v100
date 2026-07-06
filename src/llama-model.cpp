@@ -421,6 +421,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // MLA models (deepseek2 family, e.g. GLM-4.7-Flash): the KV cache holds a single
+        // shared latent head that cannot be split by heads. Mirror the whole attention
+        // block on every device and split only the FFN/expert weights - attention is a
+        // small fraction of compute for these models and the latent cache is tiny.
+        if (hparams.is_mla() &&
+                (std::regex_match(tensor_name, pattern_q_weight) ||
+                 std::regex_match(tensor_name, pattern_kv_cache) ||
+                 std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                 std::regex_match(tensor_name, pattern_attn_out_bias))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
