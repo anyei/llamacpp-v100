@@ -48,6 +48,7 @@ RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     cmake -B build -DGGML_CUDA=ON \
     -DGGML_CUDA_GRAPHS=ON \
     -DGGML_CUDA_NCCL=ON \
+    -DGGML_CUDA_FA_ALL_QUANTS=ON \
     -DGGML_NATIVE=ON \
     -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DLLAMA_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
     cmake --build build --config Release -j$(nproc)
