@@ -560,15 +560,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
         const uint32_t n_first = count_unused(cur_seq_set[0]);
 
-        // keep only the leading run of sequence sets with the same token count as the first one
+        // keep only the leading run of sequence sets with the same token count as the first one,
+        // stopping at the token budget - dropped sets are picked up by the next split call
         size_t keep = 1;
-        while (keep < cur_seq_set.size() && count_unused(cur_seq_set[keep]) == n_first) {
+        while (keep < cur_seq_set.size() && n_first*(keep + 1) <= n_ubatch && count_unused(cur_seq_set[keep]) == n_first) {
             keep++;
-        }
-
-        // respect the token budget - drop trailing sequence sets rather than splitting sequences
-        while (keep > 1 && n_first*keep > n_ubatch) {
-            keep--;
         }
 
         cur_seq_set.resize(keep);

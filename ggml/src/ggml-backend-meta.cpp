@@ -438,6 +438,8 @@ struct ggml_backend_meta_buffer_context {
             const int n_simple,
             const std::vector<ggml_backend_buffer_t> & bufs)
             : stc_static(std::move(stc_static)) {
+        // note: should stay above LLAMA_DECODE_GRAPH_CACHE (llama-context.cpp) plus the
+        // in-flight graphs, otherwise cached graphs churn through shadow recreation
         const char * GGML_META_MAX_GRAPHS = getenv("GGML_META_MAX_GRAPHS");
         const int n_graphs = std::max(2, GGML_META_MAX_GRAPHS ? atoi(GGML_META_MAX_GRAPHS) : 8);
         stc_compute.reserve(n_graphs);
@@ -1292,7 +1294,7 @@ static struct ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(const 
     }
 
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
-    ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_compute[buf_ctx->stc_compute_index], (ggml_tensor *) tensor);
+    ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), (ggml_tensor *) tensor);
 
     return ggml_backend_meta_buffer_simple_tensor(tensor, index);
 }

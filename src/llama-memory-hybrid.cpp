@@ -78,16 +78,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                if (mem_recr->n_rs_seq > 0) {
-                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                    // rollback snapshots require each sequence to be fully contained in one ubatch
-                    const bool unified = (mem_attn->get_n_stream() == 1);
-                    ubatch = balloc.split_equal(n_ubatch, !unified, /*full_seqs =*/ true);
-                } else {
-                    // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                    const bool unified = (mem_attn->get_n_stream() == 1);
-                    ubatch = balloc.split_equal(n_ubatch, !unified);
-                }
+                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
+                const bool unified = (mem_attn->get_n_stream() == 1);
+
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // rollback snapshots require each sequence to be fully contained in one ubatch
+                ubatch = balloc.split_equal(n_ubatch, !unified, /*full_seqs =*/ mem_recr->n_rs_seq > 0);
             }
 
             if (ubatch.n_tokens == 0) {

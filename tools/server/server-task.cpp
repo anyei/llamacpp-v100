@@ -1670,10 +1670,13 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     // deeper edits fall back to re-prefilling from the start.
     static constexpr size_t CACHE_CHECKPOINTS_MAX = 2;
 
-    std::list<common_prompt_checkpoint> checkpoints = prompt.checkpoints;
-    while (checkpoints.size() > CACHE_CHECKPOINTS_MAX) {
-        checkpoints.pop_front();
+    // range-construct only the tail - copying the whole list first would memcpy
+    // every ~150 MiB checkpoint just to discard it
+    auto it_ckpt = prompt.checkpoints.begin();
+    if (prompt.checkpoints.size() > CACHE_CHECKPOINTS_MAX) {
+        it_ckpt = std::prev(prompt.checkpoints.end(), CACHE_CHECKPOINTS_MAX);
     }
+    std::list<common_prompt_checkpoint> checkpoints(it_ckpt, prompt.checkpoints.end());
 
     states.push_back({
         /*.tokens      =*/ prompt.tokens.clone(),

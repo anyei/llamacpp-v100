@@ -1346,13 +1346,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     g_dec_timing.n_tokens += ubatch.n_tokens;
 
     auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
 
     ggml_backend_sched_t sched_cur = sched.get();
 
     // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by
+    // these parameters; the params are built once per ubatch and only the res target is patched
+    // per candidate (the struct embeds hparams/cparams by value and is expensive to construct)
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     // small batches go through the decode graph cache so that workloads
     // alternating between a few shapes (e.g. speculative drafting) keep
@@ -1364,49 +1365,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (use_cache) {
         decode_cache_clock++;
 
-        decode_cache_entry * e_hit = nullptr;
+        decode_cache_entry * e_cur = nullptr;
 
         for (auto & e : decode_cache) {
-            const auto gp = graph_params(e.res.get(), ubatch, mctx, gtype);
-            if (e.res->can_reuse(gp)) {
-                e_hit = &e;
+            gparams.res = e.res.get();
+            if (e.res->can_reuse(gparams)) {
+                e_cur = &e;
+                ready = true;
                 break;
             }
         }
 
-        if (e_hit == nullptr && decode_cache.size() < decode_cache_n_max) {
-            decode_cache.emplace_back();
-            auto & e = decode_cache.back();
-            const size_t max_nodes = this->graph_max_nodes(decode_cache_tokens);
-            e.res.reset(new llm_graph_result(max_nodes));
-            e.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                    max_nodes, /*parallel =*/ false, cparams.op_offload));
-        }
-
-        if (e_hit != nullptr) {
-            e_hit->last_used = decode_cache_clock;
-
-            res       = e_hit->res.get();
-            gf        = res->get_gf();
-            sched_cur = e_hit->sched.get();
-
-            n_reused++;
-            g_dec_timing.n_reused++;
-
-            ready = true;
-        } else {
-            // build into the least recently used entry
-            decode_cache_entry * e_lru = &decode_cache.front();
-            for (auto & e : decode_cache) {
-                if (e.last_used < e_lru->last_used) {
-                    e_lru = &e;
+        if (!ready) {
+            if (decode_cache.size() < decode_cache_n_max) {
+                // room in the cache: build into a fresh entry
+                auto & e = decode_cache.emplace_back();
+                const size_t max_nodes = this->graph_max_nodes(decode_cache_tokens);
+                e.res.reset(new llm_graph_result(max_nodes));
+                e.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                        max_nodes, /*parallel =*/ false, cparams.op_offload));
+                e_cur = &e;
+            } else {
+                // build into the least recently used entry
+                e_cur = &decode_cache.front();
+                for (auto & e : decode_cache) {
+                    if (e.last_used < e_cur->last_used) {
+                        e_cur = &e;
+                    }
                 }
             }
-            e_lru->last_used = decode_cache_clock;
+        }
 
-            res       = e_lru->res.get();
-            gf        = nullptr;
-            sched_cur = e_lru->sched.get();
+        e_cur->last_used = decode_cache_clock;
+
+        res       = e_cur->res.get();
+        sched_cur = e_cur->sched.get();
+
+        if (ready) {
+            n_reused++;
+            g_dec_timing.n_reused++;
         }
     } else if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1430,11 +1427,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched_cur);
         ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
 
-        const auto gparams_cur = graph_params(res, ubatch, mctx, gtype);
+        gparams.res = res;
 
         const auto t_build_0 = ggml_time_us();
 
-        gf = model.build_graph(gparams_cur);
+        ggml_cgraph * gf = model.build_graph(gparams);
 
         g_dec_timing.t_build += ggml_time_us() - t_build_0;
 

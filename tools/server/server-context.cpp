@@ -3486,6 +3486,13 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // spacing rule shared by the batch-break decision below and the actual
+                    // checkpoint creation after the loop - keep the two in sync
+                    auto ckpt_spacing_ok = [&](int32_t n_pos, bool is_last) {
+                        return slot.prompt.checkpoints.empty() || is_last ||
+                               n_pos > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3521,11 +3528,7 @@ private:
                             const auto n_next  = slot.prompt.n_tokens();
                             const bool is_last = n_next == last_user_pos;
 
-                            const bool ckpt_useful = do_checkpoint &&
-                                (slot.prompt.checkpoints.empty() || is_last ||
-                                 n_next > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
-
-                            if (is_last || ckpt_useful) {
+                            if (is_last || (do_checkpoint && ckpt_spacing_ok(n_next, is_last))) {
                                 break;
                             }
                         }
@@ -3596,7 +3599,7 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || is_last_user_message || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    do_checkpoint = do_checkpoint && ckpt_spacing_ok(n_tokens_start, is_last_user_message);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
