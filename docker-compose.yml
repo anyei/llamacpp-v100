@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # Llama.cpp backend
+  llama-tq:
+    #container_name: llama-tq-backend-Qwen3.6-27B-UD-Q4_K_XL.gguf
+    container_name: llama-tq-backend-Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
+   # image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+   # image: llamacpp-turboq-llama-tq:latest
+    image: llamacpp-local-v100:latest 
+    volumes:
+      - /mnt/models/ollama37-k80/.ollama/custom-models/:/models
+      - /mnt/files/:/models2
+      - ./cache:/models/cache
+    ports:
+      - "8097:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+# no-ops on V100 / this build, removed (see bench notes 2026-07-05):
+#      - NCCL_DEBUG=INFO            # just log noise, NCCL confirmed working over NVLink P2P
+#      - CUDA_SCALE_LAUNCH_QUEUES=4 # not a real CUDA variable
+#      - GGML_CUDA_GRAPH_OPT=1      # CUDA graphs hard-disabled on cc < 8.0
+#      - GGML_CUDA_FORCE_CUBLAS=1   # compile-time flag only, env var does nothing
+#      - TURBO_AUTO_ASYMMETRIC=0
+#     - GGML_CUDA_P2P=1
+#      --ctx-size 500000
+#      --rope-scaling yarn
+#      --rope-scale 1.4441
+#      --yarn-orig-ctx 262144
+#      --cache-type-k turbo4
+#      --cache-type-v turbo4
+#      --mmproj /models/qwen3.6-27b-mmproj-f16.gguf
+#      --spec-type draft-mtp
+#      --spec-draft-n-max 2
+#--spec-type draft-mtp
+#      --spec-draft-n-max 3
+#      --spec-draft-n-min 1
+#      --spec-draft-p-min 0.70
+# MTP re-enabled 2026-07-06 with p-min 0: the earlier loss (33.6 t/s) was caused by
+# variable draft lengths changing the batch shape every step, forcing a full graph
+# rebuild + tensor-parallel re-split per iteration. Fixed-length drafts (p-min 0)
+# keep the shape stable so graph reuse works: 65 t/s short ctx, 51 t/s at 25k ctx
+# (vs 47.9 / 42.5 without spec). Output quality is identical (exact-match verify).
+# Do NOT set p-min > 0 or n-min > 0: any draft-length variability reintroduces the
+# rebuild penalty. Known issue: -np > 1 with spec still degrades; needs a code fix.
+    command: >
+      -m /models/Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
+      --mmproj /models/qwen3.6-27b-mmproj-f16.gguf
+      --host 0.0.0.0
+      --port 8080
+      -ngl 99
+      -sm tensor
+      -ts 0.5,0.5
+      -t 10
+      -np 1
+      -c 262144
+      --rope-scaling yarn
+      --rope-scale 1.4441
+      --yarn-orig-ctx 262144
+      --batch-size 4096
+      --ubatch-size 4096
+      --cont-batching
+      --timeout 10
+      --no-mmap
+      --cache-prompt
+      --spec-type draft-mtp
+      --spec-draft-n-max 3
+      --spec-draft-n-min 0
+      --spec-draft-p-min 0
+      -fit off
+      -fa on
+      --no-prefill-assistant
+      --reasoning-preserve
+    restart: always

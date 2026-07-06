@@ -39,6 +39,23 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// env LLAMA_SPEC_TIMING: coarse per-phase timing of the speculative decode loop
+struct server_spec_timing {
+    bool    enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    int64_t n_iter  = 0;
+    int64_t t_draft = 0, t_ckpt = 0, t_decode = 0, t_accept = 0;
+
+    void report() {
+        if (!enabled || ++n_iter % 64 != 0) {
+            return;
+        }
+        SRV_INF("spec timing, last 64 iters: draft = %.1f ms, ckpt = %.1f ms, decode = %.1f ms, accept = %.1f ms\n",
+                t_draft / 1000.0, t_ckpt / 1000.0, t_decode / 1000.0, t_accept / 1000.0);
+        t_draft = t_ckpt = t_decode = t_accept = 0;
+    }
+};
+static server_spec_timing g_spec_timing;
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -2994,8 +3011,12 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t0 = ggml_time_us();
             common_speculative_draft(spec.get());
+            g_spec_timing.t_draft += ggml_time_us() - t0;
         }
+
+        const int64_t t_ckpt_0 = ggml_time_us();
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
@@ -3042,6 +3063,8 @@ private:
                 }
             }
         });
+
+        g_spec_timing.t_ckpt += ggml_time_us() - t_ckpt_0;
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -3614,7 +3637,12 @@ private:
             n_empty_consecutive = 0;
         }
 
+        const int64_t t_decode_0 = ggml_time_us();
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+
+        g_spec_timing.t_decode += ggml_time_us() - t_decode_0;
+        g_spec_timing.report();
 
         metrics.on_decoded(slots);
 
@@ -3821,6 +3849,7 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        const int64_t t_accept_0 = ggml_time_us();
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
                 return;
@@ -3944,6 +3973,7 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
         });
+        g_spec_timing.t_accept += ggml_time_us() - t_accept_0;
     }
 
     int get_slot_n_ctx() {

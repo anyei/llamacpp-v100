@@ -1301,12 +1301,33 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// env LLAMA_DECODE_TIMING: coarse per-phase timing of process_ubatch
+struct llama_decode_timing {
+    bool    enabled = getenv("LLAMA_DECODE_TIMING") != nullptr;
+    int64_t n_calls = 0, n_reused = 0, n_tokens = 0;
+    int64_t t_build = 0, t_alloc = 0, t_setinp = 0, t_compute = 0;
+
+    void report() {
+        if (!enabled || ++n_calls % 256 != 0) {
+            return;
+        }
+        fprintf(stderr, "decode timing, last 256 ubatches: reused = %" PRId64 ", tokens = %" PRId64
+                ", build = %.1f ms, alloc = %.1f ms, set_inputs = %.1f ms, compute = %.1f ms\n",
+                n_reused, n_tokens, t_build / 1000.0, t_alloc / 1000.0, t_setinp / 1000.0, t_compute / 1000.0);
+        n_reused = n_tokens = 0;
+        t_build = t_alloc = t_setinp = t_compute = 0;
+    }
+};
+static llama_decode_timing g_dec_timing;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    g_dec_timing.n_tokens += ubatch.n_tokens;
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1326,17 +1347,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        g_dec_timing.n_reused++;
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const auto t_build_0 = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        g_dec_timing.t_build += ggml_time_us() - t_build_0;
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1344,24 +1366,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto t_alloc_0 = ggml_time_us();
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        g_dec_timing.t_alloc += ggml_time_us() - t_alloc_0;
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const auto t_setinp_0 = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        g_dec_timing.t_setinp += ggml_time_us() - t_setinp_0;
     }
 
+    const auto t_compute_0 = ggml_time_us();
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    g_dec_timing.t_compute += ggml_time_us() - t_compute_0;
+    g_dec_timing.report();
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

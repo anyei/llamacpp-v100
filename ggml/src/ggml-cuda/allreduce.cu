@@ -952,6 +952,154 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// One-shot P2P AllReduce (2 devices)
+//
+// Each device copies its partial into a local scratch slot, then a single
+// kernel adds the peer's scratch (read directly over NVLink/PCIe P2P) into
+// its own tensor.  Cross-device ordering uses one event per (device, slot).
+// The scratch slots alternate between calls: call N+1's kernel on device d
+// waits for the peer's call-N+1 copy, which on the peer stream is ordered
+// after the peer's call-N kernel, so by transitivity call N+2 can safely
+// overwrite the slot that call N used.
+// ---------------------------------------------------------------------------
+
+static constexpr size_t GGML_CUDA_AR_P2P_SLOTS = 2;
+
+// Large enough for speculative-verify batches (~200 tokens at n_embd 5120);
+// larger reductions (prefill) fall back to NCCL/internal which are
+// bandwidth-optimized.  Override via GGML_CUDA_AR_P2P_MAX_BYTES.
+static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT = 4*1024*1024;
+
+struct ggml_cuda_ar_p2p {
+    int    devs[2]   = {-1, -1};
+    size_t max_bytes = GGML_CUDA_AR_P2P_MAX_BYTES_DEFAULT;
+    size_t i_slot    = 0;
+
+    void *      scratch[2][GGML_CUDA_AR_P2P_SLOTS] = {};
+    cudaEvent_t ev_copy[2][GGML_CUDA_AR_P2P_SLOTS] = {};
+};
+
+static __global__ void ar_p2p_add_f32(
+        float * __restrict__ dst, const float * __restrict__ a, const float * __restrict__ b, const int64_t ne) {
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < ne; i += stride) {
+        dst[i] = a[i] + b[i];
+    }
+}
+
+void ggml_cuda_ar_p2p_free(ggml_cuda_ar_p2p * p) {
+    if (p == nullptr) {
+        return;
+    }
+    for (int d = 0; d < 2; d++) {
+        if (p->devs[d] < 0) {
+            continue;
+        }
+        ggml_cuda_set_device(p->devs[d]);
+        for (size_t s = 0; s < GGML_CUDA_AR_P2P_SLOTS; s++) {
+            if (p->scratch[d][s]) {
+                CUDA_CHECK(cudaFree(p->scratch[d][s]));
+            }
+            if (p->ev_copy[d][s]) {
+                CUDA_CHECK(cudaEventDestroy(p->ev_copy[d][s]));
+            }
+        }
+    }
+    delete p;
+}
+
+ggml_cuda_ar_p2p * ggml_cuda_ar_p2p_init(const int * devices, size_t n_devices) {
+    if (n_devices != 2 || devices[0] == devices[1]) {
+        return nullptr;
+    }
+    for (int d = 0; d < 2; d++) {
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, devices[d], devices[d ^ 1]) != cudaSuccess || !can) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+    }
+
+    ggml_cuda_ar_p2p * p = new ggml_cuda_ar_p2p;
+
+    const char * env = getenv("GGML_CUDA_AR_P2P_MAX_BYTES");
+    if (env != nullptr) {
+        p->max_bytes = std::max<size_t>((size_t) atoll(env), 4096);
+    }
+
+    for (int d = 0; d < 2; d++) {
+        p->devs[d] = devices[d];
+        ggml_cuda_set_device(devices[d]);
+
+        const cudaError_t err = cudaDeviceEnablePeerAccess(devices[d ^ 1], 0);
+        if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+            (void) cudaGetLastError();
+            ggml_cuda_ar_p2p_free(p);
+            return nullptr;
+        }
+        (void) cudaGetLastError(); // clear cudaErrorPeerAccessAlreadyEnabled
+
+        for (size_t s = 0; s < GGML_CUDA_AR_P2P_SLOTS; s++) {
+            if (cudaMalloc(&p->scratch[d][s], p->max_bytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ggml_cuda_ar_p2p_free(p);
+                return nullptr;
+            }
+            CUDA_CHECK(cudaEventCreateWithFlags(&p->ev_copy[d][s], cudaEventDisableTiming));
+        }
+    }
+
+    return p;
+}
+
+bool ggml_cuda_ar_p2p_allreduce(ggml_cuda_ar_p2p * p, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        return true;
+    }
+    const size_t nbytes = ne*sizeof(float);
+    if (nbytes > p->max_bytes) {
+        return false;
+    }
+    for (int d = 0; d < 2; d++) {
+        if (tensors[d] == nullptr || tensors[d]->type != GGML_TYPE_F32 ||
+                ggml_nelements(tensors[d]) != ne || !ggml_is_contiguously_allocated(tensors[d])) {
+            return false;
+        }
+    }
+
+    const size_t slot = p->i_slot;
+    p->i_slot = (p->i_slot + 1) % GGML_CUDA_AR_P2P_SLOTS;
+
+    cudaStream_t streams[2];
+
+    for (int d = 0; d < 2; d++) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[d]->context;
+        streams[d] = cuda_ctx->stream();
+
+        ggml_cuda_set_device(p->devs[d]);
+        if (tensors[d]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            CUDA_CHECK(cudaMemcpyAsync(p->scratch[d][slot], tensors[d]->data, nbytes, cudaMemcpyDeviceToDevice, streams[d]));
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(p->scratch[d][slot], 0, nbytes, streams[d]));
+        }
+        CUDA_CHECK(cudaEventRecord(p->ev_copy[d][slot], streams[d]));
+    }
+
+    for (int d = 0; d < 2; d++) {
+        ggml_cuda_set_device(p->devs[d]);
+        CUDA_CHECK(cudaStreamWaitEvent(streams[d], p->ev_copy[d ^ 1][slot], 0));
+
+        const int n_blocks = (int) std::min<int64_t>((ne + 255)/256, 256);
+        ar_p2p_add_f32<<<n_blocks, 256, 0, streams[d]>>>(
+                (float *) tensors[d]->data, (const float *) p->scratch[d][slot], (const float *) p->scratch[d ^ 1][slot], ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    return true;
+}
+
 #else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
 // HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
@@ -965,6 +1113,15 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+
+ggml_cuda_ar_p2p * ggml_cuda_ar_p2p_init(const int *, size_t) {
+    return nullptr;
+}
+void ggml_cuda_ar_p2p_free(ggml_cuda_ar_p2p *) {
+}
+bool ggml_cuda_ar_p2p_allreduce(ggml_cuda_ar_p2p *, ggml_backend_t *, ggml_tensor **) {
     return false;
 }
 

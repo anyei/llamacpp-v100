@@ -1196,7 +1196,12 @@ struct ggml_backend_cuda_comm_context {
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
 
+    // set when the p2p one-shot path is active; handles small reductions and
+    // delegates everything else to this fallback (nccl or internal)
+    try_allreduce_fn            fallback_allreduce = nullptr;
+
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    ggml_cuda_ar_p2p *          ar_p2p      = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1209,6 +1214,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_p2p_free(ar_p2p);
     }
 };
 
@@ -1361,6 +1367,14 @@ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
     return false;
 }
 
+static bool ggml_backend_cuda_comm_try_allreduce_p2p(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (ggml_cuda_ar_p2p_allreduce(comm_ctx->ar_p2p, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
+    return comm_ctx->fallback_allreduce != nullptr && comm_ctx->fallback_allreduce(comm_ctx, tensors);
+}
+
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
     if (comm_ctx_v == nullptr) {
         return;
@@ -1413,6 +1427,20 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
+// P2P one-shot for small reductions, chained on top of nccl/internal which
+// keep handling large (bandwidth-bound) reductions and unsupported calls.
+static void ggml_backend_cuda_comm_init_p2p(ggml_backend_cuda_comm_context * ret) {
+    ggml_backend_cuda_comm_init_nccl(ret);
+
+    ret->ar_p2p = ggml_cuda_ar_p2p_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (ret->ar_p2p != nullptr) {
+        ret->fallback_allreduce = ret->try_allreduce;
+        ret->try_allreduce      = ggml_backend_cuda_comm_try_allreduce_p2p;
+    } else {
+        GGML_LOG_WARN("P2P AllReduce init failed (needs exactly 2 CUDA devices with peer access); using fallback\n");
+    }
+}
+
 // Top-level init.  Picks one of the three init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
@@ -1443,6 +1471,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
+        } else if (env_str == "p2p") {
+            ggml_backend_cuda_comm_init_p2p(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
@@ -4567,10 +4597,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
-            if (!graph->disable_due_to_gpu_arch) {
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+            // not validated on older archs, opt-in for experimentation
+            static const bool force_graphs = getenv("GGML_CUDA_FORCE_GRAPHS") != nullptr;
+            if (!force_graphs) {
+                if (!graph->disable_due_to_gpu_arch) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+                }
+                graph->disable_due_to_gpu_arch = true;
             }
-            graph->disable_due_to_gpu_arch = true;
         }
     }
 

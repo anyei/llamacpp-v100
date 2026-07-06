@@ -27,3 +27,21 @@ bool ggml_cuda_ar_allreduce(
     ggml_backend_t        * backends,
     ggml_tensor           ** tensors);
 
+// One-shot peer-to-peer AllReduce for exactly 2 devices with direct peer
+// access (NVLink or PCIe P2P).  Targets the small per-layer reductions of
+// tensor-parallel token generation, where per-call latency dominates.
+struct ggml_cuda_ar_p2p;
+
+// Returns nullptr unless n_devices == 2 and peer access can be enabled in
+// both directions.  devices[] holds CUDA device IDs in backend rank order.
+ggml_cuda_ar_p2p * ggml_cuda_ar_p2p_init(const int * devices, size_t n_devices);
+
+void ggml_cuda_ar_p2p_free(ggml_cuda_ar_p2p * p2p);
+
+// In-place sum across tensors[0..1] (contiguous F32 only).  Returns false if
+// this call cannot be handled (type/size); the caller falls back.
+bool ggml_cuda_ar_p2p_allreduce(
+    ggml_cuda_ar_p2p * p2p,
+    ggml_backend_t   * backends,
+    ggml_tensor      ** tensors);
+

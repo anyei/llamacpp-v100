@@ -1218,6 +1218,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
+    // keep drafting past the p_min cutoff so the draft length (and with it the
+    // verification batch shape) stays fixed at n_max; a stable shape lets the
+    // target and draft contexts reuse their graphs, which is much cheaper than
+    // the wasted rows (low-confidence tokens are simply rejected at verification)
+    bool pad_drafts = true;
+
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
@@ -1256,6 +1262,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
+
+        pad_drafts = getenv("LLAMA_SPEC_DRAFT_NO_PAD") == nullptr;
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
@@ -1553,7 +1561,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < params.p_min && !pad_drafts) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
