@@ -247,6 +247,9 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // same, but on an explicit scheduler (used by the decode graph cache)
+    ggml_status graph_compute_on(ggml_backend_sched_t sched_cur, ggml_cgraph * gf, bool batched);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -362,6 +365,28 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // small-batch decode graph cache: gf_res_prev only tracks the single most
+    // recent graph, so workloads that alternate between a few batch shapes
+    // (e.g. speculative drafting) rebuild constantly. Each entry owns its own
+    // scheduler because a scheduler can only replay the splits of its last
+    // allocated graph.
+    // env: LLAMA_DECODE_GRAPH_CACHE (entries, 0 disables),
+    //      LLAMA_DECODE_GRAPH_CACHE_TOKENS (max ubatch size to cache)
+    struct decode_cache_entry {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        int64_t last_used = 0;
+    };
+    std::vector<decode_cache_entry> decode_cache;
+    int64_t  decode_cache_clock  = 0;
+    size_t   decode_cache_n_max  = 4;
+    uint32_t decode_cache_tokens = 64;
+
+    // scheduler that ran the most recent process_ubatch (main or cache entry)
+    ggml_backend_sched_t sched_active = nullptr;
+
+    ggml_backend_sched_t active_sched() const { return sched_active != nullptr ? sched_active : sched.get(); }
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
