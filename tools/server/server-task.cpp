@@ -1663,13 +1663,25 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
+    // keep only the most recent checkpoints in the cached copy - on hybrid/recurrent
+    // models each checkpoint holds the full recurrent state (~150 MiB for a 27B DeltaNet
+    // hybrid), so carrying the whole list would turn long conversations into multi-GiB
+    // cache entries. resuming the conversation only needs the checkpoints near its end;
+    // deeper edits fall back to re-prefilling from the start.
+    static constexpr size_t CACHE_CHECKPOINTS_MAX = 2;
+
+    std::list<common_prompt_checkpoint> checkpoints = prompt.checkpoints;
+    while (checkpoints.size() > CACHE_CHECKPOINTS_MAX) {
+        checkpoints.pop_front();
+    }
+
     states.push_back({
         /*.tokens      =*/ prompt.tokens.clone(),
         /*.data        =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-        /*.checkpoints =*/ prompt.checkpoints,
+        /*.checkpoints =*/ std::move(checkpoints),
     });
 
     return &states.back();

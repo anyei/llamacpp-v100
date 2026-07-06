@@ -44,8 +44,8 @@ services:
 #      --rope-scale 1.4441
 #      --yarn-orig-ctx 262144
     command: >
-      -m /models/Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
-      --mmproj /models/qwen3.6-27b-mmproj-f16.gguf
+      -m /models/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf
+      --mmproj /models/qwen3.6-35B-A3B-mmproj-F16.gguf
       --host 0.0.0.0
       --port 8080
       -ngl 99
@@ -53,15 +53,15 @@ services:
       -ts 0.5,0.5
       -t 10
       -np 1
-      -c 200000
+      -c 50000
       --batch-size 4096
       --ubatch-size 4096
       --cont-batching
       --timeout 10
       --no-mmap
       --cache-prompt
-      --cache-type-k q8_0
-      --cache-type-v q8_0
+      --cache-ram 12288
+      --ctx-checkpoints 8
       --spec-type draft-mtp
       --spec-draft-n-max 3
       --spec-draft-n-min 1

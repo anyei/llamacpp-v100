@@ -57,6 +57,8 @@ services:
       --timeout 10
       --no-mmap
       --cache-prompt
+      --cache-ram 12288
+      --ctx-checkpoints 8
       --cache-type-k q8_0
       --cache-type-v q8_0
       -fit off
