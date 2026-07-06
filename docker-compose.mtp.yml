@@ -1,0 +1,73 @@
+version: '3.8'
+
+# MTP (speculative decoding) profile — 2026-07-06 tuning round.
+# Measured (dev build, Qwen3.6-27B, 2x V100): 66 t/s single-stream, 125 t/s
+# aggregate at -np 4 (vs 48 / 89.6 nospec).
+#
+# Image note: the aggregate -np 4 win and the decode graph cache need an image
+# rebuilt from commit 9bac6eead or later (plus the pending full-seq split fix
+# for the full 125 t/s). On an older image these settings still run correctly,
+# just without those gains. All env gates below are ignored by older builds.
+#
+# p-min 0.75 / n-min 1 is safe since commit d2b706d1b: drafts are padded to
+# n-max so the batch shape stays stable (kill switch: LLAMA_SPEC_DRAFT_NO_PAD).
+
+services:
+  llama-tq:
+    container_name: llama-tq-mtp-Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
+    image: llamacpp-local-v100:latest
+    volumes:
+      - /mnt/models/ollama37-k80/.ollama/custom-models/:/models
+      - /mnt/files/:/models2
+      - ./cache:/models/cache
+    ports:
+      - "8097:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+      # one-shot P2P AllReduce over NVLink for small tensors (+1.2% tg),
+      # falls back to NCCL for large/unsupported cases
+      - GGML_CUDA_ALLREDUCE=p2p
+      # small-batch decode graph cache: keeps one compiled graph per recurring
+      # batch shape (draft-step / verify shapes alternate every spec iteration)
+      - LLAMA_DECODE_GRAPH_CACHE=4
+      - LLAMA_DECODE_GRAPH_CACHE_TOKENS=64
+      # meta-backend compute-container ring; must cover the cached graphs above
+      - GGML_META_MAX_GRAPHS=8
+#      --rope-scaling yarn
+#      --rope-scale 1.4441
+#      --yarn-orig-ctx 262144
+    command: >
+      -m /models/Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
+      --mmproj /models/qwen3.6-27b-mmproj-f16.gguf
+      --host 0.0.0.0
+      --port 8080
+      -ngl 99
+      -sm tensor
+      -ts 0.5,0.5
+      -t 10
+      -np 1
+      -c 200000
+      --batch-size 4096
+      --ubatch-size 4096
+      --cont-batching
+      --timeout 10
+      --no-mmap
+      --cache-prompt
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --spec-type draft-mtp
+      --spec-draft-n-max 3
+      --spec-draft-n-min 1
+      --spec-draft-p-min 0.75
+      -fit off
+      -fa on
+      --no-prefill-assistant
+      --reasoning-preserve
+    restart: always
