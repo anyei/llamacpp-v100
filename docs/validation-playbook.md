@@ -262,6 +262,38 @@ docker run --rm --gpus all --entrypoint /app/ggml-rpc-server IMAGE:TAG --help \
 
 ---
 
+## 13. n-way splits on a single GPU (the dup-device harness)
+
+`LLAMA_META_DUP_DEVICE=N` duplicates the tensor-split device list so one GPU
+runs a genuine n-way split — real segmented weights, real reductions; only
+cross-device transfer physics is simulated. This is how split bugs are
+reproduced and byte-exactness-gated without a multi-GPU box:
+
+```bash
+# gate: a known-good dense model must stay byte-identical at n=2
+CUDA_VISIBLE_DEVICES=1 LLAMA_META_DUP_DEVICE=2 ./llama-server \
+  -m /models/Qwen3-0.6B-BF16.gguf -sm tensor -fa on ...   # diff vs single-GPU ref
+```
+
+Divergence hunting on top of it: `GGML_META_DEBUG_REDUCE=1` prints AllReduce
+boundary placement; `LLAMA_DEBUG_DUMP_DIR=/tmp/d LLAMA_DEBUG_DUMP_FILTER=...`
+writes full tensors for elementwise comparison (see task 13 in TASKS.md for
+the worked example).
+
+## 14. MLA / MoE tensor mode: judge by perplexity, never byte-exactness
+
+MoE routers amplify ordinary split-reduction noise discontinuously (near-tied
+experts flip), so temp-0 text from `-sm tensor` legitimately diverges from
+single-GPU runs while quality is unchanged. The correct gate:
+
+```bash
+./llama-perplexity -m model.gguf -ngl 99 -fa on -f text.txt -c 2048          # single GPU
+LLAMA_META_DUP_DEVICE=2 ./llama-perplexity ... -sm tensor ...                # n=2
+# PPL must agree within the reported +/- (measured: 14.3574 vs 14.3787 +/- 0.69)
+```
+
+Dense models have no such amplifier and MUST stay byte-identical.
+
 ## General traps collected along the way
 
 - Reference outputs depend on the exact request: same prompt, `n_predict`,

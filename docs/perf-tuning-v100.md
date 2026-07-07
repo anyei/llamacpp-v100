@@ -105,12 +105,16 @@ baseline (fresh-server and cached-prompt paths).
 
 ## Diagnostic knobs (all env-gated, zero cost when unset)
 
-| Env | Prints |
+| Env | Prints / does |
 |---|---|
 | `LLAMA_DECODE_TIMING=1` | per-256-ubatch build/alloc/set-inputs/compute + reuse counts |
 | `LLAMA_SPEC_TIMING=1` | per-64-iteration draft/checkpoint/decode/accept phases |
 | `LLAMA_BATCH_DEBUG=1/2` | ubatch composition per split (needs `-lv 5`) |
-| `GGML_META_DEBUG=1` | tensor-parallel split states per node (needs `-lv 5`) |
+| `GGML_META_DEBUG=1\|2` | tensor-parallel split states per node; `2` adds per-src resolution (needs `-lv 5`) |
+| `GGML_META_DEBUG_REDUCE=1` | where each AllReduce boundary lands (placement is device-count-independent — a 1-GPU run is authoritative) |
+| `LLAMA_META_DUP_DEVICE=N` | duplicate the tensor-split device list: one GPU runs a genuine n-way split (byte-exactness gates + split debugging without a multi-GPU box) |
+| `LLAMA_DEBUG_DUMP_DIR` + `_FILTER` | full-tensor dumps from the eval callback (corner samples hide mid-tensor divergence) |
+| `GGML_RPC_NO_W2W=1` | coordinator env: force coordinator-bridged copies instead of worker-to-worker pulls |
 
 ## Which split mode per architecture
 

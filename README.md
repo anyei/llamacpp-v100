@@ -50,11 +50,19 @@ Every change was gated on **byte-identical temp-0 output** vs. baseline.
 ### Correctness / robustness
 - Quantized KV verified in tensor mode (q8_0 lossless at 2x; mixed K/V types
   enabled via `GGML_CUDA_FA_ALL_QUANTS`).
-- MLA models (`deepseek2` family: GLM-4.7-Flash, DeepSeek V2/V3/R1, Kimi K2)
-  rejected cleanly in tensor mode instead of a core dump (proper support is a
-  pending item; single GPU or `-sm layer` works).
+- **MLA tensor mode** (`deepseek2` family: GLM-4.7-Flash, DeepSeek V2/V3/R1,
+  Kimi K2): supported — attention runs mirrored, FFN/experts split; validated
+  by perplexity (statistically identical to single-GPU). Temp-0 text can
+  diverge from single-GPU runs (MoE-router-amplified reduction noise) without
+  affecting quality. Single GPU remains fastest when the model fits.
+- Clean failure paths: unreachable `--rpc` endpoints, failed context creation,
+  and a lora-path double-free all fixed (previously silent CPU fallback /
+  null-pointer crashes).
 - Diagnostic instrumentation: `LLAMA_DECODE_TIMING`, `LLAMA_SPEC_TIMING`,
-  `GGML_META_DEBUG=1|2` (split-state + per-src resolution tracing).
+  `GGML_META_DEBUG=1|2` (split-state + per-src resolution tracing),
+  `GGML_META_DEBUG_REDUCE` (AllReduce boundary placement),
+  `LLAMA_DEBUG_DUMP_DIR`/`_FILTER` (full-tensor dumps from the eval callback),
+  `LLAMA_META_DUP_DEVICE` (genuine n-way tensor splits on one GPU).
 
 ### Distributed inference (experimental)
 - **TP islands**: `ggml-rpc-server --tensor-parallel` exposes all local GPUs
@@ -66,8 +74,12 @@ Every change was gated on **byte-identical temp-0 output** vs. baseline.
 - **State integrity over islands**: prompt checkpoints and slot save/restore
   work across RPC (views are resolved to their root tensors on the wire; a
   501 MB / 5259-token 27B state round-trips with byte-identical generation).
-- RPC protocol 4.1: split-state upload, device descriptions, buffer-usage
-  mirroring, meta-aware (logical-address) sanitization.
+- RPC protocol 4.2: split-state upload, device descriptions, buffer-usage
+  mirroring, meta-aware (logical-address) sanitization, async command
+  markers + events (scheduler pipeline parallelism engages across RPC
+  devices), multi-connection workers with per-connection buffer reclaim,
+  and fenced worker-to-worker activation transfers (`GGML_RPC_NO_W2W=1`
+  to force the old coordinator-bridged copies).
 - Pipeline over RPC measured at ~3%/token protocol cost — cross-machine
   `-sm layer` is practical on ordinary Ethernet.
 
@@ -115,24 +127,19 @@ For multi-machine setups see the
 
 Tracked in detail in [`TASKS.md`](TASKS.md):
 
-- **MLA tensor-parallelism** (task 13) — deepseek2-family models currently
-  refuse `-sm tensor`; a WIP mirrored-attention path exists behind
-  `LLAMA_TENSOR_MLA_WIP=1` but produces corrupted output. Matters if a
-  DeepSeek-family model becomes the flagship.
-- **Distributed phase 2** (task 12) — async RPC double-buffering to cut the
-  per-token latency of the synchronous protocol (mainly benefits the
-  whole-model-remote case; parked pending real cross-host hardware).
+- **SSD streaming** (task 15) — the investigation is complete (dense CPU
+  streaming: no win over kernel readahead; MoE under a memory cap: 10x
+  headroom exists but page-cache steering is self-defeating). The remaining
+  build is a userspace expert cache (pread/O_DIRECT arena + SLRU, one
+  design for CPU and GPU tiers) — see `docs/ssd-streaming-plan.md`.
+- **Distributed, hardware-gated** — two-box measurement of the
+  worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
+  RDMA / 25 GbE+).
 - **Distributed polish** — worker fault tolerance (a dead worker still
-  aborts the coordinator); RPC auth/TLS. (Slice-packed island E2E, state
-  save/restore over RPC, and adopted-alias lifetime hardening: all done
-  and verified 2026-07-07.)
-- **`--ssd-streaming`** (task 15) — three-tier weight placement
-  (VRAM / RAM / SSD) for models that don't fit in memory; investigation
-  phase, breakdown and measured storage baseline in TASKS.md.
-- **Meta-device teardown segfault** (task 14) — freeing a tensor-split model
-  without a context crashes; only reachable through error paths.
-- **Distributed phase 3** — cross-host NCCL tensor parallelism; only worth it
-  with RDMA / 25 GbE+.
+  aborts the coordinator); RPC auth/TLS (WireGuard covers this in practice).
+- **Minor debt** — CUDA OOM during meta buffer allocation asserts instead
+  of erroring cleanly; `-ot` cannot target non-default buffer types.
+- Tasks 13 (MLA tensor mode) and 14 (init-failure crashes) closed 2026-07-07.
 
 ## Reference hardware & platform
 

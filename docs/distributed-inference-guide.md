@@ -165,8 +165,10 @@ Everything here is automatic — no new flags on the happy path:
   same as bridged copies — the win is on real networks (one direct hop
   instead of two through the coordinator) and has not been measured on
   physical two-box hardware yet.
-- MLA models (`deepseek2` family) do not support tensor mode at all yet
-  (task 13) — islands included. Pipeline mode works for them.
+- MLA models (`deepseek2` family) run tensor mode with mirrored attention
+  (task 13 closed): quality validated by perplexity, but temp-0 outputs can
+  diverge from single-GPU runs (MoE-router-amplified reduction noise) — do
+  not gate MLA tensor/island setups on byte-exactness.
 - No fault tolerance: a dead worker aborts the coordinator. No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
