@@ -134,6 +134,30 @@ Tracked in detail in [`TASKS.md`](TASKS.md):
 - **Distributed phase 3** — cross-host NCCL tensor parallelism; only worth it
   with RDMA / 25 GbE+.
 
+## Reference hardware & platform
+
+Everything in this fork was developed, measured, and validated on one box:
+
+| Component | Detail |
+|---|---|
+| GPUs | 2x NVIDIA Tesla V100-SXM2-32GB (Volta, cc 7.0, 32 GB each) on an SXM2 carrier |
+| GPU interconnect | NVLink NV2 between the pair (`nvidia-smi topo -m`: `NV2`) — this is what makes `-sm tensor` + NCCL fast |
+| GPU driver | 580.x (CUDA 13 userspace; images build against CUDA 12.8) |
+| CPU | Intel Core i9-10850K, 10c/20t @ 3.6 GHz |
+| RAM | 46 GiB (+ zram swap) — note the 27B CPU-side config needs ~11 GiB anonymous memory beyond weights |
+| Storage | Models on a consumer NVMe (measured 1.6 GB/s O_DIRECT sequential); bulk HDDs for everything else |
+| OS / runtime | Linux (LTS kernel 6.18), Docker 29 with the NVIDIA container runtime; serving and dev builds both containerized |
+| Network | Single host — all RPC/distributed numbers are loopback; the 4+2+1 two-box topology is the planned expansion (see the deployment plan in `docs/perf-tuning-v100.md`) |
+
+**Linux-only, and deliberately so.** This fork is developed and tested
+exclusively on Linux inside Docker. Upstream llama.cpp supports Windows and
+macOS, but nothing added here has ever been run there, and there are no
+positive expectations that it works: the distributed transport, `O_DIRECT`
+I/O paths, the cgroup-based memory-cap testing methodology, and the compose
+deployment profiles are all Linux-specific, and the tuning targets
+(NVLink SXM2 V100s) barely exist outside Linux servers anyway. If you try it
+on Windows, you are on your own — report findings, but expect breakage.
+
 ## Provenance and caveats
 
 - Forked from upstream llama.cpp (see git history for the merge base);
