@@ -303,6 +303,13 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
             if (ggml_backend_rpc_split_state_lookup(tensor->name, &state)) {
                 return state;
             }
+            // mirrored fallback duplicates the tensor on every device - log the big ones
+            // so missing split-state uploads are visible (>= 1 MiB keeps the noise down)
+            const size_t nbytes = ggml_nbytes(tensor);
+            if (nbytes >= 1024*1024) {
+                fprintf(stderr, "split-state fallback -> mirrored: %s (%.1f MiB)\n",
+                        tensor->name, nbytes / (1024.0*1024.0));
+            }
             ggml_backend_meta_split_state mirrored = {};
             mirrored.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
             mirrored.nr[0]      = 1;

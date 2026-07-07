@@ -316,6 +316,31 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
+
+    // for statically resolvable tensors (weights, KV/recurrent caches) only the per-device
+    // slice is stored, so reserve the largest slice rather than the full tensor - otherwise
+    // every device's buffer spans the whole allocation space and split tensors waste ~half
+    // the memory per device (offset-preserving placement keeps working: slice offsets are
+    // assigned in this compacted space on every device alike)
+    if (tensor->op == GGML_OP_NONE && tensor->view_src == nullptr && buft->device != nullptr) {
+        const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) buft->device->context;
+        const ggml_backend_meta_split_state state = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+        if (state.axis >= 0 && state.axis < GGML_MAX_DIMS && tensor->ne[state.axis] > 0) {
+            int64_t ne_max = 0;
+            for (size_t j = 0; j < n_simple_bufts; j++) {
+                int64_t ne_j = 0;
+                for (size_t s = 0; s < state.n_segments; s++) {
+                    ne_j += state.ne[s*n_simple_bufts + j] * state.nr[s];
+                }
+                ne_max = std::max(ne_max, ne_j);
+            }
+            if (ne_max > 0 && ne_max < tensor->ne[state.axis]) {
+                // multiply first: divide-first truncates for quantized block sizes
+                max_alloc_size = (max_alloc_size * (size_t) ne_max + (size_t) tensor->ne[state.axis] - 1)
+                    / (size_t) tensor->ne[state.axis];
+            }
+        }
+    }
     return max_alloc_size;
 }
 
@@ -670,10 +695,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
-        GGML_ABORT("unsupported mul_mat split combination: %s = %s[%s] x %s[%s]",
+        // note: do not print src names here - over RPC the src pointers of a lone
+        // deserialized struct can dangle and turn this abort into a silent segfault
+        GGML_ABORT("unsupported mul_mat split combination: %s = src0[%s] x src1[%s]",
                 tensor->name,
-                tensor->src[0]->name, ggml_backend_meta_split_axis_name(src_ss[0].axis),
-                tensor->src[1]->name, ggml_backend_meta_split_axis_name(src_ss[1].axis));
+                ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                ggml_backend_meta_split_axis_name(src_ss[1].axis));
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
 

@@ -63,7 +63,9 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        // meta (tensor-parallel) buffers store only the per-device slice of a split
+        // tensor, which is legitimately smaller than ggml_nbytes
+        assert(size >= ggml_nbytes(tensor) || ggml_backend_buft_is_meta(buft));
         return size;
     }
     return ggml_nbytes(tensor);

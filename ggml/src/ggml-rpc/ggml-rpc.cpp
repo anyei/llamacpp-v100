@@ -668,6 +668,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
     rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
 
+    // tensor-parallel islands store only per-device slices; the actual allocation size
+    // depends on the worker-side split state, so it must always be queried
+    rpc_get |= buft->device != nullptr &&
+        strncmp(ggml_backend_dev_description(buft->device), "Meta[", 5) == 0;
+
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
         auto sock = get_socket(buft_ctx->endpoint);
@@ -1097,12 +1102,19 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     if (result->buffer) {
-        // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        if (ggml_backend_buffer_is_meta(result->buffer)) {
+            // no bounds validation possible: for tensor-parallel meta buffers the data
+            // field is a logical address - buffers are packed in per-device slice space
+            // and views carry full-tensor-space offsets. The meta layer re-derives the
+            // physical per-device placement itself and never dereferences this pointer.
+        } else {
+            // require that the tensor data does not go beyond the buffer end
+            uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
+            GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
+            GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1141,8 +1153,9 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
 
-    // sanitize tensor->data
-    {
+    // sanitize tensor->data (skip for tensor-parallel meta buffers: their data field is a
+    // logical address in split-tensor space and the meta layer bounds physical placement)
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
@@ -1212,8 +1225,9 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
 
-    // sanitize tensor->data
-    {
+    // sanitize tensor->data (skip for tensor-parallel meta buffers: their data field is a
+    // logical address in split-tensor space and the meta layer bounds physical placement)
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
@@ -1281,8 +1295,9 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
-    // sanitize tensor->data
-    {
+    // sanitize tensor->data (skip for tensor-parallel meta buffers: their data field is a
+    // logical address in split-tensor space and the meta layer bounds physical placement)
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
