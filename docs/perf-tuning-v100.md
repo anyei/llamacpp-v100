@@ -126,9 +126,32 @@ single V100 = 79 t/s coherent; the WIP tensor mode is no faster (79.8) and
 incorrect. Related: task 14 — freeing a tensor-split model without a context
 segfaults in cleanup, which is why the gate throws at model create.
 
+## Agreed deployment plan for the future hardware
+
+Target: new machine with a 4-slot SXM2 board (NVLink island) + a 2-slot SXM2
+board (NVLink island, PCIe between boards); this machine keeps a PCIe V100.
+
+1. **4-GPU island = flagship, one process**: main model, `-sm tensor
+   -ts 0.25,0.25,0.25,0.25` + NCCL. Never TP across the PCIe gap to the
+   other board. On assembly, run `nvidia-smi topo -m` and bench 6-way vs
+   4-way tensor before trusting this assumption.
+2. **2-GPU board = independent second server** (second model / draft /
+   coder), not a pipeline stage — merge into the flagship only when a model
+   needs > 128 GB.
+3. **PCIe V100 = utility node** (small/MoE models solo, embeddings). Never
+   in a TP group; never host spec-draft models across the network from
+   their target.
+4. **Cross-machine distribution = held in reserve** for (a) models that do
+   not fit 192 GB or (b) evacuating tail layers to free island VRAM for
+   giant contexts. Both use `-sm layer --rpc worker:50052`
+   (`docker-compose.rpc-worker.yml`); measured protocol cost ~3%/token +
+   2x network RTT.
+
 ## Remaining roadmap
 
-- Task 13: correct MLA tensor-parallelism (see above).
-- Distributed inference (coordinator + N workers) for the future 4x V100
-  setup — design in `docs/distributed-inference-plan.md`, implementation
-  deferred by choice.
+- Task 12 phase 1 coordinator side (split-state push) — makes TP islands
+  usable; status and design in TASKS.md item 12.
+- Task 13: correct MLA tensor-parallelism (see above) — priority rises only
+  if a DeepSeek-family model becomes the flagship.
+- Task 12 phases 2-3 (async RPC, cross-host NCCL): parked unless RDMA/25GbE
+  or a concrete >192 GB model plan appears.
