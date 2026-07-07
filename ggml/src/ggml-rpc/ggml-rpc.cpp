@@ -516,9 +516,23 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
     return GGML_STATUS_SUCCESS;
 }
 
+// raw byte-range get/set on a view touches the same memory as its root tensor at a
+// translated offset. Views must be resolved to the root before serializing: view links
+// do not survive the wire, and a tensor-parallel island worker can only re-derive the
+// per-device placement of tensors it has registered - a bare view struct would fall
+// back to mirrored placement and silently corrupt the packed per-device slices.
+static const ggml_tensor * rpc_resolve_view(const ggml_tensor * tensor, size_t & offset) {
+    while (tensor->view_src != nullptr && tensor->view_src->buffer == tensor->buffer) {
+        offset += (const char *) tensor->data - (const char *) tensor->view_src->data;
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    const ggml_tensor * root = rpc_resolve_view(tensor, offset);
+    rpc_tensor rpc_tensor = serialize_tensor(root);
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
@@ -544,8 +558,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    const ggml_tensor * root = rpc_resolve_view(tensor, offset);
     rpc_msg_get_tensor_req request;
-    request.tensor = serialize_tensor(tensor);
+    request.tensor = serialize_tensor(root);
     request.offset = offset;
     request.size = size;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);

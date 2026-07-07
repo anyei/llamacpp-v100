@@ -1458,10 +1458,40 @@ static struct ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(const 
     return ggml_backend_meta_buffer_simple_tensor(tensor, index);
 }
 
+// a bare leaf struct (no view links) whose data address falls inside a registered static
+// entry's range but failed identity adoption is an alias the meta layer cannot place -
+// typically a view whose links were lost crossing RPC. Deriving a fallback (mirrored)
+// state for it would read garbage and, worse, WRITE across the packed per-device slices
+// of neighboring tensors, so fail loudly instead. The RPC client is responsible for
+// resolving views to their root tensor before serializing (see rpc_resolve_view).
+static void ggml_backend_meta_buffer_reject_unknown_alias(const struct ggml_tensor * tensor, const char * op) {
+    if (tensor->view_src != nullptr) {
+        return; // in-process views carry walkable links; derivation handles them
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const auto & by_data = buf_ctx->stc_static.by_data;
+    auto it = by_data.upper_bound(tensor->data);
+    if (it == by_data.begin()) {
+        return;
+    }
+    --it;
+    const ggml_backend_meta_tensor_fingerprint & fp = it->second->fingerprint;
+    size_t entry_nbytes = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        entry_nbytes = std::max(entry_nbytes, (size_t) fp.ne[i] * fp.nb[i]);
+    }
+    if ((const char *) tensor->data < (const char *) it->first + entry_nbytes) {
+        GGML_ABORT("%s: tensor '%s' aliases registered island tensor '%s' but cannot be resolved - "
+                   "views must be translated to their root tensor before crossing RPC", op, tensor->name, fp.name);
+    }
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     // RPC commands arrive as freshly deserialized structs - resolve them by identity
     // first so no lookup or derivation ever walks their src pointers
-    ggml_backend_meta_buffer_adopt_identity(tensor);
+    if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
+        ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1578,7 +1608,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     // RPC commands arrive as freshly deserialized structs - resolve them by identity
     // first so no lookup or derivation ever walks their src pointers
-    ggml_backend_meta_buffer_adopt_identity(tensor);
+    if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
+        ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
+    }
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
