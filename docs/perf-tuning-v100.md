@@ -119,7 +119,7 @@ baseline (fresh-server and cached-prompt paths).
 | Dense / GQA | Qwen3.x dense, Kimi-Dev-72B, Llama-family | ✅ supported, tuned | tensor (2 GPU) |
 | Hybrid recurrent | Qwen3.5/3.6 (DeltaNet layers) | ✅ supported, tuned | tensor (2 GPU) |
 | MoE w/ GQA | Qwen3.x-A3B MoE | ✅ supported | single GPU if it fits (light active set), else tensor |
-| **MLA (`deepseek2`)** | DeepSeek V2/V3/R1, Kimi K2, GLM-4.7-Flash | ❌ rejected at load with a clean error since `c45c70081` (correct TP is task 13; `LLAMA_TENSOR_MLA_WIP=1` reaches the WIP path, which runs but corrupts output) | **single GPU** if ≤ ~30 GB (as fast as TP for MoE-light models), else `-sm layer` |
+| **MLA (`deepseek2`)** | DeepSeek V2/V3/R1, Kimi K2, GLM-4.7-Flash | ✅ supported since task 13 closed (attention mirrored on every device, FFN/experts split; ppl statistically identical to single-GPU; temp-0 text can diverge — MoE-router-amplified reduction noise, quality-neutral) | **single GPU** still recommended when the model fits (as fast as TP for MoE-light models); tensor mode for models that don't |
 
 MLA background: `deepseek2` models keep a single shared latent KV head
 (e.g. GLM-4.7-Flash: `n_head_kv = 1`, 576-dim latent, ~1.1 KB/token) — there is
