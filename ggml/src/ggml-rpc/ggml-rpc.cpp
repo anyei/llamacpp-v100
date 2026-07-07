@@ -11,6 +11,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -1022,6 +1023,11 @@ bool ggml_backend_rpc_set_split_states(const char * endpoint, const void * data,
 
 // RPC server-side implementation
 
+// One rpc_server instance is shared by every client connection (each connection
+// runs in its own thread). exec_mutex serializes command execution: backends and
+// the buffer registry are single-threaded by design, and holding the lock for the
+// duration of a command gives cross-connection commands exactly the dependency
+// semantics worker-to-worker copies need (a reader waits out an in-flight compute).
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -1029,6 +1035,16 @@ public:
         stored_graphs.resize(backends.size());
     }
     ~rpc_server();
+
+    std::mutex exec_mutex;
+    // set (under exec_mutex) by the serving thread before dispatching a command
+    uint64_t current_conn = 0;
+
+    size_t device_count() const { return backends.size(); }
+
+    // free every buffer allocated by a connection when it closes - same reclaim
+    // semantics as the old one-server-per-connection design
+    void free_owned(uint64_t conn_id);
 
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
@@ -1052,6 +1068,7 @@ public:
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
+        uint64_t               owner_conn;
     };
 
 private:
@@ -1066,9 +1083,22 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> buffer_owners;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
+
+void rpc_server::free_owned(uint64_t conn_id) {
+    for (auto it = buffer_owners.begin(); it != buffer_owners.end(); ) {
+        if (it->second == conn_id) {
+            ggml_backend_buffer_free(it->first);
+            buffers.erase(it->first);
+            it = buffer_owners.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -1132,6 +1162,7 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
         buffers.insert(buffer);
+        buffer_owners[buffer] = current_conn;
     } else {
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -1183,6 +1214,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
+    buffer_owners.erase(buffer);
     return true;
 }
 
@@ -1605,6 +1637,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].graph = graph;
+    stored_graphs[device].owner_conn = current_conn;
     return true;
 }
 
@@ -1614,6 +1647,13 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         return false;
     }
     if (stored_graphs[device].graph == nullptr) {
+        return false;
+    }
+    if (stored_graphs[device].owner_conn != current_conn) {
+        // another connection replaced this device's stored graph - recomputing it
+        // would silently run the wrong graph. Two coordinators sharing one device
+        // is unsupported; fail loudly.
+        GGML_LOG_ERROR("[%s] stored graph for device %u belongs to another connection\n", __func__, device);
         return false;
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
@@ -1664,9 +1704,7 @@ rpc_server::~rpc_server() {
     }
 }
 
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock) {
-    rpc_server server(backends, cache_dir);
+static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -1704,6 +1742,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
+        // idle wait for the next command happens without the execution lock so
+        // other connections keep making progress
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
@@ -1712,6 +1752,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        // one command executes at a time across all connections; the payload recv
+        // inside each case is safe to hold the lock over - the client sends the
+        // header and payload back-to-back
+        std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
+        server.current_conn = conn_id;
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -1722,7 +1767,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_device_count_rsp response;
-                response.device_count = backends.size();
+                response.device_count = server.device_count();
                 if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
@@ -1980,6 +2025,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
+    rpc_serve_client_loop(server, sock, conn_id);
+    // runs regardless of how the loop exited (clean close or protocol error)
+    std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
+    server.free_owned(conn_id);
+}
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -2035,17 +2087,25 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+    // one server instance shared by all connections (buffers, stored graphs);
+    // each connection is served by its own thread, execution is serialized by
+    // the server's exec_mutex
+    rpc_server server(backends, cache_dir);
+    uint64_t next_conn_id = 1;
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
             return;
         }
-        printf("Accepted client connection\n");
+        const uint64_t conn_id = next_conn_id++;
+        printf("Accepted client connection %" PRIu64 "\n", conn_id);
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket);
-        printf("Client connection closed\n");
-        fflush(stdout);
+        std::thread([&server, client_socket, conn_id]() {
+            rpc_serve_client(server, client_socket, conn_id);
+            printf("Client connection %" PRIu64 " closed\n", conn_id);
+            fflush(stdout);
+        }).detach();
     }
     rpc_transport_shutdown();
     for (auto backend : backends) {
