@@ -1,0 +1,165 @@
+# `--ssd-streaming` — Design & Investigation (Task 15, Phase 0)
+
+Three-tier weight placement — resident GPU (`-ngl`), resident CPU, streamed
+from SSD — so models can run when they don't fit in VRAM, or even in
+VRAM + RAM. Phase 0 deliverable: measured baselines, prior-art survey, code
+map, and the design the later phases implement. Task breakdown: `TASKS.md`
+item 15.
+
+## 1. Measured reality (this box, 2026-07-07)
+
+Hardware: 2x V100-SXM2-32GB, 46 GB RAM, 20 cores, models on one NVMe.
+Model: `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB dense hybrid).
+
+| Baseline | Result | Method |
+|---|---|---|
+| NVMe sequential read (O_DIRECT) | **1.6 GB/s** | `dd iflag=direct`, 4 GiB |
+| 27B CPU-only, fits in RAM (reference) | **1.51 t/s** tg, 3.5 t/s pp | `-ngl 0`, 10 threads, RSS 27.7 GB |
+| 27B CPU-only, 14 GB cgroup cap (mmap thrash) | **0.21 t/s** tg (4.8 s/token), 0.58 t/s pp | same + `docker --memory 14g`, model page-cache evicted first |
+
+Reading the numbers:
+
+- The thrash case is what llama.cpp *already does* when a model doesn't fit:
+  default mmap demand-pages weights from disk and the kernel evicts under
+  pressure. **0.21 t/s is the baseline managed streaming must beat.**
+- Thrash lands *above* the naive floor (16.4 GB / 1.6 GB/s ≈ 0.1 t/s)
+  because weight access order is sequential per layer, the loader sets
+  `POSIX_FADV_SEQUENTIAL` (kernel readahead works), and whatever fits in
+  the remaining page-cache window stays hot. A managed tier wins by
+  (a) prefetching layer n+1 *during* layer n's compute instead of faulting
+  synchronously, (b) pinning the hottest tensors deliberately rather than
+  letting LRU churn them, (c) not evicting the resident CPU tier's pages
+  (O_DIRECT bypasses page cache).
+- ~11.3 GB of the CPU run is anonymous memory (KV, compute, output buffers)
+  — the *weights* are the only streamable part; placement budgeting must
+  account for the fixed anonymous floor.
+- Measurement trap for future benchmarks: cgroup caps only charge pages
+  *faulted by that cgroup*. If the model is already in the host page cache,
+  a capped container reads it for free and shows no thrash. Evict first:
+  `os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`.
+
+Honest expectations for the feature (dense 27B, this NVMe):
+
+| Tier mix | Expected decode |
+|---|---|
+| Everything streamed | ~0.1-0.3 t/s — runnability, not speed |
+| 46/48 layers resident, 2 streamed | ~ +0.4 GB/token ≈ resident speed − ~0.25 s/token |
+| Large-batch prefill, streamed | one 16 GB stream amortized over the whole ubatch (~10 s per 4k batch) |
+| MoE with hot-expert cache | the real win — see prior art below |
+
+## 2. Prior art
+
+- Upstream has **no managed disk streaming**; the maintainers' answer is
+  "mmap demand-paging is the mechanism"
+  ([discussion #19163](https://github.com/ggml-org/llama.cpp/discussions/19163)).
+- [Issue #20757](https://github.com/ggml-org/llama.cpp/issues/20757)
+  proposes almost exactly our phase 4: GPU VRAM expert slots + pinned RAM
+  backing + mmap SSD tier, SLRU eviction, frequency-gated admission. Python
+  PoC on an 8 GB GPU running GPT-OSS-120B: 12-14 t/s steady state (~98%
+  cache hits) vs 0.5-1 t/s pure CPU offload. No maintainer response, no PR —
+  the field is open, and it validates the MoE sweet spot quantitatively.
+- [Issue #18766](https://github.com/ggml-org/llama.cpp/issues/18766):
+  upstream/this fork already ships `--direct-io` in the loader (see §3).
+- [Issue #9059](https://github.com/ggml-org/llama.cpp/issues/9059):
+  `--no-mmap` stages GPU layers through RAM — long-standing pain point that
+  a streamed buft also fixes as a side effect (SSD → staging → VRAM without
+  a full RAM copy).
+- [Issue #20697](https://github.com/ggml-org/llama.cpp/issues/20697):
+  disk offload for context checkpoints — adjacent, same staging/IO
+  machinery could serve it later.
+- Literature: FlexGen (throughput-oriented tier scheduling), DeepSpeed
+  ZeRO-Inference (layer-wise streaming with double buffering). Their core
+  lesson transfers: overlap transfer with compute and batch enough work per
+  streamed byte.
+
+## 3. What the tree already has (code map)
+
+Anchors from a full read of the loading/alloc/exec paths:
+
+- **O_DIRECT aligned reads, CLI-wired**: `llama_file` takes
+  `use_direct_io`; `src/llama-mmap.cpp:199` opens `O_RDONLY|O_DIRECT`,
+  `read_aligned_chunk` (`:319-349`) does bounce-buffer aligned reads.
+  CLI `--direct-io`/`-dio` (`common/arg.cpp:2401`). mmap and direct-io are
+  mutually exclusive in the loader (`llama-model-loader.cpp:564-567`).
+- **Per-tensor file offsets already exist**: `weights_map` /
+  `llama_tensor_weight.offs` in the model loader — GGUF is
+  offset-addressable per tensor, no format work needed.
+- **Async pinned-staging upload pipeline**: the no-mmap GPU load path
+  (`llama-model-loader.cpp:1584-1635`) already rotates 4x64 MB pinned
+  buffers through `read_raw_unsafe` → `ggml_backend_tensor_set_async` +
+  events. This is the transfer engine for streamed SSD→VRAM, reusable
+  nearly as-is.
+- **Non-resident buffer precedent**: the RPC buffer
+  (`ggml/src/ggml-rpc/ggml-rpc.cpp:610-621`) implements
+  `ggml_backend_buffer_i` where `get_base` returns an opaque handle and
+  set/get materialize data on demand — the template for a streamed buft.
+  Minimum iface: `get_base`, `set_tensor`, `get_tensor`, `clear`;
+  `init_tensor` is the natural place to attach `(file, offset)` extras.
+- **Pre-compute hook point**: `ggml_backend_sched_compute_splits`
+  (`ggml/src/ggml-backend.cpp:1546+`) — the eval-callback path (`:1687+`)
+  already demonstrates per-node pre-compute interception, but forces
+  node-at-a-time execution; a dedicated prefetch hook belongs just before
+  `graph_compute_async` (`:1683`), per split, where each split's node list
+  is known in advance.
+- **Per-graph prefetch schedules for free**: the fork's decode-graph cache
+  (`src/llama-context.cpp:1339-1430`) keeps one scheduler per cached graph
+  shape and replays identical topology — a per-`decode_cache_entry`
+  streamed-weight schedule stays valid across reuses and is computed once.
+- **Anti-features to disable for streamed tensors**: `llama_mlock`
+  (pins pages), `MAP_POPULATE`/`POSIX_MADV_WILLNEED` prefetch-at-load.
+- **Gap**: `-ot`/`--override-tensor` only offers *device default* bufts
+  (`common/arg.cpp:248-280`), so the streamed buft must be registered
+  through a device (or the parser extended) to be targetable per tensor.
+- Nothing io_uring/cuFile/`cudaMemPrefetchAsync` in the tree — phase 5
+  material, not needed for correctness.
+
+## 4. Design
+
+A new **streamed buffer type** (per backing device: CPU-streamed or
+CUDA-streamed), modeled on the RPC buffer:
+
+- Tensors carry `(file_id, offset, size)` instead of resident bytes
+  (attached at `init_tensor`; offsets come from the loader's existing
+  `weights_map`). "Loading" a streamed tensor is metadata-only — instant.
+- A **pinned staging ring** (`--ssd-stream-budget`, default a few hundred
+  MB) feeds reads; reads use the existing O_DIRECT `read_aligned_chunk`
+  so streaming never evicts the resident CPU tier from page cache.
+- **Prefetch**: per scheduler split, the ordered list of streamed tensors
+  is precomputed (once per cached decode graph); a worker thread reads
+  split n+1's tensors into the ring while split n computes; the compute
+  path blocks on a per-tensor event only when prefetch hasn't finished.
+  Dense access order is fully deterministic — prefetch hit rate should be
+  ~100%; MoE expert selection is the only dynamic part (phase 4).
+- **Placement/CLI**: `--ssd-streaming` streams everything not covered by
+  `-ngl`; `-ngl N --ssd-streaming` keeps N layers resident on GPU and
+  streams the tail (front layers resident first — they're reused by every
+  token equally, so placement policy is just "as many resident as fit");
+  interplay with `-ot` for per-tensor control once the buft is registered.
+- **Correctness**: weights are immutable and read-only — no eviction
+  bookkeeping, no writeback, crash-safe by construction. Dequant stays on
+  GPU/CPU exactly as today; the streamed buft only changes *where bytes
+  live*, never *what math runs*. Gate every phase on temp-0 byte-exactness
+  vs a fully-resident run.
+
+## 5. Phases
+
+0. ✅ This document: baselines, prior art, code map, design.
+1. CPU-tier managed streaming (staging ring + prefetch thread).
+   Gate: byte-identical output AND measurably beats 0.21 t/s thrash.
+2. GPU-tier streaming (ring → `tensor_set_async` on a side stream,
+   overlapped with layer compute; reuses the loader's staging pattern).
+3. Placement policy + CLI (`--ssd-streaming`, `--ssd-stream-budget`),
+   docs, compose profile.
+4. MoE-aware expert streaming with a hot-expert cache
+   (SLRU per issue #20757's evidence; admission-filtered).
+5. Stretch: io_uring read queues, cuFile/GDS direct SSD→VRAM, worker-side
+   streaming for TP islands (models bigger than an island's combined VRAM),
+   disk-backed context checkpoints (#20697) on the same machinery.
+
+## 6. Verification (house rules)
+
+- Temp-0 byte-exactness vs fully-resident at every phase.
+- Enforced ceilings: RSS + VRAM measured under load with the budget knobs.
+- A tg/pp table per tier mix in `docs/perf-tuning-v100.md` when phases land.
+- Repeat all capped-memory benchmarks with the page-cache eviction step
+  (§1) — results without it are invalid.
