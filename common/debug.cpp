@@ -184,6 +184,35 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+
+        // LLAMA_DEBUG_DUMP_DIR: also write the FULL tensor to <dir>/<name>.bin
+        // (ne[4] as int64 then raw data) - the printed corners can hide
+        // elementwise divergence in the middle of a tensor
+        if (const char * dump_dir = getenv("LLAMA_DEBUG_DUMP_DIR")) {
+            // optional comma-separated substring filter for the dump only
+            bool dump = true;
+            if (const char * df = getenv("LLAMA_DEBUG_DUMP_FILTER")) {
+                dump = false;
+                std::string name(t->name), filters(df);
+                size_t pos = 0;
+                while (pos != std::string::npos && !dump) {
+                    size_t next = filters.find(',', pos);
+                    std::string one = filters.substr(pos, next == std::string::npos ? next : next - pos);
+                    if (!one.empty() && name.find(one) != std::string::npos) {
+                        dump = true;
+                    }
+                    pos = next == std::string::npos ? next : next + 1;
+                }
+            }
+            if (dump && t->type == GGML_TYPE_F32) {
+                std::string path = std::string(dump_dir) + "/" + t->name + ".bin";
+                if (FILE * f = fopen(path.c_str(), "wb")) {
+                    fwrite(t->ne, sizeof(t->ne[0]), GGML_MAX_DIMS, f);
+                    fwrite(data, 1, ggml_nbytes(t), f);
+                    fclose(f);
+                }
+            }
+        }
     }
 
     return true;
