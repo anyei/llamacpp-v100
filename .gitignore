@@ -153,5 +153,5 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
-2026-*-resume.txt
+2026-*.txt   # local conversation exports - never publish
 .env
