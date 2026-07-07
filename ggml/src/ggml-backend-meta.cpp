@@ -2222,6 +2222,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 const int i_delayed = get_i_delayed(i);
 
+                // GGML_META_DEBUG_REDUCE=1: print where each AllReduce boundary lands.
+                // The placement logic is independent of n_devices, so a 1-GPU meta run
+                // shows exactly which nodes sit inside a delayed partial window.
+                static const bool debug_reduce = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                if (debug_reduce) {
+                    fprintf(stderr, "REDUCE: partial %4d '%s'[%s] -> boundary %4d '%s'[%s]\n",
+                            i, node->name, ggml_op_name(node->op),
+                            i_delayed, cgraph->nodes[i_delayed]->name, ggml_op_name(cgraph->nodes[i_delayed]->op));
+                }
+
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
                 //     its compute flag disabled and thus gets its data zeroed out.
