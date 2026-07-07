@@ -1373,10 +1373,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
 // resolve a tensor by identity (data address + fingerprint) rather than struct address -
 // RPC commands deserialize a fresh struct each time and its src pointers are meaningless,
-// so neither pointer lookups nor split-state re-derivation can be trusted for them
-static const ggml_backend_meta_simple_tensor_entry * ggml_backend_meta_buffer_find_by_identity(const struct ggml_tensor * tensor) {
+// so neither pointer lookups nor split-state re-derivation can be trusted for them.
+// src_stc receives the compute container that owns the entry, or nullptr for static.
+static const ggml_backend_meta_simple_tensor_entry * ggml_backend_meta_buffer_find_by_identity(
+        const struct ggml_tensor * tensor, ggml_backend_meta_simple_tensor_container ** src_stc) {
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
+    *src_stc = nullptr;
     {
         auto it = buf_ctx->stc_static.by_data.find(tensor->data);
         if (it != buf_ctx->stc_static.by_data.end() && it->second->fingerprint.matches(tensor)) {
@@ -1389,6 +1392,7 @@ static const ggml_backend_meta_simple_tensor_entry * ggml_backend_meta_buffer_fi
             buf_ctx->stc_compute[(buf_ctx->stc_compute_index - k + n_stc) % n_stc];
         auto it = stc.by_data.find(tensor->data);
         if (it != stc.by_data.end() && it->second->fingerprint.matches(tensor)) {
+            *src_stc = &stc;
             return it->second;
         }
     }
@@ -1402,15 +1406,24 @@ static bool ggml_backend_meta_buffer_adopt_identity(const struct ggml_tensor * t
     if (ggml_backend_meta_buffer_simple_tensor(tensor, 0) != nullptr) {
         return true; // already resolvable by pointer
     }
-    const ggml_backend_meta_simple_tensor_entry * e = ggml_backend_meta_buffer_find_by_identity(tensor);
+    ggml_backend_meta_simple_tensor_container * src_stc = nullptr;
+    const ggml_backend_meta_simple_tensor_entry * e = ggml_backend_meta_buffer_find_by_identity(tensor, &src_stc);
     if (e == nullptr) {
         return false;
     }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
-    ggml_backend_meta_simple_tensor_container & cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+    // the alias copies shadow POINTERS, so it must not outlive the container that owns
+    // them: a ring-sourced alias registers into the source's own slot (both die in the
+    // same ggml_reset; ring lookups are fingerprint-checked, so address recycling is
+    // safe). A static-sourced alias goes into the current ring slot instead - its
+    // shadows are immortal so eviction only costs a re-adoption, whereas registering
+    // it into the static container would be wrong: the static pointer lookup skips
+    // fingerprint checks and a recycled struct address would resolve to stale shadows.
+    ggml_backend_meta_simple_tensor_container & cur =
+        src_stc != nullptr ? *src_stc : buf_ctx->stc_compute[buf_ctx->stc_compute_index];
     auto & ne = cur.simple_tensors[tensor];
-    ne = *e;
+    ne = *e; // node-based map: inserting into the source's own map does not invalidate e
     cur.by_data[tensor->data] = &ne;
 
     for (int sync = 0; sync < 2; sync++) {
