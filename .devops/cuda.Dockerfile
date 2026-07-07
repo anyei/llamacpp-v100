@@ -49,6 +49,7 @@ RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     -DGGML_CUDA_GRAPHS=ON \
     -DGGML_CUDA_NCCL=ON \
     -DGGML_CUDA_FA_ALL_QUANTS=ON \
+    -DGGML_RPC=ON \
     -DGGML_NATIVE=ON \
     -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DLLAMA_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
     cmake --build build --config Release -j$(nproc)
@@ -129,7 +130,9 @@ FROM base AS server
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 
-COPY --from=build /app/full/llama /app/full/llama-server /app
+# ggml-rpc-server enables using this image as a distributed-inference worker
+# (see docs/distributed-inference-plan.md); llama-server acts as coordinator via --rpc
+COPY --from=build /app/full/llama /app/full/llama-server /app/full/ggml-rpc-server /app
 
 WORKDIR /app
 

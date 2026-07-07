@@ -1,0 +1,39 @@
+# RPC worker profile - runs this image as a distributed-inference worker
+# (docs/distributed-inference-plan.md, phase 0). Deploy one of these per
+# extra GPU box; the coordinator (a normal llama-server) connects with:
+#
+#   --rpc workerhost:50052 -sm layer -ngl 99
+#
+# Measured over loopback (2x V100, Qwen3.6-27B): RPC pipeline 32.3 t/s vs
+# 33.2 in-process layer split - the protocol hop costs ~3%. Cross-host adds
+# ~2x network RTT per token (fine on 1-10 GbE for -sm layer; never use
+# -sm tensor across hosts).
+#
+# SECURITY: the RPC protocol has no auth or TLS. Bind only to a private or
+# WireGuard/overlay network, never a public interface.
+#
+# The model file is NOT needed on the worker - weights stream from the
+# coordinator on first load and are hash-cached under /cache afterwards.
+
+services:
+  llama-rpc-worker:
+    container_name: llama-rpc-worker
+    image: llamacpp-local-v100:latest
+    entrypoint: /app/ggml-rpc-server
+    network_mode: host          # RPC + NCCL want direct sockets; see security note
+    volumes:
+      - ./cache-rpc:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+    command: >
+      -H 0.0.0.0
+      -p 50052
+      -c
+    restart: always

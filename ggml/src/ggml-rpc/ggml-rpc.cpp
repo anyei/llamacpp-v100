@@ -71,6 +71,7 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_SET_SPLIT_STATES,
     RPC_CMD_COUNT,
 };
 
@@ -289,6 +290,44 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
+// tensor-parallel islands: split states uploaded by the coordinator, resolved by
+// tensor name from the worker-side meta device callback (see tools/rpc/rpc-server.cpp)
+static std::unordered_map<std::string, ggml_backend_meta_split_state> g_rpc_split_states;
+static std::mutex g_rpc_split_states_mutex;
+
+static bool rpc_split_states_ingest(const uint8_t * data, size_t size) {
+    std::lock_guard<std::mutex> lock(g_rpc_split_states_mutex);
+    size_t off = 0;
+    while (off < size) {
+        if (off + sizeof(uint32_t) > size) {
+            return false;
+        }
+        uint32_t name_len;
+        memcpy(&name_len, data + off, sizeof(name_len));
+        off += sizeof(name_len);
+        if (name_len == 0 || off + name_len + sizeof(ggml_backend_meta_split_state) > size) {
+            return false;
+        }
+        std::string name((const char *) data + off, name_len);
+        off += name_len;
+        ggml_backend_meta_split_state state;
+        memcpy(&state, data + off, sizeof(state));
+        off += sizeof(state);
+        g_rpc_split_states[std::move(name)] = state;
+    }
+    return true;
+}
+
+bool ggml_backend_rpc_split_state_lookup(const char * name, struct ggml_backend_meta_split_state * out) {
+    std::lock_guard<std::mutex> lock(g_rpc_split_states_mutex);
+    auto it = g_rpc_split_states.find(name);
+    if (it == g_rpc_split_states.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
+}
+
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
@@ -812,6 +851,15 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
         return;
     }
     get_device_memory(sock, device, free, total);
+}
+
+bool ggml_backend_rpc_set_split_states(const char * endpoint, const void * data, size_t size) {
+    auto sock = get_socket(endpoint);
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("Failed to connect to %s\n", endpoint);
+        return false;
+    }
+    return send_rpc_cmd(sock, RPC_CMD_SET_SPLIT_STATES, data, size);
 }
 
 // RPC server-side implementation
@@ -1680,6 +1728,17 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_SPLIT_STATES: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!rpc_split_states_ingest(input.data(), input.size())) {
+                    GGML_LOG_ERROR("failed to parse split states payload (%zu bytes)\n", input.size());
                     return;
                 }
                 break;

@@ -173,6 +173,7 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
+    bool                     tensor_parallel = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -186,6 +187,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -tp, --tensor-parallel           expose all local GPUs as one tensor-parallel device\n");
+    fprintf(stderr, "                                   (TP island; coordinator must upload split states)\n");
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +236,8 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "-tp" || arg == "--tensor-parallel") {
+            params.tensor_parallel = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -282,6 +287,35 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
         if (dev) {
             devices.push_back(dev);
         }
+    }
+
+    // TP island: wrap all local accelerators in a single meta (tensor-parallel) device.
+    // Split states for statically allocated tensors (weights, KV cache) are uploaded by
+    // the coordinator via RPC_CMD_SET_SPLIT_STATES and resolved here by tensor name;
+    // unknown tensors default to mirrored (allocated whole on every device).
+    if (params.tensor_parallel) {
+        if (devices.size() < 2) {
+            fprintf(stderr, "warning: --tensor-parallel needs at least 2 devices, ignoring\n");
+            return devices;
+        }
+        static const auto split_state_cb = [](const struct ggml_tensor * tensor, void * /*ud*/) {
+            ggml_backend_meta_split_state state;
+            if (ggml_backend_rpc_split_state_lookup(tensor->name, &state)) {
+                return state;
+            }
+            ggml_backend_meta_split_state mirrored = {};
+            mirrored.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            mirrored.nr[0]      = 1;
+            mirrored.n_segments = 1;
+            return mirrored;
+        };
+        ggml_backend_dev_t meta = ggml_backend_meta_device(devices.data(), devices.size(), split_state_cb, nullptr);
+        if (meta == nullptr) {
+            fprintf(stderr, "error: failed to create tensor-parallel meta device\n");
+            return {};
+        }
+        fprintf(stderr, "tensor-parallel island: %zu devices exposed as one\n", devices.size());
+        devices = { meta };
     }
 
     return devices;
