@@ -317,6 +317,15 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         if (!devices.empty() && devices[0].is_meta && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
+        // MLA keeps a single shared latent KV head that the head-based tensor-split does
+        // not support yet (see TASKS.md item 13) - reject before loading any weights.
+        // note: this must throw here rather than fail context creation later - freeing a
+        // meta-device model without a context segfaults in cleanup.
+        // LLAMA_TENSOR_MLA_WIP=1 bypasses this for development.
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_DEEPSEEK2 && !getenv("LLAMA_TENSOR_MLA_WIP")) {
+            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR does not support MLA models (single shared latent KV head) - "
+                    "use a single GPU (fastest for MoE models with a small active set) or --split-mode layer");
+        }
     }
 
     return model;
