@@ -53,7 +53,7 @@ services:
       -ts 0.5,0.5
       -t 10
       -np 1
-      -c 50000
+      -c 262000
       --batch-size 4096
       --ubatch-size 4096
       --cont-batching
