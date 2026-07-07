@@ -952,6 +952,12 @@ static void add_rpc_devices(const std::string & servers) {
     }
     for (const auto & server : rpc_servers) {
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
+        if (reg == nullptr) {
+            // without this check an unreachable worker silently degrades to
+            // CPU-only inference, which looks like a performance bug instead
+            // of the connectivity error it actually is
+            throw std::invalid_argument("failed to connect to RPC server '" + server + "'");
+        }
         ggml_backend_register(reg);
     }
 }
