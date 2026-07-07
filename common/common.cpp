@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "ssd-streaming.h"
 #include "unicode.h"
 
 #include <algorithm>
@@ -1332,6 +1333,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // task 15: LLAMA_SSD_STREAMING=1 installs the mmap residency director
+    // (models larger than RAM; see docs/ssd-streaming-plan.md)
+    common_ssd_streaming_init(params);
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

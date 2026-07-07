@@ -71,6 +71,8 @@ add_library(${TARGET}
     console.h
     debug.cpp
     debug.h
+    ssd-streaming.cpp
+    ssd-streaming.h
     download.cpp
     download.h
     fit.cpp

@@ -144,14 +144,34 @@ CUDA-streamed), modeled on the RPC buffer:
 ## 5. Phases
 
 0. ✅ This document: baselines, prior art, code map, design.
-1. CPU-tier managed streaming (staging ring + prefetch thread).
-   Gate: byte-identical output AND measurably beats 0.21 t/s thrash.
+1. ✅ **CPU-tier managed streaming — NEGATIVE RESULT (2026-07-07).**
+   Implemented as an mmap residency director (`common/ssd-streaming.cpp`,
+   `LLAMA_SSD_STREAMING=1` + `LLAMA_SSD_STREAM_BUDGET=<MiB>`): a
+   scheduler-callback-driven loop that WILLNEEDs a budgeted window ahead of
+   compute and DONTNEEDs behind it, with the weight order discovered on the
+   first pass and treated as a ring. Byte-identical by construction
+   (madvise is advisory). Measured, 27B @ 14 GB cap, cold cache:
+   **thrash 0.266 t/s vs director 0.274 t/s — no measurable win.**
+   Root cause of the null result: for DENSE models the access pattern is
+   perfectly sequential, and the kernel's readahead (helped by the loader's
+   `POSIX_FADV_SEQUENTIAL`) already overlaps IO with compute near-optimally —
+   both configs run at ~3.7 s/token against a ~10 s/token serial-IO floor.
+   The disk is bandwidth-saturated either way; steering cannot add bandwidth.
+   **Consequence: skip further CPU-tier work for dense models.** The director
+   code stays (env-gated, off by default) as scaffolding — its ring/cursor/
+   callback machinery is exactly what phase 4 needs, where access is NOT
+   sequential and the kernel CANNOT predict it (MoE expert selection).
 2. GPU-tier streaming (ring → `tensor_set_async` on a side stream,
    overlapped with layer compute; reuses the loader's staging pattern).
+   Unlike the CPU tier this bypasses the RAM staging bottleneck entirely,
+   so the phase-1 null result does not apply.
 3. Placement policy + CLI (`--ssd-streaming`, `--ssd-stream-budget`),
    docs, compose profile.
 4. MoE-aware expert streaming with a hot-expert cache
-   (SLRU per issue #20757's evidence; admission-filtered).
+   (SLRU per issue #20757's evidence; admission-filtered). **Promoted to
+   the highest-value phase** by the phase-1 finding: expert access is the
+   one pattern the kernel cannot predict, so managed residency actually
+   changes what is on disk vs in memory when it matters.
 5. Stretch: io_uring read queues, cuFile/GDS direct SSD→VRAM, worker-side
    streaming for TP islands (models bigger than an island's combined VRAM),
    disk-backed context checkpoints (#20697) on the same machinery.
