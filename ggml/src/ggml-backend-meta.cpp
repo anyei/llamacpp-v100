@@ -62,8 +62,9 @@ struct ggml_backend_meta_device_context {
     ggml_backend_meta_device_context(
             std::vector<ggml_backend_dev_t> simple_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) :
             simple_devs(std::move(simple_devs)), get_split_state(get_split_state), get_split_state_ud(get_split_state_ud) {
+        // the [N] device count lets an RPC client detect a remote TP island and its size
         name        = std::string("Meta(");
-        description = std::string("Meta(");
+        description = std::string("Meta[") + std::to_string(this->simple_devs.size()) + "](";
         for (size_t i = 0; i < simple_devs.size(); i++) {
             if (i > 0) {
                 name        += ",";

@@ -72,6 +72,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_SET_SPLIT_STATES,
+    RPC_CMD_GET_DEVICE_DESC,
     RPC_CMD_COUNT,
 };
 
@@ -185,6 +186,14 @@ struct rpc_msg_get_device_memory_req {
 struct rpc_msg_get_device_memory_rsp {
     uint64_t free_mem;
     uint64_t total_mem;
+};
+
+struct rpc_msg_get_device_desc_req {
+    uint32_t device;
+};
+
+struct rpc_msg_get_device_desc_rsp {
+    char desc[128];
 };
 
 struct rpc_msg_graph_recompute_req {
@@ -888,6 +897,7 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool get_device_desc(const rpc_msg_get_device_desc_req & request, rpc_msg_get_device_desc_rsp & response);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1467,6 +1477,16 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::get_device_desc(const rpc_msg_get_device_desc_req & request, rpc_msg_get_device_desc_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    snprintf(response.desc, sizeof(response.desc), "%s", ggml_backend_dev_description(dev));
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -1743,6 +1763,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_GET_DEVICE_DESC: {
+                rpc_msg_get_device_desc_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_device_desc_rsp response;
+                if (!server.get_device_desc(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -1894,6 +1928,14 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
 }
 
+const char * ggml_backend_rpc_dev_endpoint(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return nullptr;
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    return ctx->endpoint.c_str();
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -1945,6 +1987,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_endpoint") == 0) {
+        return (void *)ggml_backend_rpc_dev_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_split_states") == 0) {
+        return (void *)ggml_backend_rpc_set_split_states;
     }
     return NULL;
 
@@ -2004,6 +2052,18 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     for (uint32_t ind = 0; ind < dev_count; ind++) {
         std::string dev_name = "RPC" + std::to_string(dev_id);
         std::string dev_desc = std::string(endpoint);
+        // fetch the real device description - a worker-side TP island advertises
+        // itself as "Meta[N](...)" which the coordinator uses to upload split states;
+        // older workers do not know this command and keep the endpoint as description
+        {
+            auto sock = get_socket(endpoint);
+            rpc_msg_get_device_desc_req request = { ind };
+            rpc_msg_get_device_desc_rsp response;
+            if (sock != nullptr && send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_DESC, &request, sizeof(request), &response, sizeof(response))) {
+                response.desc[sizeof(response.desc) - 1] = '\0';
+                dev_desc = std::string(response.desc) + " @ " + endpoint;
+            }
+        }
         ggml_backend_rpc_device_context * dev_ctx = new ggml_backend_rpc_device_context {
             /* .endpoint    = */    endpoint,
             /* .device      = */    ind,

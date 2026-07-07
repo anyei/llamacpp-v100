@@ -39,6 +39,11 @@ GGML_BACKEND_API bool ggml_backend_rpc_set_split_states(const char * endpoint, c
 // worker-side lookup of an uploaded split state; returns false if the name is unknown
 GGML_BACKEND_API bool ggml_backend_rpc_split_state_lookup(const char * name, struct ggml_backend_meta_split_state * out);
 
+// returns the endpoint of an RPC device, or NULL if the device is not an RPC device.
+// combined with a device description of the form "Meta[N](...)" this identifies a
+// remote tensor-parallel island of N GPUs that needs split states uploaded.
+GGML_BACKEND_API const char * ggml_backend_rpc_dev_endpoint(ggml_backend_dev_t dev);
+
 #ifdef  __cplusplus
 }
 #endif

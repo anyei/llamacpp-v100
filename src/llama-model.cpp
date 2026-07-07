@@ -709,6 +709,61 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     GGML_UNUSED(userdata);
 }
 
+void llama_rpc_push_split_states(const struct llama_model * model, ggml_backend_dev_t dev, struct ggml_context * ctx) {
+    if (dev == nullptr || ctx == nullptr) {
+        return;
+    }
+
+    // resolve the RPC backend entry points through the registry so that llama does not
+    // link against the RPC backend directly (same pattern as the NCCL AllReduce lookup)
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
+    typedef bool (*set_split_states_t)(const char *, const void *, size_t);
+    auto * dev_endpoint     = (dev_endpoint_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint");
+    auto * set_split_states = (set_split_states_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_split_states");
+    if (dev_endpoint == nullptr || set_split_states == nullptr) {
+        return;
+    }
+    const char * endpoint = dev_endpoint(dev);
+    if (endpoint == nullptr) {
+        return;
+    }
+
+    // a worker-side TP island advertises itself as "Meta[N](...)"
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    int n_devices = 0;
+    if (props.description == nullptr || sscanf(props.description, "Meta[%d](", &n_devices) != 1 || n_devices < 2) {
+        return;
+    }
+
+    llama_meta_device_get_split_state_userdata ud = { (size_t) n_devices, model };
+
+    std::vector<uint8_t> blob;
+    size_t n_tensors = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        const ggml_backend_meta_split_state state = llama_meta_device_get_split_state(t, &ud);
+        const uint32_t name_len = (uint32_t) strlen(t->name);
+        const size_t   off      = blob.size();
+        blob.resize(off + sizeof(name_len) + name_len + sizeof(state));
+        memcpy(blob.data() + off,                              &name_len, sizeof(name_len));
+        memcpy(blob.data() + off + sizeof(name_len),           t->name,   name_len);
+        memcpy(blob.data() + off + sizeof(name_len) + name_len, &state,   sizeof(state));
+        n_tensors++;
+    }
+    if (blob.empty()) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: uploading %zu split states to TP island %s (%d devices)\n", __func__, n_tensors, endpoint, n_devices);
+    if (!set_split_states(endpoint, blob.data(), blob.size())) {
+        throw std::runtime_error(format("failed to upload split states to TP island %s", endpoint));
+    }
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -1557,6 +1612,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+
+        // remote TP islands need the split states before any tensor is allocated there
+        llama_rpc_push_split_states(this, dev, ctx);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {

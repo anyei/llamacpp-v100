@@ -289,6 +289,9 @@ llama_kv_cache::llama_kv_cache(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
+        // remote TP islands need the split states of the cache tensors before allocation
+        llama_rpc_push_split_states(&model, ggml_backend_buft_get_device(buft), ctx.get());
+
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

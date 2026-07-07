@@ -540,6 +540,11 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// if dev is a remote tensor-parallel island (RPC device whose worker runs --tensor-parallel,
+// description "Meta[N](...)"), compute split states for every tensor in ctx and upload them
+// to the worker before allocation; no-op for all other devices
+void llama_rpc_push_split_states(const struct llama_model * model, ggml_backend_dev_t dev, struct ggml_context * ctx);
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
