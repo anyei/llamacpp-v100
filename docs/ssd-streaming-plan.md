@@ -168,10 +168,25 @@ CUDA-streamed), modeled on the RPC buffer:
 3. Placement policy + CLI (`--ssd-streaming`, `--ssd-stream-budget`),
    docs, compose profile.
 4. MoE-aware expert streaming with a hot-expert cache
-   (SLRU per issue #20757's evidence; admission-filtered). **Promoted to
-   the highest-value phase** by the phase-1 finding: expert access is the
-   one pattern the kernel cannot predict, so managed residency actually
-   changes what is on disk vs in memory when it matters.
+   (SLRU per issue #20757's evidence; admission-filtered).
+   **Feasibility measured (2026-07-07) — the prize is real, the madvise
+   route is not:**
+   - GLM-4.7-Flash (14 GB MoE, ~3B active) CPU-only: **10.87 t/s uncapped
+     vs 1.12 t/s at a 10 GB cap** — a 10x collapse (semi-random expert
+     access defeats page LRU + readahead), so expert-aware residency has
+     an order of magnitude of headroom. This is the one tier where the
+     kernel demonstrably fails.
+   - BUT steering via `madvise(WILLNEED)` per selected expert made it
+     **60x WORSE** (0.018 t/s): under a memory cgroup at its limit,
+     WILLNEED blocks in direct reclaim per call (~1,100 calls/token) —
+     page-cache hints are self-defeating under exactly the pressure they
+     target. The per-selection steering code remains in the director
+     (env-gated) as a record; do not enable it for capped MoE.
+   - **Conclusion: phase 4 must be a userspace cache** — pread/O_DIRECT
+     into an owned arena (pinned for the GPU tier), explicit SLRU over
+     expert slices, no page-cache involvement. That is the #20757 design,
+     and it is the same machinery the GPU tier needs anyway — phases 2
+     and 4 merge into one build.
 5. Stretch: io_uring read queues, cuFile/GDS direct SSD→VRAM, worker-side
    streaming for TP islands (models bigger than an island's combined VRAM),
    disk-backed context checkpoints (#20697) on the same machinery.

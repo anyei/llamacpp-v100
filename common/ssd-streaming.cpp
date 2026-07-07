@@ -116,6 +116,48 @@ void ssd_stream_advance(size_t pos) {
 
 } // namespace
 
+// MoE expert steering (task 15 phase 4): expert weights are one 3D tensor per
+// layer with ne[2] = n_expert, but each token touches only the selected experts'
+// slices. Under memory pressure the kernel serves those as scattered small
+// faults (measured: 10.9 -> 1.1 t/s for a 14 GB MoE at a 10 GB cap). On every
+// MUL_MAT_ID we read the (tiny, host-resident) selection ids and WILLNEED the
+// selected experts' contiguous slices - one batched readahead per expert
+// instead of hundreds of page faults. Expert tensors are excluded from the
+// generic ring: prefetching ALL experts would flood the budget with unused
+// weights, and eviction is left to kernel LRU, which approximates hot-expert
+// retention at page granularity.
+static void ssd_stream_experts(const struct ggml_tensor * t) {
+    const struct ggml_tensor * w   = t->src[0]; // experts weight [.., .., n_expert]
+    const struct ggml_tensor * ids = t->src[2]; // selected experts [n_expert_used, n_tokens]
+    if (w == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    if (w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer) || w->op != GGML_OP_NONE) {
+        return;
+    }
+    if (ids->data == nullptr || ids->buffer == nullptr || !ggml_backend_buffer_is_host(ids->buffer)) {
+        return; // ids must be directly readable (they are, for CPU inference)
+    }
+    const int64_t n_expert  = w->ne[2];
+    const size_t  slice     = w->nb[2];
+    const int64_t n_ids     = ggml_nelements(ids);
+    const int32_t * id_data = (const int32_t *) ids->data;
+    uint64_t seen = 0; // n_expert <= 64 covers current models; extras just re-advise
+    for (int64_t k = 0; k < n_ids; k++) {
+        const int32_t e = id_data[k];
+        if (e < 0 || e >= n_expert) {
+            continue;
+        }
+        if (e < 64) {
+            if (seen & (1ull << e)) {
+                continue;
+            }
+            seen |= 1ull << e;
+        }
+        ssd_madvise((const char *) w->data + (size_t) e * slice, slice, POSIX_MADV_WILLNEED);
+    }
+}
+
 bool common_ssd_streaming_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
     if (!ask) {
@@ -125,6 +167,10 @@ bool common_ssd_streaming_cb(struct ggml_tensor * t, bool ask, void * user_data)
     auto & st = g_state;
     std::lock_guard<std::mutex> lock(st.mutex);
 
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        ssd_stream_experts(t);
+    }
+
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * src = t->src[i];
         if (src == nullptr || src->op != GGML_OP_NONE || src->data == nullptr) {
@@ -132,6 +178,9 @@ bool common_ssd_streaming_cb(struct ggml_tensor * t, bool ask, void * user_data)
         }
         if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer)) {
             continue; // only file-backed host weights are streamable
+        }
+        if (src->ne[2] > 1 && t->op == GGML_OP_MUL_MAT_ID) {
+            continue; // expert tensors are steered per-selection, never as a whole
         }
         const size_t nbytes = ggml_nbytes(src);
         if (nbytes < st.min_tensor) {
