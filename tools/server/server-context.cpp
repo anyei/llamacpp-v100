@@ -1186,6 +1186,14 @@ private:
             return false;
         }
 
+        if (ctx_tgt == nullptr) {
+            // context creation can fail with a loaded model (e.g. invalid
+            // context parameters) - without this check the code below
+            // dereferences a null context
+            SRV_ERR("failed to create context with model, '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);

@@ -1228,7 +1228,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
-            pimpl->model.reset(model);
+            // drop the model so the caller's model()==nullptr check catches the
+            // failure. (this previously did reset(model) - re-storing the pointer
+            // the unique_ptr already owns, which frees it and then double-frees
+            // in the destructor)
+            pimpl->model.reset();
             return;
         }
 
@@ -1292,6 +1296,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        // drop the model: several callers only check model()==nullptr and would
+        // otherwise dereference the missing context (freeing a meta-device model
+        // without a context is verified safe - see TASKS.md item 14)
+        pimpl->model.reset();
         return;
     }
 
