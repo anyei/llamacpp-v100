@@ -179,7 +179,10 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
     GGML_ASSERT(buffer);
     buffer->usage = usage;
 
-    // FIXME: add a generic callback to the buffer interface
+    if (buffer->iface.set_usage != NULL) {
+        buffer->iface.set_usage(buffer, usage);
+    }
+
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
         ggml_backend_multi_buffer_set_usage(buffer, usage);
     }

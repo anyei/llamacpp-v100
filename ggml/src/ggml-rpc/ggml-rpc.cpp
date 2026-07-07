@@ -73,6 +73,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_SET_SPLIT_STATES,
     RPC_CMD_GET_DEVICE_DESC,
+    RPC_CMD_BUFFER_SET_USAGE,
     RPC_CMD_COUNT,
 };
 
@@ -190,6 +191,11 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_get_device_desc_req {
     uint32_t device;
+};
+
+struct rpc_msg_buffer_set_usage_req {
+    uint64_t remote_ptr;
+    uint32_t usage;
 };
 
 struct rpc_msg_get_device_desc_rsp {
@@ -575,6 +581,17 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     RPC_STATUS_ASSERT(status);
 }
 
+static void ggml_backend_rpc_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // mirror the usage on the remote buffer - the worker-side meta (tensor-parallel)
+    // device relies on it to distinguish weight from compute tensors
+    rpc_msg_buffer_set_usage_req request = { ctx->remote_ptr, (uint32_t) usage };
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_SET_USAGE, &request, sizeof(request), nullptr, 0);
+    if (!status) {
+        GGML_LOG_ERROR("failed to set remote buffer usage\n");
+    }
+}
+
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
@@ -587,6 +604,7 @@ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_rpc_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_rpc_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_usage       = */ ggml_backend_rpc_buffer_set_usage,
 };
 
 static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -898,6 +916,7 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool get_device_desc(const rpc_msg_get_device_desc_req & request, rpc_msg_get_device_desc_rsp & response);
+    bool buffer_set_usage(const rpc_msg_buffer_set_usage_req & request);
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1477,6 +1496,17 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::buffer_set_usage(const rpc_msg_buffer_set_usage_req & request) {
+    LOG_DBG("[%s] remote_ptr: %" PRIx64 ", usage: %u\n", __func__, request.remote_ptr, request.usage);
+    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+    if (buffers.find(buffer) == buffers.end()) {
+        GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buffer, (enum ggml_backend_buffer_usage) request.usage);
+    return true;
+}
+
 bool rpc_server::get_device_desc(const rpc_msg_get_device_desc_req & request, rpc_msg_get_device_desc_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
@@ -1759,6 +1789,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!rpc_split_states_ingest(input.data(), input.size())) {
                     GGML_LOG_ERROR("failed to parse split states payload (%zu bytes)\n", input.size());
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_BUFFER_SET_USAGE: {
+                rpc_msg_buffer_set_usage_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.buffer_set_usage(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
