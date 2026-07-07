@@ -1,9 +1,17 @@
 # V100 Tensor-Parallel Performance Tuning — Reference
 
 Optimization rounds of July 2026 on 2x Tesla V100-SXM2-32GB (NVLink, cc 7.0),
-serving Qwen3.6-27B-UD-Q4_K_XL-MTP via `llama-server` in tensor-split mode.
+serving via `llama-server` in tensor-split mode.
 Task-by-task history: `TASKS.md`. Image rebuild: `REBUILD-IMAGE.md`.
 Serving profiles: `docker-compose.mtp.yml` / `docker-compose.nospec.yml`.
+
+Models used throughout (mounted at `/models` inside the containers):
+
+| Model file | Role |
+|---|---|
+| `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB) | primary serving + benchmark model — hybrid attention + DeltaNet with MTP head |
+| `Qwen3-0.6B-BF16.gguf` | small test model for distributed/RPC experiments (fast iteration) |
+| `GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf` (~14 GB) | MoE + MLA (`deepseek2`) experiments, single-GPU serving profile |
 
 ## Headline results
 
@@ -147,15 +155,55 @@ board (NVLink island, PCIe between boards); this machine keeps a PCIe V100.
    (`docker-compose.rpc-worker.yml`); measured protocol cost ~3%/token +
    2x network RTT.
 
+## Distributed inference — measured results (2026-07-07)
+
+All numbers on loopback RPC (worst case for latency; a wired LAN adds ~2x
+RTT per token on top). Model: `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` unless noted.
+Full experiment history: `TASKS.md` item 12.
+
+| Experiment | Result |
+|---|---|
+| 27B in-process `-sm tensor` (reference ceiling) | 47.8 t/s |
+| 27B whole-model on a 2-GPU TP island | 33.3 t/s short ctx, 29.2 t/s @ 5.2k ctx |
+| 27B pipeline (1 local GPU + 1 RPC GPU, `-sm layer`) | 32.3 t/s vs 33.2 in-process = ~3%/token |
+| 0.6B whole-model on island (`Qwen3-0.6B-BF16.gguf`) | 148 t/s (free GPUs) |
+| Island VRAM, 27B @ 8k ctx | 19.6 GB/GPU before the slice-packing fix → **9.2 GB/GPU** after |
+| First model load over the socket | ~40 min (synchronous protocol, one-time) |
+| Reload with worker weight cache (`-c`) | **40-50 s** |
+| 27B slot save (501 MB, 5259 tokens) over RPC | 531 ms save / 635 ms restore, post-restore generation byte-identical |
+| Hybrid context checkpoint over RPC (5212-token prefill) | 149.6 MiB state read, clean |
+
+State-integrity methodology (caught two silent corruption bugs): the same
+logical state is saved from three configs — island over RPC, in-process
+tensor-parallel, single GPU — and compared byte-for-byte. Island and
+in-process TP saves are byte-identical; TP vs single-GPU differ in ~40% of
+bytes, which is low-mantissa AllReduce ordering noise (round trips are exact
+and generated text is identical). Any structural deviation from this pattern
+indicates a placement bug — this is the regression test for the meta
+backend's raw-byte get/set paths.
+
+Storage baseline (recorded for task 15, `--ssd-streaming`): the models NVMe
+sustains 1.6 GB/s O_DIRECT sequential reads → a dense 27B Q4 fully streamed
+from disk has a ~0.1 t/s decode ceiling; see TASKS.md item 15 for what that
+implies.
+
+Docker images: `llamacpp-local-v100:v100-spicy` = the pre-distributed
+serving image kept as rollback; `llamacpp-local-v100:distributed-inference`
+= built from `ddc1fd670` with the full distributed stack (islands,
+split-state push, slice-packed allocation, state save/restore over RPC,
+alias-lifetime hardening).
+
 ## Remaining roadmap
 
-- Task 12 phase 1 (TP islands): **complete and measured** — worker
+- Task 12 phase 1 (TP islands): **complete, measured, hardened** — worker
   `ggml-rpc-server --tensor-parallel` + automatic coordinator split-state
-  push; 27B hybrid runs coherently on a 2-GPU island (33.3 t/s loopback,
-  whole-model-remote pessimal case; pipeline mode ~3%/token). Usage guide:
-  `docs/distributed-inference-guide.md`. Follow-ups: phase 2 async RPC,
-  island VRAM sharding audit, adopted-alias lifetime hardening.
-- Task 13: correct MLA tensor-parallelism (see above) — priority rises only
-  if a DeepSeek-family model becomes the flagship.
+  push; 27B hybrid runs sharded (9.2 GB/GPU) and coherent on a 2-GPU island;
+  state save/restore + prompt checkpoints verified byte-exact over RPC;
+  adopted-alias lifetime closed. Usage guide:
+  `docs/distributed-inference-guide.md`.
 - Task 12 phases 2-3 (async RPC, cross-host NCCL): parked unless RDMA/25GbE
   or a concrete >192 GB model plan appears.
+- Task 13: correct MLA tensor-parallelism (see above) — priority rises only
+  if a DeepSeek-family model becomes the flagship.
+- Task 15: `--ssd-streaming` three-tier weight placement — investigation
+  phase; breakdown and storage baseline in TASKS.md.

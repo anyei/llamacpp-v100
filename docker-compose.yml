@@ -9,8 +9,8 @@ services:
    # image: llamacpp-turboq-llama-tq:latest
     image: llamacpp-local-v100:latest 
     volumes:
-      - /mnt/models/ollama37-k80/.ollama/custom-models/:/models
-      - /mnt/files/:/models2
+      - ${MODELS_DIR:-./models}:/models
+      - ${MODELS2_DIR:-./models2}:/models2
       - ./cache:/models/cache
     ports:
       - "8097:8080"

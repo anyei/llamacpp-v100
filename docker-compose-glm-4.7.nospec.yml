@@ -14,8 +14,8 @@ services:
     container_name: llama-tq-nospec-GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf
     image: llamacpp-local-v100:latest
     volumes:
-      - /mnt/models/ollama37-k80/.ollama/custom-models/:/models
-      - /mnt/files/:/models2
+      - ${MODELS_DIR:-./models}:/models
+      - ${MODELS2_DIR:-./models2}:/models2
       - ./cache:/models/cache
     ports:
       - "8097:8080"

@@ -6,8 +6,13 @@ tuned for **NVIDIA Tesla V100 (Volta, sm70, NVLink)** serving, with working
 **distributed inference** (coordinator + workers, tensor-parallel "islands").
 
 Reference hardware: 2x V100-SXM2-32GB (NVLink NV2), scaling plan for 4+2+1
-GPUs across two machines. Primary model during tuning: Qwen3.6-27B (hybrid
-attention + DeltaNet) with MTP speculation.
+GPUs across two machines. Models used for tuning and benchmarks:
+
+- `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB) — primary serving model,
+  hybrid attention + DeltaNet with an MTP head for speculation
+- `GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf` (~14 GB) — MoE / MLA
+  experiments, single-GPU profile
+- `Qwen3-0.6B-BF16.gguf` — small model for fast distributed/RPC iteration
 
 ## Headline results (vs. this fork's own starting point, July 2026)
 
@@ -18,7 +23,7 @@ attention + DeltaNet) with MTP speculation.
 | Prefill, long chat history | 860 t/s | **1237 t/s** |
 | KV cache memory (lossless q8_0) | 1x | **0.5x** |
 | GLM-class MoE, single V100 | — | 79 t/s |
-| 27B on a remote 2-GPU TP island (RPC, loopback) | crash | 33.3 t/s, ~12 GB/GPU |
+| 27B on a remote 2-GPU TP island (RPC, loopback) | crash | 33 t/s, 9.2 GB/GPU |
 
 Every change was gated on **byte-identical temp-0 output** vs. baseline.
 
@@ -55,8 +60,12 @@ Every change was gated on **byte-identical temp-0 output** vs. baseline.
 - **TP islands**: `ggml-rpc-server --tensor-parallel` exposes all local GPUs
   as one tensor-parallel device over RPC; the coordinator automatically
   computes and uploads per-tensor split states (weights, KV, recurrent-state
-  caches). A 27B hybrid model loads sharded (~12 GB per island GPU) and
-  generates coherently, driven entirely over the network.
+  caches). A 27B hybrid model loads sharded (9.2 GB per island GPU,
+  slice-packed allocation) and generates coherently, driven entirely over
+  the network; reloads take ~40-50 s with the worker weight cache.
+- **State integrity over islands**: prompt checkpoints and slot save/restore
+  work across RPC (views are resolved to their root tensors on the wire; a
+  501 MB / 5259-token 27B state round-trips with byte-identical generation).
 - RPC protocol 4.1: split-state upload, device descriptions, buffer-usage
   mirroring, meta-aware (logical-address) sanitization.
 - Pipeline over RPC measured at ~3%/token protocol cost — cross-machine
@@ -78,6 +87,11 @@ Build the image and serve with the tuned profile:
 
 ```bash
 docker build -f .devops/cuda.Dockerfile --target server -t llamacpp-local-v100:latest .
+
+# point the profiles at your GGUF directory (or create llama.cpp/.env with
+# MODELS_DIR=... — the compose files default to ./models)
+export MODELS_DIR=/path/to/your/ggufs
+
 docker compose -f docker-compose.mtp.yml up -d      # MTP speculation: fastest
 # or
 docker compose -f docker-compose.nospec.yml up -d   # plain serving
@@ -106,10 +120,13 @@ Tracked in detail in [`TASKS.md`](TASKS.md):
 - **Distributed phase 2** (task 12) — async RPC double-buffering to cut the
   per-token latency of the synchronous protocol (mainly benefits the
   whole-model-remote case; parked pending real cross-host hardware).
-- **Distributed polish** — final E2E validation of slice-packed island
-  generation (load path verified at ~12 GB/GPU); adopted-alias shadow
-  lifetime hardening; worker fault tolerance (a dead worker still aborts the
-  coordinator); RPC auth/TLS.
+- **Distributed polish** — worker fault tolerance (a dead worker still
+  aborts the coordinator); RPC auth/TLS. (Slice-packed island E2E, state
+  save/restore over RPC, and adopted-alias lifetime hardening: all done
+  and verified 2026-07-07.)
+- **`--ssd-streaming`** (task 15) — three-tier weight placement
+  (VRAM / RAM / SSD) for models that don't fit in memory; investigation
+  phase, breakdown and measured storage baseline in TASKS.md.
 - **Meta-device teardown segfault** (task 14) — freeing a tensor-split model
   without a context crashes; only reachable through error paths.
 - **Distributed phase 3** — cross-host NCCL tensor parallelism; only worth it
