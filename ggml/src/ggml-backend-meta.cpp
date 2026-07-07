@@ -1717,6 +1717,25 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, 0);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
+        case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            // a partial tensor's logical value is the sum of the per-device slices
+            // (the dual of the PARTIAL set_tensor case, which divides by n_bufs).
+            // Mainly used by debug readers (e.g. eval-callback) inspecting nodes
+            // before their AllReduce boundary.
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+            GGML_ASSERT(offset % sizeof(float) == 0 && size % sizeof(float) == 0);
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, 0);
+            ggml_backend_tensor_get(simple_tensor, data, offset, size);
+            std::vector<float> tmp(size / sizeof(float));
+            for (size_t j = 1; j < n_bufs; j++) {
+                simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
+                ggml_backend_tensor_get(simple_tensor, tmp.data(), offset, size);
+                float * out = (float *) data;
+                for (size_t k = 0; k < tmp.size(); k++) {
+                    out[k] += tmp[k];
+                }
+            }
+        } break;
         default: {
             GGML_ABORT("fatal error");
         }
@@ -1844,6 +1863,12 @@ struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+        // whether this subgraph's boundary was created by a PARTIAL node (its last
+        // node needs an AllReduce). The LAST subgraph of a graph can also end
+        // PARTIAL - e.g. when the scheduler splits a model graph right after a
+        // partial node, or under per-node debug execution - and skipping its
+        // reduce silently corrupts every consumer of that tensor.
+        bool          reduce      = false;
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -2252,6 +2277,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
+                    // reduce iff this boundary exists because of a PARTIAL node -
+                    // this includes a PARTIAL node that happens to be the LAST node
+                    // of the graph (scheduler split or per-node debug execution),
+                    // which the old position-based check silently skipped
+                    bcj.cgraphs[n_subgraphs].reduce = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 }
                 n_subgraphs++;
                 i_start = i + 1;
@@ -2476,7 +2506,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+        if (n_backends > 1 && backend_ctx->backend_configs[0].cgraphs[i].reduce) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;

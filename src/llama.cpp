@@ -173,6 +173,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
 
+            // debug-only: duplicate the device list N times so a single GPU runs a
+            // genuine n-way tensor split (real segmented weights, real reductions -
+            // only the cross-device transfer physics is simulated). Lets n>=2 split
+            // bugs reproduce and byte-exactness gates run without a multi-GPU box.
+            if (const char * dup = getenv("LLAMA_META_DUP_DEVICE")) {
+                const int n_dup = std::max(1, atoi(dup));
+                const std::vector<ggml_backend_dev_t> base = devs;
+                for (int d = 1; d < n_dup; d++) {
+                    devs.insert(devs.end(), base.begin(), base.end());
+                }
+                LLAMA_LOG_WARN("%s: LLAMA_META_DUP_DEVICE=%d - duplicating devices for debugging (%zu total)\n",
+                               __func__, n_dup, devs.size());
+            }
+
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(devs[i]), ggml_backend_dev_description(devs[i]));
