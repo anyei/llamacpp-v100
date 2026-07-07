@@ -79,7 +79,7 @@ Every change was gated on **byte-identical temp-0 output** vs. baseline.
 | [`docs/distributed-inference-guide.md`](docs/distributed-inference-guide.md) | how to run coordinator/workers/TP islands |
 | [`docs/distributed-inference-plan.md`](docs/distributed-inference-plan.md) | the distributed design rationale |
 | [`docs/validation-playbook.md`](docs/validation-playbook.md) | test scenarios + exact commands used to validate all of this |
-| [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | `--ssd-streaming` design, baselines, prior art (task 15) |
+| [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, and usage of the experimental `LLAMA_SSD_STREAMING` director (task 15) |
 | [`REBUILD-IMAGE.md`](REBUILD-IMAGE.md) | building the production Docker image |
 | [`TASKS.md`](TASKS.md) | full task history with measurements and open items |
 

@@ -191,7 +191,41 @@ CUDA-streamed), modeled on the RPC buffer:
    streaming for TP islands (models bigger than an island's combined VRAM),
    disk-backed context checkpoints (#20697) on the same machinery.
 
-## 6. Verification (house rules)
+## 6. Using the experimental director (what exists today)
+
+There is no `--ssd-streaming` CLI flag yet — the shipped artifact of phases
+1/4 is the **mmap residency director**, enabled by environment variable on
+any tool that goes through `common_init_from_params` (llama-server,
+llama-cli, llama-perplexity, ...):
+
+```bash
+LLAMA_SSD_STREAMING=1 \
+LLAMA_SSD_STREAM_BUDGET=4096 \   # resident weight window, MiB (default 4096)
+llama-server -m model.gguf -ngl 0 ...
+```
+
+What it does: rides the scheduler's eval callback, discovers the weight-use
+order on the first pass, then keeps a budgeted window resident
+(`WILLNEED` ahead of the compute cursor, `DONTNEED` behind). Requires mmap
+loading (the default; it forces `--mlock` off). Output is **byte-identical**
+with the director on or off — madvise is advisory and computation is never
+altered.
+
+Honest guidance, from the measurements in §5:
+
+| Situation | Should you enable it? |
+|---|---|
+| Model fits in RAM | **No** — pure overhead (per-node callback barriers), and a budget smaller than the weights forces needless re-streaming |
+| Dense model larger than RAM | **No benefit** — kernel readahead already overlaps IO/compute optimally (0.274 vs 0.266 t/s); it just doesn't hurt |
+| MoE model larger than RAM / under a memory cap | **NO — actively harmful.** The per-expert WILLNEED steering measures 60x slower under cgroup pressure (madvise blocks in direct reclaim). Run unmanaged mmap instead |
+| Bounding RSS of an over-provisioned box (weights resident elsewhere) | The one plausible niche: `DONTNEED` keeps the page-cache footprint near the budget instead of letting it grow to the full model |
+
+In short: the director exists to document what does not work and as
+scaffolding for the real feature. The actual `--ssd-streaming` flag arrives
+with the userspace expert cache (merged phases 2+4 above), which is the
+design the measurements point to.
+
+## 7. Verification (house rules)
 
 - Temp-0 byte-exactness vs fully-resident at every phase.
 - Enforced ceilings: RSS + VRAM measured under load with the budget knobs.
