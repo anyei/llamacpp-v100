@@ -149,8 +149,11 @@ board (NVLink island, PCIe between boards); this machine keeps a PCIe V100.
 
 ## Remaining roadmap
 
-- Task 12 phase 1 coordinator side (split-state push) — makes TP islands
-  usable; status and design in TASKS.md item 12.
+- Task 12 phase 1 (TP islands): protocol, worker (`ggml-rpc-server
+  --tensor-parallel`) and coordinator split-state push implemented and
+  verified up to weight upload; one blocker left (meta-buffer shadow keying
+  over RPC) — exact fix design and repro in TASKS.md item 12. Phase 0
+  (pipeline over RPC, ~3%/token) works today; measured numbers above.
 - Task 13: correct MLA tensor-parallelism (see above) — priority rises only
   if a DeepSeek-family model becomes the flagship.
 - Task 12 phases 2-3 (async RPC, cross-host NCCL): parked unless RDMA/25GbE
