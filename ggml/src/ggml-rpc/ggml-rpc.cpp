@@ -74,6 +74,11 @@ enum rpc_cmd {
     RPC_CMD_SET_SPLIT_STATES,
     RPC_CMD_GET_DEVICE_DESC,
     RPC_CMD_BUFFER_SET_USAGE,
+    // proto 4.2: completion marker for async command tracking. The server executes
+    // commands strictly in order per connection, so the (empty) response to a PING
+    // proves every command sent before it has finished. Events map onto PING
+    // sequence numbers client-side; no server-side state is needed.
+    RPC_CMD_PING,
     RPC_CMD_COUNT,
 };
 
@@ -343,7 +348,29 @@ bool ggml_backend_rpc_split_state_lookup(const char * name, struct ggml_backend_
     return true;
 }
 
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+// client-side async command tracking (proto 4.2). The server executes commands
+// strictly in order per connection, so a deferred RPC_CMD_PING marker's (empty)
+// response proves that every command sent before it has completed. Blocking
+// commands must drain outstanding PING responses first - responses arrive on the
+// same stream in command order.
+struct ggml_backend_rpc_async_state {
+    std::mutex mutex;
+    uint64_t pings_sent = 0;
+    uint64_t pings_done = 0;
+};
+
+static ggml_backend_rpc_async_state & rpc_async_state(socket_t * sock) {
+    static std::mutex reg_mutex;
+    static std::unordered_map<socket_t *, std::unique_ptr<ggml_backend_rpc_async_state>> reg;
+    std::lock_guard<std::mutex> lock(reg_mutex);
+    auto & e = reg[sock];
+    if (!e) {
+        e = std::make_unique<ggml_backend_rpc_async_state>();
+    }
+    return *e;
+}
+
+static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -357,10 +384,35 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return true;
 }
 
+static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state & st, uint64_t target) {
+    while (st.pings_done < target) {
+        uint64_t size;
+        if (!sock->recv_data(&size, sizeof(size))) {
+            return false;
+        }
+        if (size != 0) {
+            return false; // stream out of sync - a PING response is always empty
+        }
+        st.pings_done++;
+    }
+    return true;
+}
+
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return send_rpc_cmd_raw(sock, cmd, input, input_size);
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+        return false;
+    }
+    if (!send_rpc_cmd_raw(sock, cmd, input, input_size)) {
         return false;
     }
     uint64_t out_size;
@@ -374,6 +426,24 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         return false;
     }
     return true;
+}
+
+// send a completion marker without waiting; returns its sequence number
+static uint64_t rpc_ping_async(socket_ptr sock) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    bool status = send_rpc_cmd_raw(sock, RPC_CMD_PING, nullptr, 0);
+    GGML_ASSERT(status && "failed to send RPC ping");
+    return ++st.pings_sent;
+}
+
+// wait until the marker with the given sequence number (0 = all sent so far) has completed
+static void rpc_sync_pings(socket_ptr sock, uint64_t seq) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t target = seq == 0 ? st.pings_sent : std::min(seq, st.pings_sent);
+    bool status = rpc_drain_pings_locked(sock, st, target);
+    GGML_ASSERT(status && "RPC server crashed or returned malformed ping response");
 }
 
 // RPC client-side implementation
@@ -736,8 +806,49 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    // graph_compute and set_tensor are sent without waiting; a fresh marker's
+    // response proves everything sent so far has executed on the server
+    auto sock = get_socket(rpc_ctx->endpoint);
+    rpc_sync_pings(sock, rpc_ping_async(sock));
+}
+
+static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(tensor->buffer != nullptr && ggml_backend_buffer_is_rpc(tensor->buffer));
+    // the buffer path already sends SET_TENSOR without waiting for a response
+    // (the >HASH_THRESHOLD dedup path blocks on one round trip; inputs are small)
+    ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
     GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+}
+
+// events (proto 4.2): an event is a PING sequence number on the endpoint's
+// connection. Record = send a marker; synchronize/wait = drain to its response.
+// Waiting on an event of the SAME endpoint is a no-op: the server executes
+// commands in order, so later work is already serialized behind the marker.
+struct ggml_backend_rpc_event_context {
+    std::string endpoint;
+    uint64_t    seq; // 0 = not recorded yet
+};
+
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    ggml_backend_rpc_event_context * ectx = (ggml_backend_rpc_event_context *)event->context;
+    ectx->endpoint = rpc_ctx->endpoint;
+    ectx->seq = rpc_ping_async(get_socket(rpc_ctx->endpoint));
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    ggml_backend_rpc_event_context * ectx = (ggml_backend_rpc_event_context *)event->context;
+    if (ectx->seq == 0) {
+        return;
+    }
+    if (ectx->endpoint == rpc_ctx->endpoint) {
+        return; // same connection: ordered by the server
+    }
+    // cross-endpoint: the coordinator is the only bridge - block until the event's
+    // server has executed past the marker before issuing more work here
+    rpc_sync_pings(get_socket(ectx->endpoint), ectx->seq);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -809,7 +920,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
-    /* .set_tensor_async        = */ NULL,
+    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
     /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
@@ -820,8 +931,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -1750,6 +1861,17 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PING: {
+                // completion marker: commands execute in order, so by the time this
+                // response is sent every previously received command has finished
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -1962,11 +2084,38 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ true,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ true,
     };
+}
+
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    ggml_backend_rpc_event_context * ectx = new ggml_backend_rpc_event_context {
+        /* .endpoint = */ ctx->endpoint,
+        /* .seq      = */ 0,
+    };
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ ectx,
+    };
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    delete (ggml_backend_rpc_event_context *)event->context;
+    delete event;
+    GGML_UNUSED(dev);
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_backend_rpc_event_context * ectx = (ggml_backend_rpc_event_context *)event->context;
+    if (ectx->seq == 0) {
+        return;
+    }
+    rpc_sync_pings(get_socket(ectx->endpoint), ectx->seq);
+    GGML_UNUSED(dev);
 }
 
 static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
@@ -2022,9 +2171,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_device_event_new,
+    /* .event_free           = */ ggml_backend_rpc_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
 };
 
 // backend reg interface
