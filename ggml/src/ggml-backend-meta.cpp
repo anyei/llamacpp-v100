@@ -438,11 +438,17 @@ struct ggml_backend_meta_tensor_fingerprint {
 struct ggml_backend_meta_simple_tensor_entry {
     std::vector<ggml_tensor *> shadows;
     ggml_backend_meta_tensor_fingerprint fingerprint;
+    // captured at registration so that set/get_tensor on an RPC-deserialized struct
+    // (whose src pointers are meaningless) never needs to re-derive it
+    ggml_backend_meta_split_state split_state;
 };
 
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
     std::map<const ggml_tensor *, ggml_backend_meta_simple_tensor_entry> simple_tensors;
+    // secondary index for identity-based resolution when the struct address differs
+    // (every RPC command deserializes a fresh struct)
+    std::map<const void *, const ggml_backend_meta_simple_tensor_entry *> by_data;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -1332,8 +1338,60 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     auto & entry = stc.simple_tensors[tensor];
     entry.shadows     = std::move(simple_tensors);
     entry.fingerprint = ggml_backend_meta_tensor_fingerprint(tensor);
+    entry.split_state = split_state;
+    stc.by_data[tensor->data] = &entry;
 
     return GGML_STATUS_SUCCESS;
+}
+
+// resolve a tensor by identity (data address + fingerprint) rather than struct address -
+// RPC commands deserialize a fresh struct each time and its src pointers are meaningless,
+// so neither pointer lookups nor split-state re-derivation can be trusted for them
+static const ggml_backend_meta_simple_tensor_entry * ggml_backend_meta_buffer_find_by_identity(const struct ggml_tensor * tensor) {
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+
+    {
+        auto it = buf_ctx->stc_static.by_data.find(tensor->data);
+        if (it != buf_ctx->stc_static.by_data.end() && it->second->fingerprint.matches(tensor)) {
+            return it->second;
+        }
+    }
+    const int n_stc = (int) buf_ctx->stc_compute.size();
+    for (int k = 0; k < n_stc; k++) {
+        ggml_backend_meta_simple_tensor_container & stc =
+            buf_ctx->stc_compute[(buf_ctx->stc_compute_index - k + n_stc) % n_stc];
+        auto it = stc.by_data.find(tensor->data);
+        if (it != stc.by_data.end() && it->second->fingerprint.matches(tensor)) {
+            return it->second;
+        }
+    }
+    return nullptr;
+}
+
+// if the tensor is known by identity, alias its registration under the current struct
+// address and seed the split-state cache, so every downstream pointer-based lookup works
+// without ever walking the (possibly dangling) src pointers of a deserialized struct
+static bool ggml_backend_meta_buffer_adopt_identity(const struct ggml_tensor * tensor) {
+    if (ggml_backend_meta_buffer_simple_tensor(tensor, 0) != nullptr) {
+        return true; // already resolvable by pointer
+    }
+    const ggml_backend_meta_simple_tensor_entry * e = ggml_backend_meta_buffer_find_by_identity(tensor);
+    if (e == nullptr) {
+        return false;
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+
+    ggml_backend_meta_simple_tensor_container & cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+    auto & ne = cur.simple_tensors[tensor];
+    ne = *e;
+    cur.by_data[tensor->data] = &ne;
+
+    for (int sync = 0; sync < 2; sync++) {
+        auto & cached = buf_ctx->split_state_cache[std::make_pair(tensor, sync != 0)];
+        cached.first = ne.split_state;
+        memcpy(cached.second, (const char *) tensor, sizeof(cached.second));
+    }
+    return true;
 }
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1347,10 +1405,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
 // and sources) after they were evicted by the compute-container rotation.
 // Registers into the current compute container; the tensor's data offsets are
 // still valid because the underlying simple buffers never move.
-static struct ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    ggml_tensor * t = ggml_backend_meta_buffer_simple_tensor(tensor, index);
-    if (t != nullptr) {
-        return t;
+// force skips the lookup and always rebuilds the tensor's own shadows: graph nodes
+// arriving over RPC may have stale registrations made from bare INIT_TENSOR structs
+// (no src links, possibly overwritten arena memory) that fingerprints cannot detect.
+static struct ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(const struct ggml_tensor * tensor, size_t index, bool force = false) {
+    if (!force) {
+        ggml_tensor * t = ggml_backend_meta_buffer_simple_tensor(tensor, index);
+        if (t != nullptr) {
+            return t;
+        }
     }
 
     if (tensor->view_src != nullptr && ggml_backend_buffer_is_meta(tensor->view_src->buffer)) {
@@ -1369,6 +1432,9 @@ static struct ggml_tensor * ggml_backend_meta_buffer_ensure_simple_tensor(const 
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    // RPC commands arrive as freshly deserialized structs - resolve them by identity
+    // first so no lookup or derivation ever walks their src pointers
+    ggml_backend_meta_buffer_adopt_identity(tensor);
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1483,6 +1549,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    // RPC commands arrive as freshly deserialized structs - resolve them by identity
+    // first so no lookup or derivation ever walks their src pointers
+    ggml_backend_meta_buffer_adopt_identity(tensor);
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1928,6 +1997,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_reset(ctx.get());
             }
             stc.simple_tensors.clear();
+            stc.by_data.clear();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -1943,11 +2013,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bcj.nodes[i] = node;
                     continue;
                 }
-                bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
-                if (bcj.nodes[i] == nullptr) {
-                    // shadow evicted by the compute-container rotation while the graph
-                    // stayed cached on the llama side; recreate it on demand
-                    bcj.nodes[i] = ggml_backend_meta_buffer_ensure_simple_tensor(node, j);
+                if (j == 0) {
+                    // always rebuild node shadows from the graph itself (once per node): earlier
+                    // registrations may be stale - evicted by ring rotation for llama-side cached
+                    // graphs, or made from bare INIT_TENSOR structs over RPC whose src links are
+                    // missing and whose arena was overwritten by later commands. Leaves (weights,
+                    // caches, inputs) keep their upload-time registrations.
+                    bcj.nodes[i] = ggml_backend_meta_buffer_ensure_simple_tensor(node, j, /*force =*/ true);
+                } else {
+                    bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 }
                 GGML_ASSERT(bcj.nodes[i]);
             }
