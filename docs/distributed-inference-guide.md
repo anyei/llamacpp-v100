@@ -109,7 +109,37 @@ byte-exact on the 27B:
   payload carries low-mantissa AllReduce noise between tensor-parallel and
   single-GPU configs — harmless in practice, just not bit-identical.
 
-## 5. Operational notes
+## 5. Async RPC & multi-worker pipelines (proto 4.2)
+
+Everything here is automatic — no new flags on the happy path:
+
+- **Pipeline parallelism engages** when a layer split spans multiple RPC
+  devices: the coordinator log prints `pipeline parallelism enabled` and the
+  scheduler double-buffers ubatches (`n_copies=4`). RPC devices now report
+  async + events capability.
+- **Worker-to-worker transfers**: with two or more 4.2 workers in a layer
+  split, cross-stage activations flow directly between workers (a fenced
+  pull) instead of bouncing through the coordinator. Requirements:
+  - workers must be able to reach *each other* at the exact endpoint strings
+    the coordinator uses (`--rpc a:port,b:port`) — same network/overlay, no
+    NAT between them. If a worker cannot reach its peer, the copy silently
+    falls back to the coordinator-bridged path (the worker logs
+    `cannot reach source worker`).
+  - `GGML_RPC_NO_W2W=1` on the **coordinator** forces the old bridged copies
+    (debugging escape hatch).
+- **Multiple coordinators per worker** are now possible (the worker serves
+  connections concurrently; each connection's buffers are freed when it
+  disconnects) — but two coordinators must not share the same *device*:
+  the second one's graph replays fail loudly by design.
+- **Unreachable workers fail fast**: `llama-server --rpc bad:port` now exits
+  with `failed to connect to RPC server` instead of silently degrading to
+  CPU-only inference (pre-4.2 behavior — worth knowing if you relied on it).
+- **Version compatibility**: a 4.2 coordinator works with 4.1 workers (new
+  features simply stay off). A 4.1 coordinator refuses 4.2 workers —
+  upgrade the coordinator first, or both sides from the same image
+  (`llamacpp-local-v100:distributed-inference` and later ship 4.2).
+
+## 6. Operational notes
 
 - **First load**: budget ~40 min for a 27B over the socket (one-time per
   model per worker with `-c`). Watch progress via worker-side VRAM:
@@ -126,14 +156,17 @@ byte-exact on the 27B:
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
-## 6. Known limitations
+## 7. Known limitations
 
-- Per-token latency of whole-model-remote serving is gated by the
-  synchronous RPC protocol (phase 2, async double-buffering, is the
-  planned fix and matters mainly for that pessimal topology).
+- Per-token latency of whole-model-remote serving is still gated by the
+  synchronous per-token input/logits round trips (async double-buffering
+  helps pipelines, not the single-stage whole-model-remote case).
+- On loopback with a shared GPU, worker-to-worker transfers measure the
+  same as bridged copies — the win is on real networks (one direct hop
+  instead of two through the coordinator) and has not been measured on
+  physical two-box hardware yet.
 - MLA models (`deepseek2` family) do not support tensor mode at all yet
   (task 13) — islands included. Pipeline mode works for them.
-- Protocol version must match between coordinator and worker builds
-  (both sides from this repo's image; proto 4.1+).
 - No fault tolerance: a dead worker aborts the coordinator. No auth/TLS:
-  private networks only.
+  private networks only — and workers now also connect to each other, so
+  the whole worker set must share the trusted network.

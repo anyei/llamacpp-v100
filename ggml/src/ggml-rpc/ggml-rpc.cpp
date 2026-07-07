@@ -12,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <condition_variable>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -80,6 +82,15 @@ enum rpc_cmd {
     // proves every command sent before it has finished. Events map onto PING
     // sequence numbers client-side; no server-side state is needed.
     RPC_CMD_PING,
+    // proto 4.2: worker-to-worker activation transfer. The coordinator tells the
+    // destination worker to pull a tensor directly from the source worker instead
+    // of bridging the bytes through itself. The pull is fenced: it waits until the
+    // source has executed >= fence_seq commands on the coordinator's connection
+    // (identified via GET_CONN_ID), i.e. until the compute that produces the data
+    // has actually run.
+    RPC_CMD_GET_CONN_ID,
+    RPC_CMD_GET_TENSOR_FENCED,
+    RPC_CMD_COPY_FROM_REMOTE,
     RPC_CMD_COUNT,
 };
 
@@ -183,6 +194,24 @@ struct rpc_msg_copy_tensor_req {
 };
 
 struct rpc_msg_copy_tensor_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_get_conn_id_rsp {
+    uint64_t conn_id;
+};
+
+struct rpc_msg_get_tensor_fenced_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+    uint64_t fence_conn; // connection id on the receiving server whose progress gates this read
+    uint64_t fence_seq;  // read allowed once that connection has executed >= fence_seq commands
+};
+
+// RPC_CMD_COPY_FROM_REMOTE request is variable-size:
+// | rpc_tensor src | rpc_tensor dst | fence_conn (8) | fence_seq (8) | ep_len (4) | src endpoint bytes |
+struct rpc_msg_copy_from_remote_rsp {
     uint8_t result;
 };
 
@@ -358,20 +387,38 @@ struct ggml_backend_rpc_async_state {
     std::mutex mutex;
     uint64_t pings_sent = 0;
     uint64_t pings_done = 0;
+    // every command sent on this socket, HELLO included - must stay in lockstep
+    // with the server's per-connection executed counter (fence sequencing)
+    uint64_t cmds_sent = 0;
+    uint8_t  server_minor = 0; // from HELLO; gates use of 4.2+ commands
+    uint64_t conn_id = 0;      // this socket's connection id on the server (0 = not fetched)
 };
 
+static std::mutex g_rpc_async_reg_mutex;
+static std::unordered_map<socket_t *, std::unique_ptr<ggml_backend_rpc_async_state>> g_rpc_async_reg;
+
 static ggml_backend_rpc_async_state & rpc_async_state(socket_t * sock) {
-    static std::mutex reg_mutex;
-    static std::unordered_map<socket_t *, std::unique_ptr<ggml_backend_rpc_async_state>> reg;
-    std::lock_guard<std::mutex> lock(reg_mutex);
-    auto & e = reg[sock];
+    std::lock_guard<std::mutex> lock(g_rpc_async_reg_mutex);
+    auto & e = g_rpc_async_reg[sock];
     if (!e) {
         e = std::make_unique<ggml_backend_rpc_async_state>();
     }
     return *e;
 }
 
-static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+// the registry is keyed by raw socket address: when a connection dies and a new
+// socket_t is allocated at the same address, it must NOT inherit the dead
+// connection's counters (cmds_sent would run ahead of the new connection's
+// executed count on the server and every fence against it would hang; stale
+// pings_sent would make drains wait for responses that will never come).
+// Call for every freshly created socket, before its HELLO.
+static void rpc_async_state_reset(socket_t * sock) {
+    std::lock_guard<std::mutex> lock(g_rpc_async_reg_mutex);
+    g_rpc_async_reg.erase(sock);
+}
+
+// caller must hold st.mutex
+static bool send_rpc_cmd_raw(socket_ptr sock, ggml_backend_rpc_async_state & st, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -382,6 +429,7 @@ static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * inp
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    st.cmds_sent++;
     return true;
 }
 
@@ -402,7 +450,7 @@ static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    return send_rpc_cmd_raw(sock, cmd, input, input_size);
+    return send_rpc_cmd_raw(sock, st, cmd, input, input_size);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -413,7 +461,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
         return false;
     }
-    if (!send_rpc_cmd_raw(sock, cmd, input, input_size)) {
+    if (!send_rpc_cmd_raw(sock, st, cmd, input, input_size)) {
         return false;
     }
     uint64_t out_size;
@@ -433,7 +481,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 static uint64_t rpc_ping_async(socket_ptr sock) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    bool status = send_rpc_cmd_raw(sock, RPC_CMD_PING, nullptr, 0);
+    bool status = send_rpc_cmd_raw(sock, st, RPC_CMD_PING, nullptr, 0);
     GGML_ASSERT(status && "failed to send RPC ping");
     return ++st.pings_sent;
 }
@@ -466,9 +514,30 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
                        response.major, response.minor, response.patch);
         return false;
     }
+    rpc_async_state(sock.get()).server_minor = response.minor;
 
     sock->update_caps(response.conn_caps);
     return true;
+}
+
+// this socket's connection id on the server (proto 4.2+), fetched once and cached
+static uint64_t rpc_get_conn_id(socket_ptr sock) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    {
+        std::lock_guard<std::mutex> lock(st.mutex);
+        if (st.conn_id != 0) {
+            return st.conn_id;
+        }
+        if (st.server_minor < 2) {
+            return 0;
+        }
+    }
+    rpc_msg_get_conn_id_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_GET_CONN_ID, nullptr, 0, &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.conn_id = response.conn_id;
+    return st.conn_id;
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -496,6 +565,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
+    // fresh connection: never inherit a dead socket's counters (address reuse)
+    rpc_async_state_reset(sock.get());
     if (!negotiate_hello(sock)) {
         return nullptr;
     }
@@ -822,6 +893,89 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     GGML_UNUSED(backend);
 }
 
+// worker-to-worker activation transfer (proto 4.2): instead of bridging the bytes
+// through the coordinator (blocking GET from the source, then SET to the
+// destination), tell the destination worker to pull directly from the source.
+// The pull is fenced so it cannot read before the source has executed the compute
+// that produces the data (read-after-write); the blocking ack means the
+// coordinator queues no further source work until the read is out
+// (write-after-read) - the same contract the CUDA cross-device copy implements
+// with events, while the transfer itself takes one direct hop.
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_RPC_NO_W2W") != nullptr;
+    if (disabled) {
+        return false; // escape hatch: force the coordinator-bridged copy
+    }
+    if (backend_src->iface.get_name != ggml_backend_rpc_name) {
+        return false; // source is not an RPC backend
+    }
+    ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
+    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
+    if (src_ctx->endpoint == dst_ctx->endpoint) {
+        return false; // same server: the buffer-level COPY_TENSOR path already handles it
+    }
+    if (src->buffer == nullptr || dst->buffer == nullptr ||
+        !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
+        return false;
+    }
+    if (ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    auto sock_src = get_socket(src_ctx->endpoint);
+    auto sock_dst = get_socket(dst_ctx->endpoint);
+    ggml_backend_rpc_async_state & st_src = rpc_async_state(sock_src.get());
+    ggml_backend_rpc_async_state & st_dst = rpc_async_state(sock_dst.get());
+    if (st_src.server_minor < 2 || st_dst.server_minor < 2) {
+        return false; // an old worker on either side: fall back to the bridged copy
+    }
+    // the tensors must actually live on these endpoints
+    if (((ggml_backend_rpc_buffer_context *)src->buffer->context)->sock != sock_src ||
+        ((ggml_backend_rpc_buffer_context *)dst->buffer->context)->sock != sock_dst) {
+        return false;
+    }
+    const uint64_t fence_conn = rpc_get_conn_id(sock_src);
+    if (fence_conn == 0) {
+        return false;
+    }
+    uint64_t fence_seq;
+    {
+        // everything sent to the source so far includes the compute producing src
+        std::lock_guard<std::mutex> lock(st_src.mutex);
+        fence_seq = st_src.cmds_sent;
+    }
+    // views: resolve to root + byte offset, exactly like the get/set paths - view
+    // links do not survive the wire
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+    const ggml_tensor * src_root = rpc_resolve_view(src, src_offset);
+    const ggml_tensor * dst_root = rpc_resolve_view(dst, dst_offset);
+    const rpc_tensor rsrc = serialize_tensor(src_root);
+    const rpc_tensor rdst = serialize_tensor(dst_root);
+    const uint64_t size = (uint64_t) ggml_nbytes(src);
+    const std::string & ep = src_ctx->endpoint;
+    const uint32_t ep_len = (uint32_t) ep.size();
+
+    // | rpc_tensor src | rpc_tensor dst | src_offset | dst_offset | size | fence_conn | fence_seq | ep_len | ep |
+    std::vector<uint8_t> input(2*sizeof(rpc_tensor) + 5*sizeof(uint64_t) + sizeof(uint32_t) + ep_len);
+    uint8_t * p = input.data();
+    memcpy(p, &rsrc, sizeof(rsrc));                p += sizeof(rsrc);
+    memcpy(p, &rdst, sizeof(rdst));                p += sizeof(rdst);
+    uint64_t off64 = src_offset; memcpy(p, &off64, sizeof(off64)); p += sizeof(off64);
+    off64 = dst_offset;          memcpy(p, &off64, sizeof(off64)); p += sizeof(off64);
+    memcpy(p, &size, sizeof(size));                p += sizeof(size);
+    memcpy(p, &fence_conn, sizeof(fence_conn));    p += sizeof(fence_conn);
+    memcpy(p, &fence_seq, sizeof(fence_seq));      p += sizeof(fence_seq);
+    memcpy(p, &ep_len, sizeof(ep_len));            p += sizeof(ep_len);
+    memcpy(p, ep.data(), ep_len);
+
+    rpc_msg_copy_from_remote_rsp response;
+    bool status = send_rpc_cmd(sock_dst, RPC_CMD_COPY_FROM_REMOTE, input.data(), input.size(), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    // a failed pull (e.g. the destination worker cannot reach the source) falls
+    // back to the coordinator-bridged copy
+    return response.result != 0;
+}
+
 // events (proto 4.2): an event is a PING sequence number on the endpoint's
 // connection. Record = send a marker; synchronize/wait = drain to its response.
 // Waiting on an event of the SAME endpoint is a no-op: the server executes
@@ -925,7 +1079,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -1065,6 +1219,17 @@ public:
     bool get_device_desc(const rpc_msg_get_device_desc_req & request, rpc_msg_get_device_desc_rsp & response);
     bool buffer_set_usage(const rpc_msg_buffer_set_usage_req & request);
 
+    // fence bookkeeping (proto 4.2 worker-to-worker pulls): per-connection count of
+    // executed commands, kept in lockstep with the client's sent-command counter
+    // (HELLO included). A fenced read waits - without holding exec_mutex - until the
+    // named connection has executed past the fence.
+    void conn_started(uint64_t conn_id);  // counts the HELLO
+    void mark_executed(uint64_t conn_id);
+    void conn_closed(uint64_t conn_id);
+    bool wait_fence(uint64_t conn_id, uint64_t seq);
+
+    bool copy_from_remote(const std::vector<uint8_t> & input, rpc_msg_copy_from_remote_rsp & response);
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -1086,7 +1251,126 @@ private:
     std::unordered_map<ggml_backend_buffer_t, uint64_t> buffer_owners;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+    std::mutex fence_mutex;
+    std::condition_variable fence_cv;
+    std::unordered_map<uint64_t, uint64_t> conn_executed;
+    std::unordered_set<uint64_t> conns_gone;
 };
+
+void rpc_server::conn_started(uint64_t conn_id) {
+    {
+        std::lock_guard<std::mutex> lock(fence_mutex);
+        conn_executed[conn_id] = 1; // the HELLO
+    }
+    fence_cv.notify_all();
+}
+
+void rpc_server::mark_executed(uint64_t conn_id) {
+    {
+        std::lock_guard<std::mutex> lock(fence_mutex);
+        conn_executed[conn_id]++;
+    }
+    fence_cv.notify_all();
+}
+
+void rpc_server::conn_closed(uint64_t conn_id) {
+    {
+        std::lock_guard<std::mutex> lock(fence_mutex);
+        conns_gone.insert(conn_id);
+    }
+    fence_cv.notify_all();
+}
+
+bool rpc_server::wait_fence(uint64_t conn_id, uint64_t seq) {
+    std::unique_lock<std::mutex> lock(fence_mutex);
+    // generous ceiling: a fence only outlives its compute if something is wedged
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
+    while (conn_executed[conn_id] < seq) {
+        if (conns_gone.count(conn_id) > 0) {
+            return false; // the gating connection died before reaching the fence
+        }
+        if (fence_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+            GGML_LOG_ERROR("[%s] timed out waiting for conn %" PRIu64 " to reach seq %" PRIu64 "\n",
+                           __func__, conn_id, seq);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rpc_server::copy_from_remote(const std::vector<uint8_t> & input, rpc_msg_copy_from_remote_rsp & response) {
+    // | rpc_tensor src | rpc_tensor dst | src_offset | dst_offset | size | fence_conn | fence_seq | ep_len | ep |
+    response.result = 0;
+    const size_t fixed = 2*sizeof(rpc_tensor) + 5*sizeof(uint64_t) + sizeof(uint32_t);
+    if (input.size() < fixed) {
+        return false;
+    }
+    const uint8_t * p = input.data();
+    rpc_tensor rsrc, rdst;
+    uint64_t src_offset, dst_offset, size, fence_conn, fence_seq;
+    uint32_t ep_len;
+    memcpy(&rsrc, p, sizeof(rsrc));               p += sizeof(rsrc);
+    memcpy(&rdst, p, sizeof(rdst));               p += sizeof(rdst);
+    memcpy(&src_offset, p, sizeof(src_offset));   p += sizeof(src_offset);
+    memcpy(&dst_offset, p, sizeof(dst_offset));   p += sizeof(dst_offset);
+    memcpy(&size, p, sizeof(size));               p += sizeof(size);
+    memcpy(&fence_conn, p, sizeof(fence_conn));   p += sizeof(fence_conn);
+    memcpy(&fence_seq, p, sizeof(fence_seq));     p += sizeof(fence_seq);
+    memcpy(&ep_len, p, sizeof(ep_len));           p += sizeof(ep_len);
+    if (input.size() != fixed + ep_len || ep_len == 0) {
+        return false;
+    }
+    std::string src_endpoint((const char *) p, ep_len);
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * dst = deserialize_tensor(ctx_ptr.get(), &rdst);
+    if (dst == nullptr || dst->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing dst tensor\n", __func__);
+        return false;
+    }
+
+    // pull directly from the source worker - this process is a normal RPC client
+    // there. Peer sockets are cached with strong references: the general registry
+    // only holds weak_ptrs, and reconnecting (+ HELLO) per pull would add a round
+    // trip to every handoff.
+    static std::mutex peer_mutex;
+    static std::unordered_map<std::string, socket_ptr> peer_socks;
+    socket_ptr sock;
+    {
+        std::lock_guard<std::mutex> lock(peer_mutex);
+        auto it = peer_socks.find(src_endpoint);
+        if (it != peer_socks.end()) {
+            sock = it->second;
+        }
+    }
+    if (sock == nullptr) {
+        sock = get_socket(src_endpoint);
+        if (sock == nullptr) {
+            GGML_LOG_ERROR("[%s] cannot reach source worker '%s'\n", __func__, src_endpoint.c_str());
+            return true; // soft failure: the coordinator falls back to the bridged copy
+        }
+        std::lock_guard<std::mutex> lock(peer_mutex);
+        peer_socks[src_endpoint] = sock;
+    }
+    rpc_msg_get_tensor_fenced_req req = { rsrc, src_offset, size, fence_conn, fence_seq };
+    std::vector<uint8_t> data(size);
+    if (!send_rpc_cmd(sock, RPC_CMD_GET_TENSOR_FENCED, &req, sizeof(req), data.data(), size)) {
+        GGML_LOG_ERROR("[%s] fenced pull from '%s' failed\n", __func__, src_endpoint.c_str());
+        std::lock_guard<std::mutex> lock(peer_mutex);
+        peer_socks.erase(src_endpoint); // dead peer socket: reconnect on the next pull
+        return true; // soft failure
+    }
+    ggml_backend_tensor_set(dst, data.data(), dst_offset, size);
+    response.result = 1;
+    return true;
+}
 
 void rpc_server::free_owned(uint64_t conn_id) {
     for (auto it = buffer_owners.begin(); it != buffer_owners.end(); ) {
@@ -1741,6 +2025,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+    server.conn_started(conn_id);
     while (true) {
         // idle wait for the next command happens without the execution lock so
         // other connections keep making progress
@@ -1751,6 +2036,29 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
+        }
+        if (cmd == RPC_CMD_GET_TENSOR_FENCED) {
+            // the fence wait must happen WITHOUT the execution lock: the commands
+            // it waits for need that lock to execute
+            rpc_msg_get_tensor_fenced_req request;
+            if (!recv_msg(sock, &request, sizeof(request))) {
+                break;
+            }
+            if (!server.wait_fence(request.fence_conn, request.fence_seq)) {
+                break;
+            }
+            std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
+            server.current_conn = conn_id;
+            rpc_msg_get_tensor_req greq = { request.tensor, request.offset, request.size };
+            std::vector<uint8_t> response;
+            if (!server.get_tensor(greq, response)) {
+                break;
+            }
+            if (!send_msg(sock, response.data(), response.size())) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
         }
         // one command executes at a time across all connections; the payload recv
         // inside each case is safe to hold the lock over - the client sends the
@@ -1917,6 +2225,30 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 }
                 break;
             }
+            case RPC_CMD_GET_CONN_ID: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_get_conn_id_rsp response = { conn_id };
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_COPY_FROM_REMOTE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_copy_from_remote_rsp response;
+                if (!server.copy_from_remote(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2022,12 +2354,15 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 return;
             }
         }
+        // fence progress: in lockstep with the client's sent-command counter
+        server.mark_executed(conn_id);
     }
 }
 
 static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
     rpc_serve_client_loop(server, sock, conn_id);
     // runs regardless of how the loop exited (clean close or protocol error)
+    server.conn_closed(conn_id); // wakes any fence waiting on this connection
     std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
     server.free_owned(conn_id);
 }
