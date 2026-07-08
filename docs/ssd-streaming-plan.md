@@ -289,8 +289,16 @@ not a can't-run case; the true can't-run target is >110 GB models.)
 
 Increment staircase (each is a commit with its own gate):
 
-1. **Streamed host buffer type + "runs at all" (CPU landing, pull-compute-drop,
-   no persistent cache).** New `ggml_backend_buffer_type` reporting `is_host`,
+1. **✅ DONE (2026-07-08, commit 5b3a7377c). Streamed host buffer type + LRU
+   expert cache (CPU landing).** Result: Qwen-35B-A3B (23 GB, `-ngl 0 --no-mmap`)
+   byte-IDENTICAL to fully-resident, peak RSS 8.2 GB. **Headline: DeepSeek-V4-Flash
+   81 GB runs on ONE V100 (32 GB VRAM) + 46 GB RAM** — load 9.2 s, coherent output,
+   decode 0.69 t/s (cold cache / CPU compute / node-at-a-time = the correctness-
+   first floor). Implementation note vs the original sketch below: fill uses
+   buffered `pread` (not yet O_DIRECT) and a node-at-a-time eval callback (the
+   router that produces the expert-selection ids must compute before the fill
+   reads them — batching them corrupted output; fixed). Original sketch:
+   New `ggml_backend_buffer_type` reporting `is_host`,
    backed by a `mmap(MAP_ANON|MAP_NORESERVE)` arena sized to the streamed
    tensors at their natural offsets; loading is metadata-only (record file
    offset, no copy). A pre-`MUL_MAT_ID` hook `pread`s (O_DIRECT, via the
