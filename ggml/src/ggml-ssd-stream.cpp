@@ -22,6 +22,7 @@
 // RSS-bounded; O_DIRECT / prefetch / GPU-landing are later increments.
 
 #if defined(__linux__)
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #define GGML_SSD_STREAM_SUPPORTED 1
@@ -54,8 +55,13 @@ struct ssd_stream_state {
     bool   enabled_checked = false;
     bool   enabled         = false;
     bool   debug           = false;
+    bool   odirect         = false;   // reads bypass the page cache (set when the file fd takes O_DIRECT)
     size_t budget_bytes    = 0;
     long   page_size       = 4096;
+
+    // aligned bounce buffer for O_DIRECT reads (reused; guarded by mutex during fill)
+    void * bounce      = nullptr;
+    size_t bounce_cap  = 0;
 
     std::unordered_map<const ggml_tensor *, tensor_backing> registry;
     std::unordered_map<int, int>                            fd_dup;      // orig fd -> dup fd
@@ -71,23 +77,72 @@ struct ssd_stream_state {
 
 ssd_stream_state g_state;
 
-void ssd_pread_full(int fd, void * dst, size_t len, size_t off) {
 #ifdef GGML_SSD_STREAM_SUPPORTED
-    char * p = (char *) dst;
+// plain buffered pread of [off, off+len) into dst (loops over short reads)
+bool ssd_pread_buffered(int fd, char * dst, size_t len, size_t off) {
     size_t done = 0;
     while (done < len) {
-        ssize_t r = pread(fd, p + done, len - done, (off_t) (off + done));
+        ssize_t r = pread(fd, dst + done, len - done, (off_t) (off + done));
         if (r < 0) {
             GGML_LOG_ERROR("%s: pread failed (fd=%d off=%zu len=%zu): %s\n",
                     __func__, fd, off + done, len - done, strerror(errno));
-            return;
+            return false;
         }
         if (r == 0) {
-            break; // EOF (should not happen for valid offsets)
+            break; // EOF
         }
         done += (size_t) r;
     }
-    g_state.bytes_read += done;
+    return done >= len;
+}
+#endif
+
+// read [off, off+len) from fd into dst. With O_DIRECT the read is issued to a
+// page-aligned bounce buffer over the aligned superset and the exact range is
+// copied out - so streaming never populates the page cache (keeps RSS/cgroup
+// charge bounded to the arena, unlike buffered reads). Caller holds the mutex.
+void ssd_pread_full(int fd, void * dst, size_t len, size_t off) {
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    auto & st = g_state;
+    if (!st.odirect) {
+        if (ssd_pread_buffered(fd, (char *) dst, len, off)) {
+            st.bytes_read += len;
+        }
+        return;
+    }
+    const size_t A    = (size_t) st.page_size;
+    const size_t aoff = off & ~(A - 1);
+    const size_t aend = (off + len + A - 1) & ~(A - 1);
+    const size_t asz  = aend - aoff;
+    if (st.bounce_cap < asz) {
+        free(st.bounce);
+        st.bounce = nullptr;
+        if (posix_memalign(&st.bounce, A, asz) != 0) {
+            st.bounce = nullptr; st.bounce_cap = 0;
+            GGML_LOG_ERROR("%s: posix_memalign(%zu) failed\n", __func__, asz);
+            return;
+        }
+        st.bounce_cap = asz;
+    }
+    // O_DIRECT requires aligned offset/buffer; the kernel returns a short (but
+    // still page-multiple) count only at EOF, which is fine as long as it covers
+    // the requested tail.
+    const size_t need = off + len - aoff;
+    size_t done = 0;
+    while (done < need) {
+        ssize_t r = pread(fd, (char *) st.bounce + done, asz - done, (off_t) (aoff + done));
+        if (r < 0) {
+            GGML_LOG_ERROR("%s: O_DIRECT pread failed (fd=%d aoff=%zu asz=%zu): %s\n",
+                    __func__, fd, aoff, asz - done, strerror(errno));
+            return;
+        }
+        if (r == 0) {
+            break; // EOF
+        }
+        done += (size_t) r;
+    }
+    memcpy(dst, (const char *) st.bounce + (off - aoff), len);
+    st.bytes_read += len;
 #else
     GGML_UNUSED(fd); GGML_UNUSED(dst); GGML_UNUSED(len); GGML_UNUSED(off);
 #endif
@@ -283,6 +338,15 @@ void ggml_ssd_stream_note(const ggml_tensor * t, int fd, size_t file_offset) {
     auto f = st.fd_dup.find(fd);
     if (f == st.fd_dup.end()) {
         dfd = dup(fd); // survives loader teardown
+        // switch the dup to O_DIRECT so streamed reads bypass the page cache
+        // (keeps the cgroup/page-cache charge bounded to the arena). Falls back
+        // to buffered reads if the fs/file rejects it.
+        const int fl = fcntl(dfd, F_GETFL);
+        if (fl != -1 && fcntl(dfd, F_SETFL, fl | O_DIRECT) == 0) {
+            st.odirect = true;
+        } else if (st.fd_dup.empty()) {
+            GGML_LOG_INFO("ggml_ssd_stream: O_DIRECT unavailable, using buffered reads\n");
+        }
         st.fd_dup[fd] = dfd;
     } else {
         dfd = f->second;
