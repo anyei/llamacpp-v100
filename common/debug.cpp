@@ -193,15 +193,12 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
             bool dump = true;
             if (const char * df = getenv("LLAMA_DEBUG_DUMP_FILTER")) {
                 dump = false;
-                std::string name(t->name), filters(df);
-                size_t pos = 0;
-                while (pos != std::string::npos && !dump) {
-                    size_t next = filters.find(',', pos);
-                    std::string one = filters.substr(pos, next == std::string::npos ? next : next - pos);
+                const std::string name(t->name);
+                for (const auto & one : string_split<std::string>(df, ',')) {
                     if (!one.empty() && name.find(one) != std::string::npos) {
                         dump = true;
+                        break;
                     }
-                    pos = next == std::string::npos ? next : next + 1;
                 }
             }
             if (dump && t->type == GGML_TYPE_F32) {
