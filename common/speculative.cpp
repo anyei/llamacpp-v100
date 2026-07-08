@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <cmath>
+
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
@@ -147,6 +149,23 @@ struct common_speculative_impl {
     size_t n_acc_tokens = 0; // number of tokens accepted by the target model.
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
+
+    // LLAMA_SPEC_ADAPTIVE=1: cap each draft round near the measured acceptance
+    // EMA instead of always drafting n_max, saving draft passes on content
+    // where acceptance runs cold. The verify batch shape is unaffected (drafts
+    // are padded to n_max, see pad_drafts), and this is sampling policy only -
+    // the target model's temp-0 output is unchanged by construction.
+    float acc_ema = 1e6f; // warm start above any cap: draft n_max until measured
+
+    int adaptive_n_max(int n_min, int n_max) const {
+        static const bool enabled = getenv("LLAMA_SPEC_ADAPTIVE") != nullptr;
+        if (!enabled || n_max <= n_min) {
+            return n_max;
+        }
+        // draft one past the recent average acceptance
+        const int cap = (int) std::lround(acc_ema) + 1;
+        return std::min(std::max(cap, std::max(n_min, 1)), n_max);
+    }
 
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
@@ -343,7 +362,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if ((params.n_max <= (int) result.size()) ||
+                if ((adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -799,7 +818,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1575,7 +1594,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2542,6 +2561,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
         }
+
+        // acceptance EMA for the adaptive draft cap (first sample replaces the
+        // warm-start sentinel entirely)
+        impl->acc_ema = impl->acc_ema > 1e5f ? (float) n_accepted
+                                             : 0.9f*impl->acc_ema + 0.1f*(float) n_accepted;
 
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
