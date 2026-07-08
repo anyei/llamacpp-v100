@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1920,6 +1921,12 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
 
+    // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
+    int64_t tm_compute_us = 0;
+    int64_t tm_reduce_us  = 0;
+    int64_t tm_reduces    = 0;
+    int64_t tm_graphs     = 0;
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -2523,6 +2530,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // GGML_META_TIMING=1: attribute wall time to kernel compute vs AllReduce
+    // boundaries. Adds explicit device syncs at each boundary, so it slightly
+    // serializes execution - a diagnostic mode, not for production serving.
+    // Motivation: quantify the per-token synchronization tax (2 reduces/layer)
+    // before attempting reduce/compute overlap (see TASKS.md roadmap).
+    static const bool tm_enabled = getenv("GGML_META_TIMING") != nullptr;
+    const auto tm_sync_all = [&]() {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+    };
+    int64_t tm_last = tm_enabled ? (tm_sync_all(), ggml_time_us()) : 0;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2530,6 +2550,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+        }
+        if (tm_enabled) {
+            tm_sync_all();
+            const int64_t t = ggml_time_us();
+            backend_ctx->tm_compute_us += t - tm_last;
+            tm_last = t;
         }
 
         if (n_backends > 1 && backend_ctx->backend_configs[0].cgraphs[i].reduce) {
@@ -2551,7 +2577,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            if (tm_enabled) {
+                tm_sync_all();
+                const int64_t t = ggml_time_us();
+                backend_ctx->tm_reduce_us += t - tm_last;
+                tm_last = t;
+                backend_ctx->tm_reduces++;
+            }
         }
+    }
+    if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
+        GGML_LOG_INFO("META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, reduce %.2f ms/graph over %.1f boundaries/graph\n",
+                backend_ctx->tm_graphs,
+                backend_ctx->tm_compute_us / 1000.0 / backend_ctx->tm_graphs,
+                backend_ctx->tm_reduce_us  / 1000.0 / backend_ctx->tm_graphs,
+                (double) backend_ctx->tm_reduces / backend_ctx->tm_graphs);
+        backend_ctx->tm_compute_us = 0;
+        backend_ctx->tm_reduce_us  = 0;
+        backend_ctx->tm_reduces    = 0;
+        backend_ctx->tm_graphs     = 0;
     }
     return GGML_STATUS_SUCCESS;
 }
