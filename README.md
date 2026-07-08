@@ -29,39 +29,71 @@ Every change was gated on **byte-identical temp-0 output** vs. baseline.
 
 ## What this fork adds over upstream
 
-### Serving performance
-- **Multi-shape decode graph cache** — LRU of small-batch decode graphs, each
-  with its own scheduler; 100% graph reuse for speculative workloads.
-  (`LLAMA_DECODE_GRAPH_CACHE`, `LLAMA_DECODE_GRAPH_CACHE_TOKENS`,
-  `GGML_META_MAX_GRAPHS`)
-- **MTP draft padding** — fixed-length drafts keep batch shapes stable so
-  graph reuse works with confidence-based drafting (`--spec-draft-p-min`).
-- **Full-sequence equal ubatch splits** — hybrid (recurrent) models no longer
-  fall back to one-sequence-per-ubatch under speculative rollback; the 4-slot
-  verify runs as one batch (the 64.7 → 125 t/s fix).
-- **Prompt-batch defragmentation** — prompt processing no longer breaks the
-  batch at every user message, only where a context checkpoint is created.
-- **Prompt-cache checkpoint pruning + RAM bounds** — cached conversations keep
-  only their newest checkpoints (hybrid-model checkpoints are ~150-230 MiB
-  each); compose profiles bound cache/checkpoint RAM to prevent host OOM.
-- **One-shot P2P NVLink AllReduce** for 2-GPU tensor mode
-  (`GGML_CUDA_ALLREDUCE=p2p`).
+### Backend-agnostic improvements (not V100-specific)
 
-### Correctness / robustness
-- Quantized KV verified in tensor mode (q8_0 lossless at 2x; mixed K/V types
-  enabled via `GGML_CUDA_FA_ALL_QUANTS`).
+These live in backend-neutral code (`common/`, `src/llama-*`, `tools/server/`),
+so they help speculative decoding, hybrid/recurrent models, and long-context
+serving on **any** ggml backend — CPU, CUDA, Metal, ROCm, Vulkan, RPC — not
+just CUDA/Volta. They were tuned and measured here on V100s, but nothing about
+them is V100-specific.
+
+- **Multi-shape decode graph cache** (`src/llama-context`) — an LRU of decode
+  graphs keyed by ubatch shape, each with its own scheduler, so a workload that
+  alternates between a few small shapes (speculative draft/verify, varying
+  concurrency) replays cached graphs instead of rebuilding **and reallocating**
+  every step. 100% steady-state reuse; build+alloc drops to ~0 ms. Env:
+  `LLAMA_DECODE_GRAPH_CACHE` (entries, default 4), `LLAMA_DECODE_GRAPH_CACHE_TOKENS`
+  (max cached ubatch size). (`GGML_META_MAX_GRAPHS` is the CUDA-tensor-split
+  companion knob.)
+- **Speculative draft padding** (`common/speculative`) — drafts padded to a
+  fixed length so the verify batch shape stays constant across steps; this is
+  what lets graph reuse and confidence-gated drafting (`--spec-draft-p-min`)
+  actually pay off instead of forcing a rebuild every iteration. Kill switch:
+  `LLAMA_SPEC_DRAFT_NO_PAD=1`.
+- **Full-sequence equal ubatch splits** (`src/llama-batch`) — hybrid recurrent
+  models (e.g. DeltaNet) no longer collapse to one-sequence-per-ubatch under
+  speculative rollback; `split_equal(..., full_seqs=true)` groups whole
+  sequences while preserving the rollback-snapshot invariant (the 64.7 → 125 t/s
+  concurrent-spec fix).
+- **Server prompt-batch defragmentation** (`tools/server`) — prompt processing
+  breaks the batch only where a context checkpoint is actually created, not at
+  every user message (large win for long chat-history prefill).
+- **Prompt-cache checkpoint pruning + RAM bounds** (`tools/server`) — cached
+  conversations keep only their newest checkpoints (hybrid-model checkpoints are
+  ~150–230 MiB each regardless of token count), preventing multi-GiB cache
+  entries and host OOM.
+- **Adaptive speculative draft cap** (`common/speculative`, opt-in
+  `LLAMA_SPEC_ADAPTIVE=1`) — caps each draft round near the measured acceptance
+  EMA to skip cold draft passes. Measured tg-neutral on the MTP config here (the
+  confidence gate already captures the value), so it ships **off by default**.
+- **Robustness fixes** — clean failure on unreachable `--rpc` endpoints (was a
+  silent CPU fallback), on failed context/lora init (was a null-pointer crash),
+  and a lora-path double-free.
+- **Env-gated diagnostics** (zero cost when unset): `LLAMA_DECODE_TIMING`
+  (per-ubatch build/alloc/set/compute + reuse), `LLAMA_SPEC_TIMING`
+  (draft/checkpoint/decode/accept phases).
+
+### CUDA / Volta (V100) specific
+- **One-shot P2P NVLink AllReduce** for 2-GPU tensor mode
+  (`GGML_CUDA_ALLREDUCE=p2p`, NCCL fallback, cap `GGML_CUDA_AR_P2P_MAX_BYTES`).
+- **MMVQ sm70 tuning** — a dedicated Volta parameter table for the quantized
+  matrix-vector kernels; K-quant batch-1 decode uses `nwarps=2` (+1.8% nospec
+  tg, perplexity-identical). Volta was previously served by the generic
+  (untuned) path.
+- **Quantized KV in tensor mode** — verified lossless at q8_0 (2x); mixed K/V
+  types enabled via `GGML_CUDA_FA_ALL_QUANTS`. Note (measured): on Volta,
+  quantized KV is for **capacity**, not long-context *speed* — the decode
+  flash-attention kernel is compute-bound there, so quantizing KV slightly
+  *increases* the long-context penalty.
 - **MLA tensor mode** (`deepseek2` family: GLM-4.7-Flash, DeepSeek V2/V3/R1,
-  Kimi K2): supported — attention runs mirrored, FFN/experts split; validated
-  by perplexity (statistically identical to single-GPU). Temp-0 text can
-  diverge from single-GPU runs (MoE-router-amplified reduction noise) without
-  affecting quality. Single GPU remains fastest when the model fits.
-- Clean failure paths: unreachable `--rpc` endpoints, failed context creation,
-  and a lora-path double-free all fixed (previously silent CPU fallback /
-  null-pointer crashes).
-- Diagnostic instrumentation: `LLAMA_DECODE_TIMING`, `LLAMA_SPEC_TIMING`,
-  `GGML_META_DEBUG=1|2` (split-state + per-src resolution tracing),
-  `GGML_META_DEBUG_REDUCE` (AllReduce boundary placement),
-  `LLAMA_DEBUG_DUMP_DIR`/`_FILTER` (full-tensor dumps from the eval callback),
+  Kimi K2) — attention runs mirrored, FFN/experts split; validated by
+  perplexity (statistically identical to single-GPU). Temp-0 text can diverge
+  from single-GPU runs (MoE-router-amplified reduction noise) without affecting
+  quality. Single GPU remains fastest when the model fits.
+- **Meta tensor-split backend diagnostics**: `GGML_META_DEBUG=1|2` (split-state
+  + per-src resolution), `GGML_META_DEBUG_REDUCE` (AllReduce boundary
+  placement), `GGML_META_TIMING` (compute-vs-reduce wall-time attribution),
+  `LLAMA_DEBUG_DUMP_DIR`/`_FILTER` (full-tensor eval-callback dumps),
   `LLAMA_META_DUP_DEVICE` (genuine n-way tensor splits on one GPU).
 
 ### Distributed inference (experimental)
