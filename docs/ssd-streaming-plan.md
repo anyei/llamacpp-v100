@@ -270,3 +270,44 @@ design the measurements point to.
 - A tg/pp table per tier mix in `docs/perf-tuning-v100.md` when phases land.
 - Repeat all capped-memory benchmarks with the page-cache eviction step
   (§1) — results without it are invalid.
+
+## 8. Build plan — phase 2/4 implementation (2026-07-08, in progress)
+
+Decision: **land experts on the GPU (VRAM) as the end-state compute/cache tier,
+with RAM as an L2 victim cache and SSD as the cold tier** (the V100 out-computes
+the CPU by 10-50x, and at realistic MoE hit rates the model is compute-bound
+where the GPU wins; a VRAM miss that hits RAM refills at PCIe ~12 GB/s instead
+of re-reading SSD at 2.7 GB/s). But **build the CPU-landing tier first** — it
+gets the model *running* with zero kernel changes and lets us measure the real
+expert hit rate cheaply; the GPU tier is a later speed upgrade.
+
+**Simulation harness:** to force a genuine "doesn't fit VRAM+RAM" case on this
+box, constrain to **one V100 (32 GB) + 46 GB RAM = 78 GB < 81 GB** (`CUDA_VISIBLE_DEVICES=0`).
+The DeepSeek-V4-Flash 81 GB then cannot be held resident by any `-ngl` split and
+*must* stream. (On both GPUs it fits combined — that case is the stress vehicle,
+not a can't-run case; the true can't-run target is >110 GB models.)
+
+Increment staircase (each is a commit with its own gate):
+
+1. **Streamed host buffer type + "runs at all" (CPU landing, pull-compute-drop,
+   no persistent cache).** New `ggml_backend_buffer_type` reporting `is_host`,
+   backed by a `mmap(MAP_ANON|MAP_NORESERVE)` arena sized to the streamed
+   tensors at their natural offsets; loading is metadata-only (record file
+   offset, no copy). A pre-`MUL_MAT_ID` hook `pread`s (O_DIRECT, via the
+   loader's `read_aligned_chunk`) the *selected* experts' slices into the arena,
+   computes, then `MADV_DONTNEED`s them — RSS stays at the in-flight working
+   set. `ffn_*_exps.weight` routed to the buft (auto-detect or `-ot`). **Gate:**
+   (a) byte-exact temp-0 vs fully-resident on a small MoE that fits (GLM-4.7-Flash
+   14 GB or Qwen3.6-35B-A3B 23 GB); (b) DeepSeek-V4-Flash 81 GB *runs* on 1 GPU
+   with RSS bounded to the budget. Expected speed = the ~1.5 t/s streaming floor.
+2. **SLRU expert cache in the arena (keep hot, evict LRU only under budget
+   pressure).** `--ssd-stream-budget` bounds resident expert bytes. **Gate:**
+   still byte-exact; measure real hit rate + t/s vs the increment-1 floor on
+   DeepSeek.
+3. **GPU landing + `MUL_MAT_ID` slot indirection** (hot experts in VRAM cache
+   slots, GPU computes them), RAM demoted to L2 victim cache. **Gate:** byte-exact
+   (reduction-order tolerance for GPU), t/s at GPU compute speed.
+4. **Prefetch / overlap** (double-buffer reads behind compute; within-flight
+   only — a token's experts are known only after its router runs).
+5. Stretch (§5): io_uring, cuFile/GDS direct SSD→VRAM, worker-side streaming for
+   TP islands, disk-backed checkpoints.
