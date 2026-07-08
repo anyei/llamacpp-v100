@@ -202,13 +202,14 @@ For multi-machine setups see the
 
 Tracked in detail in [`TASKS.md`](TASKS.md):
 
-- **SSD streaming** (task 15) — feasibility **validated, build in progress**
-  (see the highlighted use-case above). Investigation ruled out the dead ends
-  (dense CPU streaming: no win over kernel readahead; page-cache steering:
-  self-defeating under memory pressure) and the O_DIRECT-random-read spike
-  passed (~2.7 GB/s, beats the mmap-thrash floor even with no cache). Building
-  the userspace expert cache (pread/O_DIRECT arena + SLRU, one design for CPU
-  and GPU tiers) — see `docs/ssd-streaming-plan.md`.
+- **SSD streaming** (task 15) — **in progress; the core works** (see the
+  highlighted use-case above). Increment 1 shipped: a streamed expert buffer
+  type (`LLAMA_SSD_STREAM_BUFFER=1`) that preads MoE experts on demand into a
+  budgeted, O_DIRECT-fed arena. DeepSeek-V4-Flash **81 GB runs on one 32 GB
+  V100 + 46 GB RAM** — byte-identical to resident, decode 1.66 t/s and climbing
+  (0.69 → 1.66 across batching + O_DIRECT). Remaining: GPU landing (compute
+  experts on the GPU), prefetch/overlap, and the `--ssd-streaming` CLI flag —
+  see `docs/ssd-streaming-plan.md §8`.
 - **Distributed, hardware-gated** — two-box measurement of the
   worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
   RDMA / 25 GbE+).
@@ -217,6 +218,12 @@ Tracked in detail in [`TASKS.md`](TASKS.md):
 - **Minor debt** — CUDA OOM during meta buffer allocation asserts instead
   of erroring cleanly; `-ot` cannot target non-default buffer types.
 - Tasks 13 (MLA tensor mode) and 14 (init-failure crashes) closed 2026-07-07.
+- Token-generation round closed 2026-07-08: **17** overlap AllReduce with
+  compute — negative, reverted (`97dffd25f`); **18** MMVQ sm70 tuning — +1.8%
+  batch-1 nospec decode, ppl-identical (`b912d1b1e`); **19** FA long-context
+  decay — sized, compute-bound, quant-KV counterproductive for speed, deep
+  kernel work deferred (`723cf9fed`); **20** adaptive speculative draft cap —
+  measured tg-neutral, ships off (`bc52cf1ea`).
 
 ## Reference hardware & platform
 
@@ -244,8 +251,7 @@ on Windows, you are on your own — report findings, but expect breakage.
 
 ## Provenance and caveats
 
-- Forked from upstream llama.cpp (see git history for the merge base);
-  upstream remote kept as `origin` for future merges.
+- Forked from upstream llama.cpp (see git history for the merge base).
 - Tuned specifically for Volta (cc 7.0): CUDA graphs are unavailable there,
   MMQ/MMVQ dispatch thresholds and measured curves are V100-specific.
 - The RPC protocol has **no authentication or TLS** — private networks only.
