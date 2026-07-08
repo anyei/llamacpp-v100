@@ -85,6 +85,21 @@ baseline (fresh-server and cached-prompt paths).
    predicate, range-constructed checkpoint tail, collapsed split branches.
    Also resolved the last temp-0 divergence.
 
+10. **MMVQ Volta (sm70) table** (`ggml/src/ggml-cuda/mmvq.cu`, commit
+    `b912d1b1e`) — Volta previously fell through to `MMVQ_PARAMETERS_GENERIC`,
+    which lumps `ncols_dst` 1-4 at `nwarps=4`, untuned for sm70. Added a
+    dedicated `MMVQ_PARAMETERS_VOLTA` that differs only at the batch-1 decode
+    path: K-quants (Q2_K…Q6_K) now use `nwarps=2` (mirrors TURING). Measured
+    sweep, single-GPU tg128, Qwen 27B Q4_K: nwarps 1=30.2, **2=31.6**, 4=31.1,
+    8=27.8 → **+1.8%**. ppl identical to 4 decimals (5.9063). The change alters
+    only the cross-warp reduction order, so it is *not* byte-exact (gated on
+    ppl, not bytes). **Scope: batch-1 nospec decode only** — the MTP-spec prod
+    path verifies at batch-4 (`ncols_dst=4`) and is unaffected (measured
+    neutral). Tuning `ncols_dst` 2-4 helped pure batched decode (+3-4%) but was
+    prod-neutral on the AllReduce-bound 2-GPU spec path — deliberately not
+    shipped (see TASKS.md item 18 for the follow-up on the nospec `-np>1`
+    profile). Pascal/older keep GENERIC.
+
 ## Volta-specific facts worth remembering
 
 - CUDA graphs are hard-disabled for cc < 8.0; launch overhead is not the
@@ -92,11 +107,23 @@ baseline (fresh-server and cached-prompt paths).
 - Quantized matmul dispatch: MMVQ vec kernels up to 8 tokens, dp4a MMQ from 9
   to 64, dequant+cuBLAS above. Step-time curve (27B, 2 GPU): 1 tok = 20.8ms,
   4 = 40.4, 8 = 69.6, 12 = 65.8, 16 = 74.5, 32 = 123 — note MMQ at 12 beats
-  MMVQ at 8.
+  MMVQ at 8. The batch-1 MMVQ path for K-quants is tuned for sm70 as of
+  `b912d1b1e` (`nwarps=2`, +1.8% nospec decode; see change #10).
 - Prefill at depth is FA-bound physics: ~1400 t/s at depth 0 falls to ~720 t/s
   at 65k context in perfect batches. Mid-prefill log numbers are cumulative
   averages, so they always decay; look at deltas between lines for the
   instantaneous rate.
+- **Long-context *decode* is FA compute-bound, not KV-bandwidth-bound**
+  (measured, task 19). tg decays ~30% from depth 0 to 65k (Qwen 27B single-GPU:
+  31.5 → 22.1 t/s, ~13.5 ms/token of FA at 65k; only full-attention layers
+  decay, DeltaNet is depth-independent). The decode kernel is `fattn-vec`
+  (D=256, stream-K KV-split already engaged). **Consequence: quantizing KV
+  makes long-context decode *slower*, not faster** — it adds dequant work to an
+  already compute-bound kernel (d0→d65k decay: f16 −29.8%, q8_0 −32.0%, q4_0
+  −34.6%). Use quantized KV for *capacity* (more context/slots), never for
+  long-context *speed*. The vec-kernel block size (`nthreads=128`) is already
+  optimal on Volta (64 and 256 both regress); further speed needs sm70
+  kernel-algorithm work (deferred).
 - `GGML_CUDA_FORCE_CUBLAS` / `FORCE_MMQ` are compile-time flags; the env vars
   do nothing.
 - Tensor mode requires flash attention and disables backend sampling — the
@@ -112,6 +139,7 @@ baseline (fresh-server and cached-prompt paths).
 | `LLAMA_BATCH_DEBUG=1/2` | ubatch composition per split (needs `-lv 5`) |
 | `GGML_META_DEBUG=1\|2` | tensor-parallel split states per node; `2` adds per-src resolution (needs `-lv 5`) |
 | `GGML_META_DEBUG_REDUCE=1` | where each AllReduce boundary lands (placement is device-count-independent — a 1-GPU run is authoritative) |
+| `GGML_META_TIMING=1` | per-128-graph wall-time attribution, compute vs AllReduce-boundary (adds explicit syncs — diagnostic only, not for serving). Measured the reduce tax at ~10 ms/token that motivated task 17 |
 | `LLAMA_META_DUP_DEVICE=N` | duplicate the tensor-split device list: one GPU runs a genuine n-way split (byte-exactness gates + split debugging without a multi-GPU box) |
 | `LLAMA_DEBUG_DUMP_DIR` + `_FILTER` | full-tensor dumps from the eval callback (corner samples hide mid-tensor divergence) |
 | `GGML_RPC_NO_W2W=1` | coordinator env: force coordinator-bridged copies instead of worker-to-worker pulls |
@@ -211,3 +239,22 @@ alias-lifetime hardening).
   if a DeepSeek-family model becomes the flagship.
 - Task 15: `--ssd-streaming` three-tier weight placement — investigation
   phase; breakdown and storage baseline in TASKS.md.
+- **Token-generation levers, closed 2026-07-08 (details in TASKS.md 17-20):**
+  - Task 17 (overlap AllReduce with the next subgraph's independent prefix):
+    **closed negative, reverted.** The residual stream makes every post-reduce
+    node consume the reduced tensor immediately, so there is no independent
+    prefix to hoist (dense/hybrid), and where one exists (MoE) the per-boundary
+    event/launch cost on Volta exceeds the reduce it hides. The reduce tax is
+    unrecoverable at the scheduler level; only a chunked-GEMM reduce-scatter
+    epilogue (kernel work) could help.
+  - Task 18 (sm70 MMVQ tuning): **partial win landed** (+1.8% batch-1 nospec
+    decode, prod-spec neutral) — see change #10.
+  - Task 19 (FA long-context decay): **sized, compute-bound, deferred** — the
+    easy launch-config lever is exhausted; see Volta facts above.
+  - Task 20 (adaptive speculative draft cap, `LLAMA_SPEC_ADAPTIVE`): **measured
+    tg-neutral, ships off.** Cuts ~5% of draft passes but the p_min gate already
+    captures the early-exit value and MTP drafting is cheap vs verify.
+  - **Net: batch-1 tg headroom on Volta is now mostly exhausted at the
+    orchestration/launch-config level. Remaining gains require sm70
+    kernel-algorithm work (MMVQ small-batch, fattn-vec) — high effort, uncertain
+    payoff.**
