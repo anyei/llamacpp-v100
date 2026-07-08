@@ -470,6 +470,10 @@ struct ggml_backend_meta_simple_tensor_entry {
 
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
+    // arenas that filled up and were replaced: their shadow tensors are still
+    // referenced by entries in simple_tensors, so they stay alive until the
+    // container is reset (ring rotation / free)
+    std::vector<ggml_context_ptr> ctxs_retired;
     std::map<const ggml_tensor *, ggml_backend_meta_simple_tensor_entry> simple_tensors;
     // secondary index for identity-based resolution when the struct address differs
     // (every RPC command deserializes a fresh struct)
@@ -482,6 +486,27 @@ struct ggml_backend_meta_simple_tensor_container {
         }
     }
     ggml_backend_meta_simple_tensor_container() {}
+
+    // shadow arena with guaranteed room for at least one more tensor. The initial
+    // sizing is a heuristic (e.g. 16 views per static tensor) that real graphs
+    // can exceed - DeltaNet layers create many views of the recurrent state per
+    // graph - so a full arena chains a fresh one instead of aborting in
+    // ggml_new_tensor (this crashed production: "not enough space in the
+    // context's memory pool", TASKS.md).
+    ggml_context * shadow_ctx(size_t j) {
+        ggml_context * c = ctxs[j].get();
+        if (ggml_get_mem_size(c) - ggml_used_mem(c) < 2*ggml_tensor_overhead()) {
+            const ggml_init_params params = {
+                /*.mem_size   =*/ ggml_get_mem_size(c),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctxs_retired.push_back(std::move(ctxs[j]));
+            ctxs[j].reset(ggml_init(params));
+            c = ctxs[j].get();
+        }
+        return c;
+    }
 };
 
 struct ggml_backend_meta_buffer_context {
@@ -1267,7 +1292,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctxs[j].get();
+        ggml_context          * simple_ctx = stc.shadow_ctx(j); // grows when the arena is full
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if ((simple_buf != nullptr) && ggml_backend_buffer_is_multi_buffer(simple_buf)) {
@@ -2093,6 +2118,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
             }
+            stc.ctxs_retired.clear(); // frees overflow arenas chained by shadow_ctx
             stc.simple_tensors.clear();
             stc.by_data.clear();
         }
