@@ -311,3 +311,42 @@ Increment staircase (each is a commit with its own gate):
    only — a token's experts are known only after its router runs).
 5. Stretch (§5): io_uring, cuFile/GDS direct SSD→VRAM, worker-side streaming for
    TP islands, disk-backed checkpoints.
+
+### 8.1 Implementation spec / integration anchors (from code recon 2026-07-08)
+
+Key constraint: a ggml CPU kernel reads `src[i]->data` as a raw host pointer at
+compute time — there is no set/get indirection to hook. So the streamed buffer
+**must own real host backing** that we populate *before* the consuming node
+runs. Mechanism: `is_host`→true buffer over a `mmap(MAP_ANON|MAP_NORESERVE)`
+arena (virtual = sum of streamed tensors at gallocr-assigned offsets; physical =
+only pread'd, not-yet-`MADV_DONTNEED`'d pages), + an eval-callback that returns
+`true` on streamed-expert nodes to force a per-node pre-compute fill.
+
+- **Buffer ifaces**: `ggml/src/ggml-backend-impl.h` — `ggml_backend_buffer_type_i`
+  (17-29; required get_name/alloc_buffer/get_alignment; optional is_host,
+  get_alloc_size), `ggml_backend_buffer_i` (41-64; required get_base/clear;
+  provide set_tensor/get_tensor). Factory `ggml_backend_buffer_init`.
+- **Template**: RPC buffer, `ggml/src/ggml-rpc/ggml-rpc.cpp` iface tables
+  752-765 / 859-866, buft singleton 1094-1125. (RPC `is_host`=NULL → must
+  override to true for in-place CPU matmul.)
+- **CPU accepts host bufts**: `ggml_backend_buft_is_host` (ggml-backend.cpp
+  74-80); `ggml_backend_cpu_device_supports_buft` (ggml-cpu.cpp 476-477).
+- **Loader routing + skip-read**: `src/llama-model-loader.cpp` buft select
+  1143-1205 (-ot match 1162-1188); bulk read host path `file->seek(offs);
+  read_raw(cur->data, n_size)` at 1574-1576 — must be skipped for streamed
+  tensors and (tensor→file,offs) registered instead. Offsets:
+  `llama_tensor_weight.offs` (llama-model-loader.h 33-50), file idx `.idx`.
+  Increment 1 routes `blk.\d+.ffn_(gate|down|up)_exps.weight` via a
+  `--ssd-streaming` flag (own path), not `-ot` (the -ot buft-discovery gap).
+- **MUL_MAT_ID srcs** (`ggml.c` 3290-3314): src[0]=experts (ne[2]=n_expert,
+  slice stride nb[2]), src[1]=activations, src[2]=ids (I32, ne[0]=used/token,
+  ne[1]=n_tokens); ids->data host-readable at eval.
+- **Eval-callback hook**: `ggml-backend.cpp` compute_splits 1546-1730, ask=true
+  pre-compute call at 1693; returning true forces the node to compute alone
+  right after the fill (nodes with false return get batched, losing the seam).
+- **O_DIRECT reads**: self-contained `pread` with 4 KB-aligned bounce buffer
+  (proven at ~2.7 GB/s in `scripts/ssd-stream-bench-odirect.cpp`); or
+  `llama_file(path,"rb",use_direct_io=true)` + `seek;read_aligned_chunk`
+  (llama-mmap.h 16-41). Home: new `src/llama-ssd-stream.{cpp,h}` (llama-internal,
+  reachable by the loader; the existing `common/ssd-streaming.cpp` director is a
+  separate, advisory mechanism and stays as-is).
