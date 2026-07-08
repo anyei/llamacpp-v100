@@ -308,8 +308,15 @@ Increment staircase (each is a commit with its own gate):
    (a) byte-exact temp-0 vs fully-resident on a small MoE that fits (GLM-4.7-Flash
    14 GB or Qwen3.6-35B-A3B 23 GB); (b) DeepSeek-V4-Flash 81 GB *runs* on 1 GPU
    with RSS bounded to the budget. Expected speed = the ~1.5 t/s streaming floor.
+
+   **Optimizations landed since increment 1 (DeepSeek-V4 81GB, 1×V100, 30GB budget):**
+   batch non-expert nodes / node-at-a-time only as fallback (`0d07b9647`, 1.00→1.29
+   t/s; `LLAMA_SSD_STREAM_SERIAL=1` for -ngl 0) · O_DIRECT bounce reads
+   (`1bb6244c5`, bypass page cache → bounded cgroup charge + faster DMA, 1.29→1.66
+   t/s). **Trajectory: 0.69 cold → 1.00 warm → 1.29 batched → 1.66 O_DIRECT t/s.**
+   Next big lever = GPU landing (3) to drop the CPU expert-matmul.
 2. **SLRU expert cache in the arena (keep hot, evict LRU only under budget
-   pressure).** `--ssd-stream-budget` bounds resident expert bytes. **Gate:**
+   pressure).** (LRU + budget already in increment 1; SLRU/admission is a refinement.) `--ssd-stream-budget` bounds resident expert bytes. **Gate:**
    still byte-exact; measure real hit rate + t/s vs the increment-1 floor on
    DeepSeek.
 3. **GPU landing + `MUL_MAT_ID` slot indirection** (hot experts in VRAM cache
