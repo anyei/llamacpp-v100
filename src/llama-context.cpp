@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-ssd-stream.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1425,7 +1426,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched_cur);
-        ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
+        // SSD expert streaming (task 15) installs its own pre-compute fill callback
+        // when no user eval callback is set; it fills selected experts before each
+        // MUL_MAT_ID computes.
+        if (cparams.cb_eval == nullptr && ggml_ssd_stream_enabled()) {
+            ggml_backend_sched_set_eval_callback(sched_cur, ggml_ssd_stream_eval_cb, nullptr);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         gparams.res = res;
 

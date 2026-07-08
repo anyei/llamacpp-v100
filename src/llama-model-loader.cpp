@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-ssd-stream.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -1187,6 +1188,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // route MoE expert weights to the SSD streaming buffer type (task 15);
+        // takes effect only under LLAMA_SSD_STREAM_BUFFER and yields to explicit -ot overrides
+        if (!buft && ggml_ssd_stream_enabled() && ggml_ssd_stream_should_stream(tn.str().c_str())) {
+            buft = ggml_ssd_stream_buft();
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
@@ -1539,6 +1546,16 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // SSD-streamed expert tensors (task 15): metadata-only. Record the file
+        // backing and skip the resident read entirely; per-expert slices are
+        // pread on demand before compute. Must run before the mmap/non-mmap
+        // branches (both would otherwise make the tensor resident).
+        if (ggml_ssd_stream_is_streamed(cur)) {
+            ggml_ssd_stream_note(cur, files.at(weight->idx)->file_id(), weight->offs);
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

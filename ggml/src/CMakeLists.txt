@@ -193,6 +193,7 @@ add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h
+            ../include/ggml-ssd-stream.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
             ../include/gguf.h
@@ -201,6 +202,7 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-ssd-stream.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
