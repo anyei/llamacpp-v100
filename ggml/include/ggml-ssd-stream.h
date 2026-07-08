@@ -11,6 +11,12 @@
 // Enabled by env LLAMA_SSD_STREAM_BUFFER=1 (budget: LLAMA_SSD_STREAM_BUDGET MiB,
 // default 8192). This is a distinct mechanism from the advisory mmap director
 // in common/ssd-streaming.cpp (LLAMA_SSD_STREAMING).
+//
+// The fill callback lets non-expert nodes batch and only forces a boundary at
+// each streamed expert node; this relies on the expert-selection ids being
+// produced in an earlier scheduler split (true when non-experts are offloaded,
+// -ngl > 0). For configs where experts and their router share a split (pure-CPU
+// -ngl 0), set LLAMA_SSD_STREAM_SERIAL=1 to force correct node-at-a-time fills.
 
 #include "ggml.h"
 #include "ggml-backend.h"

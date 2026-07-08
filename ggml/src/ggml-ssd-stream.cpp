@@ -295,24 +295,32 @@ void ggml_ssd_stream_note(const ggml_tensor * t, int fd, size_t file_offset) {
 
 bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
-    // We must return true on EVERY node so the scheduler computes node-at-a-time:
-    // a streamed MUL_MAT_ID reads its expert-selection ids (src[2]), which are
-    // produced by an earlier node. If we let nodes batch, that producer would be
-    // in the same not-yet-computed batch and we'd fill experts from garbage ids.
-    if (!ask || t->op != GGML_OP_MUL_MAT_ID) {
+    if (!ask) {
         return true;
+    }
+    // A streamed MUL_MAT_ID reads its expert-selection ids (src[2]) at fill time,
+    // so those ids must already be computed. When non-experts are offloaded
+    // (-ngl > 0), the router that produces the ids runs in an earlier scheduler
+    // split (different backend) and is done by the time the CPU expert node's
+    // callback fires — so we can let every other node batch normally and only
+    // force a boundary at the expert node. When experts and their router share a
+    // split (e.g. pure-CPU -ngl 0), that guarantee doesn't hold; set
+    // LLAMA_SSD_STREAM_SERIAL=1 to fall back to node-at-a-time execution.
+    static const bool serial = getenv("LLAMA_SSD_STREAM_SERIAL") != nullptr;
+    if (t->op != GGML_OP_MUL_MAT_ID) {
+        return serial;
     }
     ggml_tensor * w   = t->src[0];
     ggml_tensor * ids = t->src[2];
     if (w == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
-        return true;
+        return serial;
     }
 
     auto & st = g_state;
     std::lock_guard<std::mutex> lock(st.mutex);
     auto reg = st.registry.find(w);
     if (reg == st.registry.end()) {
-        return true; // not a streamed expert tensor
+        return serial; // not a streamed expert tensor
     }
 
     const int64_t n_expert = w->ne[2];
