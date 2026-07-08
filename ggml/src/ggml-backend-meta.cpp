@@ -2587,7 +2587,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
     if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
-        GGML_LOG_INFO("META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, reduce %.2f ms/graph over %.1f boundaries/graph\n",
+        fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, reduce %.2f ms/graph over %.1f boundaries/graph\n",
                 backend_ctx->tm_graphs,
                 backend_ctx->tm_compute_us / 1000.0 / backend_ctx->tm_graphs,
                 backend_ctx->tm_reduce_us  / 1000.0 / backend_ctx->tm_graphs,
