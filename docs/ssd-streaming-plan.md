@@ -165,6 +165,44 @@ CUDA-streamed), modeled on the RPC buffer:
    overlapped with layer compute; reuses the loader's staging pattern).
    Unlike the CPU tier this bypasses the RAM staging bottleneck entirely,
    so the phase-1 null result does not apply.
+
+   **Phase 2/4 feasibility spike — MEASURED, PASS (2026-07-08).** The whole
+   design rests on one number: random small-block **O_DIRECT** read bandwidth
+   (the cache-miss path). Measured on this box's NVMe against the real 81 GB
+   `DeepSeek-V4-Flash-IQ2XXS` GGUF (`scripts/ssd-stream-bench-odirect.cpp`,
+   O_DIRECT `pread` at random aligned offsets across the 78 GB expert region):
+
+   | Read size | 1 thread | 2-8 threads |
+   |---|---|---|
+   | 2.16 MB (one expert slice) | 1672 MB/s | **~2700 MB/s** |
+   | 7.08 MB (gate+up+down set) | 2448 MB/s | **~2800 MB/s** |
+
+   Random O_DIRECT reads do **not** collapse — they *exceed* the 1.6 GB/s
+   sequential `dd` figure and saturate at ~2 threads, and O_DIRECT never
+   touches the page cache, so the `madvise(WILLNEED)` direct-reclaim trap
+   (phase 4, −60x) cannot recur. DeepSeek-V4-Flash layout (via
+   `scripts/ssd-stream-gguf-layout.py`): 43 layers × 256 experts, **6 used +
+   1 shared** per token; expert tensors are **77.9 GB of the 81 GB** (gate/up
+   IQ2_XXS ~2.16 MB/slice, down Q2_K ~2.75 MB/slice), non-expert weights only
+   **8.8 GB** (fit RAM or one GPU). Cold per-token expert traffic = 258
+   slice-sets × 7.08 MB = **1.83 GB**. Projected expert-IO-bound decode at
+   2.7 GB/s:
+
+   | Cache hit rate | miss/token | t/s (IO-bound) |
+   |---|---|---|
+   | 0% (pure stream, no cache) | 1.83 GB | **1.48** |
+   | 44% (uniform, 34 GB RAM cache) | 1.02 GB | **2.64** |
+   | 80% (moderate routing skew) | 0.37 GB | **7.39** |
+   | 95% (strong skew, cf. #20757) | 0.09 GB | **29.6** → compute-bound |
+
+   Even a zero-cache pure stream (1.48 t/s) beats the mmap-thrash floor
+   (1.12 t/s) purely by replacing page-faults with O_DIRECT `pread`; a RAM
+   cache and real routing skew multiply from there. **Conclusion: build it.**
+   The 81 GB DeepSeek-V4-Flash (doesn't fit VRAM *or* RAM) is the reference
+   test vehicle — it can only run via this feature. Note: t/s above is
+   expert-IO only; at high hit rates the model becomes compute-bound (MLA
+   attention + 6 experts/layer on whatever tier runs the matmul), which is the
+   next thing to measure once a build exists.
 3. Placement policy + CLI (`--ssd-streaming`, `--ssd-stream-budget`),
    docs, compose profile.
 4. MoE-aware expert streaming with a hot-expert cache
