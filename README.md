@@ -115,6 +115,49 @@ them is V100-specific.
 - Pipeline over RPC measured at ~3%/token protocol cost — cross-machine
   `-sm layer` is practical on ordinary Ethernet.
 
+### 🚧 Coming: `--ssd-streaming` — run MoE models bigger than VRAM **+** RAM
+
+> **Status: design validated, build in progress (task 15).** The feasibility
+> is measured and committed; the flag and the buffer type are not landed yet.
+
+**The use case.** Today a model has to fit in VRAM, or in VRAM + system RAM
+(spilled via `-ngl` / CPU offload). When it doesn't fit *even in VRAM + RAM
+combined*, you're stuck — mmap demand-paging thrashes the disk and collapses
+to a fraction of a token/sec. `--ssd-streaming` adds the **SSD as a managed
+third tier**: the small always-needed weights live resident (GPU/RAM), and the
+bulk of the model is held on NVMe and pulled in on demand. The SSD is the
+holding hand that lets a model far larger than your memory actually *run* at a
+usable speed.
+
+**Why MoE is the sweet spot (any MoE architecture, not just ours).** A
+Mixture-of-Experts model activates only a few experts per token, so per step
+you only need to *read* that token's experts — not the whole model. That turns
+"stream 80 GB per token" into "stream the few MB of experts this token
+actually uses," backed by a hot-expert cache in RAM/VRAM. This is
+architecture-agnostic: it targets **any** MoE GGUF (Qwen3-MoE, Mixtral,
+GPT-OSS, GLM, DeepSeek, …). **GLM-4.7-Flash and DeepSeek-V4-Flash are our two
+first-class targets** (and we're validating on DeepSeek first) — but nothing in
+the design is specific to them.
+
+**Measured feasibility (this box: 2× V100 = 64 GB VRAM, 46 GB RAM, one NVMe).**
+Reference model: `DeepSeek-V4-Flash-IQ2XXS`, **81 GB** — larger than VRAM *and*
+RAM, so it can only run this way. 77.9 GB of it is experts (256 per layer,
+6 active/token); 8.8 GB is always-resident. Random O_DIRECT reads on the NVMe
+sustain **~2.7 GB/s** (they *bypass* the page cache, avoiding the reclaim trap
+that sinks naive prefetching). Projected decode, expert-IO-bound:
+
+| Expert-cache hit rate | Projected t/s | vs. today (mmap thrash) |
+|---|---|---|
+| 0% (pure stream, no cache) | ~1.5 | ~1.1 |
+| ~44% (RAM cache, uniform routing) | ~2.6 | — |
+| ~80% (realistic routing skew) | ~7.4 | — |
+| ~95% (strong skew) | ~30 → compute-bound | — |
+
+Even a cold pure-stream already beats mmap thrash; a hot-expert cache and real
+routing locality multiply from there. Design, numbers, and the reproducible
+benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
+[`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md).
+
 ## Documentation map
 
 | Doc | Contents |
@@ -159,11 +202,13 @@ For multi-machine setups see the
 
 Tracked in detail in [`TASKS.md`](TASKS.md):
 
-- **SSD streaming** (task 15) — the investigation is complete (dense CPU
-  streaming: no win over kernel readahead; MoE under a memory cap: 10x
-  headroom exists but page-cache steering is self-defeating). The remaining
-  build is a userspace expert cache (pread/O_DIRECT arena + SLRU, one
-  design for CPU and GPU tiers) — see `docs/ssd-streaming-plan.md`.
+- **SSD streaming** (task 15) — feasibility **validated, build in progress**
+  (see the highlighted use-case above). Investigation ruled out the dead ends
+  (dense CPU streaming: no win over kernel readahead; page-cache steering:
+  self-defeating under memory pressure) and the O_DIRECT-random-read spike
+  passed (~2.7 GB/s, beats the mmap-thrash floor even with no cache). Building
+  the userspace expert cache (pread/O_DIRECT arena + SLRU, one design for CPU
+  and GPU tiers) — see `docs/ssd-streaming-plan.md`.
 - **Distributed, hardware-gated** — two-box measurement of the
   worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
   RDMA / 25 GbE+).
