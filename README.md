@@ -26,7 +26,7 @@ are below the tables.
 
 | Configuration | Prefill | **Decode** | | Configuration | Prefill | **Decode** |
 |---|---:|---:|---|---|---:|---:|
-| CPU (20t) | 10.1 | 1.4 | | 1 GPU + MTP | 106.6 | 47.9 |
+| CPU (20t) | 10.1 | 1.4 | | 1 GPU + MTP | 106.6 | **51** ¹ |
 | CPU + MTP | 9.7 | 3.4 | | 2 GPU layer + MTP | 100.9 | 52.6 |
 | 1 GPU | 115.6 | 31.5 | | 2 GPU tensor | 100.5 | 48.8 |
 | 2 GPU layer | 113.3 | 32.8 | | **2 GPU tensor + MTP** | 89.3 | **81** ¹ |
@@ -54,7 +54,7 @@ single stream, the dense 27B **~81 t/s** (server steady-state; both scale furthe
 ¹ MTP rows marked ¹ are the **production server steady-state** (`docker-compose.mtp.yml`,
 full config + env gates, long generation, ~88.6% MTP draft acceptance, mean accepted len
 3.66), read from `docker logs`: **35B tensor ~166** (peak `tg_3s` 174), **35B 1-GPU ~140**
-(peak 148), **27B tensor ~81** (peak 87). Unmarked MTP rows are `llama-cli` short-run
+(peak 148), **27B tensor ~81** (peak 87), **27B 1-GPU ~51** (peak 53). Unmarked MTP rows are `llama-cli` short-run
 figures that measure the cold→warm ramp (tg climbs for the first ~500 tokens), so they
 read several t/s low vs. the warmed server steady-state.
 
