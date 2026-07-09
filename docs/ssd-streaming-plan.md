@@ -419,6 +419,28 @@ Increment staircase (each is a commit with its own gate):
 3. **GPU landing + `MUL_MAT_ID` slot indirection** (hot experts in VRAM cache
    slots, GPU computes them), RAM demoted to L2 victim cache. **Gate:** byte-exact
    (reduction-order tolerance for GPU), t/s at GPU compute speed.
+   **Recon (2026-07-09):** `MUL_MAT_ID` offloads to the GPU only when
+   n_tokens >= `GGML_OP_OFFLOAD_MIN_BATCH` (default 32, `get_op_batch_size` = the
+   op's ne[2]; `ggml-cuda.cu`). So **prefill already computes experts on the GPU**
+   (that path hit the copy bug, now fixed), but **decode (1 token) computes experts
+   on the CPU** - that is the ~2.5-3 t/s decode bottleneck. The scheduler's
+   selective-copy already compacts the *used* experts onto the GPU when offloaded,
+   but transiently (re-copied every token, no persistent VRAM cache).
+   **Phase-0 experiment (`GGML_OP_OFFLOAD_MIN_BATCH=1`, force decode onto GPU, no
+   code):** DeepSeek-81GB streamed decode **2.5 -> 1.2 t/s (WORSE)** - the
+   1.83 GB/token of experts re-copied H2D over PCIe every token dominates; Qwen-35B
+   (smaller expert volume) **2.5 -> 3.6 t/s (better)**. **Conclusion: a persistent
+   VRAM slot cache is REQUIRED, not optional** - naive offload is a net loss on the
+   flagship. Skip a "just force offload" phase. **Bonus:** the GPU-offloaded run is
+   **byte-identical to resident** (Qwen sha == resident) - GPU expert compute matches
+   the resident GPU reduction order, so the CPU-path near-tie flip disappears on GPU.
+   **Design (phase 2, ds4-style):** a bounded CUDA buffer of K expert slots with a
+   stable **id->slot table** (LRU eviction); hot experts persist in VRAM across
+   tokens, only misses fill (RAM arena -> VRAM H2D, or SSD -> staging -> VRAM). Before
+   the matmul, remap global expert ids -> slot ids and run the existing `MUL_MAT_ID`
+   kernel against the compact K-slot tensor (no custom kernel needed for a first cut).
+   RAM arena stays as the L2 victim tier. Composes with CPU-only mode (no GPU => just
+   don't allocate the VRAM tier; CPU-resident + SSD-streamed still runs).
 4. **Prefetch / overlap** (double-buffer reads behind compute; within-flight
    only — a token's experts are known only after its router runs).
 5. Stretch (§5): io_uring, cuFile/GDS direct SSD→VRAM, worker-side streaming for
@@ -462,3 +484,176 @@ only pread'd, not-yet-`MADV_DONTNEED`'d pages), + an eval-callback that returns
   (llama-mmap.h 16-41). Home: new `src/llama-ssd-stream.{cpp,h}` (llama-internal,
   reachable by the loader; the existing `common/ssd-streaming.cpp` director is a
   separate, advisory mechanism and stays as-is).
+
+### 8.2 Phase 2 design — VRAM expert slot cache (GPU landing), scoped 2026-07-09
+
+Goal: compute streamed experts on the GPU at decode without paying a per-token
+H2D of the whole used-expert set (phase-0 proved naive offload loses on DeepSeek:
+2.5 -> 1.2 t/s). Keep hot experts resident in a bounded VRAM cache across tokens;
+only misses fill. This is ds4/DwarfStar's design (`cuda_stream_expert_cache`:
+compact gate/up/down slot buffers + id->slot indirection).
+
+Injection point: `llm_graph_context::build_moe_ffn` (`src/llama-graph.cpp:1746`),
+which calls `ggml_mul_mat_id(w, cur, ids)` for gate/up/down over the streamed
+`*_exps` tensors with the router's `selected_experts` ids. When
+`ggml_ssd_stream_is_streamed(w)` and GPU-landing is enabled, swap `(w, ids)` ->
+`(slot_buffer, slot_ids)`.
+
+Components:
+- **VRAM slot pool** per streamed expert tensor (or one pool keyed by
+  (tensor,expert)): a persistent CUDA buffer of K slots x expert-slice-bytes,
+  K << n_expert, allocated at load like a weight (outside gallocr). K derived from
+  a VRAM budget knob (`LLAMA_SSD_STREAM_VRAM_BUDGET`). Quantized slice format
+  preserved (IQ2/Q2_K) so the existing MMQ/MMVQ `MUL_MAT_ID` kernel consumes it.
+- **Slot table** (host): (tensor,expert) -> slot, LRU. RAM arena stays as the L2
+  victim tier (VRAM miss -> check RAM arena -> else SSD).
+- **Remap+fill op** before each streamed `mul_mat_id` (a `ggml_map_custom` or new
+  op): reads `selected_experts`; for each used expert ensure a VRAM slot (miss =>
+  evict LRU slot, enqueue H2D from the RAM arena / pinned staging on the compute
+  stream); output `slot_ids` (global id -> slot id). In-stream ordering makes the
+  fills complete before the matmul; no extra sync.
+
+Key facts that make it tractable:
+- `MUL_MAT_ID` reads src0 expert `s` at `s*nb[2]` and picks experts via src2 ids,
+  so a K-slot tensor (ne[2]=K) + remapped slot_ids reuses the existing kernel -
+  NO custom matmul kernel needed for the first cut (unlike ds4's fully custom one).
+- The scheduler's selective-copy already proves the used-expert -> GPU compaction
+  works; phase 2 makes it persistent + compact instead of full-size + per-token.
+
+Constraints / risks:
+- Budget K must hold one layer-ubatch's used-expert union (same rule as the CPU
+  arena) or slots thrash within a node.
+- Eviction must not drop a slot the current node still needs (touch-then-pin, like
+  the CPU tier).
+- gate/up/down are separate tensors -> separate slot pools (ds4 keeps 3 buffers).
+- H2D from the arena wants pinned staging for bandwidth (non-pinned is ~2x slower).
+
+Sub-increments (each its own commit + gate):
+- 3.2a Allocate VRAM slot pool + host slot table; budget accounting; no compute
+  change. Gate: allocates, RSS/VRAM bounded.
+- 3.2b Remap+fill custom op (fill from arena, emit slot_ids). Offline unit-test the
+  remap/LRU like the SLRU test.
+- 3.2c Rewire `build_moe_ffn` for streamed experts behind `LLAMA_SSD_STREAM_GPU=1`.
+  Gate: byte-exact vs resident within GPU reduction tolerance on Qwen (recall the
+  phase-0 GPU path was byte-identical to resident); coherent DeepSeek.
+- 3.2d Measure t/s vs CPU baseline (2.5) and phase-0 offload (1.2); target > 2.5 and
+  toward the projected 7+ at high VRAM hit rate.
+- 3.2e Tune K/budget; RAM arena as L2 victim; optional pinned staging ring.
+- (Phase 3) prefetch/overlap H2D behind compute on a side stream.
+
+Composes with CPU-only mode: no GPU => don't allocate the VRAM tier; CPU-resident +
+SSD-streamed still runs (just slower). GPU-landing is strictly additive.
+
+#### 8.2.1 Prior-art validation (2026-07-09) — the design is proven, be optimistic
+
+Two independent implementations confirm the phase-2 design and, importantly,
+correct a framing mistake (I had under-emphasized *persistence*):
+
+- **ds4/DwarfStar (ships it)**: `ds4_gpu_stream_expert_cache_begin_selected_load`
+  builds `compact_ids` (unique used experts) + `slot_ids` (remapped) and loads via
+  `cuda_stream_selected_cache_begin_compact_load`, which tracks
+  cache_hits/misses/host_hits/direct_loads against a persistent host hash cache +
+  a peer-GPU VRAM cache tier (`DS4_CUDA_PEER_EXPERT_CACHE_GB`, +12% decode). So the
+  compact-per-token load is fed by persistent tiers — hits avoid re-read.
+- **llama.cpp issue #20757 (spec'd + measured, NO PR yet — field is open)**:
+  proposes exactly this — a GPU buffer of N slots (`--moe-expert-cache-size N`,
+  N << n_expert) with a **persistent expert_id->slot_idx mapping carried across
+  decode passes: HIT = zero copy**, miss = evict + copy from pinned RAM + update
+  map. **Hook is the same block as our bug fix**: `compute_splits` selective
+  expert-copy (`expert offset = first_id*expert_size`) — remap to slot indices
+  there; "a small change to the `GGML_OP_MUL_MAT_ID` path" for slot-remapped ids.
+  Eviction = **SLRU (probationary ~20% / protected ~80%) + a 2nd-miss admission
+  filter**, +8-15pp hit rate over LRU. Measured on GPT-OSS-120B (57GB experts) on
+  an **8GB** GPU: cold 1.9-2.5 t/s (48-56% hit) -> steady **12-14 t/s at ~98-100%
+  hit**, where "the model is GPU-compute bound, the PCIe pipe mostly idle." CPU
+  baseline 0.5-1 t/s. MoE routing is skewed (~15-20% of experts serve ~80% of
+  tokens), which is why a small VRAM cache reaches ~98% hit.
+- Adjacent field: ik_llama.cpp hybrid CPU/GPU MoE, the HF "MoE offload" guide,
+  KTransformers - the broad approach (keep hot experts on GPU, stream the tail) is
+  well-trodden, not speculative.
+
+**What this changes in our plan:**
+1. **Persistence is the whole game.** Phase-0's 1.2 t/s (re-copy every token) is
+   exactly the antipattern #20757 identifies; with a persistent id->slot map that
+   number becomes ~12 t/s. Design the mapping to survive across `llama_decode`
+   calls from day one.
+2. **Hook = the `compute_splits` selective-copy block we already own** (where
+   `ggml_ssd_stream_prefill_experts` lives), NOT `build_moe_ffn`. Redirect the
+   used-expert copy into a persistent K-slot VRAM buffer and remap the ids GPU copy
+   to slot indices right there. We know this code intimately from the bug fix.
+3. **SLRU is rescued and belongs here.** Increment 2's "no win" was the *RAM* tier
+   at 30GB/73% hit; the *VRAM* tier is small + high-pressure + skewed, exactly where
+   #20757 measures SLRU +8-15pp. Reuse the increment-2 SLRU and add the 2nd-miss
+   admission filter.
+4. **Realistic target: compute-bound 12+ t/s at steady state** on the skewed-MoE
+   models, not the timid "> 2.5" I first wrote.
+
+#### 8.2.2 3.2b implementation notes (in progress 2026-07-09)
+
+- **3.2b-1 (landed in tree, gated off):** `gpu_slot_pool` policy engine (LRU, K
+  slots, touch->{slot,hit/miss}, offline-tested) + lazy VRAM slot-buffer alloc
+  (`ggml_ssd_stream_gpu_ensure_pool`, one pool per expert-slice shape, K = VRAM
+  budget / slice) driven from the `compute_splits` expert-copy block via the
+  generic backend API (no CUDA in ggml-backend.cpp). Config: `LLAMA_SSD_STREAM_GPU`,
+  `LLAMA_SSD_STREAM_VRAM_BUDGET`. No compute change yet.
+- **3.2b-2 subtlety to solve (the fill + remap + src swap):** the block detects the
+  streamed offloaded MUL_MAT_ID via `node->src[0] == input_cpy`. If we permanently
+  swap `src[0]` to the persistent K-slot buffer, the NEXT token's block no longer
+  matches (src[0] is now the slot buffer) -> no fill -> stale. Re-entry must be
+  handled. Plan: track the node by the stable **input-weight identity** (the arena
+  tensor, which never changes), capture the **original ids tensor** once (so we can
+  keep reading the router's fresh selection after swapping src[2]), and each token:
+  touch the pool (hits skip fill), H2D-fill misses from the RAM arena
+  (prefill_experts already made them resident -> RAM is the L2 victim tier), build
+  slot_ids into a persistent GPU scratch, set `src[0]=slot_buffer` + `src[2]=slot_ids`,
+  and skip the old full-size `copy_experts`. On Volta there are no CUDA graphs, so
+  per-token src mutation is safe. Gate: byte-exact vs resident on Qwen (phase-0
+  showed the GPU path is byte-identical), then measure decode t/s (needs 3.2b-3:
+  force offload at batch-1 for streamed experts).
+
+#### 8.2.3 3.2b-2 result (2026-07-09) — GPU landing WORKS: byte-exact + ~2-3x decode
+
+The full path landed: fill used-expert slots (hit = zero copy) H2D from the RAM
+arena, remap ids -> slot ids into a contiguous GPU scratch, alias `input_cpy` to
+the persistent slot buffer (keeps `src[0]==input_cpy` so the block's detection and
+re-entry stay valid), swap `src[2]` to slot ids, skip the full copy. Re-entry solved
+by capturing the router-selection tensor per node. +1 pad slot for the MMQ over-read.
+
+Gate (Qwen-35B-A3B, `-ngl 99`, forced offload `GGML_OP_OFFLOAD_MIN_BATCH=1`, 6 GB
+VRAM cache):
+- **Correctness: byte-exact.** cache ON == cache OFF == resident (sha 7e35bdc...).
+- **Perf:** no-cache forced offload 3.7 t/s -> **cache 6.1 t/s (40 tok) -> 7.2 t/s
+  (96 tok, warming)**; vs the ~2.5 t/s CPU-compute baseline = ~3x, still climbing.
+  Matches the #20757 trajectory (warms toward compute-bound).
+
+Remaining in 3.2b/3.2e: (3.2b-3) scope the offload to streamed expert nodes only so
+decode uses GPU landing without the global `GGML_OP_OFFLOAD_MIN_BATCH` env; GPU-cache
+hit-rate debug log; DeepSeek-81GB measurement; then SLRU + 2nd-miss admission (the
+increment-2 policy, #20757 +8-15pp) and RAM-tier skip on VRAM hits.
+
+#### 8.2.4 RAM-skip (L2 victim tier) + honest perf split (2026-07-09)
+
+Made the RAM arena a true L2 victim tier: on GPU landing, the unconditional
+prefill is skipped; `gpu_bind` fills RAM (ssd_touch, pread on a RAM miss) ONLY on a
+VRAM miss, then H2Ds that slice to the slot. VRAM hits touch neither RAM nor SSD.
+Added a GPU-cache hit-rate debug line. Qwen still byte-exact; Qwen decode 6.1 ->
+**7.0 t/s** (the redundant RAM fill on hits is gone).
+
+**Honest perf split:**
+- **Cache covers the hot set (Qwen-35B-A3B): big win.** 2.5 (CPU) -> **7.0 t/s**,
+  byte-exact vs resident.
+- **Experts >> VRAM (DeepSeek-V4 81GB, 77.9GB experts / 8-16GB cache): not winning
+  yet.** LRU ~30% hit, per-token H2D of the misses dominates: 1.5-1.8 t/s vs CPU 2.5.
+  Large VRAM budgets also hit pressure from the wasted full-size `input_cpy` gallocr
+  buffers (aliasing leaves them allocated) -> a transient exit=137 at 12-16GB.
+
+Not the final word for DeepSeek: issue #20757 reached 98% hit / 12-14 t/s at a
+*similar* ratio (57GB experts / 8GB GPU) via routing SKEW + SLRU + 2nd-miss
+admission, warmed over ~160 tokens. Our runs are LRU, <=96 tokens, VRAM-pressured.
+
+**3.2e (next, to settle DeepSeek):** (a) stop gallocr from allocating the full-size
+`input_cpy` for GPU-landing experts (reclaim VRAM -> bigger cache, no OOM); (b) SLRU
++ 2nd-miss admission on the slot pool (reuse increment-2 SLRU); (c) longer warm +
+per-pool budget by hot-set size. Also: 3.2b-3 (scope offload to streamed expert
+nodes so decode uses GPU landing without the global GGML_OP_OFFLOAD_MIN_BATCH).
+Committed state: GPU landing works, byte-exact, gated off by default (LLAMA_SSD_STREAM_GPU).

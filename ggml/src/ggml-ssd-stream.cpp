@@ -1,5 +1,6 @@
 #include "ggml-ssd-stream.h"
 #include "ggml-backend-impl.h"
+#include "ggml-alloc.h"
 #include "ggml-impl.h"
 
 #include <cerrno>
@@ -11,8 +12,10 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // SSD expert-streaming buffer type — see ggml-ssd-stream.h / docs/ssd-streaming-plan.md.
 //
@@ -73,6 +76,8 @@ struct ssd_stream_state {
     bool   odirect         = false;   // reads bypass the page cache (set when the file fd takes O_DIRECT)
     bool   no_odirect      = false;   // force buffered reads (kill-switch / A-B diagnostic)
     bool   slru            = true;     // segmented LRU (probationary+protected); false = plain LRU
+    bool   gpu             = false;    // increment 3: GPU expert-slot cache (LLAMA_SSD_STREAM_GPU)
+    size_t gpu_vram_budget = 0;        // VRAM budget for the slot cache, bytes (LLAMA_SSD_STREAM_VRAM_BUDGET MiB)
     size_t budget_bytes    = 0;
     size_t protected_cap   = 0;        // byte cap of the protected segment (slru only)
     long   page_size       = 4096;
@@ -98,6 +103,7 @@ struct ssd_stream_state {
 
     // stats
     uint64_t n_hit = 0, n_miss = 0, n_evict = 0, n_promote = 0, bytes_read = 0;
+    uint64_t gpu_hit = 0, gpu_miss = 0; // VRAM slot-cache hits/misses (GPU landing)
 };
 
 ssd_stream_state g_state;
@@ -247,6 +253,98 @@ void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
     st.n_miss++;
 }
 
+// ---- GPU expert-slot cache policy (increment 3.2a) -------------------------
+//
+// A persistent pool of K VRAM slots holding hot expert slices across decode
+// passes: a cache hit is a zero-copy GPU read (the antipattern to avoid is
+// re-copying the used experts H2D every token - measured 2.5 -> 1.2 t/s on
+// DeepSeek). Keyed by (expert-weight tensor, expert index); one pool per expert
+// tensor "class" (e.g. gate/up/down share a pool across layers - same slice
+// shape). This 3.2a step is the host-side policy only (slot assignment + LRU
+// eviction); the VRAM buffer alloc, H2D fill, and id->slot remap in the
+// scheduler's expert-copy block land in 3.2b. Plain LRU here; SLRU + 2nd-miss
+// admission (issue #20757: +8-15pp hit) is the 3.2e refinement.
+
+struct gpu_slot_pool {
+    int                                                                 k = 0;   // total slots
+    std::list<slice_key>                                                lru;     // MRU front; resident keys
+    std::map<slice_key, std::pair<int, std::list<slice_key>::iterator>> idx;     // key -> (slot, lru iter)
+    std::vector<int>                                                    freelist;
+    uint64_t n_hit = 0, n_miss = 0, n_evict = 0;
+
+    void init(int k_) {
+        k = k_ > 0 ? k_ : 0;
+        lru.clear();
+        idx.clear();
+        freelist.clear();
+        freelist.reserve(k);
+        for (int i = k - 1; i >= 0; --i) {
+            freelist.push_back(i); // hand out slots 0,1,2,... first
+        }
+        n_hit = n_miss = n_evict = 0;
+    }
+
+    // Return the slot holding (key); on a miss, assign a slot (a free one, or by
+    // evicting the LRU tail) and set *miss=true so the caller fills it. Returns
+    // -1 only if the pool has no slots (k==0).
+    int touch(const slice_key & key, bool * miss) {
+        auto it = idx.find(key);
+        if (it != idx.end()) {
+            lru.splice(lru.begin(), lru, it->second.second); // -> MRU
+            *miss = false;
+            n_hit++;
+            return it->second.first;
+        }
+        if (k == 0) {
+            *miss = true;
+            return -1;
+        }
+        int slot;
+        if (!freelist.empty()) {
+            slot = freelist.back();
+            freelist.pop_back();
+        } else {
+            const slice_key victim = lru.back();
+            slot = idx[victim].first;
+            idx.erase(victim);
+            lru.pop_back();
+            n_evict++;
+        }
+        lru.push_front(key);
+        idx[key] = { slot, lru.begin() };
+        *miss = true;
+        n_miss++;
+        return slot;
+    }
+};
+
+// One VRAM slot pool + its backing tensor, shared by all streamed expert tensors
+// of the same slice shape (gate/up share; down is a different shape -> own pool).
+// Slots are keyed by (source tensor, expert) so distinct tensors never alias.
+struct gpu_pool_entry {
+    ggml_context *        ctx   = nullptr;
+    ggml_backend_buffer_t buf   = nullptr;
+    ggml_tensor *         slots = nullptr; // [ne0, ne1, K] on the GPU backend
+    gpu_slot_pool         pool;
+    int                   k     = 0;
+    bool                  logged = false;
+};
+
+// keyed by (ne0, ne1, type) of one expert slice
+using gpu_pool_key = std::tuple<int64_t, int64_t, int>;
+std::map<gpu_pool_key, gpu_pool_entry> g_gpu_pools;
+
+// per-MUL_MAT_ID-node state: the captured router-selection tensor (so we keep
+// reading fresh ids after swapping src[2]) and the remapped slot-ids GPU scratch.
+struct gpu_node_state {
+    const ggml_tensor *   orig_ids = nullptr;
+    ggml_context *        ids_ctx  = nullptr;
+    ggml_backend_buffer_t ids_buf  = nullptr;
+    ggml_tensor *         slot_ids = nullptr; // GPU I32, same shape as orig_ids
+    int64_t               cap      = 0;
+};
+std::map<const ggml_tensor *, gpu_node_state> g_gpu_nodes;
+
 // ---- buffer type / buffer iface -------------------------------------------
 
 struct ssd_buffer_context {
@@ -367,17 +465,192 @@ bool ggml_ssd_stream_enabled(void) {
         if (pct < 0)   pct = 0;
         if (pct > 100) pct = 100;
         st.protected_cap = st.slru ? (size_t) ((double) st.budget_bytes * pct / 100.0) : 0;
+        // increment 3: GPU expert-slot cache (host policy only in 3.2a)
+        st.gpu = getenv("LLAMA_SSD_STREAM_GPU") != nullptr && atoi(getenv("LLAMA_SSD_STREAM_GPU")) != 0;
+        const char * vb = getenv("LLAMA_SSD_STREAM_VRAM_BUDGET");
+        st.gpu_vram_budget = (vb ? (size_t) atoll(vb) : 4096ull) * 1024ull * 1024ull;
         st.page_size = sysconf(_SC_PAGESIZE);
         st.enabled_checked = true;
         if (st.enabled) {
             st.debug = getenv("GGML_SSD_STREAM_DEBUG") != nullptr;
-            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s\n",
+            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s%s\n",
                     st.budget_bytes / (1024 * 1024),
-                    st.slru ? "SLRU" : "LRU");
+                    st.slru ? "SLRU" : "LRU",
+                    st.gpu ? " [GPU slot cache ON]" : "");
         }
     }
     return st.enabled;
 #else
+    return false;
+#endif
+}
+
+bool ggml_ssd_stream_gpu_enabled(void) {
+    return ggml_ssd_stream_enabled() && g_state.gpu;
+}
+
+void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backend) {
+    if (!ggml_ssd_stream_gpu_enabled() || w == nullptr || backend == nullptr) {
+        return;
+    }
+    if (!ggml_ssd_stream_is_streamed(w)) {
+        return;
+    }
+    auto & st = g_state;
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const gpu_pool_key key{ w->ne[0], w->ne[1], (int) w->type };
+    gpu_pool_entry & e = g_gpu_pools[key];
+    if (e.slots != nullptr) {
+        return; // already allocated for this slice shape
+    }
+    // The VRAM budget is TOTAL across all pools (a model may have several expert
+    // slice classes - gate/up/down, plus mixed quants in UD models). Give each
+    // pool an equal share of the budget divided by the expected pool count
+    // (LLAMA_SSD_STREAM_VRAM_POOLS, default 6: gate/up/down x up to 2 quant mixes).
+    static const int pools_hint = []{ const char * e = getenv("LLAMA_SSD_STREAM_VRAM_POOLS"); int v = e ? atoi(e) : 6; return v > 0 ? v : 6; }();
+    const size_t slice          = w->nb[2];
+    const size_t per_pool_bytes = st.gpu_vram_budget / (size_t) pools_hint;
+    int k = slice ? (int) (per_pool_bytes / slice) : 0;
+    if (k < 1) {
+        k = 1;
+    }
+    struct ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+    e.ctx = ggml_init(ip);
+    if (e.ctx == nullptr) {
+        GGML_LOG_ERROR("ggml_ssd_stream: GPU pool ggml_init failed\n");
+        return;
+    }
+    // +1 pad slot: the CUDA MMQ path may over-read ~512 B past the last expert
+    // (the reason copy_experts pads); the extra slot keeps that read in-bounds.
+    e.slots = ggml_new_tensor_3d(e.ctx, w->type, w->ne[0], w->ne[1], k + 1);
+    e.buf   = e.slots ? ggml_backend_alloc_ctx_tensors(e.ctx, backend) : nullptr;
+    if (e.buf == nullptr || e.slots == nullptr) {
+        GGML_LOG_ERROR("ggml_ssd_stream: GPU slot pool alloc failed (K=%d, %.2f GB)\n",
+                k, (double) k * slice / 1e9);
+        return;
+    }
+    e.k = k;
+    e.pool.init(k);
+    e.logged = true;
+    GGML_LOG_INFO("ggml_ssd_stream: GPU slot pool [%lldx%lld %s] K=%d slots (%.2f GB VRAM)\n",
+            (long long) w->ne[0], (long long) w->ne[1], ggml_type_name(w->type), k,
+            (double) k * slice / 1e9);
+}
+
+const ggml_tensor * ggml_ssd_stream_gpu_orig_ids(const ggml_tensor * node, const ggml_tensor * cur_ids) {
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    gpu_node_state & ns = g_gpu_nodes[node];
+    if (ns.orig_ids == nullptr) {
+        ns.orig_ids = cur_ids; // capture the router selection tensor once (before any src[2] swap)
+    }
+    return ns.orig_ids;
+}
+
+bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggml_tensor * input_cpy,
+        ggml_backend_t backend, const int32_t * ids, int64_t n_ids, int64_t n_expert) {
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    if (!ggml_ssd_stream_gpu_enabled() || node == nullptr || input == nullptr ||
+        input_cpy == nullptr || backend == nullptr || ids == nullptr || n_ids <= 0 || n_expert <= 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_state.mutex);
+    const gpu_pool_key key{ input->ne[0], input->ne[1], (int) input->type };
+    auto pit = g_gpu_pools.find(key);
+    if (pit == g_gpu_pools.end() || pit->second.slots == nullptr || pit->second.k <= 0) {
+        return false; // pool not allocated for this slice class
+    }
+    gpu_pool_entry & pe    = pit->second;
+    const size_t     slice = input->nb[2];
+
+    gpu_node_state & ns = g_gpu_nodes[node];
+    if (ns.orig_ids == nullptr) {
+        return false; // orig_ids must be captured (gpu_orig_ids) before binding
+    }
+    // logical id shape + strides come from orig_ids (the router selection); the
+    // `ids` buffer is a raw host copy of it, so we index with the same strides.
+    const ggml_tensor * oi = ns.orig_ids;
+    const int64_t ne0 = oi->ne[0], ne1 = oi->ne[1];
+    const int64_t s0  = (int64_t) (oi->nb[0] / sizeof(int32_t));
+    const int64_t s1  = (int64_t) (oi->nb[1] / sizeof(int32_t));
+    const int64_t n_logical = ne0 * ne1;
+    if (n_logical <= 0 || (s1 * (ne1 - 1) + s0 * (ne0 - 1)) >= n_ids) {
+        return false; // ids buffer smaller than the strided extent - bail safely
+    }
+
+    // touch each used expert once; fill misses H2D from the RAM arena (input->data,
+    // made resident by prefill_experts) into its slot. Build expert -> slot.
+    std::vector<int32_t> expert_to_slot((size_t) n_expert, -1);
+    for (int64_t i1 = 0; i1 < ne1; i1++) {
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            const int32_t e = ids[i1 * s1 + i0 * s0];
+            if (e < 0 || e >= n_expert || expert_to_slot[e] != -1) {
+                continue;
+            }
+            bool miss = false;
+            const int slot = pe.pool.touch(slice_key{ input, (int) e }, &miss);
+            if (slot < 0) {
+                return false;
+            }
+            if (miss) { g_state.gpu_miss++; } else { g_state.gpu_hit++; }
+            expert_to_slot[e] = slot;
+            if (miss) {
+                // VRAM miss: ensure the slice is resident in the RAM arena (the L2
+                // victim tier - pread from SSD on a RAM miss too), then H2D it into
+                // the VRAM slot. VRAM hits touch neither RAM nor SSD (zero copy).
+                auto reg = g_state.registry.find(input);
+                if (reg != g_state.registry.end()) {
+                    ssd_touch(input, (int) e, (char *) input->data + (size_t) e * slice, slice,
+                            reg->second.fd, reg->second.offs + (size_t) e * slice);
+                }
+                ggml_backend_tensor_set_async(backend, pe.slots,
+                        (const char *) input->data + (size_t) e * slice, (size_t) slot * slice, slice);
+            }
+        }
+    }
+
+    // remap into a CONTIGUOUS GPU scratch shaped like orig_ids (values in [0,K)).
+    if (ns.slot_ids == nullptr || ns.cap < n_logical) {
+        if (ns.ids_buf) { ggml_backend_buffer_free(ns.ids_buf); ns.ids_buf = nullptr; }
+        if (ns.ids_ctx) { ggml_free(ns.ids_ctx); ns.ids_ctx = nullptr; }
+        struct ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+        ns.ids_ctx  = ggml_init(ip);
+        ns.slot_ids = ns.ids_ctx ? ggml_new_tensor_2d(ns.ids_ctx, GGML_TYPE_I32, ne0, ne1) : nullptr;
+        ns.ids_buf  = ns.slot_ids ? ggml_backend_alloc_ctx_tensors(ns.ids_ctx, backend) : nullptr;
+        if (ns.ids_buf == nullptr) {
+            ns.slot_ids = nullptr;
+            return false;
+        }
+        ns.cap = n_logical;
+    }
+    static thread_local std::vector<int32_t> slot_ids_host;
+    slot_ids_host.resize((size_t) n_logical);
+    for (int64_t i1 = 0; i1 < ne1; i1++) {
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            const int32_t e = ids[i1 * s1 + i0 * s0];
+            slot_ids_host[i1 * ne0 + i0] = (e >= 0 && e < n_expert && expert_to_slot[e] >= 0) ? expert_to_slot[e] : 0;
+        }
+    }
+    ggml_backend_tensor_set_async(backend, ns.slot_ids, slot_ids_host.data(), 0, (size_t) n_logical * sizeof(int32_t));
+
+    // alias input_cpy to the persistent slot buffer and swap the ids -> slot ids.
+    input_cpy->data  = pe.slots->data;
+    input_cpy->ne[2] = pe.k;
+    input_cpy->nb[2] = slice;
+    node->src[2]     = ns.slot_ids;
+
+    if (g_state.debug) {
+        const uint64_t tot = g_state.gpu_hit + g_state.gpu_miss;
+        if (tot % 8000 < (uint64_t) n_logical) {
+            GGML_LOG_INFO("ggml_ssd_stream: GPU cache hit=%llu miss=%llu (%.1f%%) [pool %lldx%lld %s K=%d]\n",
+                    (unsigned long long) g_state.gpu_hit, (unsigned long long) g_state.gpu_miss,
+                    tot ? 100.0 * g_state.gpu_hit / tot : 0.0,
+                    (long long) input->ne[0], (long long) input->ne[1], ggml_type_name(input->type), pe.k);
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(node); GGML_UNUSED(input); GGML_UNUSED(input_cpy); GGML_UNUSED(backend);
+    GGML_UNUSED(ids); GGML_UNUSED(n_ids); GGML_UNUSED(n_expert);
     return false;
 #endif
 }

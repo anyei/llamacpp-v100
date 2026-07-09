@@ -32,6 +32,35 @@ extern "C" {
 // true when SSD expert streaming is enabled (env LLAMA_SSD_STREAM_BUFFER)
 GGML_API bool ggml_ssd_stream_enabled(void);
 
+// true when the GPU expert-slot cache (increment 3) is enabled
+// (LLAMA_SSD_STREAM_GPU=1; VRAM budget MiB via LLAMA_SSD_STREAM_VRAM_BUDGET).
+// 3.2a wires the host-side policy only; the VRAM buffer + fill + id->slot remap
+// land in later sub-increments.
+GGML_API bool ggml_ssd_stream_gpu_enabled(void);
+
+// (3.2b-1) Lazily allocate a persistent VRAM slot pool for streamed expert tensor
+// w on `backend`, sized by the VRAM budget / slice bytes. One pool per slice
+// shape (gate/up share; down separate). No-op if GPU landing is off, w is not
+// streamed, or the pool already exists. Called from the scheduler's expert-copy
+// block. Fill + id->slot remap wire in later sub-increments.
+GGML_API void ggml_ssd_stream_gpu_ensure_pool(const struct ggml_tensor * w, ggml_backend_t backend);
+
+// (3.2b-2) Capture and return the node's original ids (router selection) tensor.
+// The scheduler block reads the router's fresh selection each token from this,
+// even after we swap node->src[2] to the remapped slot ids. Captured once per node.
+GGML_API const struct ggml_tensor * ggml_ssd_stream_gpu_orig_ids(
+        const struct ggml_tensor * node, const struct ggml_tensor * cur_ids);
+
+// (3.2b-2) GPU landing for one streamed-expert MUL_MAT_ID: touch the VRAM slot
+// pool for each used expert (hit = resident, zero copy), H2D-fill misses from the
+// RAM arena (input->data), remap ids -> slot ids, alias input_cpy to the slot
+// buffer, and swap node->src[2] to the slot ids. Returns true if it handled the
+// node (caller then skips the full copy_experts). ids = host copy of the router
+// selection, n_ids elements; n_expert = input->ne[2].
+GGML_API bool ggml_ssd_stream_gpu_bind(struct ggml_tensor * node, const struct ggml_tensor * input,
+        struct ggml_tensor * input_cpy, ggml_backend_t backend,
+        const int32_t * ids, int64_t n_ids, int64_t n_expert);
+
 // true if a tensor with this name should be streamed (MoE expert weight tensor)
 GGML_API bool ggml_ssd_stream_should_stream(const char * name);
 

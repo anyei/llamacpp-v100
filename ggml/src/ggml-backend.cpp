@@ -1597,13 +1597,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
 
-                    // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
-                    // in that case, we use the original ids tensor
-                    for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
-                            ids_tensor = split->inputs[i];
-                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
-                            break;
+                    // SSD GPU landing swaps node->src[2] to remapped slot ids, so
+                    // read the router's fresh selection from the captured original.
+                    const bool ssd_gpu = ggml_ssd_stream_gpu_enabled() && ggml_ssd_stream_is_streamed(input);
+                    if (ssd_gpu) {
+                        ids_tensor = (ggml_tensor *) ggml_ssd_stream_gpu_orig_ids(node, ids_tensor);
+                    } else {
+                        // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+                        // in that case, we use the original ids tensor
+                        for (int i = input_id + 1; i < split->n_inputs; i++) {
+                            if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                ids_tensor = split->inputs[i];
+                                ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                                break;
+                            }
                         }
                     }
 
@@ -1626,9 +1633,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // SSD streaming: copy_experts below reads the used experts
-                    // straight from input->data during this input-copy phase,
-                    // which runs before the consuming node - so the lazy per-node
+                    // (3.2b) GPU landing: allocate the persistent VRAM slot pool,
+                    // then fill used-expert slots (hit = zero copy, RAM/SSD untouched;
+                    // miss = RAM arena -> VRAM), remap ids -> slots, and point the
+                    // matmul at the slot buffer. When handled, skip the full per-token
+                    // copy (and its RAM prefill) below. No-op unless LLAMA_SSD_STREAM_GPU.
+                    ggml_ssd_stream_gpu_ensure_pool(input, split_backend);
+                    bool ssd_gpu_bound = false;
+                    if (ssd_gpu) {
+                        ssd_gpu_bound = ggml_ssd_stream_gpu_bind(node, input, input_cpy, split_backend,
+                                ids.data(), (int64_t) ids.size(), n_expert);
+                    }
+
+                    if (!ssd_gpu_bound) {
+                    // SSD streaming (CPU-compute fallback): copy_experts below reads
+                    // the used experts straight from input->data during this input-copy
+                    // phase, which runs before the consuming node - so the lazy per-node
                     // fill is too late here. Make the used experts resident first
                     // (no-op unless input is a streamed expert tensor).
                     ggml_ssd_stream_prefill_experts(input, used_ids.data(), n_expert);
@@ -1671,6 +1691,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    } // if (!ssd_gpu_bound)
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
