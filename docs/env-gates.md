@@ -135,11 +135,15 @@ docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 \
   -e LLAMA_SSD_STREAM_BUFFER=1 \
   -e LLAMA_SSD_STREAM_BUDGET=30720 \
   -e GGML_SSD_STREAM_DEBUG=1 \
-  llamacpp-local-v100:latest \
-  -m /models/DeepSeek-V4-Flash-...gguf -ngl 99 --no-mmap -c 4096
+  -v /path/to/models:/models:ro \
+  --entrypoint /app/llama llamacpp-local-v100:latest cli \
+  -m /models/DeepSeek-V4-Flash-...gguf -ngl 99 --no-mmap -c 4096 -n 96 --temp 0 -st -v \
+  -p "Explain how a CPU pipeline works."
 ```
 
-Pure-CPU (no GPU) variant adds `LLAMA_SSD_STREAM_SERIAL=1` and `-ngl 0`.
+Pure-CPU (no GPU) variant adds `-e LLAMA_SSD_STREAM_SERIAL=1` and `-ngl 0`.
+Equivalent CLI flags (no env needed): `--ssd-streaming --ssd-stream-budget 30720`
+(+ `--ssd-stream-gpu --ssd-stream-vram-budget <MiB>` for the VRAM slot cache).
 
 ### GPU landing (experts computed on the GPU via a VRAM slot cache)
 

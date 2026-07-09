@@ -172,10 +172,32 @@ them is V100-specific.
 - Pipeline over RPC measured at ~3%/token protocol cost — cross-machine
   `-sm layer` is practical on ordinary Ethernet.
 
-### 🚧 Coming: `--ssd-streaming` — run MoE models bigger than VRAM **+** RAM
+### `--ssd-streaming` — run MoE models bigger than VRAM **+** RAM
 
-> **Status: design validated, build in progress (task 15).** The feasibility
-> is measured and committed; the flag and the buffer type are not landed yet.
+> **Status: working (beta).** Landed and usable via CLI flags / env gates.
+> **DeepSeek-V4-Flash 81 GB runs on one 32 GB V100 + 46 GB RAM** — coherent,
+> byte-/PPL-neutral vs resident. Decode is IO-bound and depends on your NVMe and
+> the expert-cache hit rate (this box's ~1.6–2.7 GB/s drive: ~1.5–2.6 t/s; a
+> faster Gen-4/5 drive scales up). Full design + measured results in
+> [`docs/ssd-streaming-plan.md §8`](docs/ssd-streaming-plan.md); every knob in
+> [`docs/env-gates.md`](docs/env-gates.md).
+
+**Run it** (DeepSeek-81GB on 1 GPU; experts stream to a 30 GB RAM cache + a 14 GB
+VRAM slot cache, non-experts on the GPU):
+
+```bash
+docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 -e GGML_SSD_STREAM_DEBUG=1 \
+  -v /path/to/models:/models:ro --entrypoint /app/llama llamacpp-local-v100:latest cli \
+  -m /models/DeepSeek-V4-Flash-...gguf -ngl 99 --no-mmap -c 4096 -n 96 --temp 0 -st -v \
+  --ssd-streaming --ssd-stream-budget 30000 \
+  --ssd-stream-gpu --ssd-stream-vram-budget 14000 \
+  -p "Explain how a CPU pipeline works."
+```
+
+`--ssd-streaming` = RAM/SSD expert tier; `--ssd-stream-gpu` adds the VRAM slot cache
+(GPU landing, single-GPU). On a fast NVMe, add `-e LLAMA_SSD_STREAM_READ_THREADS=4`
+(parallel miss-path reads — a prefill/long-prompt win). `GGML_SSD_STREAM_DEBUG=1`
+prints the per-tier hit rates and the miss-path read/H2D time split (needs `-v`).
 
 **The use case.** Today a model has to fit in VRAM, or in VRAM + system RAM
 (spilled via `-ngl` / CPU offload). When it doesn't fit *even in VRAM + RAM
