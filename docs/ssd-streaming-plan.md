@@ -680,3 +680,25 @@ break-even, up from 1.5 pre-fix.** Clear-win levers remain: SLRU + 2nd-miss admi
 (reuse the inc-2 SLRU on gpu_slot_pool; #20757 +8-15pp), reclaim the wasted full-size
 input_cpy VRAM for a bigger cache, and prefetch/overlap the miss H2D (3.3). Qwen-class
 (cache covers the hot set) is already a clear win: 2.5 -> 7.0 t/s.
+
+#### 8.2.6 SLRU on the GPU slot pool - NEUTRAL for DeepSeek (2026-07-09)
+
+Added a segmented LRU (probation/protected, promote-on-2nd-hit, evict probation-
+tail-first) to gpu_slot_pool, default on (LLAMA_SSD_STREAM_GPU_SLRU, PROTECTED_PCT
+80). Offline-tested (scan resistance holds; zero-copy hit preserved). On-model it
+is a NO-WIN for DeepSeek: LRU 64.5% hit / 2.3 t/s vs SLRU 64.7% / 2.5 t/s (noise) -
+same result as the increment-2 RAM-tier SLRU. At a 12 GB cache the resident set
+already covers what fits, so scan resistance isn't the binding constraint; the
+misses are genuinely cold experts neither policy keeps. (The 2nd-miss admission
+filter #20757 pairs with SLRU was NOT added; given pure SLRU is neutral here it is
+unlikely to move the needle much for this workload.) Kept default-on as the
+prior-art policy (harmless, may help more-skewed models); Qwen still byte-exact.
+
+**Increment-3 verdict:** GPU landing is a clear win where the VRAM cache covers the
+hot expert set (Qwen-35B-A3B **2.5 -> 7 t/s**, byte-exact). For the >>VRAM extreme
+(DeepSeek-V4 81GB, 77.9GB experts / 12GB cache) it reaches **break-even (2.5 t/s)**
+after the pool-sizing fix (30 -> 64.7% hit) and crash fix; SLRU is neutral. Beyond
+break-even needs prefetch/overlap of the miss H2D (phase 3.3) and/or reclaiming the
+wasted full-size input_cpy VRAM for a bigger cache - diminishing returns for a model
+this far over VRAM. Recommend shipping GPU landing for the Qwen-class win and
+treating DeepSeek-scale as runnable-at-parity.

@@ -266,34 +266,68 @@ void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
 // admission (issue #20757: +8-15pp hit) is the 3.2e refinement.
 
 struct gpu_slot_pool {
-    int                                                                 k = 0;   // total slots
-    std::list<slice_key>                                                lru;     // MRU front; resident keys
-    std::map<slice_key, std::pair<int, std::list<slice_key>::iterator>> idx;     // key -> (slot, lru iter)
-    std::vector<int>                                                    freelist;
-    uint64_t n_hit = 0, n_miss = 0, n_evict = 0;
+    // Segmented LRU (SLRU) over K slots for scan resistance: a slice seen once sits
+    // in probation; a second hit promotes it to protected (bounded by protected_cap,
+    // overflow demotes back). Eviction takes the probation LRU tail first, so a burst
+    // of one-time experts never displaces a hot (protected) expert. This raises the
+    // steady-state hit rate on skewed MoE routing (issue #20757: +8-15pp vs LRU).
+    // slru=false degenerates to a single global LRU (everything stays in probation).
+    struct ref { bool prot; int slot; std::list<slice_key>::iterator it; };
 
-    void init(int k_) {
-        k = k_ > 0 ? k_ : 0;
-        lru.clear();
+    int  k             = 0;
+    int  protected_cap = 0;
+    bool slru          = true;
+    std::list<slice_key>       probation;   // MRU front
+    std::list<slice_key>       protectd;     // MRU front
+    std::map<slice_key, ref>   idx;
+    std::vector<int>           freelist;
+    uint64_t n_hit = 0, n_miss = 0, n_evict = 0, n_promote = 0;
+
+    void init(int k_, bool slru_, int protected_pct) {
+        k    = k_ > 0 ? k_ : 0;
+        slru = slru_;
+        protected_cap = slru ? (int) ((double) k * protected_pct / 100.0) : 0;
+        probation.clear();
+        protectd.clear();
         idx.clear();
         freelist.clear();
         freelist.reserve(k);
         for (int i = k - 1; i >= 0; --i) {
-            freelist.push_back(i); // hand out slots 0,1,2,... first
+            freelist.push_back(i);
         }
-        n_hit = n_miss = n_evict = 0;
+        n_hit = n_miss = n_evict = n_promote = 0;
     }
 
-    // Return the slot holding (key); on a miss, assign a slot (a free one, or by
-    // evicting the LRU tail) and set *miss=true so the caller fills it. Returns
-    // -1 only if the pool has no slots (k==0).
+    void demote() {
+        while ((int) protectd.size() > protected_cap && !protectd.empty()) {
+            auto tail = std::prev(protectd.end());
+            ref & r = idx[*tail];
+            probation.splice(probation.begin(), protectd, tail);
+            r.prot = false;
+            r.it   = probation.begin();
+        }
+    }
+
+    // Return the slot holding (key); on a miss assign a slot (free, else evict the
+    // probation LRU tail, else the protected tail) and set *miss=true. -1 if k==0.
     int touch(const slice_key & key, bool * miss) {
         auto it = idx.find(key);
         if (it != idx.end()) {
-            lru.splice(lru.begin(), lru, it->second.second); // -> MRU
+            ref & r = it->second;
+            if (r.prot) {
+                protectd.splice(protectd.begin(), protectd, r.it);
+            } else if (slru) {
+                protectd.splice(protectd.begin(), probation, r.it); // promote
+                r.prot = true;
+                r.it   = protectd.begin();
+                n_promote++;
+                demote();
+            } else {
+                probation.splice(probation.begin(), probation, r.it);
+            }
             *miss = false;
             n_hit++;
-            return it->second.first;
+            return r.slot;
         }
         if (k == 0) {
             *miss = true;
@@ -304,14 +338,15 @@ struct gpu_slot_pool {
             slot = freelist.back();
             freelist.pop_back();
         } else {
-            const slice_key victim = lru.back();
-            slot = idx[victim].first;
+            std::list<slice_key> & seg = !probation.empty() ? probation : protectd;
+            const slice_key victim = seg.back();
+            slot = idx[victim].slot;
             idx.erase(victim);
-            lru.pop_back();
+            seg.pop_back();
             n_evict++;
         }
-        lru.push_front(key);
-        idx[key] = { slot, lru.begin() };
+        probation.push_front(key);
+        idx[key] = ref{ false, slot, probation.begin() };
         *miss = true;
         n_miss++;
         return slot;
@@ -529,8 +564,13 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
                 k, (double) k * slice / 1e9);
         return;
     }
+    // GPU slot pool defaults to SLRU (scan resistance for skewed MoE routing);
+    // LLAMA_SSD_STREAM_GPU_SLRU=0 forces plain LRU, LLAMA_SSD_STREAM_GPU_PROTECTED_PCT
+    // sizes the protected segment (default 80).
+    static const bool gpu_slru = []{ const char * e = getenv("LLAMA_SSD_STREAM_GPU_SLRU"); return e == nullptr || atoi(e) != 0; }();
+    static const int  gpu_pct  = []{ const char * e = getenv("LLAMA_SSD_STREAM_GPU_PROTECTED_PCT"); int v = e ? atoi(e) : 80; return v < 0 ? 0 : (v > 100 ? 100 : v); }();
     e.k = k;
-    e.pool.init(k);
+    e.pool.init(k, gpu_slru, gpu_pct);
     e.logged = true;
     GGML_LOG_INFO("ggml_ssd_stream: GPU slot pool [%lldx%lld %s] K=%d slots (%.2f GB VRAM)\n",
             (long long) w->ne[0], (long long) w->ne[1], ggml_type_name(w->type), k,
