@@ -765,6 +765,30 @@ task 17's negative overlap result) and coarser read batching across layers -
 diminishing returns; not pursued. The profiling timers stay (debug-gated) as the tool
 that sized this.
 
+#### 8.2.9 Multi-GPU crash fix: GPU landing is cleanly single-GPU-only (2026-07-09)
+
+GPU landing was documented as single-GPU-only but *engaged* under `-sm layer` and
+**crashed**: `GGML_ASSERT(id >= 0 && id < n_expert)` (garbage ids from the per-node
+orig_ids tracking across two compute backends), and the class-only pool key would
+alias a device-1 node's `input_cpy` onto the device-0 slot buffer (cross-device
+pointer). The auto-offload (streamed `MUL_MAT_ID` -> device) is what started routing
+streamed experts through the per-device CUDA backends and exposed this.
+
+Two changes: (1) the slot-pool key gained the backend -> **one pool per (class,
+device)**, correct for a future real multi-GPU landing; (2) a **single-GPU gate** -
+`ggml_backend_sched_n_gpu(sched) == 1` guards both the `input_cpy` shrink (split
+graph) and the `ssd_gpu` detection + pool alloc + bind (compute splits), consistently.
+With >1 GPU backend (`-sm layer`) landing stays a clean CPU-tier fallback instead of
+engaging; `-sm tensor` is one meta backend (reads as 1) and never reaches the
+offload/copy path anyway. This also makes the reclaim shrink safe (it only fires
+where bind will handle the node).
+
+Verified (Qwen, `inc3-mgpu2`): `-sm layer` **exit 139 -> exit 0**, coherent, pools=0
+(clean fallback, decode 3.5 t/s); single-GPU unchanged (compute buffer 73.69 MiB,
+**PPL 7.0898 == baseline**); `-sm tensor` exit 0, no abort. Full multi-GPU landing
+(per-device caches spanning both GPUs) is left for later - the benchmark shows 2-GPU
+streaming has no single-stream speedup over 1-GPU landing, so it is low priority.
+
 ### 8.3 Multi-GPU behavior - benchmarked (2026-07-09)
 
 First real multi-GPU measurements of the streaming feature (2x V100-32GB, cli

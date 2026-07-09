@@ -1016,6 +1016,22 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// Number of GPU device backends in the scheduler. SSD GPU-landing is single-GPU-only
+// (the VRAM slot pool is one buffer on one device, and the id->slot node tracking
+// assumes one compute backend); with >1 GPU backend (`-sm layer`) landing must stay a
+// clean CPU-tier fallback instead of engaging (and crashing). `-sm tensor` uses one
+// meta backend, so it reads as 1 and never reaches the offload/copy path anyway.
+static int ggml_backend_sched_n_gpu(ggml_backend_sched_t sched) {
+    int n = 0;
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            n++;
+        }
+    }
+    return n;
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1369,8 +1385,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             // SSD GPU landing: the full-size copy of a streamed expert weight is
                             // dead weight (gpu_bind redirects its data to the persistent slot pool).
                             // Shrink it to one slice so gallocr reserves ~nothing, freeing VRAM for
-                            // a bigger cache. Only fires for the expert MUL_MAT_ID weight (src[0]).
-                            if (node->op == GGML_OP_MUL_MAT_ID && j == 0) {
+                            // a bigger cache. Only fires for the expert MUL_MAT_ID weight (src[0]),
+                            // and only single-GPU (landing is a no-op under -sm layer; shrinking a
+                            // copy whose node won't be bound would corrupt the CPU-compute fallback).
+                            if (node->op == GGML_OP_MUL_MAT_ID && j == 0 &&
+                                ggml_backend_sched_n_gpu(sched) == 1) {
                                 ggml_ssd_stream_gpu_shrink_copy(tensor_copy, src, backend);
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
@@ -1606,7 +1625,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // SSD GPU landing swaps node->src[2] to remapped slot ids, so
                     // read the router's fresh selection from the captured original.
-                    const bool ssd_gpu = ggml_ssd_stream_gpu_enabled() && ggml_ssd_stream_is_streamed(input);
+                    // Single-GPU only (must match the shrink gate in split_graph): with
+                    // >1 GPU backend (-sm layer) landing stays a CPU-tier fallback.
+                    const bool ssd_gpu = ggml_ssd_stream_gpu_enabled() &&
+                        ggml_ssd_stream_is_streamed(input) && ggml_backend_sched_n_gpu(sched) == 1;
                     if (ssd_gpu) {
                         ids_tensor = (ggml_tensor *) ggml_ssd_stream_gpu_orig_ids(node, ids_tensor);
                     } else {
@@ -1644,10 +1666,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // then fill used-expert slots (hit = zero copy, RAM/SSD untouched;
                     // miss = RAM arena -> VRAM), remap ids -> slots, and point the
                     // matmul at the slot buffer. When handled, skip the full per-token
-                    // copy (and its RAM prefill) below. No-op unless LLAMA_SSD_STREAM_GPU.
-                    ggml_ssd_stream_gpu_ensure_pool(input, split_backend);
+                    // copy (and its RAM prefill) below. No-op unless LLAMA_SSD_STREAM_GPU
+                    // (and single-GPU: ssd_gpu gates both the pool alloc and the bind).
                     bool ssd_gpu_bound = false;
                     if (ssd_gpu) {
+                        ggml_ssd_stream_gpu_ensure_pool(input, split_backend);
                         ssd_gpu_bound = ggml_ssd_stream_gpu_bind(node, input, input_cpy, split_backend,
                                 ids.data(), (int64_t) ids.size(), n_expert);
                     }

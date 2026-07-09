@@ -402,8 +402,11 @@ struct gpu_pool_entry {
     bool                  logged = false;
 };
 
-// keyed by (ne0, ne1, type) of one expert slice
-using gpu_pool_key = std::tuple<int64_t, int64_t, int>;
+// keyed by (ne0, ne1, type, backend) of one expert slice. The backend makes pools
+// per-device: under -sm layer the same expert class lives on BOTH GPUs (different
+// layers), and a class-only key would alias a device-1 node's slots onto the
+// device-0 pool -> cross-device pointer -> segfault. One pool per (class, device).
+using gpu_pool_key = std::tuple<int64_t, int64_t, int, const void *>;
 std::map<gpu_pool_key, gpu_pool_entry> g_gpu_pools;
 
 // per-MUL_MAT_ID-node state: the captured router-selection tensor (so we keep
@@ -576,10 +579,10 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
     }
     auto & st = g_state;
     std::lock_guard<std::mutex> lock(st.mutex);
-    const gpu_pool_key key{ w->ne[0], w->ne[1], (int) w->type };
+    const gpu_pool_key key{ w->ne[0], w->ne[1], (int) w->type, (const void *) backend };
     gpu_pool_entry & e = g_gpu_pools[key];
     if (e.slots != nullptr) {
-        return; // already allocated for this slice shape
+        return; // already allocated for this (slice shape, device)
     }
     // The VRAM budget is TOTAL across all pools; give each pool an equal share.
     // The number of pools = distinct expert-slice classes (ne0,ne1,type), auto-
@@ -590,10 +593,11 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
     if (ph && atoi(ph) > 0) {
         n_pools = atoi(ph);
     } else {
+        // count distinct slice classes (device-agnostic: same class set on each GPU).
         std::set<gpu_pool_key> classes;
         for (const auto & kv : st.registry) {
             const ggml_tensor * t = kv.first;
-            classes.insert(gpu_pool_key{ t->ne[0], t->ne[1], (int) t->type });
+            classes.insert(gpu_pool_key{ t->ne[0], t->ne[1], (int) t->type, nullptr });
         }
         n_pools = classes.empty() ? 1 : (int) classes.size();
     }
@@ -698,10 +702,10 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         return false;
     }
     std::lock_guard<std::mutex> lock(g_state.mutex);
-    const gpu_pool_key key{ input->ne[0], input->ne[1], (int) input->type };
+    const gpu_pool_key key{ input->ne[0], input->ne[1], (int) input->type, (const void *) backend };
     auto pit = g_gpu_pools.find(key);
     if (pit == g_gpu_pools.end() || pit->second.slots == nullptr || pit->second.k <= 0) {
-        return false; // pool not allocated for this slice class
+        return false; // pool not allocated for this (slice class, device)
     }
     gpu_pool_entry & pe    = pit->second;
     const size_t     slice = input->nb[2];
