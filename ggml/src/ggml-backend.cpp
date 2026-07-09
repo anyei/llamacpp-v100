@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-ssd-stream.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1624,6 +1625,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+
+                    // SSD streaming: copy_experts below reads the used experts
+                    // straight from input->data during this input-copy phase,
+                    // which runs before the consuming node - so the lazy per-node
+                    // fill is too late here. Make the used experts resident first
+                    // (no-op unless input is a streamed expert tensor).
+                    ggml_ssd_stream_prefill_experts(input, used_ids.data(), n_expert);
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {

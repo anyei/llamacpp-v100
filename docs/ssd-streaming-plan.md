@@ -315,10 +315,107 @@ Increment staircase (each is a commit with its own gate):
    (`1bb6244c5`, bypass page cache → bounded cgroup charge + faster DMA, 1.29→1.66
    t/s). **Trajectory: 0.69 cold → 1.00 warm → 1.29 batched → 1.66 O_DIRECT t/s.**
    Next big lever = GPU landing (3) to drop the CPU expert-matmul.
-2. **SLRU expert cache in the arena (keep hot, evict LRU only under budget
-   pressure).** (LRU + budget already in increment 1; SLRU/admission is a refinement.) `--ssd-stream-budget` bounds resident expert bytes. **Gate:**
-   still byte-exact; measure real hit rate + t/s vs the increment-1 floor on
-   DeepSeek.
+2. **✅ DONE - SLRU measured, NO WIN; kept opt-in, LRU stays default.**
+   Implemented a segmented LRU (probation + protected, 2nd hit promotes, eviction
+   takes the probation tail first) behind `LLAMA_SSD_STREAM_SLRU=1`
+   (`LLAMA_SSD_STREAM_PROTECTED_PCT`, default 80). Offline unit test confirms scan
+   resistance; on-model it is **output-neutral** (SLRU == LRU == big-budget,
+   byte-identical on the deterministic Qwen-35B-A3B `-ngl 0` path; identical
+   hit/miss/evict stats on DeepSeek).
+   **DeepSeek-V4 81GB, 1×V100, `-ngl 99`, decode hit rate (deterministic) + t/s:**
+
+   | budget | LRU hit | SLRU hit | t/s |
+   |-------:|--------:|---------:|----:|
+   |  8 GB  |  54.0%  |  52.9%   | ~1.7 |
+   | 20 GB  |  68.1%  |  67.8%   | ~2.5 |
+   | 30 GB  |  73.4%  |  73.6%   | ~3.1 |
+
+   SLRU ties LRU at 30 GB and is marginally *worse* at 8/20 GB - DeepSeek routed-
+   expert reuse is not skewed enough for the protected segment to earn its
+   complexity (a burst of one-time experts is rare; the working set is
+   near-uniform over the 256 experts). **Keep plain LRU (simpler, >= SLRU
+   everywhere measured); SLRU stays opt-in for more skewed future workloads.**
+   The measured hit rates *exceed* the phase-2/4 feasibility projections (44% @
+   34 GB) - real MoE locality is stronger than the uniform-random model assumed;
+   30 GB (39% of the 77.9 GB expert set resident) already hits 73% and 3.1 t/s
+   (vs the 1.66 t/s increment-1 O_DIRECT figure, which was a colder/earlier
+   measurement). Harness: `llama cli -ngl 99 --no-mmap -st [--ignore-eos]`,
+   `GGML_SSD_STREAM_DEBUG=1 -v` for the hit-rate line.
+
+   **⚠ TWO pre-existing issues found while probing correctness (NEITHER caused by
+   increment 2; increment 2's code is output-neutral by construction and verified
+   so - SLRU == LRU == no-eviction big budget, byte-identical):**
+
+   **(a) Generation: a small near-tie MoE divergence from fully-resident.** On the
+   deterministic Qwen `-ngl 0` path, streamed greedy output differs from resident
+   by ~1 token in 40 (coherent, ~97% identical: "The user says" vs "User says") -
+   a MoE-router near-tie flip, same class as task 13/17 for GLM. A/B established:
+   cache-policy-independent (SLRU/LRU/big-budget identical); **NOT the read method**
+   (buffered `LLAMA_SSD_STREAM_NO_ODIRECT=1` == O_DIRECT), so intrinsic to the
+   streaming compute path. Generation is coherent and top-1-stable at every config
+   tested - single-stream decode and prefill up to ~80-token prompts, both `-ngl 0`
+   and `-ngl 99` (Qwen `-ngl 99` streamed decode == `-ngl 0` streamed, coherent).
+   At `-ngl 99` output is additionally run-to-run non-deterministic (GPU/MoE
+   near-tie noise; two identical LRU runs differ with byte-identical cache stats).
+   Logits are clearly *good* in generation (garbage logits would give garbage
+   greedy text; the text is coherent), so this reads as benign near-tie noise -
+   but see (b): it could NOT be PPL-validated.
+
+   **(b) [FIXED 2026-07-09] `llama-perplexity` / all-position eval produced GARBAGE
+   with streaming.** Streamed PPL over wikitext-2 (Qwen-35B-A3B, 16 chunks) = **193**
+   vs resident **7.09**; garbage from chunk 1.
+   **Root cause: the scheduler's "copy only the used experts" optimization**
+   (`ggml-backend.cpp` compute_splits, ~1582-1665) materializes a `MUL_MAT_ID`'s
+   expert weights straight from the source buffer (`input->data`) into a per-split
+   copy during the **input-copy phase - which runs before any node in the split**,
+   i.e. before the lazy eval-callback fill. So it copies *unfilled* (`MAP_NORESERVE`
+   zero) arena pages; the matmul then computes from that copy and the fill lands too
+   late / into a buffer the compute no longer reads. Fires whenever a streamed
+   expert is a cross-split input (both `-ngl 0` via the distinct buft boundary and
+   `-ngl 99` CPU->GPU). This ALSO explains issue (a)'s generation near-tie flip:
+   first use of an expert reads the unfilled arena (1-2 wrong tokens), later decode
+   steps read the now-filled arena -> coherent.
+   **Fix:** new hook `ggml_ssd_stream_prefill_experts(w, used_ids_bitset, n_expert)`
+   called from that block (using the `used_ids` the optimization already computes)
+   to make the used experts resident *before* the copy reads them; no-op when
+   streaming is off (so `-cmoe`/resident are untouched). **Verified: Qwen-35B-A3B
+   streamed PPL 158/193 -> 6.2022, byte-identical to the `-cmoe` control (6.2022)
+   and resident; and the flagship DeepSeek-V4-Flash 81 GB on ONE V100 (30 GB
+   budget, `-ub 128`) now scores a sane PPL 4.0568 (was the 100+ garbage class).**
+   The generation near-tie flip at `-ngl 0` remains (5541 vs 7e35) but is now
+   **proven quality-neutral** - PPL is identical, so the distribution matches and
+   only a near-tied argmax flips (benign, task-13 class). Requires the per-node
+   expert working set to fit the budget (true for decode; large prefill ubatches
+   need a budget >= one ubatch's expert union, or a smaller `-ub`).
+   Original isolation trail (kept for the record):
+   - Independent of read method, cache policy, and budget (24 GB = no eviction).
+   - Independent of ubatch size (`-ub 512` 158.6, `-ub 64` 158.7 - identical) and
+     of n_seq (`-b 512` = n_seq 1 still garbage).
+   - **Independent of backend**: `-ngl 0` SERIAL streamed PPL = **100** vs ~5
+     resident - so it is not the `-ngl 99` cross-backend split, and SERIAL
+     (node-at-a-time, fully synchronized) does NOT fix it.
+   - The ONLY axis that flips it: **perplexity mode itself** (all-position /
+     `logits_all` evaluation) vs generation (last-position logits). Same model,
+     same prompt, same budget: an ~80-token prompt *generated* coherently but the
+     same tokens under perplexity score PPL 100+.
+   The `-cmoe` control was the clue that cracked it: keeping experts on a *normal*
+   CPU buffer (`llama-perplexity -ngl 99 -cmoe`, no streaming - identical partial
+   offload) scores PPL 6.20 (correct), so only the streaming arena breaks it - which,
+   combined with reading the scheduler (a study of antirez/ds4 pointed at the
+   all-position case being special), located the copy-path materialization above.
+   Standing test = `-cmoe` vs streamed PPL A/B (`scratchpad/verify_fix.sh`).
+   With the fix, `llama-perplexity` can validate a streamed model and `-np > 1`
+   concurrent serving is verified: a 2-slot streamed server (`-np 2`, `-ngl 99`)
+   served two concurrent temp-0 requests with coherent output (same multi-output
+   `n_outputs>1` path the fix covers).
+   **Reference (ds4/DwarfStar)**: antirez's DeepSeek-V4 engine sidesteps this whole
+   class - experts live in a *compact* VRAM/host slot cache and a *custom* MoE kernel
+   does id->slot indirection, so streamed experts never go through ggml's
+   buffer/scheduler copy paths at all. Its prefill is layer-major (batch all tokens
+   through each layer, amortizing one expert load per layer), and it validates
+   against official all-position logits. That is also the increment-3 GPU-landing
+   design (compact slot cache + `MUL_MAT_ID` id->slot), which would replace the
+   natural-stride arena.
 3. **GPU landing + `MUL_MAT_ID` slot indirection** (hot experts in VRAM cache
    slots, GPU computes them), RAM demoted to L2 victim cache. **Gate:** byte-exact
    (reduction-order tolerance for GPU), t/s at GPU compute speed.

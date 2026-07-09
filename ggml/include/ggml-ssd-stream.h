@@ -4,12 +4,16 @@
 //
 // A host buffer type whose tensors are backed by a sparse anonymous arena that
 // is filled on demand from the model file (per-expert slices) just before the
-// consuming MUL_MAT_ID computes, and evicted (MADV_DONTNEED) under an LRU byte
+// consuming MUL_MAT_ID computes, and evicted (MADV_DONTNEED) under a byte
 // budget. Lets an MoE model whose expert weights exceed VRAM+RAM run by holding
 // only the hot/in-flight experts resident. See docs/ssd-streaming-plan.md.
 //
 // Enabled by env LLAMA_SSD_STREAM_BUFFER=1 (budget: LLAMA_SSD_STREAM_BUDGET MiB,
-// default 8192). This is a distinct mechanism from the advisory mmap director
+// default 8192). The resident cache is a plain LRU by default; an optional
+// segmented LRU (LLAMA_SSD_STREAM_SLRU=1, protected size LLAMA_SSD_STREAM_PROTECTED_PCT,
+// default 80) adds scan resistance but measured no win for DeepSeek MoE.
+// LLAMA_SSD_STREAM_NO_ODIRECT=1 forces buffered reads (kill-switch/diagnostic).
+// This is a distinct mechanism from the advisory mmap director
 // in common/ssd-streaming.cpp (LLAMA_SSD_STREAMING).
 //
 // The fill callback lets non-expert nodes batch and only forces a boundary at
@@ -46,6 +50,15 @@ GGML_API void ggml_ssd_stream_note(const struct ggml_tensor * t, int fd, size_t 
 // "ask" for a streamed MUL_MAT_ID, fills the selected experts' slices into the
 // arena and returns true (forcing the node to compute alone right after).
 GGML_API bool ggml_ssd_stream_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
+
+// Ensure streamed experts are resident in the arena before the scheduler reads
+// them. The backend scheduler's "copy only the used experts" optimization
+// materializes a MUL_MAT_ID's expert weights from the source buffer during the
+// input-copy phase - which runs BEFORE the consuming node, so the lazy eval_cb
+// fill is too late on that path. This hook is called from that block to fill the
+// used experts first. w is the expert-weight tensor; used_ids is a ggml_bitset
+// over [0, n_expert) (NULL => ensure all experts). No-op if w is not streamed.
+GGML_API void ggml_ssd_stream_prefill_experts(const struct ggml_tensor * w, const uint32_t * used_ids, int64_t n_expert);
 
 #ifdef __cplusplus
 }

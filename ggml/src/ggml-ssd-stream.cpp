@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <list>
 #include <map>
 #include <mutex>
@@ -17,9 +18,17 @@
 //
 // Increment 1 (CPU-landing): experts live in a sparse anonymous arena at their
 // natural offsets; a per-expert slice is pread() from the model file into the
-// arena just before the MUL_MAT_ID that consumes it, cached under an LRU byte
-// budget, and MADV_DONTNEED-evicted when the budget is exceeded. Correct and
-// RSS-bounded; O_DIRECT / prefetch / GPU-landing are later increments.
+// arena just before the MUL_MAT_ID that consumes it, cached under a byte budget,
+// and MADV_DONTNEED-evicted when the budget is exceeded. Correct and RSS-bounded.
+//
+// Increment 2 (this): the resident cache defaults to plain LRU; an optional
+// segmented LRU (SLRU) is available via LLAMA_SSD_STREAM_SLRU=1 - slices seen
+// once sit in a probation segment, a second hit promotes to a protected segment,
+// and eviction always takes the probation tail first, so a burst of one-time
+// experts churns only probation and never displaces a hot expert.
+// LLAMA_SSD_STREAM_PROTECTED_PCT sizes the protected segment (default 80%).
+// Measured neutral-to-slightly-worse than LRU for DeepSeek-V4 (expert reuse not
+// skewed enough); kept opt-in for more skewed workloads. See docs/ssd-streaming-plan.md.
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -44,6 +53,12 @@ struct slice_node {
     size_t    len;
 };
 
+// index entry: which segment the slice lives in, and its node iterator.
+struct slice_ref {
+    bool                            prot; // true = protected segment
+    std::list<slice_node>::iterator it;
+};
+
 struct tensor_backing {
     int    fd;   // dup'd, kept open for process lifetime
     size_t offs; // byte offset of the tensor's data in the file
@@ -56,7 +71,10 @@ struct ssd_stream_state {
     bool   enabled         = false;
     bool   debug           = false;
     bool   odirect         = false;   // reads bypass the page cache (set when the file fd takes O_DIRECT)
+    bool   no_odirect      = false;   // force buffered reads (kill-switch / A-B diagnostic)
+    bool   slru            = true;     // segmented LRU (probationary+protected); false = plain LRU
     size_t budget_bytes    = 0;
+    size_t protected_cap   = 0;        // byte cap of the protected segment (slru only)
     long   page_size       = 4096;
 
     // aligned bounce buffer for O_DIRECT reads (reused; guarded by mutex during fill)
@@ -66,13 +84,20 @@ struct ssd_stream_state {
     std::unordered_map<const ggml_tensor *, tensor_backing> registry;
     std::unordered_map<int, int>                            fd_dup;      // orig fd -> dup fd
 
-    // global LRU of resident expert slices, bounded by budget_bytes
-    std::list<slice_node>                                   lru;
-    std::map<slice_key, std::list<slice_node>::iterator>    index;
-    size_t                                                  resident_bytes = 0;
+    // resident expert slices as a segmented LRU, bounded by budget_bytes.
+    // probation holds slices seen once; a second hit promotes to protected
+    // (bounded by protected_cap, overflow demotes back). Eviction takes the
+    // probation LRU tail first, so a scan of one-time experts never displaces a
+    // hot expert. Plain LRU (slru=false) skips promotion: everything stays in
+    // probation, which then behaves as a single global LRU. Both lists MRU-front.
+    std::list<slice_node>                probation;
+    std::list<slice_node>                protectd;
+    size_t                               protected_bytes = 0;
+    std::map<slice_key, slice_ref>       index;
+    size_t                               resident_bytes  = 0;
 
     // stats
-    uint64_t n_hit = 0, n_miss = 0, n_evict = 0, bytes_read = 0;
+    uint64_t n_hit = 0, n_miss = 0, n_evict = 0, n_promote = 0, bytes_read = 0;
 };
 
 ssd_stream_state g_state;
@@ -165,29 +190,61 @@ void ssd_evict(const slice_node & s) {
 #endif
 }
 
+// demote protected LRU tails back to the probation MRU until protected fits its
+// cap; caller holds g_state.mutex. Splices preserve node iterators.
+void ssd_demote_protected(void) {
+    auto & st = g_state;
+    while (st.protected_bytes > st.protected_cap && !st.protectd.empty()) {
+        auto tail = std::prev(st.protectd.end());
+        st.protected_bytes -= tail->len;
+        st.probation.splice(st.probation.begin(), st.protectd, tail);
+        st.index[tail->key] = slice_ref{ false, st.probation.begin() };
+    }
+}
+
 // ensure expert slice (t,e) at [addr,addr+len) backed by file bytes at file_off
 // is resident; caller holds g_state.mutex.
 void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, size_t file_off) {
+    auto &  st  = g_state;
     slice_key key{ t, e };
-    auto it = g_state.index.find(key);
-    if (it != g_state.index.end()) {
-        g_state.lru.splice(g_state.lru.begin(), g_state.lru, it->second); // -> MRU
-        g_state.n_hit++;
+    auto it = st.index.find(key);
+    if (it != st.index.end()) {
+        slice_ref & ref = it->second;
+        if (ref.prot) {
+            st.protectd.splice(st.protectd.begin(), st.protectd, ref.it); // -> protected MRU
+        } else if (st.slru) {
+            // second hit: promote probation -> protected MRU (node iterator survives splice)
+            st.protectd.splice(st.protectd.begin(), st.probation, ref.it);
+            ref.prot = true;
+            st.protected_bytes += len;
+            st.n_promote++;
+            ssd_demote_protected();
+        } else {
+            st.probation.splice(st.probation.begin(), st.probation, ref.it); // plain LRU: -> MRU
+        }
+        st.n_hit++;
         return;
     }
-    // miss: evict LRU until the new slice fits
-    while (g_state.resident_bytes + len > g_state.budget_bytes && !g_state.lru.empty()) {
-        auto & back = g_state.lru.back();
-        ssd_evict(back);
-        g_state.resident_bytes -= back.len;
-        g_state.index.erase(back.key);
-        g_state.lru.pop_back();
+    // miss: evict the probation LRU tail (then protected tail as a last resort)
+    // until the new slice fits the budget.
+    while (st.resident_bytes + len > st.budget_bytes &&
+           (!st.probation.empty() || !st.protectd.empty())) {
+        const bool from_prot = st.probation.empty();
+        std::list<slice_node> & seg = from_prot ? st.protectd : st.probation;
+        auto tail = std::prev(seg.end());
+        ssd_evict(*tail);
+        st.resident_bytes -= tail->len;
+        if (from_prot) {
+            st.protected_bytes -= tail->len;
+        }
+        st.index.erase(tail->key);
+        seg.pop_back();
     }
     ssd_pread_full(fd, addr, len, file_off);
-    g_state.lru.push_front(slice_node{ key, addr, len });
-    g_state.index[key] = g_state.lru.begin();
-    g_state.resident_bytes += len;
-    g_state.n_miss++;
+    st.probation.push_front(slice_node{ key, addr, len });
+    st.index[key] = slice_ref{ false, st.probation.begin() };
+    st.resident_bytes += len;
+    st.n_miss++;
 }
 
 // ---- buffer type / buffer iface -------------------------------------------
@@ -297,12 +354,26 @@ bool ggml_ssd_stream_enabled(void) {
         st.enabled = env != nullptr && atoi(env) != 0;
         const char * b = getenv("LLAMA_SSD_STREAM_BUDGET");
         st.budget_bytes = (b ? (size_t) atoll(b) : 8192ull) * 1024ull * 1024ull;
+        st.no_odirect = getenv("LLAMA_SSD_STREAM_NO_ODIRECT") != nullptr;
+        // Plain LRU is the default: SLRU was measured neutral-to-slightly-worse
+        // than LRU for DeepSeek-V4 MoE streaming (30GB budget: 73.4% vs 73.6%
+        // hit; 8GB: 54.0% vs 52.9%) - expert reuse is not skewed enough for the
+        // protected segment to earn its complexity. Kept opt-in for skewed
+        // workloads. LLAMA_SSD_STREAM_SLRU=1 enables it.
+        const char * s = getenv("LLAMA_SSD_STREAM_SLRU");
+        st.slru = s != nullptr && atoi(s) != 0;
+        const char * p = getenv("LLAMA_SSD_STREAM_PROTECTED_PCT");
+        long pct = p ? atol(p) : 80;
+        if (pct < 0)   pct = 0;
+        if (pct > 100) pct = 100;
+        st.protected_cap = st.slru ? (size_t) ((double) st.budget_bytes * pct / 100.0) : 0;
         st.page_size = sysconf(_SC_PAGESIZE);
         st.enabled_checked = true;
         if (st.enabled) {
             st.debug = getenv("GGML_SSD_STREAM_DEBUG") != nullptr;
-            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB\n",
-                    st.budget_bytes / (1024 * 1024));
+            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s\n",
+                    st.budget_bytes / (1024 * 1024),
+                    st.slru ? "SLRU" : "LRU");
         }
     }
     return st.enabled;
@@ -340,12 +411,13 @@ void ggml_ssd_stream_note(const ggml_tensor * t, int fd, size_t file_offset) {
         dfd = dup(fd); // survives loader teardown
         // switch the dup to O_DIRECT so streamed reads bypass the page cache
         // (keeps the cgroup/page-cache charge bounded to the arena). Falls back
-        // to buffered reads if the fs/file rejects it.
-        const int fl = fcntl(dfd, F_GETFL);
+        // to buffered reads if the fs/file rejects it or LLAMA_SSD_STREAM_NO_ODIRECT.
+        const int fl = st.no_odirect ? -1 : fcntl(dfd, F_GETFL);
         if (fl != -1 && fcntl(dfd, F_SETFL, fl | O_DIRECT) == 0) {
             st.odirect = true;
         } else if (st.fd_dup.empty()) {
-            GGML_LOG_INFO("ggml_ssd_stream: O_DIRECT unavailable, using buffered reads\n");
+            GGML_LOG_INFO("ggml_ssd_stream: %s, using buffered reads\n",
+                    st.no_odirect ? "O_DIRECT disabled (LLAMA_SSD_STREAM_NO_ODIRECT)" : "O_DIRECT unavailable");
         }
         st.fd_dup[fd] = dfd;
     } else {
@@ -354,6 +426,32 @@ void ggml_ssd_stream_note(const ggml_tensor * t, int fd, size_t file_offset) {
     st.registry[t] = tensor_backing{ dfd, file_offset };
 #else
     GGML_UNUSED(t); GGML_UNUSED(fd); GGML_UNUSED(file_offset);
+#endif
+}
+
+void ggml_ssd_stream_prefill_experts(const ggml_tensor * w, const uint32_t * used_ids, int64_t n_expert) {
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    if (!ggml_ssd_stream_enabled() || w == nullptr || n_expert <= 0) {
+        return;
+    }
+    auto & st = g_state;
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto reg = st.registry.find(w);
+    if (reg == st.registry.end()) {
+        return; // not a streamed expert tensor
+    }
+    const size_t slice = w->nb[2];
+    char *       base  = (char *) w->data;
+    const int    fd    = reg->second.fd;
+    const size_t offs  = reg->second.offs;
+    for (int64_t e = 0; e < n_expert; e++) {
+        if (used_ids && !ggml_bitset_get(used_ids, e)) {
+            continue;
+        }
+        ssd_touch(w, (int) e, base + (size_t) e * slice, slice, fd, offs + (size_t) e * slice);
+    }
+#else
+    GGML_UNUSED(w); GGML_UNUSED(used_ids); GGML_UNUSED(n_expert);
 #endif
 }
 
@@ -403,9 +501,13 @@ bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
         ssd_touch(w, (int) e, base + (size_t) e * slice, slice, fd, offs + (size_t) e * slice);
     }
     if (st.debug && (st.n_hit + st.n_miss) % 4000 < (uint64_t) n_ids) {
-        GGML_LOG_INFO("ggml_ssd_stream: hits=%llu miss=%llu evict=%llu resident=%zuMiB read=%.2fGB\n",
+        const uint64_t total = st.n_hit + st.n_miss;
+        GGML_LOG_INFO("ggml_ssd_stream: hits=%llu miss=%llu (hit %.1f%%) promote=%llu evict=%llu resident=%zuMiB (prot %zuMiB) read=%.2fGB\n",
                 (unsigned long long) st.n_hit, (unsigned long long) st.n_miss,
-                (unsigned long long) st.n_evict, st.resident_bytes / (1024*1024), st.bytes_read / 1e9);
+                total ? 100.0 * st.n_hit / total : 0.0,
+                (unsigned long long) st.n_promote, (unsigned long long) st.n_evict,
+                st.resident_bytes / (1024*1024), st.protected_bytes / (1024*1024),
+                st.bytes_read / 1e9);
     }
     return true; // node-at-a-time: guarantees ids and all deps are computed before the fill
 }
