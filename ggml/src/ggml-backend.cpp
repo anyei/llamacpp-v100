@@ -838,6 +838,8 @@ struct ggml_backend_sched {
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
+static int ggml_backend_sched_n_gpu(ggml_backend_sched_t sched); // defined below
+
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
     for (int i = 0; i < sched->n_backends; i++) {
@@ -923,10 +925,20 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                        SET_CAUSE(tensor, "1.off");
-                        return b;
+                // In multi-GPU streaming, keep streamed experts on the CPU tier.
+                // Offloading them builds full-size input_cpy copies whose worst-case
+                // gallocr reserve balloons (~73 GB on one device -> a noisy non-fatal
+                // OOM that recovers). GPU landing - the reason to offload streamed
+                // experts - is single-GPU-only, so there's no benefit to offloading
+                // them across >1 GPU. Single-GPU offload is unaffected.
+                const bool ssd_multi_gpu =
+                    ggml_ssd_stream_is_streamed(src) && ggml_backend_sched_n_gpu(sched) > 1;
+                if (!ssd_multi_gpu) {
+                    for (int b = 0; b < src_backend_id; b++) {
+                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            SET_CAUSE(tensor, "1.off");
+                            return b;
+                        }
                     }
                 }
             }

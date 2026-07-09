@@ -789,6 +789,27 @@ Verified (Qwen, `inc3-mgpu2`): `-sm layer` **exit 139 -> exit 0**, coherent, poo
 (per-device caches spanning both GPUs) is left for later - the benchmark shows 2-GPU
 streaming has no single-stream speedup over 1-GPU landing, so it is low priority.
 
+#### 8.2.10 Multi-GPU streaming gallocr OOM - fixed (2026-07-09)
+
+The non-fatal `graph_reserve` OOM (#8.3 item 4): under `-sm layer` streaming the
+worst-case (512-token) compute-buffer reserve asked for **~73 GB on one device**,
+failed (`cudaMalloc failed`), and recovered - alarming but harmless. Root-caused to
+the streamed-expert offload: the scheduler offloads host-buffer expert weights to a
+GPU (`ggml_backend_sched_backend_id_from_cur`), building full-size `input_cpy` copies
+that gallocr's worst case sums. Single-GPU shrinks them (the reclaim); multi-GPU can't
+(the shrink is gated off since bind is single-GPU-only), so they stayed full size.
+Confirmed streaming-specific: resident `-sm layer` reserves normally (100 t/s, no OOM).
+
+Fix: **skip the streamed-expert offload when >1 GPU backend** - keep them on the CPU
+tier under `-sm layer`. That is the correct behaviour anyway (GPU landing, the only
+reason to offload streamed experts, is single-GPU-only), and it removes the inflated
+reserve at the source. Single-GPU offload is untouched (guard is `n_gpu > 1`).
+
+Verified (Qwen, `inc3-mgpu3`): `-sm layer` streaming **OOM lines 2 -> 0**, coherent
+(7.8 t/s); single-GPU streaming unaffected (0 OOM, PPL unchanged). Trade-off: multi-GPU
+streaming decode is a touch lower (experts compute on CPU vs offloaded) - acceptable,
+since multi-GPU streaming has no single-stream speedup over 1-GPU landing regardless.
+
 ### 8.3 Multi-GPU behavior - benchmarked (2026-07-09)
 
 First real multi-GPU measurements of the streaming feature (2x V100-32GB, cli
