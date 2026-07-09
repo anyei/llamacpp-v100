@@ -168,6 +168,7 @@ benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
 | [`docs/validation-playbook.md`](docs/validation-playbook.md) | test scenarios + exact commands used to validate all of this |
 | [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, CPU + GPU-landing tiers (task 15) |
 | [`docs/env-gates.md`](docs/env-gates.md) | every fork env gate + CLI flag, grouped, with usage examples |
+| [`docs/dev-workflow.md`](docs/dev-workflow.md) | the dev image, how runs/tests are done, correctness gates, the iterative loop |
 | [`REBUILD-IMAGE.md`](REBUILD-IMAGE.md) | building the production Docker image |
 | [`TASKS.md`](TASKS.md) | full task history with measurements and open items |
 

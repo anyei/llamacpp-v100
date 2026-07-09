@@ -734,6 +734,37 @@ the only residual (`nb[3]`) is unused since the weight is 3D (ne[3]=1).
   overrun its one slice, so that path aborts loudly (only possible on catastrophic
   VRAM exhaustion). Kill-switch: `LLAMA_SSD_STREAM_GPU_NO_RECLAIM=1`.
 
+#### 8.2.8 3.3 parallel miss-path reads - prefill win, decode-neutral (2026-07-09)
+
+Profiled the GPU-landing miss path first (env-gated timers, `GGML_SSD_STREAM_DEBUG`):
+on a VRAM miss `ssd_touch` either finds the slice resident in the RAM arena or preads
+it from SSD, then we H2D it to the slot. DeepSeek-81GB (14 GB VRAM / 30 GB RAM,
+66-68% VRAM hit) split as **read 26 s vs H2D-issue 16 s** over a 96-tok run, and **62%
+of VRAM misses also miss RAM** -> a single-threaded O_DIRECT pread (~1.5 GB/s, the
+1-thread baseline) dominated. So the reads, not the H2D, were the thing to attack.
+
+Parallelized the preads (`LLAMA_SSD_STREAM_READ_THREADS`, default 1 = serial/unchanged):
+`gpu_bind` now runs three phases - (1) touch the VRAM pool + reserve the RAM slot
+serially (SLRU state is not thread-safe; `ssd_touch` gained a `defer_read` mode that
+does bookkeeping/eviction but skips the pread), (2) pread the RAM-missed slices across
+N workers, each with its OWN O_DIRECT bounce buffer (the shared `st.bounce` is not
+concurrency-safe; distinct dst + bounce -> race-free), (3) H2D every VRAM miss.
+
+Result (DeepSeek-81GB, 96 tok, sweep 1/2/4/8): read time **25.9 -> 20.1 s (-22%,
+saturates at 2 threads)**; **prefill +31% (1.3 -> 1.7 t/s)** - prefill's per-node call
+has a large batch of misses to parallelize; **decode neutral (2.5 -> 2.6 t/s, noise)** -
+decode touches only ~6 experts/layer, so within-call parallelism has little to chew on,
+and the token is now co-bound by the untouched pageable H2D (16 s ~ 20 s read).
+**Correctness: DeepSeek PPL rt=1 4.5240 == rt=4 4.5240** (8 chunks, prefill-heavy so it
+exercises the parallel path hard).
+
+**Verdict:** parallel reads help the batch-amortized path (prefill / long prompts), not
+single-stream decode of a model this far over VRAM. Kept env-gated (default 1). Pushing
+decode further would need the H2D overlapped + pinned (a Volta side-stream, risky - see
+task 17's negative overlap result) and coarser read batching across layers -
+diminishing returns; not pursued. The profiling timers stay (debug-gated) as the tool
+that sized this.
+
 ### 8.3 Multi-GPU behavior - benchmarked (2026-07-09)
 
 First real multi-GPU measurements of the streaming feature (2x V100-32GB, cli

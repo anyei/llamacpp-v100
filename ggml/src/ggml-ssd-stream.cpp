@@ -4,6 +4,7 @@
 #include "ggml-impl.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -87,6 +89,13 @@ struct ssd_stream_state {
     void * bounce      = nullptr;
     size_t bounce_cap  = 0;
 
+    // (3.3) parallel miss-path reads: LLAMA_SSD_STREAM_READ_THREADS workers, each
+    // with its own aligned bounce buffer (the shared `bounce` above is not safe for
+    // concurrent O_DIRECT reads). Default 1 => serial path, no behaviour change.
+    int                 read_threads = 1;
+    std::vector<void *>  rbufs;      // per-worker O_DIRECT bounce buffers
+    std::vector<size_t>  rbuf_caps;
+
     std::unordered_map<const ggml_tensor *, tensor_backing> registry;
     std::unordered_map<int, int>                            fd_dup;      // orig fd -> dup fd
 
@@ -105,6 +114,9 @@ struct ssd_stream_state {
     // stats
     uint64_t n_hit = 0, n_miss = 0, n_evict = 0, n_promote = 0, bytes_read = 0;
     uint64_t gpu_hit = 0, gpu_miss = 0; // VRAM slot-cache hits/misses (GPU landing)
+    // (3.3 profiling, GGML_SSD_STREAM_DEBUG) miss-path time split: wall-clock ns
+    // blocked in ssd_touch (RAM lookup / SSD pread) vs issuing the H2D copy.
+    uint64_t gpu_read_ns = 0, gpu_h2d_ns = 0;
 };
 
 ssd_stream_state g_state;
@@ -129,10 +141,56 @@ bool ssd_pread_buffered(int fd, char * dst, size_t len, size_t off) {
 }
 #endif
 
-// read [off, off+len) from fd into dst. With O_DIRECT the read is issued to a
-// page-aligned bounce buffer over the aligned superset and the exact range is
-// copied out - so streaming never populates the page cache (keeps RSS/cgroup
-// charge bounded to the arena, unlike buffered reads). Caller holds the mutex.
+// O_DIRECT read of [off, off+len) into dst via a caller-owned page-aligned bounce
+// (grown as needed). Touches no shared state, so concurrent callers with distinct
+// dst + bounce are safe. Returns true on success. (O_DIRECT reads an aligned
+// superset into the bounce, then copies the exact range out - so streaming never
+// populates the page cache, keeping RSS/cgroup charge bounded to the arena.)
+static bool ssd_pread_odirect(int fd, void * dst, size_t len, size_t off,
+                              void ** bounce, size_t * bounce_cap, long page_size) {
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    const size_t A    = (size_t) page_size;
+    const size_t aoff = off & ~(A - 1);
+    const size_t aend = (off + len + A - 1) & ~(A - 1);
+    const size_t asz  = aend - aoff;
+    if (*bounce_cap < asz) {
+        free(*bounce);
+        *bounce = nullptr;
+        if (posix_memalign(bounce, A, asz) != 0) {
+            *bounce = nullptr; *bounce_cap = 0;
+            GGML_LOG_ERROR("%s: posix_memalign(%zu) failed\n", __func__, asz);
+            return false;
+        }
+        *bounce_cap = asz;
+    }
+    // O_DIRECT requires aligned offset/buffer; the kernel returns a short (but
+    // still page-multiple) count only at EOF, which is fine as long as it covers
+    // the requested tail.
+    const size_t need = off + len - aoff;
+    size_t done = 0;
+    while (done < need) {
+        ssize_t r = pread(fd, (char *) *bounce + done, asz - done, (off_t) (aoff + done));
+        if (r < 0) {
+            GGML_LOG_ERROR("%s: O_DIRECT pread failed (fd=%d aoff=%zu asz=%zu): %s\n",
+                    __func__, fd, aoff, asz - done, strerror(errno));
+            return false;
+        }
+        if (r == 0) {
+            break; // EOF
+        }
+        done += (size_t) r;
+    }
+    memcpy(dst, (const char *) *bounce + (off - aoff), len);
+    return true;
+#else
+    GGML_UNUSED(fd); GGML_UNUSED(dst); GGML_UNUSED(len); GGML_UNUSED(off);
+    GGML_UNUSED(bounce); GGML_UNUSED(bounce_cap); GGML_UNUSED(page_size);
+    return false;
+#endif
+}
+
+// read [off, off+len) from fd into dst (serial path; uses the shared bounce).
+// Caller holds the mutex.
 void ssd_pread_full(int fd, void * dst, size_t len, size_t off) {
 #ifdef GGML_SSD_STREAM_SUPPORTED
     auto & st = g_state;
@@ -142,39 +200,9 @@ void ssd_pread_full(int fd, void * dst, size_t len, size_t off) {
         }
         return;
     }
-    const size_t A    = (size_t) st.page_size;
-    const size_t aoff = off & ~(A - 1);
-    const size_t aend = (off + len + A - 1) & ~(A - 1);
-    const size_t asz  = aend - aoff;
-    if (st.bounce_cap < asz) {
-        free(st.bounce);
-        st.bounce = nullptr;
-        if (posix_memalign(&st.bounce, A, asz) != 0) {
-            st.bounce = nullptr; st.bounce_cap = 0;
-            GGML_LOG_ERROR("%s: posix_memalign(%zu) failed\n", __func__, asz);
-            return;
-        }
-        st.bounce_cap = asz;
+    if (ssd_pread_odirect(fd, dst, len, off, &st.bounce, &st.bounce_cap, st.page_size)) {
+        st.bytes_read += len;
     }
-    // O_DIRECT requires aligned offset/buffer; the kernel returns a short (but
-    // still page-multiple) count only at EOF, which is fine as long as it covers
-    // the requested tail.
-    const size_t need = off + len - aoff;
-    size_t done = 0;
-    while (done < need) {
-        ssize_t r = pread(fd, (char *) st.bounce + done, asz - done, (off_t) (aoff + done));
-        if (r < 0) {
-            GGML_LOG_ERROR("%s: O_DIRECT pread failed (fd=%d aoff=%zu asz=%zu): %s\n",
-                    __func__, fd, aoff, asz - done, strerror(errno));
-            return;
-        }
-        if (r == 0) {
-            break; // EOF
-        }
-        done += (size_t) r;
-    }
-    memcpy(dst, (const char *) st.bounce + (off - aoff), len);
-    st.bytes_read += len;
 #else
     GGML_UNUSED(fd); GGML_UNUSED(dst); GGML_UNUSED(len); GGML_UNUSED(off);
 #endif
@@ -210,8 +238,13 @@ void ssd_demote_protected(void) {
 }
 
 // ensure expert slice (t,e) at [addr,addr+len) backed by file bytes at file_off
-// is resident; caller holds g_state.mutex.
-void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, size_t file_off) {
+// is resident; caller holds g_state.mutex. With defer_read=true the SLRU
+// bookkeeping/eviction/insertion happen now (serial) but the pread is SKIPPED and
+// the function returns true - the caller must then read [file_off,+len) into addr
+// itself (used to batch+parallelize the miss reads). Returns false when no read is
+// needed (RAM hit, or defer_read=false where the read was done inline).
+bool ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, size_t file_off,
+        bool defer_read = false) {
     auto &  st  = g_state;
     slice_key key{ t, e };
     auto it = st.index.find(key);
@@ -230,7 +263,7 @@ void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
             st.probation.splice(st.probation.begin(), st.probation, ref.it); // plain LRU: -> MRU
         }
         st.n_hit++;
-        return;
+        return false; // resident: no read needed
     }
     // miss: evict the probation LRU tail (then protected tail as a last resort)
     // until the new slice fits the budget.
@@ -247,11 +280,14 @@ void ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
         st.index.erase(tail->key);
         seg.pop_back();
     }
-    ssd_pread_full(fd, addr, len, file_off);
+    if (!defer_read) {
+        ssd_pread_full(fd, addr, len, file_off);
+    }
     st.probation.push_front(slice_node{ key, addr, len });
     st.index[key] = slice_ref{ false, st.probation.begin() };
     st.resident_bytes += len;
     st.n_miss++;
+    return defer_read; // caller reads the bytes when deferred
 }
 
 // ---- GPU expert-slot cache policy (increment 3.2a) -------------------------
@@ -506,13 +542,19 @@ bool ggml_ssd_stream_enabled(void) {
         const char * vb = getenv("LLAMA_SSD_STREAM_VRAM_BUDGET");
         st.gpu_vram_budget = (vb ? (size_t) atoll(vb) : 4096ull) * 1024ull * 1024ull;
         st.page_size = sysconf(_SC_PAGESIZE);
+        // (3.3) parallel miss-path reads; clamp to a sane range.
+        const char * rt = getenv("LLAMA_SSD_STREAM_READ_THREADS");
+        st.read_threads = rt ? atoi(rt) : 1;
+        if (st.read_threads < 1)  st.read_threads = 1;
+        if (st.read_threads > 16) st.read_threads = 16;
         st.enabled_checked = true;
         if (st.enabled) {
             st.debug = getenv("GGML_SSD_STREAM_DEBUG") != nullptr;
-            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s%s\n",
+            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s%s, read-threads %d\n",
                     st.budget_bytes / (1024 * 1024),
                     st.slru ? "SLRU" : "LRU",
-                    st.gpu ? " [GPU slot cache ON]" : "");
+                    st.gpu ? " [GPU slot cache ON]" : "",
+                    st.read_threads);
         }
     }
     return st.enabled;
@@ -679,9 +721,21 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         return false; // ids buffer smaller than the strided extent - bail safely
     }
 
-    // touch each used expert once; fill misses H2D from the RAM arena (input->data,
-    // made resident by prefill_experts) into its slot. Build expert -> slot.
+    // touch each used expert once; VRAM misses are filled H2D from the RAM arena
+    // (input->data) into their slot. Build expert -> slot. Three phases so the SSD
+    // miss reads can be parallelized (LLAMA_SSD_STREAM_READ_THREADS): (1) touch the
+    // pool + reserve the RAM slot serially (SLRU state is not thread-safe), (2) pread
+    // the RAM-missed slices - parallel when read_threads>1, (3) H2D every VRAM miss.
+    const bool prof = g_state.debug;
+    const bool par  = g_state.read_threads > 1;
+    auto reg = g_state.registry.find(input);
+    const bool have_reg = reg != g_state.registry.end();
+    struct read_task { int fd; char * dst; size_t len; size_t off; };
+    std::vector<std::pair<int32_t,int>> misses; // (expert, slot) needing an H2D
+    std::vector<read_task>              reads;  // VRAM misses that also missed RAM
+
     std::vector<int32_t> expert_to_slot((size_t) n_expert, -1);
+    auto tp0 = std::chrono::steady_clock::now();
     for (int64_t i1 = 0; i1 < ne1; i1++) {
         for (int64_t i0 = 0; i0 < ne0; i0++) {
             const int32_t e = ids[i1 * s1 + i0 * s0];
@@ -696,18 +750,61 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
             if (miss) { g_state.gpu_miss++; } else { g_state.gpu_hit++; }
             expert_to_slot[e] = slot;
             if (miss) {
-                // VRAM miss: ensure the slice is resident in the RAM arena (the L2
-                // victim tier - pread from SSD on a RAM miss too), then H2D it into
-                // the VRAM slot. VRAM hits touch neither RAM nor SSD (zero copy).
-                auto reg = g_state.registry.find(input);
-                if (reg != g_state.registry.end()) {
-                    ssd_touch(input, (int) e, (char *) input->data + (size_t) e * slice, slice,
-                            reg->second.fd, reg->second.offs + (size_t) e * slice);
+                misses.emplace_back(e, slot);
+                if (have_reg) {
+                    // RAM tier: bookkeeping now (serial); on a RAM miss, read the
+                    // slice - inline when serial, or deferred to the parallel phase.
+                    char * dst = (char *) input->data + (size_t) e * slice;
+                    const size_t foff = reg->second.offs + (size_t) e * slice;
+                    if (ssd_touch(input, (int) e, dst, slice, reg->second.fd, foff, /*defer_read=*/par)) {
+                        reads.push_back(read_task{ reg->second.fd, dst, slice, foff });
+                    }
                 }
-                ggml_backend_tensor_set_async(backend, pe.slots,
-                        (const char *) input->data + (size_t) e * slice, (size_t) slot * slice, slice);
             }
         }
+    }
+    auto tp1 = std::chrono::steady_clock::now();
+
+    // (2) read the RAM-missed slices. Parallel across read_threads workers, each with
+    // its own O_DIRECT bounce buffer (distinct dst + bounce -> no shared state).
+    if (par && !reads.empty()) {
+        const int nt = std::min<int>(g_state.read_threads, (int) reads.size());
+        if ((int) g_state.rbufs.size() < nt) {
+            g_state.rbufs.resize(nt, nullptr);
+            g_state.rbuf_caps.resize(nt, 0);
+        }
+        auto worker = [&](int wi) {
+            for (size_t j = (size_t) wi; j < reads.size(); j += (size_t) nt) {
+                const read_task & t = reads[j];
+                if (g_state.odirect) {
+                    ssd_pread_odirect(t.fd, t.dst, t.len, t.off,
+                            &g_state.rbufs[wi], &g_state.rbuf_caps[wi], g_state.page_size);
+                } else {
+                    ssd_pread_buffered(t.fd, t.dst, t.len, t.off);
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve((size_t) (nt - 1));
+        for (int wi = 1; wi < nt; ++wi) pool.emplace_back(worker, wi);
+        worker(0);
+        for (auto & th : pool) th.join();
+        for (const read_task & t : reads) g_state.bytes_read += t.len;
+    }
+    auto tp2 = std::chrono::steady_clock::now();
+
+    // (3) H2D every VRAM miss (arena -> slot); the arena slice is now resident.
+    for (const auto & m : misses) {
+        ggml_backend_tensor_set_async(backend, pe.slots,
+                (const char *) input->data + (size_t) m.first * slice,
+                (size_t) m.second * slice, slice);
+    }
+    if (prof) {
+        auto tp3 = std::chrono::steady_clock::now();
+        // phase-1 ssd_touch inline reads (serial path) + phase-2 parallel reads.
+        g_state.gpu_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count()
+                             + std::chrono::duration_cast<std::chrono::nanoseconds>(tp2 - tp1).count();
+        g_state.gpu_h2d_ns  += std::chrono::duration_cast<std::chrono::nanoseconds>(tp3 - tp2).count();
     }
 
     // remap into a CONTIGUOUS GPU scratch shaped like orig_ids (values in [0,K)).
@@ -743,10 +840,19 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
     if (g_state.debug) {
         const uint64_t tot = g_state.gpu_hit + g_state.gpu_miss;
         if (tot % 8000 < (uint64_t) n_logical) {
+            const uint64_t ram_tot = g_state.n_hit + g_state.n_miss;
             GGML_LOG_INFO("ggml_ssd_stream: GPU cache hit=%llu miss=%llu (%.1f%%) [pool %lldx%lld %s K=%d]\n",
                     (unsigned long long) g_state.gpu_hit, (unsigned long long) g_state.gpu_miss,
                     tot ? 100.0 * g_state.gpu_hit / tot : 0.0,
                     (long long) input->ne[0], (long long) input->ne[1], ggml_type_name(input->type), pe.k);
+            // (3.3 profiling) On a VRAM miss, ssd_touch either finds the slice in the
+            // RAM arena (fast) or preads it from SSD (slow); then we H2D it. This shows
+            // the RAM-tier hit rate and the cumulative time split read(RAM/SSD) vs H2D
+            // issue - deciding whether prefetch should target SSD reads or the H2D.
+            GGML_LOG_INFO("ggml_ssd_stream: miss-path RAM hit=%llu miss=%llu (%.1f%%) | read %.2fs H2D-issue %.3fs\n",
+                    (unsigned long long) g_state.n_hit, (unsigned long long) g_state.n_miss,
+                    ram_tot ? 100.0 * g_state.n_hit / ram_tot : 0.0,
+                    g_state.gpu_read_ns / 1e9, g_state.gpu_h2d_ns / 1e9);
         }
     }
     return true;
