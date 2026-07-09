@@ -29,7 +29,7 @@ are below the tables.
 | CPU (20t) | 10.1 | 1.4 | | 1 GPU + MTP | 106.6 | 47.9 |
 | CPU + MTP | 9.7 | 3.4 | | 2 GPU layer + MTP | 100.9 | 52.6 |
 | 1 GPU | 115.6 | 31.5 | | 2 GPU tensor | 100.5 | 48.8 |
-| 2 GPU layer | 113.3 | 32.8 | | **2 GPU tensor + MTP** | 89.3 | **73.0** |
+| 2 GPU layer | 113.3 | 32.8 | | **2 GPU tensor + MTP** | 89.3 | **81** ¹ |
 
 **Qwen3.6-35B-A3B** — MoE (3B active), MTP head:
 
@@ -49,7 +49,12 @@ are below the tables.
 
 Takeaways: MTP adds ~+40-50% (dense) up to ~+35% (MoE); tensor-split helps the dense 27B
 (32.8 → 48.8) more than the already-fast MoE; the MoE + MTP stack peaks at **141 t/s**
-single stream, the dense 27B at **73 t/s** (both scale further in aggregate at `-np 4`).
+single stream, the dense 27B at **~81 t/s** (both scale further in aggregate at `-np 4`).
+
+¹ 27B tensor+MTP decode is the **production server steady-state** (`docker-compose.mtp.yml`,
+full config + env gates, long generation, 88.6% MTP draft acceptance) — held **~81 t/s**
+(peak `tg_3s` 87). The other MTP rows are `llama-cli` short-run figures that measure the
+cold→warm ramp, so they read a few t/s low vs. the warmed server steady-state.
 
 Reproduce (swap `M` per model; drop the `MTP` fragment for GLM, which has no MTP head):
 
