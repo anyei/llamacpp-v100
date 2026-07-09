@@ -1366,6 +1366,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
+                            // SSD GPU landing: the full-size copy of a streamed expert weight is
+                            // dead weight (gpu_bind redirects its data to the persistent slot pool).
+                            // Shrink it to one slice so gallocr reserves ~nothing, freeing VRAM for
+                            // a bigger cache. Only fires for the expert MUL_MAT_ID weight (src[0]).
+                            if (node->op == GGML_OP_MUL_MAT_ID && j == 0) {
+                                ggml_ssd_stream_gpu_shrink_copy(tensor_copy, src, backend);
+                            }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
@@ -1646,6 +1653,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (!ssd_gpu_bound) {
+                    // If the copy was shrunk for GPU landing (ne[2]=1) but bind did not
+                    // handle it, copy_experts below would overrun the one-slice buffer.
+                    // This only happens on catastrophic VRAM exhaustion (the pool existed
+                    // at reserve time); fail loudly rather than corrupt.
+                    if (input_cpy->ne[2] != input->ne[2]) {
+                        GGML_ABORT("ssd-stream: GPU landing bind failed on a reclaimed expert copy "
+                                   "(VRAM exhausted); set LLAMA_SSD_STREAM_GPU_NO_RECLAIM=1 to disable reclaim");
+                    }
                     // SSD streaming (CPU-compute fallback): copy_experts below reads
                     // the used experts straight from input->data during this input-copy
                     // phase, which runs before the consuming node - so the lazy per-node

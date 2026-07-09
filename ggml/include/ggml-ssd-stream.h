@@ -45,6 +45,22 @@ GGML_API bool ggml_ssd_stream_gpu_enabled(void);
 // block. Fill + id->slot remap wire in later sub-increments.
 GGML_API void ggml_ssd_stream_gpu_ensure_pool(const struct ggml_tensor * w, ggml_backend_t backend);
 
+// (3.2e) Reclaim the wasted VRAM the graph allocator would otherwise reserve for
+// a streamed-expert MUL_MAT_ID input copy. At compute the copy's data pointer is
+// redirected to the persistent slot pool (see gpu_bind), so its own full-size
+// n_expert-slice buffer is dead weight in the compute arena. This shrinks the copy
+// to a single slice BEFORE gallocr sizes the arena, freeing that VRAM for a bigger
+// cache. Does NOT allocate the pool (this runs in the measure/reserve pass, before
+// the weights load and the streamed-tensor registry is populated - allocating here
+// would mis-size the pools by class count); the pool is allocated on the compute
+// path and gpu_bind redirects copy->data to it. Returns true if it shrank the copy -
+// the caller MUST then let gpu_bind handle the node (the copy is too small for
+// copy_experts; the compute fallback aborts loudly if bind ever fails on a shrunk
+// copy). No-op (returns false) if GPU landing/reclaim is off or src is not a streamed
+// expert tensor (ne[2] <= 1). Kill-switch: LLAMA_SSD_STREAM_GPU_NO_RECLAIM=1.
+GGML_API bool ggml_ssd_stream_gpu_shrink_copy(struct ggml_tensor * copy,
+        const struct ggml_tensor * src, ggml_backend_t backend);
+
 // (3.2b-2) Capture and return the node's original ids (router selection) tensor.
 // The scheduler block reads the router's fresh selection each token from this,
 // even after we swap node->src[2] to the remapped slot ids. Captured once per node.

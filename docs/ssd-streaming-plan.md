@@ -703,6 +703,37 @@ wasted full-size input_cpy VRAM for a bigger cache - diminishing returns for a m
 this far over VRAM. Recommend shipping GPU landing for the Qwen-class win and
 treating DeepSeek-scale as runnable-at-parity.
 
+#### 8.2.7 3.2e-a input_cpy VRAM reclaim - DONE (2026-07-09)
+
+Reclaimed the dead-weight VRAM the graph allocator reserves for each streamed-expert
+`MUL_MAT_ID` input copy. The scheduler creates `input_cpy` as a full copy of one
+layer's expert weight (n_expert slices), but on GPU landing `gpu_bind` redirects
+`input_cpy->data` to the persistent slot pool - so that full-size arena reservation
+is never read. New `ggml_ssd_stream_gpu_shrink_copy()` shrinks the copy to a single
+slice (`ne[2]=1`) at the copy-creation site in `ggml_backend_sched_split_graph`,
+BEFORE gallocr sizes the arena. Compute-time behaviour is unchanged: `gpu_bind`
+already overwrote `ne[2]`/`nb[2]`/`data` regardless of the copy's original size, and
+the only residual (`nb[3]`) is unused since the weight is 3D (ne[3]=1).
+
+- **Correctness (the gate): PPL identical.** Qwen-35B-A3B streamed + GPU landing,
+  16 chunks: reclaim ON **7.0898 ± 0.27805** == OFF **7.0898 ± 0.27805**. (Greedy
+  temp-0 text is NOT a usable gate here - `-ngl 99` GPU MoE is intermittently
+  non-deterministic from near-tie routing noise: across repeat batches ON==OFF held
+  in 2 of 3 and the lone mismatch had ON≠OFF *and* OFF≠OFF - independent of the flag.
+  PPL averages over the noise and is the fork's standard streamed-correctness gate.)
+- **Reclaim measured (CUDA0 compute buffer, tenant-independent):** Qwen **407.00 ->
+  73.69 MiB (-82%, ~333 MiB)**; DeepSeek-81GB **1344.25 -> 517.77 MiB (-61%, ~826
+  MiB)** (bigger slices -> bigger reclaim). Hit rate and t/s identical at equal
+  budget (same cache); the freed VRAM is additive headroom for a larger cache/budget
+  and removes the transient `exit=137` pressure at 12-16 GB.
+- **Safety:** the shrink does NOT allocate the pool (it runs in the measure/reserve
+  pass before weights load - allocating there mis-sized pools by class count: the
+  registry was empty so auto-size saw 0 classes and gave each pool the whole budget,
+  4x25 GB on Qwen - caught and fixed). The pool is allocated on the compute path with
+  a complete registry; a shrunk copy that ever reached the CPU-compute fallback would
+  overrun its one slice, so that path aborts loudly (only possible on catastrophic
+  VRAM exhaustion). Kill-switch: `LLAMA_SSD_STREAM_GPU_NO_RECLAIM=1`.
+
 ### 8.3 Multi-GPU behavior - benchmarked (2026-07-09)
 
 First real multi-GPU measurements of the streaming feature (2x V100-32GB, cli

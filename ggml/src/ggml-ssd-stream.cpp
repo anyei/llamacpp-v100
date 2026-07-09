@@ -589,6 +589,46 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
             (double) k * slice / 1e9, n_pools);
 }
 
+bool ggml_ssd_stream_gpu_shrink_copy(ggml_tensor * copy, const ggml_tensor * src, ggml_backend_t backend) {
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    if (!ggml_ssd_stream_gpu_enabled() || copy == nullptr || src == nullptr || backend == nullptr) {
+        return false;
+    }
+    if (!ggml_ssd_stream_is_streamed(src) || src->ne[2] <= 1) {
+        return false; // only the 3D expert weight (ne[2] = n_expert) is worth shrinking
+    }
+    static const bool no_reclaim = []{
+        const char * e = getenv("LLAMA_SSD_STREAM_GPU_NO_RECLAIM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (no_reclaim) {
+        return false;
+    }
+    GGML_UNUSED(backend);
+    // NOTE: do NOT allocate the pool here. This runs during the scheduler's
+    // measure/reserve pass, which happens BEFORE the model weights finish loading -
+    // so the streamed-tensor registry is still empty and pool auto-sizing (by class
+    // count) would see 0 classes and give each pool the whole budget. The pool is
+    // allocated later on the compute path (ggml_ssd_stream_gpu_ensure_pool, called
+    // right before gpu_bind) when the registry is complete. The shrink is safe
+    // without a pool now: gpu_bind is guaranteed to redirect copy->data to the pool
+    // at compute (same streamed-expert MUL_MAT_ID condition drives both), and the
+    // compute-path fallback aborts loudly if bind ever fails on a shrunk copy.
+    if (copy->ne[2] <= 1) {
+        return true; // already minimal
+    }
+    // Shrink to a single expert slice: at compute gpu_bind sets ne[2]=pool.k and
+    // data=slots, so this buffer is never read - it just needs to be tiny for the
+    // arena. Keep the tensor contiguous (recompute the row stride nb[3]).
+    copy->ne[2] = 1;
+    copy->nb[3] = copy->nb[2];
+    return true;
+#else
+    GGML_UNUSED(copy); GGML_UNUSED(src); GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
 const ggml_tensor * ggml_ssd_stream_gpu_orig_ids(const ggml_tensor * node, const ggml_tensor * cur_ids) {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     gpu_node_state & ns = g_gpu_nodes[node];
