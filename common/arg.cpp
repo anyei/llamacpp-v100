@@ -2412,6 +2412,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--ssd-streaming"},
+        "stream MoE expert weights from SSD on demand into a bounded RAM cache, so a model\n"
+        "whose experts exceed VRAM+RAM can still run. implies --no-mmap.\n"
+        "sets LLAMA_SSD_STREAM_BUFFER",
+        [](common_params & params) {
+            params.use_mmap = false; // streamed experts skip the read; keep others resident
+            setenv("LLAMA_SSD_STREAM_BUFFER", "1", 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--ssd-stream-budget"}, "MiB",
+        "RAM expert-cache byte budget for --ssd-streaming (default 8192). sets LLAMA_SSD_STREAM_BUDGET",
+        [](common_params & params, const std::string & value) {
+            (void) params;
+            setenv("LLAMA_SSD_STREAM_BUDGET", value.c_str(), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--ssd-stream-gpu"},
+        "compute streamed experts on the GPU via a persistent VRAM slot cache (big win when\n"
+        "the hot expert set fits VRAM; use with --ssd-streaming). sets LLAMA_SSD_STREAM_GPU",
+        [](common_params & params) {
+            (void) params;
+            setenv("LLAMA_SSD_STREAM_GPU", "1", 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--ssd-stream-vram-budget"}, "MiB",
+        "total VRAM budget for the --ssd-stream-gpu slot cache (default 4096). sets LLAMA_SSD_STREAM_VRAM_BUDGET",
+        [](common_params & params, const std::string & value) {
+            (void) params;
+            setenv("LLAMA_SSD_STREAM_VRAM_BUDGET", value.c_str(), 1);
+        }
+    ));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
