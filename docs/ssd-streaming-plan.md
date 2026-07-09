@@ -823,27 +823,28 @@ First real multi-GPU measurements of the streaming feature (2x V100-32GB, cli
 | DeepSeek-V4 81 GB (**can't fit 64 GB**) | streaming | ~2.5 | 1.5 | **load crash** |
 | DeepSeek | streaming + GPU landing | ~1.5-2.5 | 1.5 (no-op) | - |
 
-**Findings:**
-1. **GPU landing is single-GPU-only.** In *both* multi-GPU modes the VRAM slot pool
-   never allocates (0 pool-alloc lines): `-sm tensor` routes compute through the
-   meta backend, which bypasses the CUDA-device offload hook; `-sm layer` splits
-   layers across devices, and the class-keyed pool (one buffer, one GPU) doesn't
-   fit that. So 2 GPUs buy **no streaming speedup** - the CPU-tier expert path is
-   single-stream-bound regardless of GPU count, and 1-GPU GPU-landing (11.7) beats
-   every 2-GPU streaming config.
+**Findings** (items 1 + 4 resolved 2026-07-09 — see §8.2.9, §8.2.10):
+1. **GPU landing is single-GPU-only** — now *enforced*, not just observed. It used to
+   *engage* under `-sm layer` and crash (`GGML_ASSERT(id >= 0 && id < n_expert)` from
+   the auto-offload routing streamed experts through per-device backends). Fixed
+   (§8.2.9): a single-GPU gate makes landing a clean CPU-tier fallback in multi-GPU;
+   the pool key gained the device for a future real multi-GPU implementation. 1-GPU
+   GPU-landing (11.7) still beats every 2-GPU streaming config, so this is fine.
 2. **The only real 2-GPU win is resident** (Qwen 100-108 t/s) - for models that fit.
    Streaming is a single-GPU-focused runnability tool; when a model fits, resident
    tensor-split is ~10x faster than streaming it (108 vs 9.6).
 3. **DeepSeek 81 GB loads + runs in `-sm layer`** (1.5 t/s, coherent) but **crashes
    at load in `-sm tensor`**: `llama_meta_device_get_split_state` ->
    `GGML_ASSERT(!suffix_fallback.empty())` (`llama-model.cpp:427`) - the meta
-   backend's split-state resolver doesn't handle the streamed expert tensors for the
-   `deepseek2`/MLA arch (task-13-adjacent). So DeepSeek streaming on 2 GPUs = layer
-   mode only, today.
-4. **Non-fatal gallocr OOM in multi-GPU streaming:** `ggml_gallocr_reserve_n_impl`
-   attempts an oversized reserve (79 GB Qwen / 298 GB DeepSeek on one device),
-   fails, and the run recovers with coherent output. Cosmetically alarming; a
-   mis-sized worst-case reservation in the streaming + multi-GPU-split path to clean up.
+   backend's split-state resolver can't find the split-axis companion for a streamed
+   `deepseek2`/MLA expert. **Known limitation, left as-is:** it is a meta-backend MLA
+   split-policy issue (task-13-adjacent), not a streaming bug, and the config is
+   triple-niche with no benefit (multi-GPU streaming < single-GPU; `-sm tensor` adds
+   no speedup). **Use single-GPU or `-sm layer` for DeepSeek streaming.**
+4. **Non-fatal gallocr OOM in multi-GPU streaming** — **fixed** (§8.2.10). The ~73 GB
+   worst-case reserve was the streamed-expert offload building full-size `input_cpy`
+   copies; skipping that offload when `n_gpu > 1` (streamed experts stay CPU-tier)
+   removes it at the source. `-sm layer` streaming OOM lines 2 -> 0.
 
 **Recommendation:** ship single-GPU GPU-landing as the sweet spot. A real 2-GPU
 streaming win needs GPU landing made multi-GPU-aware - per-GPU slot pools keyed by
