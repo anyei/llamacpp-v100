@@ -14,59 +14,68 @@ GPUs across two machines. Models used for tuning and benchmarks:
   experiments, single-GPU profile
 - `Qwen3-0.6B-BF16.gguf` — small model for fast distributed/RPC iteration
 
-## Benchmarks — Qwen3.6-27B, single stream (max t/s per config)
+## Benchmarks — single stream, max t/s per config
 
-`Qwen3.6-27B-UD-Q4_K_XL-MTP` (17.9 GB, dense) on **2× V100-SXM2-32GB (NVLink)**,
-temp-0, `-n 128`, single stream. **MTP** = the model's built-in multi-token-prediction
-head used for self-speculation (`--spec-type draft-mtp`). Every change is gated on
-byte-identical / PPL-neutral temp-0 output vs. baseline. Reproduce with the commands
-below (image built from this tree, `--target full`).
+**2× V100-SXM2-32GB (NVLink)**, temp-0, `-n 128`, single stream, image built from this
+tree. **MTP** = the model's built-in multi-token-prediction head used for self-speculation
+(`--spec-type draft-mtp`). Numbers are decode (tg) / prefill (pp) t/s. Every change is
+gated on byte-identical / PPL-neutral temp-0 output vs. baseline. Commands to reproduce
+are below the tables.
 
-| # | Configuration | Prefill t/s | **Decode t/s** |
-|---|---|---:|---:|
-| 1 | CPU (20 threads) | 10.1 | 1.4 |
-| 2 | CPU + MTP | 9.7 | 3.4 |
-| 3 | 1× GPU | 115.6 | 31.5 |
-| 4 | 2× GPU (layer split) | 113.3 | 32.8 |
-| 5 | 1× GPU + MTP | 106.6 | 47.9 |
-| 6 | 2× GPU (layer) + MTP | 100.9 | 52.6 |
-| 7 | 2× GPU (tensor split) | 100.5 | 48.8 |
-| 8 | **2× GPU (tensor) + MTP** | 89.3 | **73.0** |
+**Qwen3.6-27B** — dense, MTP head (17.9 GB):
 
-MTP adds ~+50% at every tier; tensor-split adds dense-decode bandwidth (32.8 → 48.8);
-the full stack peaks at **73 t/s** single stream (throughput scales further to ~125 t/s
-aggregate at `-np 4`). The `MTP` and `BASE`/`TENSOR` shell fragments below are shared:
+| Configuration | Prefill | **Decode** | | Configuration | Prefill | **Decode** |
+|---|---:|---:|---|---|---:|---:|
+| CPU (20t) | 10.1 | 1.4 | | 1 GPU + MTP | 106.6 | 47.9 |
+| CPU + MTP | 9.7 | 3.4 | | 2 GPU layer + MTP | 100.9 | 52.6 |
+| 1 GPU | 115.6 | 31.5 | | 2 GPU tensor | 100.5 | 48.8 |
+| 2 GPU layer | 113.3 | 32.8 | | **2 GPU tensor + MTP** | 89.3 | **73.0** |
+
+**Qwen3.6-35B-A3B** — MoE (3B active), MTP head:
+
+| Configuration | Prefill | **Decode** | | Configuration | Prefill | **Decode** |
+|---|---:|---:|---|---|---:|---:|
+| CPU (20t) | 35.7 | 7.8 | | 1 GPU + MTP | 159.2 | 133.3 |
+| CPU + MTP | 32.9 | 9.9 | | 2 GPU layer + MTP | 175.7 | 133.1 |
+| 1 GPU | 203.3 | 100.9 | | 2 GPU tensor | 138.0 | 110.4 |
+| 2 GPU layer | 200.3 | 100.1 | | **2 GPU tensor + MTP** | 122.8 | **141.4** |
+
+**GLM-4.7-Flash-UD** — MoE / MLA (deepseek2 arch), no MTP head:
+
+| Configuration | Prefill | **Decode** |
+|---|---:|---:|
+| CPU (20t) | 35.4 | 9.5 |
+| 1 GPU | 185.0 | 89.5 |
+
+Takeaways: MTP adds ~+40-50% (dense) up to ~+35% (MoE); tensor-split helps the dense 27B
+(32.8 → 48.8) more than the already-fast MoE; the MoE + MTP stack peaks at **141 t/s**
+single stream, the dense 27B at **73 t/s** (both scale further in aggregate at `-np 4`).
+
+Reproduce (swap `M` per model; drop the `MTP` fragment for GLM, which has no MTP head):
 
 ```bash
 MODELS=/mnt/models/ollama37-k80/.ollama/custom-models   # your GGUF dir
 IMG=llamacpp-local-v100:latest                          # built --target full/server
-M=Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
+M=Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf   # or Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf, GLM-4.7-Flash-UD-Q4_K_XL.gguf
 BASE="-m /models/$M --no-mmap -c 4096 -n 128 --temp 0 --seed 1 -st -p 'Explain how a CPU pipeline works.'"
 MTP="--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1 --spec-draft-p-min 0.75"
 run() { docker run --rm --gpus all "$@" -v $MODELS:/models:ro --entrypoint /app/llama $IMG cli; }
 
-# 1  CPU                     -> tg 1.4
-run -e CUDA_VISIBLE_DEVICES=   $BASE -ngl 0 -t 20
-# 2  CPU + MTP               -> tg 3.4
-run -e CUDA_VISIBLE_DEVICES=   $BASE -ngl 0 -t 20 $MTP
-# 3  1 GPU                   -> tg 31.5
-run -e CUDA_VISIBLE_DEVICES=0  $BASE -ngl 99
-# 4  2 GPU (layer)           -> tg 32.8
-run -e CUDA_VISIBLE_DEVICES=0,1  $BASE -ngl 99 -sm layer
-# 5  1 GPU + MTP             -> tg 47.9
-run -e CUDA_VISIBLE_DEVICES=0 -e LLAMA_DECODE_GRAPH_CACHE=4  $BASE -ngl 99 $MTP
-# 6  2 GPU (layer) + MTP     -> tg 52.6
-run -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_DECODE_GRAPH_CACHE=4  $BASE -ngl 99 -sm layer $MTP
-# 7  2 GPU (tensor)          -> tg 48.8
-run -e CUDA_VISIBLE_DEVICES=0,1 -e GGML_CUDA_ALLREDUCE=p2p  $BASE -ngl 99 -sm tensor -ts 0.5,0.5
-# 8  2 GPU (tensor) + MTP    -> tg 73.0   (production config)
+run -e CUDA_VISIBLE_DEVICES=    $BASE -ngl 0 -t 20                                   # CPU
+run -e CUDA_VISIBLE_DEVICES=    $BASE -ngl 0 -t 20 $MTP                              # CPU + MTP
+run -e CUDA_VISIBLE_DEVICES=0   $BASE -ngl 99                                        # 1 GPU
+run -e CUDA_VISIBLE_DEVICES=0,1 $BASE -ngl 99 -sm layer                              # 2 GPU layer
+run -e CUDA_VISIBLE_DEVICES=0 -e LLAMA_DECODE_GRAPH_CACHE=4   $BASE -ngl 99 $MTP     # 1 GPU + MTP
+run -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_DECODE_GRAPH_CACHE=4 $BASE -ngl 99 -sm layer $MTP   # 2 GPU layer + MTP
+run -e CUDA_VISIBLE_DEVICES=0,1 -e GGML_CUDA_ALLREDUCE=p2p    $BASE -ngl 99 -sm tensor -ts 0.5,0.5   # 2 GPU tensor
 run -e CUDA_VISIBLE_DEVICES=0,1 -e GGML_CUDA_ALLREDUCE=p2p -e LLAMA_DECODE_GRAPH_CACHE=4 \
     -e LLAMA_DECODE_GRAPH_CACHE_TOKENS=64 -e GGML_META_MAX_GRAPHS=8 \
-    $BASE -ngl 99 -sm tensor -ts 0.5,0.5 $MTP
+    $BASE -ngl 99 -sm tensor -ts 0.5,0.5 $MTP                                        # 2 GPU tensor + MTP (peak)
 ```
 
-Other measured highlights: KV cache q8_0 = **0.5×** memory (lossless), GLM-4.7-Flash MoE
-**~90 t/s** single V100, 27B on a remote 2-GPU RPC TP island **33 t/s** (loopback).
+Other measured highlights: KV cache q8_0 = **0.5×** memory (lossless), 27B on a remote
+2-GPU RPC TP island **33 t/s** (loopback), and DeepSeek-V4 **81 GB streamed from SSD on
+one 32 GB V100** (see the SSD-streaming section below).
 
 ## What this fork adds over upstream
 
