@@ -22,6 +22,12 @@ Conventions:
 Run MoE models whose expert weights exceed VRAM+RAM by streaming routed experts
 from SSD into a bounded RAM cache. See `docs/ssd-streaming-plan.md`.
 
+> The common ones have **CLI flags** (preferred over the env vars):
+> `--ssd-streaming`, `--ssd-stream-budget <MiB>`, `--ssd-stream-gpu`,
+> `--ssd-stream-vram-budget <MiB>`. E.g.
+> `llama-server -m model.gguf -ngl 99 --ssd-streaming --ssd-stream-gpu --ssd-stream-vram-budget 6000`.
+> The remaining knobs below are env-only tuning/diagnostics.
+
 | Gate | Type | Default | What it does |
 |---|---|---|---|
 | `LLAMA_SSD_STREAM_BUFFER` | bool | off | Master switch: route `blk.*.ffn_*_exps.weight` to the streamed buffer type (RAM cache, filled on demand from the GGUF). |

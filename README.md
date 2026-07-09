@@ -166,7 +166,8 @@ benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
 | [`docs/distributed-inference-guide.md`](docs/distributed-inference-guide.md) | how to run coordinator/workers/TP islands |
 | [`docs/distributed-inference-plan.md`](docs/distributed-inference-plan.md) | the distributed design rationale |
 | [`docs/validation-playbook.md`](docs/validation-playbook.md) | test scenarios + exact commands used to validate all of this |
-| [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, and usage of the experimental `LLAMA_SSD_STREAMING` director (task 15) |
+| [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, CPU + GPU-landing tiers (task 15) |
+| [`docs/env-gates.md`](docs/env-gates.md) | every fork env gate + CLI flag, grouped, with usage examples |
 | [`REBUILD-IMAGE.md`](REBUILD-IMAGE.md) | building the production Docker image |
 | [`TASKS.md`](TASKS.md) | full task history with measurements and open items |
 
@@ -202,14 +203,16 @@ For multi-machine setups see the
 
 Tracked in detail in [`TASKS.md`](TASKS.md):
 
-- **SSD streaming** (task 15) — **in progress; the core works** (see the
-  highlighted use-case above). Increment 1 shipped: a streamed expert buffer
-  type (`LLAMA_SSD_STREAM_BUFFER=1`) that preads MoE experts on demand into a
-  budgeted, O_DIRECT-fed arena. DeepSeek-V4-Flash **81 GB runs on one 32 GB
-  V100 + 46 GB RAM** — byte-identical to resident, decode 1.66 t/s and climbing
-  (0.69 → 1.66 across batching + O_DIRECT). Remaining: GPU landing (compute
-  experts on the GPU), prefetch/overlap, and the `--ssd-streaming` CLI flag —
-  see `docs/ssd-streaming-plan.md §8`.
+- **SSD streaming** (task 15) — **beta; usable via CLI flags.** Stream MoE
+  experts from SSD to run models larger than VRAM+RAM: `--ssd-streaming`
+  (RAM-cached expert tier, O_DIRECT), plus `--ssd-stream-gpu` to compute the
+  hot experts on the GPU via a persistent VRAM slot cache (auto-offload +
+  auto-sized pools). DeepSeek-V4-Flash **81 GB runs on one 32 GB V100 + 46 GB
+  RAM**. GPU landing is **byte-exact and a ~3x decode win where the cache covers
+  the hot expert set** (Qwen-35B-A3B 2.5 → ~9 t/s); for the >>VRAM extreme
+  (DeepSeek) it reaches CPU parity. Remaining: prefetch/overlap of miss H2D,
+  and DeepSeek-scale tuning — see `docs/ssd-streaming-plan.md §8` and the flag
+  list in `docs/env-gates.md`.
 - **Distributed, hardware-gated** — two-box measurement of the
   worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
   RDMA / 25 GbE+).
