@@ -210,9 +210,12 @@ Tracked in detail in [`TASKS.md`](TASKS.md):
   auto-sized pools). DeepSeek-V4-Flash **81 GB runs on one 32 GB V100 + 46 GB
   RAM**. GPU landing is **byte-exact and a ~3x decode win where the cache covers
   the hot expert set** (Qwen-35B-A3B 2.5 → ~9 t/s); for the >>VRAM extreme
-  (DeepSeek) it reaches CPU parity. Remaining: prefetch/overlap of miss H2D,
-  and DeepSeek-scale tuning — see `docs/ssd-streaming-plan.md §8` and the flag
-  list in `docs/env-gates.md`.
+  (DeepSeek) it reaches CPU parity. **GPU landing is single-GPU today** (no-op
+  under `-sm tensor`/`-sm layer`); the CPU-tier `--ssd-streaming` works on 2 GPUs
+  (layer-split, DeepSeek 81 GB runs) but buys no speedup over one card, and
+  `-sm tensor` + DeepSeek crashes at load (meta split-state). Remaining:
+  multi-GPU GPU landing, prefetch/overlap, DeepSeek-scale tuning — see
+  `docs/ssd-streaming-plan.md §8` and `docs/env-gates.md`.
 - **Distributed, hardware-gated** — two-box measurement of the
   worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
   RDMA / 25 GbE+).

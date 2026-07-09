@@ -45,6 +45,11 @@ Compute streamed experts on the GPU with a persistent VRAM slot cache
 (hot experts stay resident across tokens; a cache hit is a zero-copy GPU read).
 Composes with the CPU tier above (RAM becomes the L2 victim tier).
 
+> **Single-GPU only (today).** GPU landing is a no-op under multi-GPU (`-sm tensor`
+> or `-sm layer`); the slot cache doesn't allocate. On 2 GPUs, use plain
+> `--ssd-streaming` (CPU tier, layer-split) - it works and is coherent, but gives
+> no speedup over one GPU. See `docs/ssd-streaming-plan.md §8.3`.
+
 | Gate | Type | Default | What it does |
 |---|---|---|---|
 | `LLAMA_SSD_STREAM_GPU` | bool | off | Enable the VRAM expert-slot cache + id->slot indirection. Requires `LLAMA_SSD_STREAM_BUFFER=1`. |
