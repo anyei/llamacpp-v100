@@ -158,6 +158,78 @@ routing locality multiply from there. Design, numbers, and the reproducible
 benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
 [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md).
 
+## Fork knobs (env gates)
+
+Everything this fork adds is **off by default** and gated by an env var (or CLI
+flag), so a stock run behaves like upstream. Full rationale, measured effects, and
+usage examples in [`docs/env-gates.md`](docs/env-gates.md); the complete list:
+
+**SSD streaming — CPU tier**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `LLAMA_SSD_STREAM_BUFFER` | off | Master switch: stream MoE expert weights from the GGUF on demand (run models bigger than VRAM+RAM). |
+| `LLAMA_SSD_STREAM_BUDGET` | 8192 MiB | RAM expert-cache byte budget (LRU-bounded). |
+| `LLAMA_SSD_STREAM_READ_THREADS` | 1 | Parallelize SSD miss-path preads (prefill/long-prompt win; decode-neutral). |
+| `LLAMA_SSD_STREAM_SLRU` | off | Segmented LRU for the RAM cache instead of plain LRU (measured no-win; opt-in). |
+| `LLAMA_SSD_STREAM_PROTECTED_PCT` | 80 | Protected-segment size for the RAM SLRU. |
+| `LLAMA_SSD_STREAM_SERIAL` | off | Node-at-a-time execution. **Required for `-ngl 0`** (pure CPU). |
+| `LLAMA_SSD_STREAM_NO_ODIRECT` | off | Force buffered reads instead of O_DIRECT (kill-switch / A-B). |
+| `GGML_SSD_STREAM_DEBUG` | off | Periodic hit/miss/evict/hit-rate + miss-path timing log. |
+| `LLAMA_SSD_STREAMING` | off | Legacy advisory-mmap "residency director" (phase-1 negative result; prefer the streamed buffer). |
+
+**SSD streaming — GPU landing** (VRAM expert-slot cache; single-GPU)
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `LLAMA_SSD_STREAM_GPU` | off | Compute streamed experts on the GPU via a VRAM slot cache + id→slot indirection. Needs `…_BUFFER=1`. |
+| `LLAMA_SSD_STREAM_VRAM_BUDGET` | 4096 MiB | Total VRAM budget for the slot pools. |
+| `LLAMA_SSD_STREAM_VRAM_POOLS` | auto | Override the expert-slice class count the budget splits across (auto-detected). |
+| `LLAMA_SSD_STREAM_GPU_SLRU` | on | Segmented LRU (scan resistance) for the VRAM cache; `=0` = plain LRU. |
+| `LLAMA_SSD_STREAM_GPU_PROTECTED_PCT` | 80 | Protected-segment size for the VRAM SLRU. |
+| `LLAMA_SSD_STREAM_GPU_NO_RECLAIM` | off | Kill-switch for the `input_cpy` VRAM reclaim (default shrinks the dead-weight copy). |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload; not needed with GPU landing (auto-offloads at batch-1). |
+
+**Speculative decoding / MTP**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `LLAMA_SPEC_DRAFT_NO_PAD` | off | Kill-switch for MTP draft-length padding (padding keeps batch shape stable — the default win). |
+| `LLAMA_SPEC_ADAPTIVE` | off | Cap each draft round by an acceptance EMA (measured tg-neutral). |
+| `LLAMA_SPEC_TIMING` | off | Log server draft/verify/accept timings. |
+| `--spec-draft-p-min` *(flag)* | — | Confidence gate: stop drafting below this probability. |
+
+**Tensor-parallel AllReduce (2-GPU tensor split)**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `GGML_CUDA_ALLREDUCE=p2p` | NCCL | One-shot P2P NVLink AllReduce for 2 GPUs (falls back to NCCL). |
+| `GGML_CUDA_AR_P2P_MAX_BYTES` | 4 MB | Size cap above which P2P defers to NCCL. |
+| `GGML_CUDA_FORCE_GRAPHS` | off | Force CUDA graphs on Volta (cc<8.0; no measured gain here). |
+
+**Meta tensor-split backend**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `GGML_META_MAX_GRAPHS` | 8 | Shadow-container slots (raise if many decode graph shapes are cached). |
+| `GGML_META_DEBUG` | off | Split-state diagnostics (`=2` also prints per-source resolution). |
+| `GGML_META_DEBUG_REDUCE` | off | Print AllReduce boundary placement. |
+| `GGML_META_TIMING` | off | Per-step compute-vs-reduce timing. |
+| `LLAMA_META_DUP_DEVICE` | 1 | Duplicate the device list N× so one GPU runs a genuine N-way split (validation harness). |
+
+**Decode graph cache · Distributed/RPC · KV cache**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `LLAMA_DECODE_GRAPH_CACHE` | 4 | Cached small-batch decode graphs for steady-state reuse (`=0` disables). |
+| `LLAMA_DECODE_GRAPH_CACHE_TOKENS` | 64 | Max ubatch size eligible for the cache. |
+| `GGML_RPC_NO_W2W` | off | Disable direct worker-to-worker tensor pull (bridge through the coordinator). |
+| `GGML_RDMA_DEV` / `GGML_RDMA_GID` | auto | RDMA device / GID selection for the RPC transport. |
+| `LLAMA_ATTN_ROT_DISABLE` | off | Opt out of Hadamard-rotated KV quantization (auto-on when KV is quantized). |
+
+**Diagnostics** (zero cost unless set): `LLAMA_DECODE_TIMING`, `LLAMA_BATCH_DEBUG`,
+`LLAMA_DEBUG_DUMP_DIR`/`_FILTER`, `LLAMA_DSV4_COMPRESS_DEBUG`, `GGML_SCHED_DEBUG`, `GGML_RPC_DEBUG`.
+
 ## Documentation map
 
 | Doc | Contents |

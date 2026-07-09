@@ -32,6 +32,7 @@ from SSD into a bounded RAM cache. See `docs/ssd-streaming-plan.md`.
 |---|---|---|---|
 | `LLAMA_SSD_STREAM_BUFFER` | bool | off | Master switch: route `blk.*.ffn_*_exps.weight` to the streamed buffer type (RAM cache, filled on demand from the GGUF). |
 | `LLAMA_SSD_STREAM_BUDGET` | MiB | 8192 | RAM expert-cache byte budget (LRU-bounded resident experts). |
+| `LLAMA_SSD_STREAM_READ_THREADS` | count | 1 | Parallelize the SSD miss-path preads across N workers (each with its own O_DIRECT bounce). Helps the **batch-amortized** path — prefill/long prompts (+31% on DeepSeek-81GB), saturates at 2; single-stream decode is neutral. Default 1 = serial. |
 | `LLAMA_SSD_STREAM_SLRU` | bool | off (LRU) | Use a segmented LRU (probation/protected) for the RAM cache instead of plain LRU. Measured no-win for DeepSeek; kept opt-in. |
 | `LLAMA_SSD_STREAM_PROTECTED_PCT` | 0-100 | 80 | Protected-segment size for the RAM SLRU (only when SLRU on). |
 | `LLAMA_SSD_STREAM_SERIAL` | bool | off | Force node-at-a-time execution. **Required for `-ngl 0`** (pure CPU), where the router and experts share a scheduler split. Not needed when `-ngl > 0`. |
@@ -54,6 +55,7 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 |---|---|---|---|
 | `LLAMA_SSD_STREAM_GPU` | bool | off | Enable the VRAM expert-slot cache + id->slot indirection. Requires `LLAMA_SSD_STREAM_BUFFER=1`. |
 | `LLAMA_SSD_STREAM_VRAM_BUDGET` | MiB | 4096 | **Total** VRAM budget for the slot pools. |
+| `LLAMA_SSD_STREAM_GPU_NO_RECLAIM` | bool | off | Kill-switch: keep the full-size `input_cpy` gallocr reservation for streamed-expert matmuls. By default the copy is shrunk to one slice (its data is redirected to the slot pool anyway) — reclaiming ~0.3-0.8 GB of compute-arena VRAM. Set to A-B the reclaim. |
 | `LLAMA_SSD_STREAM_VRAM_POOLS` | count | auto | Override the number of expert-slice classes the budget is split across. **Auto-detected** from the model (e.g. 2 for DeepSeek-V4, 4 for mixed-quant UD Qwen); only set this to override. |
 | `LLAMA_SSD_STREAM_GPU_SLRU` | bool | on | Segmented-LRU (scan resistance) for the VRAM slot cache; `=0` forces plain LRU. (Measured neutral for DeepSeek; may help more-skewed models.) |
 | `LLAMA_SSD_STREAM_GPU_PROTECTED_PCT` | 0-100 | 80 | Protected-segment size for the VRAM SLRU. |
