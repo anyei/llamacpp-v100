@@ -58,26 +58,31 @@ full config + env gates, long generation, ~88.6% MTP draft acceptance, mean acce
 figures that measure the cold→warm ramp (tg climbs for the first ~500 tokens), so they
 read several t/s low vs. the warmed server steady-state.
 
-Reproduce (swap `M` per model; drop the `MTP` fragment for GLM, which has no MTP head):
+**Reproduce with [`docker-compose.mtp.yml`](docker-compose.mtp.yml)** (the production
+server config). The **MTP (¹) numbers must come from the server, not `llama-cli`** —
+speculation has a warmup ramp (draft-acceptance EMA + graph cache) that short cli runs
+never leave, so cli reads several t/s low; the server's steady-state `tg` is the real
+figure. Non-MTP numbers match cli either way.
+
+The compose defaults to **2 GPU tensor + MTP, 27B** (`tg` peaks at the table value).
+Edit it per scenario, bring it up, send one long request, and read the held `tg`:
 
 ```bash
-MODELS=/mnt/models/ollama37-k80/.ollama/custom-models   # your GGUF dir
-IMG=llamacpp-local-v100:latest                          # built --target full/server
-M=Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf   # or Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf, GLM-4.7-Flash-UD-Q4_K_XL.gguf
-BASE="-m /models/$M --no-mmap -c 4096 -n 128 --temp 0 --seed 1 -st -p 'Explain how a CPU pipeline works.'"
-MTP="--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1 --spec-draft-p-min 0.75"
-run() { docker run --rm --gpus all "$@" -v $MODELS:/models:ro --entrypoint /app/llama $IMG cli; }
+# 1) edit docker-compose.mtp.yml for the scenario:
+#    model     : -m /models/Qwen3.6-27B-...   -> swap to the 35B-A3B gguf
+#    CPU       : CUDA_VISIBLE_DEVICES=  (empty) ; command: -ngl 0  (drop -sm tensor / -ts)
+#    1 GPU     : CUDA_VISIBLE_DEVICES=0        ; command: drop -sm tensor / -ts
+#    2 GPU lyr : command: -sm layer            (instead of -sm tensor -ts 0.5,0.5)
+#    no MTP    : delete the --spec-type / --spec-draft-* command lines
+docker compose -f docker-compose.mtp.yml up -d
 
-run -e CUDA_VISIBLE_DEVICES=    $BASE -ngl 0 -t 20                                   # CPU
-run -e CUDA_VISIBLE_DEVICES=    $BASE -ngl 0 -t 20 $MTP                              # CPU + MTP
-run -e CUDA_VISIBLE_DEVICES=0   $BASE -ngl 99                                        # 1 GPU
-run -e CUDA_VISIBLE_DEVICES=0,1 $BASE -ngl 99 -sm layer                              # 2 GPU layer
-run -e CUDA_VISIBLE_DEVICES=0 -e LLAMA_DECODE_GRAPH_CACHE=4   $BASE -ngl 99 $MTP     # 1 GPU + MTP
-run -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_DECODE_GRAPH_CACHE=4 $BASE -ngl 99 -sm layer $MTP   # 2 GPU layer + MTP
-run -e CUDA_VISIBLE_DEVICES=0,1 -e GGML_CUDA_ALLREDUCE=p2p    $BASE -ngl 99 -sm tensor -ts 0.5,0.5   # 2 GPU tensor
-run -e CUDA_VISIBLE_DEVICES=0,1 -e GGML_CUDA_ALLREDUCE=p2p -e LLAMA_DECODE_GRAPH_CACHE=4 \
-    -e LLAMA_DECODE_GRAPH_CACHE_TOKENS=64 -e GGML_META_MAX_GRAPHS=8 \
-    $BASE -ngl 99 -sm tensor -ts 0.5,0.5 $MTP                                        # 2 GPU tensor + MTP (peak)
+# 2) warm it up: one long generation (~1-2k tokens) so MTP + the graph cache settle
+curl -s localhost:8097/v1/chat/completions -H 'content-type: application/json' -d \
+  '{"messages":[{"role":"user","content":"Write a complete Flappy Bird clone in Python with pygame."}],"max_tokens":2000,"temperature":0}' >/dev/null
+
+# 3) read the held steady-state (tg / tg_3s AFTER the first ~500-token ramp; and the
+#    final `eval time = … tokens per second` + `draft acceptance` summary)
+docker compose -f docker-compose.mtp.yml logs 2>&1 | grep -E "print_timing"
 ```
 
 Other measured highlights: KV cache q8_0 = **0.5×** memory (lossless), 27B on a remote
