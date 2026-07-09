@@ -657,3 +657,26 @@ admission, warmed over ~160 tokens. Our runs are LRU, <=96 tokens, VRAM-pressure
 per-pool budget by hot-set size. Also: 3.2b-3 (scope offload to streamed expert
 nodes so decode uses GPU landing without the global GGML_OP_OFFLOAD_MIN_BATCH).
 Committed state: GPU landing works, byte-exact, gated off by default (LLAMA_SSD_STREAM_GPU).
+
+#### 8.2.5 Pool sizing + recycled-node crash fix (2026-07-09)
+
+Two DeepSeek findings:
+- **Pool sizing was silently starving the cache.** Per-pool budget = total /
+  LLAMA_SSD_STREAM_VRAM_POOLS (default 6). DeepSeek has only 2 expert-slice classes
+  (gate_up iq2_xxs, down q2_K), so a "12 GB" budget gave 12/6=2 GB/pool -> ~4 GB
+  effective. Setting VRAM_POOLS=2 gives full utilization (2 x 6.3 GB) and hit rate
+  jumped 30% -> **64.5%** - DeepSeek routing IS skewed and a right-sized cache
+  captures the hot set. (Follow-up: auto-size pools by discovered class count.)
+- **Recycled-node crash (exit 139).** g_gpu_nodes is keyed by node pointer; DeepSeek's
+  longer/bigger decode churns the graph cache, and a rebuilt node can reuse a freed
+  address -> stale entry with a dangling orig_ids -> garbage ids -> the MUL_MAT_ID
+  id-range assert. Fixed: ggml_ssd_stream_gpu_orig_ids validates node->src[2] is
+  either the captured orig_ids or our slot_ids; otherwise the node was recycled, so
+  re-capture and drop the stale scratch. (Qwen never triggered it - stable decode
+  graph, verified byte-exact + survives heavy eviction.)
+
+**DeepSeek now: crash-free, 64.5% hit, 2.3 t/s decode (POOLS=2, 12 GB) vs CPU 2.5 -
+break-even, up from 1.5 pre-fix.** Clear-win levers remain: SLRU + 2nd-miss admission
+(reuse the inc-2 SLRU on gpu_slot_pool; #20757 +8-15pp), reclaim the wasted full-size
+input_cpy VRAM for a bigger cache, and prefetch/overlap the miss H2D (3.3). Qwen-class
+(cache covers the hot set) is already a clear win: 2.5 -> 7.0 t/s.

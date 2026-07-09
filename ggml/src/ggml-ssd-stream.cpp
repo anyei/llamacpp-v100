@@ -540,8 +540,18 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
 const ggml_tensor * ggml_ssd_stream_gpu_orig_ids(const ggml_tensor * node, const ggml_tensor * cur_ids) {
     std::lock_guard<std::mutex> lock(g_state.mutex);
     gpu_node_state & ns = g_gpu_nodes[node];
-    if (ns.orig_ids == nullptr) {
-        ns.orig_ids = cur_ids; // capture the router selection tensor once (before any src[2] swap)
+    // cur_ids (node->src[2]) is either the router selection (first sight, or a fresh
+    // graph node) or our slot_ids (swapped on a previous token for THIS node). If it
+    // is neither the captured orig_ids nor our slot_ids, the node pointer was recycled
+    // by a graph rebuild onto a stale entry whose orig_ids now dangles - reset and
+    // re-capture, dropping the stale scratch. (Without this, a recycled node reads a
+    // freed ids tensor -> garbage expert ids -> the MUL_MAT_ID id-range assert.)
+    if (ns.orig_ids == nullptr || (cur_ids != ns.orig_ids && cur_ids != ns.slot_ids)) {
+        if (ns.ids_buf) { ggml_backend_buffer_free(ns.ids_buf); ns.ids_buf = nullptr; }
+        if (ns.ids_ctx) { ggml_free(ns.ids_ctx); ns.ids_ctx = nullptr; }
+        ns.slot_ids = nullptr;
+        ns.cap      = 0;
+        ns.orig_ids = cur_ids;
     }
     return ns.orig_ids;
 }
