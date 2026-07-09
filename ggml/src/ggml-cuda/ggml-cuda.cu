@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-ssd-stream.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -5637,6 +5638,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    // SSD GPU landing: always offload a streamed-expert MUL_MAT_ID so its VRAM slot
+    // cache engages at decode (batch-1), without needing GGML_OP_OFFLOAD_MIN_BATCH=1.
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_ssd_stream_gpu_enabled() &&
+        op->src[0] != nullptr && ggml_ssd_stream_is_streamed(op->src[0])) {
+        return true;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }

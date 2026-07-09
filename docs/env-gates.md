@@ -43,10 +43,10 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 |---|---|---|---|
 | `LLAMA_SSD_STREAM_GPU` | bool | off | Enable the VRAM expert-slot cache + id->slot indirection. Requires `LLAMA_SSD_STREAM_BUFFER=1`. |
 | `LLAMA_SSD_STREAM_VRAM_BUDGET` | MiB | 4096 | **Total** VRAM budget for the slot pools. |
-| `LLAMA_SSD_STREAM_VRAM_POOLS` | count | 6 | How many expert-slice classes to split the budget across. Set to the model's actual class count for full utilization (e.g. **2 for DeepSeek-V4**: gate_up + down; 3-4 for mixed-quant UD models). Too high starves each pool. |
-| `LLAMA_SSD_STREAM_GPU_SLRU` | bool | on | Segmented-LRU (scan resistance) for the VRAM slot cache; `=0` forces plain LRU. SLRU raises the steady-state hit rate on skewed MoE routing. |
+| `LLAMA_SSD_STREAM_VRAM_POOLS` | count | auto | Override the number of expert-slice classes the budget is split across. **Auto-detected** from the model (e.g. 2 for DeepSeek-V4, 4 for mixed-quant UD Qwen); only set this to override. |
+| `LLAMA_SSD_STREAM_GPU_SLRU` | bool | on | Segmented-LRU (scan resistance) for the VRAM slot cache; `=0` forces plain LRU. (Measured neutral for DeepSeek; may help more-skewed models.) |
 | `LLAMA_SSD_STREAM_GPU_PROTECTED_PCT` | 0-100 | 80 | Protected-segment size for the VRAM SLRU. |
-| `GGML_OP_OFFLOAD_MIN_BATCH` | count | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload to the GPU. Set **=1** to force decode's expert matmul onto the GPU so GPU landing engages at batch-1. |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | count | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload to the GPU. **Not needed for GPU landing** - streamed-expert matmuls auto-offload at batch-1 when `LLAMA_SSD_STREAM_GPU=1`. |
 
 ## 3. Speculative decoding / MTP (tasks 1, 20)
 
@@ -133,17 +133,18 @@ Pure-CPU (no GPU) variant adds `LLAMA_SSD_STREAM_SERIAL=1` and `-ngl 0`.
 Best on models whose hot expert set fits the VRAM cache (big win: Qwen-35B-A3B
 2.5 -> 7 t/s). Note `VRAM_POOLS` should match the model's expert-slice classes:
 
-```sh
-# Qwen-35B-A3B: byte-exact, ~3x decode
--e LLAMA_SSD_STREAM_BUFFER=1 -e LLAMA_SSD_STREAM_BUDGET=24000 \
--e LLAMA_SSD_STREAM_GPU=1   -e LLAMA_SSD_STREAM_VRAM_BUDGET=6000 \
--e GGML_OP_OFFLOAD_MIN_BATCH=1
+Streamed-expert matmuls auto-offload to the GPU and the VRAM budget auto-splits
+across the model's expert-slice classes, so only the two budgets are needed:
 
-# DeepSeek-V4 (2 expert classes -> POOLS=2 for full cache utilization)
+```sh
+# Qwen-35B-A3B: cache covers the hot set -> big win (~9 t/s decode), byte-exact
 -e LLAMA_SSD_STREAM_BUFFER=1 -e LLAMA_SSD_STREAM_BUDGET=24000 \
--e LLAMA_SSD_STREAM_GPU=1   -e LLAMA_SSD_STREAM_VRAM_BUDGET=12000 \
--e LLAMA_SSD_STREAM_VRAM_POOLS=2 -e GGML_OP_OFFLOAD_MIN_BATCH=1 \
--e GGML_SSD_STREAM_DEBUG=1   # watch the GPU cache hit rate climb
+-e LLAMA_SSD_STREAM_GPU=1    -e LLAMA_SSD_STREAM_VRAM_BUDGET=6000
+
+# DeepSeek-V4 81GB (experts >> VRAM): break-even with CPU; watch the hit rate
+-e LLAMA_SSD_STREAM_BUFFER=1 -e LLAMA_SSD_STREAM_BUDGET=24000 \
+-e LLAMA_SSD_STREAM_GPU=1    -e LLAMA_SSD_STREAM_VRAM_BUDGET=12000 \
+-e GGML_SSD_STREAM_DEBUG=1
 ```
 
 ### 2-GPU tensor parallelism with fast NVLink AllReduce

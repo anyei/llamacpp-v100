@@ -12,6 +12,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -538,13 +539,24 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
     if (e.slots != nullptr) {
         return; // already allocated for this slice shape
     }
-    // The VRAM budget is TOTAL across all pools (a model may have several expert
-    // slice classes - gate/up/down, plus mixed quants in UD models). Give each
-    // pool an equal share of the budget divided by the expected pool count
-    // (LLAMA_SSD_STREAM_VRAM_POOLS, default 6: gate/up/down x up to 2 quant mixes).
-    static const int pools_hint = []{ const char * e = getenv("LLAMA_SSD_STREAM_VRAM_POOLS"); int v = e ? atoi(e) : 6; return v > 0 ? v : 6; }();
+    // The VRAM budget is TOTAL across all pools; give each pool an equal share.
+    // The number of pools = distinct expert-slice classes (ne0,ne1,type), auto-
+    // detected from the registered streamed tensors (all registered at load, before
+    // this runs at first compute). LLAMA_SSD_STREAM_VRAM_POOLS overrides the count.
+    int n_pools;
+    const char * ph = getenv("LLAMA_SSD_STREAM_VRAM_POOLS");
+    if (ph && atoi(ph) > 0) {
+        n_pools = atoi(ph);
+    } else {
+        std::set<gpu_pool_key> classes;
+        for (const auto & kv : st.registry) {
+            const ggml_tensor * t = kv.first;
+            classes.insert(gpu_pool_key{ t->ne[0], t->ne[1], (int) t->type });
+        }
+        n_pools = classes.empty() ? 1 : (int) classes.size();
+    }
     const size_t slice          = w->nb[2];
-    const size_t per_pool_bytes = st.gpu_vram_budget / (size_t) pools_hint;
+    const size_t per_pool_bytes = st.gpu_vram_budget / (size_t) n_pools;
     int k = slice ? (int) (per_pool_bytes / slice) : 0;
     if (k < 1) {
         k = 1;
@@ -572,9 +584,9 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
     e.k = k;
     e.pool.init(k, gpu_slru, gpu_pct);
     e.logged = true;
-    GGML_LOG_INFO("ggml_ssd_stream: GPU slot pool [%lldx%lld %s] K=%d slots (%.2f GB VRAM)\n",
+    GGML_LOG_INFO("ggml_ssd_stream: GPU slot pool [%lldx%lld %s] K=%d slots (%.2f GB VRAM, 1/%d classes)\n",
             (long long) w->ne[0], (long long) w->ne[1], ggml_type_name(w->type), k,
-            (double) k * slice / 1e9);
+            (double) k * slice / 1e9, n_pools);
 }
 
 const ggml_tensor * ggml_ssd_stream_gpu_orig_ids(const ggml_tensor * node, const ggml_tensor * cur_ids) {
