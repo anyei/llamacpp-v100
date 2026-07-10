@@ -98,6 +98,36 @@ registry's garbage collector (deletes are enabled):
 docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml
 ```
 
+### 1c. Fast iteration: incremental builds in a dev container
+
+The image build is a clean rebuild every time (§1). For a code-compile-test loop that
+is *seconds* (CPU) / *minutes-once-then-seconds* (CUDA), run a persistent dev container
+with the repo mounted read-only and an out-of-tree build dir (validated 2026-07-10 —
+the whole RPC feature batch was developed this way):
+
+```bash
+# CPU loop (arg parsing, RPC protocol, anything backend-agnostic):
+docker run -d --name llama-devcpu --network host \
+  -v "$PWD":/src:ro -v /path/to/work:/work \
+  -v /mnt/models/ollama37-k80/.ollama/custom-models:/models:ro \
+  ubuntu:24.04 sleep infinity
+docker exec llama-devcpu bash -c 'apt-get update -qq && apt-get install -y -qq build-essential cmake git'
+docker exec llama-devcpu bash -c 'cmake -S /src -B /work/build-cpu -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF && \
+  cmake --build /work/build-cpu --target llama-cli ggml-rpc-server -j $(nproc)'
+
+# CUDA loop: same pattern with the devel base image (already pulled) + --gpus all:
+#   nvidia/cuda:12.8.1-devel-ubuntu24.04, cmake flags from .devops/cuda.Dockerfile
+#   (-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_NATIVE=ON; skip
+#   GGML_CUDA_FA_ALL_QUANTS unless testing quantized-KV FA — it dominates compile time)
+```
+
+Traps: `pkill -f ggml-rpc-server` from a `docker exec bash -c` kills the exec shell
+itself (the pattern matches its own command line) — anchor it
+(`pkill -f "^/work/build-cpu/bin/ggml-rpc-server"`). Background a server with
+`docker exec -d`, never `nohup ... &` inside a foreground exec. These containers are
+throwaway — the real gate before commit is still the production image build (§1).
+
 ---
 
 ## 2. Models & data
