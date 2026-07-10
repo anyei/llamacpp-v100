@@ -45,11 +45,31 @@ The lifecycle of a coordinator + RPC worker, with real sizes:
                                                        ▼
                                                   /cache volume
 
+ ①b FIRST LOAD, worker has its own copy ── nothing big ever crosses
+    (rpc-server --model-dir /models — the worker indexed its GGUFs by
+     tensor-content hash at startup)
+
+    ┌──────────┐                                ┌───────────────┐
+    │ GGUF on  │ ── SET_TENSOR_HASH (~KB) ─────▶│ hash in local │
+    │ disk     │                                │ model index?  │
+    └──────────┘                                └──────┬────────┘
+                                            hit        │        miss (stale /
+                                    ┌───────────────┐  │        different file)
+                                    │ worker's own  │◀─┤
+                                    │ .gguf ── pread│  └──▶ falls back to the
+                                    │ at NVMe speed │       ① stream for that
+                                    └──────┬────────┘       tensor only
+                                           ▼
+                                      worker RAM / VRAM
+    23 GB slice: ~3.5 min of ① streaming becomes seconds of local reads;
+    the coordinator can't even tell the difference
+
  ②  EVERY LATER LOAD ── hashes only, weights come from the worker's disk
     ┌──────────┐                                ┌───────────────┐
     │ GGUF     │ ── SET_TENSOR_HASH (~KB) ─────▶│ "have it"     │
     └──────────┘                                │ load /cache   │
-                                                └───────────────┘
+    (same story with --model-dir: the local     └───────────────┘
+     index serves whatever the /cache misses)
 
  ③  INFERENCE ── per token, only boundary tensors cross
     ┌──────────┐    activations (KB-tens of KB) ┌───────────────┐
@@ -67,6 +87,18 @@ The lifecycle of a coordinator + RPC worker, with real sizes:
    layers on the worker) sends the entire model (23 GB for the 35B ≈ ~3.5 min
    on GbE); a layer split (`-sm layer -ts …`) sends only the worker's slice.
    The worker never needs the model file.
+
+   **1b. Worker-local models (`--model-dir`) — even the first stream disappears.**
+   If the worker box has its own copy of the GGUF (any directory of GGUFs),
+   `rpc-server --model-dir <dir>` indexes every tensor by content hash at
+   startup (one read of each file, ~seconds/10 GB on NVMe; the index persists
+   in the cache dir, so later starts are instant). The coordinator's
+   `SET_TENSOR_HASH` then hits the index and the worker preads the bytes from
+   its *own* GGUF instead of receiving the stream — first load at local-disk
+   speed instead of network speed. Every read is re-hash-verified, and a
+   stale or different local file simply hash-misses and streams as before —
+   there is no version-skew failure mode, and the coordinator cannot tell the
+   difference.
 
 2. **Worker weight cache — the transfer happens only once.** With `-c` (and
    `LLAMA_CACHE=/cache` + a volume in a container), the worker hashes and
@@ -214,7 +246,10 @@ Combined with `--rpc-skip-unavailable` for the static part of the list, the
 fleet is fully dynamic: whoever is present at load time gets used, nobody
 missing blocks startup. `--rpc-discover-group ADDR:PORT` selects a custom
 multicast group. Trusted networks only — beacons are unauthenticated, like
-the RPC protocol itself.
+the RPC protocol itself. Compose reference:
+`docker-compose.fleet-coordinator.yml` (discovery + skip-unavailable + an
+optional static list), paired with the `docker-compose.rpc-worker*.yml`
+workers, which all `--announce` by default.
 
 ## 3. What to expect (measured, loopback worst case)
 

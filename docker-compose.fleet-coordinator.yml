@@ -1,0 +1,51 @@
+# Fleet coordinator — serves a model across whatever RPC workers are PRESENT on the
+# LAN right now, discovered dynamically (TASKS.md #29a/#29d; guide §2 "Dynamic fleets").
+#
+#   docker compose -f docker-compose.fleet-coordinator.yml up -d
+#
+# How it composes:
+#   - workers run with --announce (all docker-compose.rpc-worker*.yml do by default) and
+#     beacon their presence over UDP multicast every ~2 s;
+#   - LLAMA_ARG_RPC_DISCOVER makes this coordinator listen ~2.5 s at startup and use
+#     every worker it hears — laptops that are off simply don't get layers;
+#   - LLAMA_ARG_RPC_SKIP_UNAVAILABLE covers the race where a worker vanishes between
+#     its last beacon and the connect (and any static COORD_RPC list entries below).
+#
+# Optional static workers on top of discovery: COORD_RPC=host:port,host:port
+# (duplicates against discovered workers are skipped automatically).
+#
+# NOTE: discovery re-runs only at startup — `docker compose restart` after the fleet
+# changes. The default memory-proportional split then recomputes over whoever answered.
+#
+# SECURITY: beacons and the RPC protocol are unauthenticated — private LAN only.
+services:
+  llama-fleet-coordinator:
+    container_name: llama-fleet-coordinator
+    image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
+    network_mode: host              # multicast discovery + direct worker sockets
+    volumes:
+      - ${MODELS_DIR:-/mnt/models/ollama37-k80/.ollama/custom-models}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # which local GPUs join the pipeline alongside the discovered workers;
+      # empty = pure orchestration, every layer goes to the fleet
+      - CUDA_VISIBLE_DEVICES=${COORD_GPUS:-0,1}
+      - LLAMA_ARG_RPC_DISCOVER=1
+      - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
+      # optional static workers in addition to discovery (comma-separated host:port)
+      - LLAMA_ARG_RPC=${COORD_RPC:-}
+    command: >
+      -m ${COORD_MODEL:-/models/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}
+      --host 0.0.0.0
+      --port ${COORD_PORT:-8090}
+      -ngl 99
+      -sm layer
+      -c ${COORD_CTX:-16384}
+      --no-mmap
+    restart: unless-stopped

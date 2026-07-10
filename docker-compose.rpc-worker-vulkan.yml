@@ -30,8 +30,12 @@ services:
       - ./cache-rpc:/cache
     environment:
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+    # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
+    # coordinator with --rpc-discover finds this worker without a static --rpc list.
+    # Remove the flag to opt out; --announce-group ADDR:PORT to use a custom group.
     command: >
       -H ${WORKER_BIND:-0.0.0.0}
       -p ${WORKER_PORT:-50052}
       -c
+      --announce
     restart: always

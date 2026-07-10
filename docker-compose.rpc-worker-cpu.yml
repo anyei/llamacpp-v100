@@ -30,9 +30,13 @@ services:
     # (half the cores) measured FASTER than all-cores on loopback (7.7 vs 7.0
     # t/s, 35B A3B) — oversubscription hurts. On a dedicated worker box, sweep
     # half/physical/all and keep the winner.
+    # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
+    # coordinator with --rpc-discover finds this worker without a static --rpc list.
+    # Remove the flag to opt out; --announce-group ADDR:PORT to use a custom group.
     command: >
       -H ${WORKER_BIND:-0.0.0.0}
       -p ${WORKER_PORT:-50052}
       -t ${WORKER_THREADS:-8}
       -c
+      --announce
     restart: always

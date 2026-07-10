@@ -956,8 +956,14 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
 
 static void add_rpc_devices(const std::string & servers, bool skip_unavailable) {
     auto rpc_servers = string_split<std::string>(servers, ',');
+    // drop empty entries (trailing commas, or an empty LLAMA_ARG_RPC= from a compose
+    // file whose static-workers variable is unset) — an all-empty list is a no-op
+    rpc_servers.erase(std::remove_if(rpc_servers.begin(), rpc_servers.end(),
+                                     [](const std::string & s) { return s.empty(); }),
+                      rpc_servers.end());
     if (rpc_servers.empty()) {
-        throw std::invalid_argument("no RPC servers specified");
+        LOG_WRN("--rpc/LLAMA_ARG_RPC is empty, no RPC servers added\n");
+        return;
     }
     ggml_backend_load_all();
     ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
