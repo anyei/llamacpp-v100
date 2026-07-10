@@ -2448,6 +2448,64 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     }
 }
 
+// LAN presence beacon + discovery (TASKS.md #29d). The payload is a single
+// versioned text line; the coordinator derives the worker's IP from the
+// datagram source address, so only the port needs to be advertised.
+static constexpr const char * RPC_ANNOUNCE_MAGIC = "llama.cpp-rpc/1";
+
+bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
+                                      size_t n_devices, ggml_backend_dev_t * devices) {
+    std::string host;
+    int port = 0;
+    if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR("invalid endpoint '%s'\n", endpoint);
+        return false;
+    }
+    std::vector<ggml_backend_dev_t> devs(devices, devices + n_devices);
+    auto make_payload = [port, devs]() {
+        size_t free_total = 0;
+        for (auto dev : devs) {
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            free_total += free;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s port=%d proto=%d.%d devs=%zu free_mib=%zu",
+                 RPC_ANNOUNCE_MAGIC, port, RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION,
+                 devs.size(), free_total / (1024 * 1024));
+        return std::string(buf);
+    };
+    return rpc_announce_start(group, host.c_str(), std::move(make_payload));
+}
+
+int ggml_backend_rpc_discover(const char * group, int timeout_ms,
+                              void (*cb)(const char * endpoint, const char * payload, void * user_data),
+                              void * user_data) {
+    const auto found = rpc_discover_listen(group, timeout_ms);
+    const std::string magic  = std::string(RPC_ANNOUNCE_MAGIC) + " ";
+    std::unordered_set<std::string> endpoints;
+    int n = 0;
+    for (const auto & [ip, payload] : found) {
+        if (payload.compare(0, magic.size(), magic) != 0) {
+            continue; // not a worker beacon
+        }
+        const size_t pos = payload.find(" port=");
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const int port = atoi(payload.c_str() + pos + 6);
+        if (port <= 0 || port > 65535) {
+            continue;
+        }
+        const std::string endpoint = ip + ":" + std::to_string(port);
+        if (endpoints.insert(endpoint).second) {
+            cb(endpoint.c_str(), payload.c_str(), user_data);
+            n++;
+        }
+    }
+    return n;
+}
+
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
@@ -2615,6 +2673,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
         // rpc-server resolves this via the registry (a direct call would leave
         // the tool with an undefined symbol when GGML_BACKEND_DL=ON)
         return (void *)ggml_backend_rpc_split_state_lookup;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_start_announcer") == 0) {
+        return (void *)ggml_backend_rpc_start_announcer;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_discover") == 0) {
+        return (void *)ggml_backend_rpc_discover;
     }
     return NULL;
 

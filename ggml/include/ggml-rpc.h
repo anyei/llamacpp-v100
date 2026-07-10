@@ -44,6 +44,18 @@ GGML_BACKEND_API bool ggml_backend_rpc_split_state_lookup(const char * name, str
 // remote tensor-parallel island of N GPUs that needs split states uploaded.
 GGML_BACKEND_API const char * ggml_backend_rpc_dev_endpoint(ggml_backend_dev_t dev);
 
+// LAN presence beacon + discovery over UDP multicast (opt-in, trusted networks only —
+// the beacon egress is pinned to the interface the RPC endpoint is bound to).
+// group syntax "ADDR:PORT"; NULL selects the built-in default group.
+// worker side: announce this rpc-server every ~2 s so coordinators can discover it.
+GGML_BACKEND_API bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
+                                                       size_t n_devices, ggml_backend_dev_t * devices);
+// coordinator side: listen for worker beacons for timeout_ms; cb fires once per unique
+// endpoint ("ip:port", with the beacon's payload line). returns the number of workers found.
+GGML_BACKEND_API int ggml_backend_rpc_discover(const char * group, int timeout_ms,
+                                               void (*cb)(const char * endpoint, const char * payload, void * user_data),
+                                               void * user_data);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -117,6 +117,12 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
 - `--tensor-parallel` requires >= 2 local GPUs; the worker prints
   `tensor-parallel island: N devices exposed as one` and advertises itself
   as `Meta[N](...)`. NCCL/P2P AllReduce runs worker-locally between its GPUs.
+- `-a`/`--announce` (opt-in) broadcasts a presence beacon every ~2 s over UDP
+  multicast so a coordinator running `--rpc-discover` finds this worker
+  without a hard-coded `--rpc` list. The beacon egress is pinned to the
+  interface of `-H`, so it never widens exposure beyond where the RPC port
+  already listens. `--announce-group ADDR:PORT` overrides the default group
+  (must match the coordinator's `--rpc-discover-group`).
 - The model file is only needed on the coordinator.
 
 **SECURITY**: the RPC protocol has no authentication or TLS. Bind only to a
@@ -188,6 +194,17 @@ mirrored weights: still correct, but no memory savings.
 
 `-ts` splits by memory across devices as usual; an island counts as one
 device with the combined VRAM of its GPUs.
+
+**Dynamic fleets** (workers come and go): instead of — or alongside — a
+static `--rpc` list, pass `--rpc-discover` and start the workers with
+`--announce`. The coordinator listens for beacons for ~2.5 s at startup,
+registers every worker it hears (duplicates against `--rpc` are skipped),
+and warns-and-continues if a discovered worker vanished before connect.
+Combined with `--rpc-skip-unavailable` for the static part of the list, the
+fleet is fully dynamic: whoever is present at load time gets used, nobody
+missing blocks startup. `--rpc-discover-group ADDR:PORT` selects a custom
+multicast group. Trusted networks only — beacons are unauthenticated, like
+the RPC protocol itself.
 
 ## 3. What to expect (measured, loopback worst case)
 

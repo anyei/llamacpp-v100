@@ -2,7 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -32,3 +36,16 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
+
+// LAN presence beacon + discovery over UDP multicast (TASKS.md #29d).
+// No auth — trusted private networks only, like the RPC protocol itself.
+// group syntax: "ADDR:PORT"; nullptr/empty selects RPC_DISCOVER_GROUP_DEFAULT.
+static constexpr const char * RPC_DISCOVER_GROUP_DEFAULT = "239.255.77.99:50153";
+
+// worker side: detached thread multicasts make_payload() every ~2 s.
+// iface_host selects the egress interface — pass the rpc-server bind host so the
+// beacon never leaves the interface the RPC port itself is on ("0.0.0.0" => OS default).
+bool rpc_announce_start(const char * group, const char * iface_host, std::function<std::string()> make_payload);
+
+// coordinator side: listen on the group for timeout_ms; returns unique (src_ip, payload) pairs.
+std::vector<std::pair<std::string, std::string>> rpc_discover_listen(const char * group, int timeout_ms);

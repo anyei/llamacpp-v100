@@ -174,6 +174,8 @@ struct rpc_server_params {
     int                      port        = 50052;
     bool                     use_cache   = false;
     bool                     tensor_parallel = false;
+    bool                     announce    = false;
+    std::string              announce_group; // empty = built-in default multicast group
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -189,6 +191,9 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "  -tp, --tensor-parallel           expose all local GPUs as one tensor-parallel device\n");
     fprintf(stderr, "                                   (TP island; coordinator must upload split states)\n");
+    fprintf(stderr, "  -a, --announce                   announce this worker on the LAN via UDP multicast so\n");
+    fprintf(stderr, "                                   coordinators with --rpc-discover find it (trusted networks only)\n");
+    fprintf(stderr, "  --announce-group ADDR:PORT       multicast group for --announce (default: built-in group)\n");
     fprintf(stderr, "\n");
 }
 
@@ -238,6 +243,14 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.use_cache = true;
         } else if (arg == "-tp" || arg == "--tensor-parallel") {
             params.tensor_parallel = true;
+        } else if (arg == "-a" || arg == "--announce") {
+            params.announce = true;
+        } else if (arg == "--announce-group") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.announce = true;
+            params.announce_group = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -389,6 +402,21 @@ int main(int argc, char * argv[]) {
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
+    }
+
+    if (params.announce) {
+        auto start_announcer_fn = (decltype(ggml_backend_rpc_start_announcer)*)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_announcer");
+        if (start_announcer_fn == nullptr) {
+            fprintf(stderr, "Failed to obtain RPC backend announcer function, --announce disabled\n");
+        } else if (start_announcer_fn(endpoint.c_str(),
+                                      params.announce_group.empty() ? nullptr : params.announce_group.c_str(),
+                                      devices.size(), devices.data())) {
+            fprintf(stderr, "announcing this worker on multicast group %s (trusted networks only)\n",
+                    params.announce_group.empty() ? "(default)" : params.announce_group.c_str());
+        } else {
+            fprintf(stderr, "warning: failed to start the LAN announcer, continuing without it\n");
+        }
     }
 
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());

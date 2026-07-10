@@ -578,6 +578,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // CLI argument parsing functions
 //
 
+static void discover_rpc_devices(const std::string & group);
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -704,6 +706,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse the first time to get -hf option (used for remote preset)
     parse_cli_args();
+
+    // runs after parsing so it composes with --rpc/--rpc-skip-unavailable in any order
+    if (params.rpc_discover) {
+        discover_rpc_devices(params.rpc_discover_group);
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -962,10 +969,18 @@ static void add_rpc_devices(const std::string & servers, bool skip_unavailable) 
     if (!ggml_backend_rpc_add_server_fn) {
         throw std::invalid_argument("failed to find RPC add server function");
     }
+    // endpoints already registered this process — a duplicate (e.g. the same worker in
+    // --rpc AND discovered via --rpc-discover) would register the same backend reg twice
+    static std::set<std::string> registered;
     std::vector<std::string> unavailable;
     for (const auto & server : rpc_servers) {
+        if (!registered.insert(server).second) {
+            LOG_INF("RPC server '%s' already registered, skipping duplicate\n", server.c_str());
+            continue;
+        }
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         if (reg == nullptr) {
+            registered.erase(server); // not actually registered — allow a later retry
             if (skip_unavailable) {
                 LOG_WRN("RPC server '%s' is unreachable, skipping it\n", server.c_str());
                 unavailable.push_back(server);
@@ -988,6 +1003,44 @@ static void add_rpc_devices(const std::string & servers, bool skip_unavailable) 
         }
         LOG_WRN("note: an explicit -ts/--tensor-split maps to devices positionally and will NOT account for the dropped servers\n");
     }
+}
+
+// listen for rpc-server --announce beacons and register whoever is present (TASKS.md #29d)
+static void discover_rpc_devices(const std::string & group) {
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef int (*ggml_backend_rpc_discover_t)(const char * group, int timeout_ms,
+        void (*cb)(const char * endpoint, const char * payload, void * user_data), void * user_data);
+    auto discover_fn = (ggml_backend_rpc_discover_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_discover");
+    if (!discover_fn) {
+        throw std::invalid_argument("failed to find RPC discover function");
+    }
+    const int window_ms = 2500; // must exceed the worker beacon period (~2 s)
+    LOG_INF("discovering RPC workers on multicast group %s for %.1f s...\n",
+            group.empty() ? "(default)" : group.c_str(), window_ms / 1000.0f);
+    std::vector<std::pair<std::string, std::string>> found;
+    discover_fn(group.empty() ? nullptr : group.c_str(), window_ms,
+        [](const char * endpoint, const char * payload, void * ud) {
+            auto * v = (std::vector<std::pair<std::string, std::string>> *) ud;
+            v->emplace_back(endpoint, payload);
+        }, &found);
+    if (found.empty()) {
+        LOG_WRN("no RPC workers discovered, continuing without them\n");
+        return;
+    }
+    std::string servers;
+    for (const auto & [endpoint, payload] : found) {
+        LOG_INF("discovered RPC worker %s (%s)\n", endpoint.c_str(), payload.c_str());
+        if (!servers.empty()) {
+            servers += ',';
+        }
+        servers += endpoint;
+    }
+    // a worker can vanish between its last beacon and the connect — always skip, never abort
+    add_rpc_devices(servers, /*skip_unavailable=*/ true);
 }
 
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
@@ -2433,6 +2486,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 add_rpc_devices(value, params.rpc_skip_unavailable);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--rpc-discover"},
+            "discover RPC workers announcing themselves on the LAN (rpc-server --announce) and use them; composes with --rpc (duplicates are skipped). Trusted networks only",
+            [](common_params & params) {
+                params.rpc_discover = true;
+            }
+        ).set_env("LLAMA_ARG_RPC_DISCOVER"));
+        add_opt(common_arg(
+            {"--rpc-discover-group"}, "ADDR:PORT",
+            "multicast group for --rpc-discover (default: the built-in group; must match the workers' --announce-group)",
+            [](common_params & params, const std::string & value) {
+                params.rpc_discover       = true;
+                params.rpc_discover_group = value;
+            }
+        ).set_env("LLAMA_ARG_RPC_DISCOVER_GROUP"));
     }
     add_opt(common_arg(
         {"--mlock"},

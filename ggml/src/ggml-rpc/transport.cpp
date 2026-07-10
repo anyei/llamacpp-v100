@@ -17,9 +17,12 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #endif
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -680,4 +683,161 @@ void rpc_transport_shutdown() {
     WSACleanup();
     g_rpc_transport_wsa_started = false;
 #endif
+}
+
+//
+// LAN presence beacon + discovery (UDP multicast, TASKS.md #29d)
+//
+
+static void rpc_close_fd(sockfd_t fd) {
+#ifdef _WIN32
+    if (fd != INVALID_SOCKET) closesocket(fd);
+#else
+    if (fd >= 0) close(fd);
+#endif
+}
+
+static bool rpc_parse_group(const char * group, std::string & addr, int & port) {
+    if (group == nullptr || group[0] == '\0') {
+        group = RPC_DISCOVER_GROUP_DEFAULT;
+    }
+    const char * colon = strrchr(group, ':');
+    if (colon == nullptr) {
+        return false;
+    }
+    addr.assign(group, colon - group);
+    port = atoi(colon + 1);
+    if (port <= 0 || port > 65535 || inet_addr(addr.c_str()) == INADDR_NONE) {
+        return false;
+    }
+    return true;
+}
+
+bool rpc_announce_start(const char * group, const char * iface_host, std::function<std::string()> make_payload) {
+    if (!rpc_transport_init()) {
+        return false;
+    }
+    std::string gaddr;
+    int gport = 0;
+    if (!rpc_parse_group(group, gaddr, gport)) {
+        GGML_LOG_ERROR("invalid multicast group '%s' (expected ADDR:PORT)\n", group ? group : "");
+        return false;
+    }
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family      = AF_INET;
+    dst.sin_addr.s_addr = inet_addr(gaddr.c_str());
+    dst.sin_port        = htons(gport);
+
+    sockfd_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (!is_valid_fd(fd)) {
+        return false;
+    }
+    // LAN-only scope; loop enabled so a coordinator on the same host hears the beacon
+    int ttl = 1;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL,  (const char *) &ttl,  sizeof(ttl));
+    int loop = 1;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, (const char *) &loop, sizeof(loop));
+    // keep the beacon on the interface the RPC port is bound to — discovery must not
+    // widen exposure beyond where the server already listens
+    if (iface_host != nullptr && strcmp(iface_host, "0.0.0.0") != 0) {
+        struct in_addr ifaddr;
+        ifaddr.s_addr = inet_addr(iface_host);
+        if (ifaddr.s_addr != INADDR_NONE) {
+            setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, (const char *) &ifaddr, sizeof(ifaddr));
+        }
+    }
+    std::thread([fd, dst, gaddr, gport, make_payload]() {
+        for (;;) {
+            const std::string payload = make_payload();
+            const ssize_t n = sendto(fd, payload.c_str(), payload.size(), 0, (const struct sockaddr *) &dst, sizeof(dst));
+            if (n < 0) {
+                LOG_DBG("[announce] sendto %s:%d failed\n", gaddr.c_str(), gport);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        }
+    }).detach();
+    return true;
+}
+
+std::vector<std::pair<std::string, std::string>> rpc_discover_listen(const char * group, int timeout_ms) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (!rpc_transport_init()) {
+        return out;
+    }
+    std::string gaddr;
+    int gport = 0;
+    if (!rpc_parse_group(group, gaddr, gport)) {
+        GGML_LOG_ERROR("invalid multicast group '%s' (expected ADDR:PORT)\n", group ? group : "");
+        return out;
+    }
+    sockfd_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (!is_valid_fd(fd)) {
+        return out;
+    }
+    set_reuse_addr(fd); // several coordinators may listen on one box
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family      = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind_addr.sin_port        = htons(gport);
+    if (bind(fd, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) < 0) {
+        GGML_LOG_ERROR("failed to bind discovery socket to port %d\n", gport);
+        rpc_close_fd(fd);
+        return out;
+    }
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    mreq.imr_multiaddr.s_addr = inet_addr(gaddr.c_str());
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq, sizeof(mreq)) < 0) {
+        GGML_LOG_ERROR("failed to join multicast group %s\n", gaddr.c_str());
+        rpc_close_fd(fd);
+        return out;
+    }
+    // also join via loopback (best effort) so same-host workers bound to 127.0.0.1 are heard
+    struct ip_mreq mreq_lo = mreq;
+    mreq_lo.imr_interface.s_addr = inet_addr("127.0.0.1");
+    setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq_lo, sizeof(mreq_lo));
+
+    // poll in short slices until the window closes
+#ifdef _WIN32
+    DWORD tv = 200;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 200 * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv));
+#endif
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    char buf[512];
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct sockaddr_in src;
+        memset(&src, 0, sizeof(src));
+#ifdef _WIN32
+        int src_len = sizeof(src);
+#else
+        socklen_t src_len = sizeof(src);
+#endif
+        const ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *) &src, &src_len);
+        if (n <= 0) {
+            continue;
+        }
+        buf[n] = '\0';
+        const std::string ip      = inet_ntoa(src.sin_addr);
+        const std::string payload = buf;
+        bool seen = false;
+        for (const auto & p : out) {
+            if (p.first == ip && p.second == payload) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            out.emplace_back(ip, payload);
+        }
+    }
+    rpc_close_fd(fd);
+    return out;
 }
