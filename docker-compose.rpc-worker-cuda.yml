@@ -12,6 +12,10 @@
 # The coordinator connects the same as any worker:
 #   --rpc <workerhost>:50052 -sm layer -ngl 99
 #
+# GTX 16xx note (TU116/117, e.g. 1660 Ti): pass -fa off on the COORDINATOR -
+# these cards are cc 7.5 without tensor cores and the FA MMA kernel crashes
+# the worker (TASKS.md #32).
+#
 # VRAM note: layers assigned to this worker must fit its VRAM (e.g. a 6 GB
 # 1660 Ti holds ~a quarter of a 23 GB model — weight the split with -ts, or
 # run a small model whole). To expose the box's CPU alongside the GPU as a

@@ -355,3 +355,8 @@ Everything here is automatic — no new flags on the happy path:
 - No fault tolerance: a dead worker aborts the coordinator. No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
+- **GTX 16xx workers (TU116/117) need `-fa off` on the coordinator**: those
+  cards are cc 7.5 WITHOUT tensor cores, and the flash-attention MMA kernel
+  selected by CC crashes the worker (`cudaFuncSetAttribute: invalid
+  argument`, TASKS.md #32). Verified: 35B layers on a 1660 Ti run fine with
+  `-fa off` and crash the worker with FA on.
