@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -58,6 +59,9 @@ struct slice_node {
     slice_key key;
     void *    addr;
     size_t    len;
+    // fill-pass epoch: slices touched in the CURRENT pass are pinned against
+    // eviction (their pages are queued for copy/H2D within this pass).
+    uint64_t  pass = 0;
 };
 
 // index entry: which segment the slice lives in, and its node iterator.
@@ -115,6 +119,9 @@ struct ssd_stream_state {
     // stats
     uint64_t n_hit = 0, n_miss = 0, n_evict = 0, n_promote = 0, bytes_read = 0;
     uint64_t gpu_hit = 0, gpu_miss = 0; // VRAM slot-cache hits/misses (GPU landing)
+    // current fill-pass epoch (see slice_node::pass) + one-shot overshoot warning
+    uint64_t cur_pass = 0;
+    bool     overshoot_warned = false;
     // (3.3 profiling, GGML_SSD_STREAM_DEBUG) miss-path time split: wall-clock ns
     // blocked in ssd_touch (RAM lookup / SSD pread) vs issuing the H2D copy.
     uint64_t gpu_read_ns = 0, gpu_h2d_ns = 0;
@@ -191,19 +198,21 @@ static bool ssd_pread_odirect(int fd, void * dst, size_t len, size_t off,
 }
 
 // read [off, off+len) from fd into dst (serial path; uses the shared bounce).
-// Caller holds the mutex.
+// Caller holds the mutex. A failed read ABORTS: the slice is about to be
+// inserted as resident and its pages consumed by compute - continuing would
+// serve garbage weights silently and the poisoned entry would persist until
+// eviction. A disk error mid-stream is not recoverable here.
 void ssd_pread_full(int fd, void * dst, size_t len, size_t off) {
 #ifdef GGML_SSD_STREAM_SUPPORTED
     auto & st = g_state;
-    if (!st.odirect) {
-        if (ssd_pread_buffered(fd, (char *) dst, len, off)) {
-            st.bytes_read += len;
-        }
-        return;
+    const bool ok = st.odirect
+        ? ssd_pread_odirect(fd, dst, len, off, &st.bounce, &st.bounce_cap, st.page_size)
+        : ssd_pread_buffered(fd, (char *) dst, len, off);
+    if (!ok) {
+        GGML_ABORT("ggml_ssd_stream: disk read failed (fd=%d off=%zu len=%zu) - "
+                   "cannot continue safely with unfilled expert weights", fd, off, len);
     }
-    if (ssd_pread_odirect(fd, dst, len, off, &st.bounce, &st.bounce_cap, st.page_size)) {
-        st.bytes_read += len;
-    }
+    st.bytes_read += len;
 #else
     GGML_UNUSED(fd); GGML_UNUSED(dst); GGML_UNUSED(len); GGML_UNUSED(off);
 #endif
@@ -263,28 +272,48 @@ bool ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
         } else {
             st.probation.splice(st.probation.begin(), st.probation, ref.it); // plain LRU: -> MRU
         }
+        ref.it->pass = st.cur_pass; // pin: this pass reads these pages after the loop
         st.n_hit++;
         return false; // resident: no read needed
     }
     // miss: evict the probation LRU tail (then protected tail as a last resort)
-    // until the new slice fits the budget.
-    while (st.resident_bytes + len > st.budget_bytes &&
-           (!st.probation.empty() || !st.protectd.empty())) {
-        const bool from_prot = st.probation.empty();
-        std::list<slice_node> & seg = from_prot ? st.protectd : st.probation;
-        auto tail = std::prev(seg.end());
+    // until the new slice fits the budget. Slices touched in the CURRENT pass are
+    // pinned: their pages are read by copy_experts/H2D after this loop, and a
+    // touched node always sits at its segment's MRU front - so a current-pass
+    // node at the TAIL means everything left is pinned. Evicting it would
+    // MADV_DONTNEED pages queued for copy (silent zeroed experts); overshoot the
+    // budget for the rest of the pass instead, and say so once.
+    while (st.resident_bytes + len > st.budget_bytes) {
+        std::list<slice_node> * seg = nullptr;
+        if (!st.probation.empty() && st.probation.back().pass != st.cur_pass) {
+            seg = &st.probation;
+        } else if (!st.protectd.empty() && st.protectd.back().pass != st.cur_pass) {
+            seg = &st.protectd;
+        }
+        if (seg == nullptr) {
+            if (!st.overshoot_warned) {
+                GGML_LOG_WARN("ggml_ssd_stream: one fill pass needs more than the %zu MiB budget "
+                        "(a single node's expert working set exceeds it); temporarily overshooting "
+                        "instead of corrupting - raise LLAMA_SSD_STREAM_BUDGET to silence this\n",
+                        st.budget_bytes / (1024*1024));
+                st.overshoot_warned = true;
+            }
+            break;
+        }
+        const bool from_prot = seg == &st.protectd;
+        auto tail = std::prev(seg->end());
         ssd_evict(*tail);
         st.resident_bytes -= tail->len;
         if (from_prot) {
             st.protected_bytes -= tail->len;
         }
         st.index.erase(tail->key);
-        seg.pop_back();
+        seg->pop_back();
     }
     if (!defer_read) {
         ssd_pread_full(fd, addr, len, file_off);
     }
-    st.probation.push_front(slice_node{ key, addr, len });
+    st.probation.push_front(slice_node{ key, addr, len, st.cur_pass });
     st.index[key] = slice_ref{ false, st.probation.begin() };
     st.resident_bytes += len;
     st.n_miss++;
@@ -703,6 +732,7 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         return false;
     }
     std::lock_guard<std::mutex> lock(g_state.mutex);
+    g_state.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     const gpu_pool_key key{ input->ne[0], input->ne[1], (int) input->type, (const void *) backend };
     auto pit = g_gpu_pools.find(key);
     if (pit == g_gpu_pools.end() || pit->second.slots == nullptr || pit->second.k <= 0) {
@@ -778,14 +808,16 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
             g_state.rbufs.resize(nt, nullptr);
             g_state.rbuf_caps.resize(nt, 0);
         }
+        std::atomic<bool> read_failed{false};
         auto worker = [&](int wi) {
             for (size_t j = (size_t) wi; j < reads.size(); j += (size_t) nt) {
                 const read_task & t = reads[j];
-                if (g_state.odirect) {
-                    ssd_pread_odirect(t.fd, t.dst, t.len, t.off,
-                            &g_state.rbufs[wi], &g_state.rbuf_caps[wi], g_state.page_size);
-                } else {
-                    ssd_pread_buffered(t.fd, t.dst, t.len, t.off);
+                const bool ok = g_state.odirect
+                    ? ssd_pread_odirect(t.fd, t.dst, t.len, t.off,
+                            &g_state.rbufs[wi], &g_state.rbuf_caps[wi], g_state.page_size)
+                    : ssd_pread_buffered(t.fd, t.dst, t.len, t.off);
+                if (!ok) {
+                    read_failed.store(true, std::memory_order_relaxed);
                 }
             }
         };
@@ -794,6 +826,12 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         for (int wi = 1; wi < nt; ++wi) pool.emplace_back(worker, wi);
         worker(0);
         for (auto & th : pool) th.join();
+        if (read_failed.load()) {
+            // same rationale as ssd_pread_full: the slices are already marked
+            // resident and phase 3 would H2D unfilled pages - fail loudly.
+            GGML_ABORT("ggml_ssd_stream: disk read failed in a parallel miss-read worker - "
+                       "cannot continue safely with unfilled expert weights");
+        }
         for (const read_task & t : reads) g_state.bytes_read += t.len;
     }
     auto tp2 = std::chrono::steady_clock::now();
@@ -803,6 +841,14 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         ggml_backend_tensor_set_async(backend, pe.slots,
                 (const char *) input->data + (size_t) m.first * slice,
                 (size_t) m.second * slice, slice);
+    }
+    if (!misses.empty()) {
+        // Defensive: the async H2D reads arena pages that a LATER pass may evict
+        // (MADV_DONTNEED) - pinning only protects the CURRENT pass. Complete the
+        // copies before the pins are released. (Note: this did NOT explain the
+        // deterministic PPL drift observed at a 48 MB budget - see TASKS.md #23
+        // residual - but the ordering hazard is real, so the sync stays.)
+        ggml_backend_synchronize(backend);
     }
     if (prof) {
         auto tp3 = std::chrono::steady_clock::now();
@@ -935,6 +981,7 @@ void ggml_ssd_stream_prefill_experts(const ggml_tensor * w, const uint32_t * use
     }
     auto & st = g_state;
     std::lock_guard<std::mutex> lock(st.mutex);
+    st.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     auto reg = st.registry.find(w);
     if (reg == st.registry.end()) {
         return; // not a streamed expert tensor
@@ -979,6 +1026,7 @@ bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
     auto & st = g_state;
     std::lock_guard<std::mutex> lock(st.mutex);
+    st.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     auto reg = st.registry.find(w);
     if (reg == st.registry.end()) {
         return serial; // not a streamed expert tensor

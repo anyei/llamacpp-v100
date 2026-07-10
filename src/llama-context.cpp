@@ -1432,6 +1432,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (cparams.cb_eval == nullptr && ggml_ssd_stream_enabled()) {
             ggml_backend_sched_set_eval_callback(sched_cur, ggml_ssd_stream_eval_cb, nullptr);
         } else {
+            // The scheduler has ONE eval-callback slot: a user callback (e.g. the
+            // LLAMA_DEBUG dump cb) DISPLACES the streaming fill callback, and any
+            // streamed expert computed on the CPU path would read unfilled memory.
+            // (The scheduler's expert-copy prefill hook still covers the offloaded
+            // path.) Warn loudly instead of corrupting silently.
+            if (cparams.cb_eval != nullptr && ggml_ssd_stream_enabled()) {
+                LLAMA_LOG_WARN("%s: an eval callback is set while SSD streaming is enabled - "
+                        "the streaming fill callback is DISPLACED; CPU-path streamed experts "
+                        "will read unfilled memory (garbage output). Unset the callback or "
+                        "disable --ssd-streaming.\n", __func__);
+            }
             ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
         }
 
