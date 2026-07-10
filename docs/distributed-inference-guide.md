@@ -11,12 +11,17 @@ attention + DeltaNet) unless noted; small-model checks use
 
 ## TL;DR — which mode for which situation
 
-| Situation | Mode | Measured |
+All decode t/s below are `Qwen3.6-27B-UD-Q4_K_XL` on 2× V100 (loopback, no
+speculation) unless a different model is named; the 27B's *production* number
+with MTP speculation is higher (~81 t/s — see the README benchmarks).
+
+| Situation | Mode | Measured (model) |
 |---|---|---|
-| All GPUs in one machine | single process, `-sm tensor` + NCCL — do NOT use RPC | 47.8 t/s |
+| All GPUs in one machine | single process, `-sm tensor` + NCCL — do NOT use RPC | 47.8 t/s (27B, nospec) — the ceiling reference |
 | Model fits one machine, second box idle | leave it idle, or serve another model on it | — |
-| Model does NOT fit one machine | pipeline between boxes: `-sm layer --rpc worker:port` | ~3%/token protocol cost + network RTT |
-| Second box has multiple NVLinked GPUs | TP island: worker runs `--tensor-parallel`, coordinator pipelines to it | 33.3 t/s whole-model-remote (pessimal case) |
+| Model does NOT fit one machine | pipeline between boxes: `-sm layer --rpc worker:port` | 32.3 vs 33.2 t/s in-process (27B, 1 local + 1 RPC GPU) → ~3%/token + network RTT |
+| Second box has multiple NVLinked GPUs | TP island: worker runs `--tensor-parallel`, coordinator pipelines to it | 33.3 t/s (27B entirely on a remote 2-GPU island — pessimal case) |
+| Second box has no GPU (CPU + RAM only) | CPU worker: `cpu.Dockerfile --target rpc-worker` (§1b) | 35B-A3B MoE: 7.4-10.4 t/s by CPU; 0.6B: ~20 t/s; ~2-4% network tax (§3b) |
 | Need max context, model fits | offload tail layers to remote box (frees local VRAM for KV) | pipeline cost only |
 
 Rule of thumb: **tensor parallelism inside a box (NVLink), pipeline between
