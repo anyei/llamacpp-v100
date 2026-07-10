@@ -594,6 +594,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // the --rpc handler registers backend devices as a side effect the moment it runs
+    // (possibly during env-var handling below), so its skip-unavailable modifier must
+    // be known up front regardless of where it appears on the command line
+    if (const char * skip_env = std::getenv("LLAMA_ARG_RPC_SKIP_UNAVAILABLE"); skip_env && is_truthy(skip_env)) {
+        params.rpc_skip_unavailable = true;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--rpc-skip-unavailable") {
+            params.rpc_skip_unavailable = true;
+        }
+    }
+
     // handle environment variables
     for (auto & opt : ctx_arg.options) {
         std::string value;
@@ -935,7 +947,7 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
-static void add_rpc_devices(const std::string & servers) {
+static void add_rpc_devices(const std::string & servers, bool skip_unavailable) {
     auto rpc_servers = string_split<std::string>(servers, ',');
     if (rpc_servers.empty()) {
         throw std::invalid_argument("no RPC servers specified");
@@ -950,15 +962,31 @@ static void add_rpc_devices(const std::string & servers) {
     if (!ggml_backend_rpc_add_server_fn) {
         throw std::invalid_argument("failed to find RPC add server function");
     }
+    std::vector<std::string> unavailable;
     for (const auto & server : rpc_servers) {
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         if (reg == nullptr) {
+            if (skip_unavailable) {
+                LOG_WRN("RPC server '%s' is unreachable, skipping it\n", server.c_str());
+                unavailable.push_back(server);
+                continue;
+            }
             // without this check an unreachable worker silently degrades to
             // CPU-only inference, which looks like a performance bug instead
             // of the connectivity error it actually is
-            throw std::invalid_argument("failed to connect to RPC server '" + server + "'");
+            throw std::invalid_argument("failed to connect to RPC server '" + server + "'"
+                " (use --rpc-skip-unavailable to drop unreachable servers instead)");
         }
         ggml_backend_register(reg);
+    }
+    if (!unavailable.empty()) {
+        if (unavailable.size() == rpc_servers.size()) {
+            LOG_WRN("all %zu RPC servers are unreachable, continuing with local devices only\n", rpc_servers.size());
+        } else {
+            LOG_WRN("%zu of %zu RPC servers are unreachable, the model will be split across the remaining devices\n",
+                    unavailable.size(), rpc_servers.size());
+        }
+        LOG_WRN("note: an explicit -ts/--tensor-split maps to devices positionally and will NOT account for the dropped servers\n");
     }
 }
 
@@ -2390,11 +2418,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
+            {"--rpc-skip-unavailable"},
+            "drop unreachable --rpc servers with a warning and split the model across the remaining devices, instead of exiting with an error",
+            [](common_params & params) {
+                // already applied by the pre-scan in common_params_parse_ex (it must
+                // take effect before the --rpc handler runs, wherever this flag sits)
+                params.rpc_skip_unavailable = true;
+            }
+        ).set_env("LLAMA_ARG_RPC_SKIP_UNAVAILABLE"));
+        add_opt(common_arg(
             {"--rpc"}, "SERVERS",
             "comma-separated list of RPC servers (host:port)",
             [](common_params & params, const std::string & value) {
-                add_rpc_devices(value);
-                GGML_UNUSED(params);
+                add_rpc_devices(value, params.rpc_skip_unavailable);
             }
         ).set_env("LLAMA_ARG_RPC"));
     }

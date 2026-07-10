@@ -334,8 +334,15 @@ Everything here is automatic — no new flags on the happy path:
 - **Env knobs on the worker**: `GGML_META_DEBUG=1|2` traces split-state
   decisions (needs debug log level); `GGML_CUDA_ALLREDUCE=p2p` enables the
   one-shot NVLink AllReduce inside the island.
-- **Failure behavior**: the protocol has no fault tolerance — a dead worker
-  aborts the coordinator (TASKS.md item 12 phase 4 tracks hardening).
+- **Failure behavior**: at load time, an unreachable worker errors the
+  coordinator out by default; pass `--rpc-skip-unavailable` (env
+  `LLAMA_ARG_RPC_SKIP_UNAVAILABLE`) to drop dead workers with a warning and
+  split the model across whoever is present — the right mode for fleets
+  where laptops come and go. Caveat: an explicit `-ts` maps to devices
+  positionally and will not account for the dropped servers, so prefer the
+  default memory-proportional split with this flag. At runtime the protocol
+  still has no fault tolerance — a worker that dies mid-session aborts the
+  coordinator (TASKS.md #29 tracks reconnect/redistribution).
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
@@ -352,7 +359,9 @@ Everything here is automatic — no new flags on the happy path:
   (task 13 closed): quality validated by perplexity, but temp-0 outputs can
   diverge from single-GPU runs (MoE-router-amplified reduction noise) — do
   not gate MLA tensor/island setups on byte-exactness.
-- No fault tolerance: a dead worker aborts the coordinator. No auth/TLS:
+- No *runtime* fault tolerance: a worker that dies mid-session aborts the
+  coordinator (load-time degradation exists — see `--rpc-skip-unavailable`
+  in §6). No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
 - **GTX 16xx workers (TU116/117) need `-fa off` on the coordinator**: those
