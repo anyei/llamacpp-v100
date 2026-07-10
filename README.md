@@ -204,6 +204,14 @@ docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 -e GGML_SSD_STREAM_DEBUG=1 
 (parallel miss-path reads — a prefill/long-prompt win). `GGML_SSD_STREAM_DEBUG=1`
 prints the per-tier hit rates and the miss-path read/H2D time split (needs `-v`).
 
+Or use the **tuned showcase server** — [`docker-compose.ssd.yml`](docker-compose.ssd.yml)
+(best-measured VRAM/RAM/read-thread values, all knobs overridable inline; watch
+`docker compose logs` for the `GPU cache hit=` line):
+
+```bash
+MODELS_DIR=/path/to/models docker compose -f docker-compose.ssd.yml up
+```
+
 **The use case.** Today a model has to fit in VRAM, or in VRAM + system RAM
 (spilled via `-ngl` / CPU offload). When it doesn't fit *even in VRAM + RAM
 combined*, you're stuck — mmap demand-paging thrashes the disk and collapses

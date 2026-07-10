@@ -1,0 +1,63 @@
+version: '3.8'
+
+# SSD-STREAMING SHOWCASE — run an 81 GB MoE on ONE 32 GB GPU (+ RAM + NVMe).
+#
+# DeepSeek-V4-Flash (81 GB, 77.9 GB of it experts) fits neither VRAM nor VRAM+RAM,
+# so it can ONLY run by streaming. Three managed tiers, hottest first:
+#   1. VRAM slot cache  (GPU landing)   — experts computed on the GPU, zero-copy on hit
+#   2. RAM expert cache (SLRU)          — L2 victim tier
+#   3. O_DIRECT NVMe stream             — cold experts, page-cache-bypassing reads
+# GPU landing is SINGLE-GPU-only, so this is a one-GPU config by design.
+#
+# Measured with these defaults (1x V100-32GB, ~1.6 GB/s NVMe): loads + runs coherent,
+# GPU-cache hit ~71%, decode ~2.7 t/s (IO-bound; a faster drive lifts this — that is the
+# point of the showcase). Byte-/PPL-neutral vs resident.
+#
+# IMAGE: must be built from this tree (`--target server`) — needs the SSD-streaming
+# commits (input_cpy reclaim + LLAMA_SSD_STREAM_READ_THREADS). :latest may be older.
+#
+# TUNING (hit rate is everything — watch the `GPU cache hit=` / `miss-path` log lines):
+#   SSD_VRAM_MIB   VRAM slot cache — raise until just below OOM (bigger = higher hit).
+#                  ~16 GB fits a 32 GB card alongside ~9 GB non-experts + KV + compute.
+#   SSD_RAM_MIB    RAM L2 cache — set to (free system RAM − a few GB headroom).
+#   SSD_READ_THREADS  parallel O_DIRECT miss reads — this box's ~1.6 GB/s NVMe saturates
+#                  at ~2; a Gen-4/5 drive (5-7 GB/s) keeps scaling, try 8.
+# Override any of them inline, e.g.:  SSD_VRAM_MIB=20480 docker compose -f docker-compose.ssd.yml up
+
+services:
+  llama-ssd:
+    container_name: llama-ssd-deepseek
+    image: ${SSD_IMAGE:-llamacpp-local-v100:latest}
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    ports:
+      - "8098:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0                                  # GPU landing is single-GPU
+      - LLAMA_SSD_STREAM_BUFFER=1                               # tier 1+2+3: stream MoE experts
+      - LLAMA_SSD_STREAM_GPU=1                                  # tier 1: VRAM slot cache (GPU landing)
+      - LLAMA_SSD_STREAM_VRAM_BUDGET=${SSD_VRAM_MIB:-16384}     # VRAM cache, MiB
+      - LLAMA_SSD_STREAM_BUDGET=${SSD_RAM_MIB:-32768}           # RAM cache, MiB
+      - LLAMA_SSD_STREAM_READ_THREADS=${SSD_READ_THREADS:-4}    # parallel O_DIRECT miss reads
+      # SLRU scan-resistance (default on) + O_DIRECT (default on) + input_cpy reclaim
+      # (default on) are already the best values — left at defaults intentionally.
+      - GGML_SSD_STREAM_DEBUG=1                                 # log hit rates + miss-path timing
+    command: >
+      -m /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+      --host 0.0.0.0
+      --port 8080
+      -ngl 99
+      -t 8
+      -np 1
+      -c 8192
+      --no-mmap
+      --cache-prompt
+      -fa on
+    restart: "no"
