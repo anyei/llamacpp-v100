@@ -12,6 +12,7 @@
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <ifaddrs.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
@@ -713,6 +714,30 @@ static bool rpc_parse_group(const char * group, std::string & addr, int & port) 
     return true;
 }
 
+// every local IPv4 interface address — multicast joins/egress bound to the default
+// route alone miss multi-homed boxes (fleet reality: laptops with WiFi as the default
+// route and the actual worker LAN on ethernet)
+static std::vector<struct in_addr> rpc_local_ifaces() {
+    std::vector<struct in_addr> out;
+#ifndef _WIN32
+    struct ifaddrs * ifs = nullptr;
+    if (getifaddrs(&ifs) == 0) {
+        for (struct ifaddrs * i = ifs; i != nullptr; i = i->ifa_next) {
+            if (i->ifa_addr != nullptr && i->ifa_addr->sa_family == AF_INET) {
+                out.push_back(((struct sockaddr_in *) i->ifa_addr)->sin_addr);
+            }
+        }
+        freeifaddrs(ifs);
+    }
+#endif
+    if (out.empty()) {
+        struct in_addr any;
+        any.s_addr = htonl(INADDR_ANY); // fallback: the OS default interface only
+        out.push_back(any);
+    }
+    return out;
+}
+
 bool rpc_announce_start(const char * group, const char * iface_host, std::function<std::string()> make_payload) {
     if (!rpc_transport_init()) {
         return false;
@@ -738,21 +763,32 @@ bool rpc_announce_start(const char * group, const char * iface_host, std::functi
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL,  (const char *) &ttl,  sizeof(ttl));
     int loop = 1;
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, (const char *) &loop, sizeof(loop));
-    // keep the beacon on the interface the RPC port is bound to — discovery must not
-    // widen exposure beyond where the server already listens
+    // egress selection: an RPC server bound to a specific address keeps the beacon on
+    // that interface (discovery must not widen exposure beyond where the server already
+    // listens); bound to 0.0.0.0 it beacons on EVERY interface — the RPC port is open on
+    // all of them, and the default-route interface alone misses multi-homed boxes
+    std::vector<struct in_addr> egress;
     if (iface_host != nullptr && strcmp(iface_host, "0.0.0.0") != 0) {
         struct in_addr ifaddr;
         ifaddr.s_addr = inet_addr(iface_host);
         if (ifaddr.s_addr != INADDR_NONE) {
-            setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, (const char *) &ifaddr, sizeof(ifaddr));
+            egress.push_back(ifaddr);
         }
     }
-    std::thread([fd, dst, gaddr, gport, make_payload]() {
+    if (egress.empty()) {
+        egress = rpc_local_ifaces();
+    }
+    std::thread([fd, dst, gaddr, gport, egress, make_payload]() {
         for (;;) {
             const std::string payload = make_payload();
-            const ssize_t n = sendto(fd, payload.c_str(), payload.size(), 0, (const struct sockaddr *) &dst, sizeof(dst));
-            if (n < 0) {
-                LOG_DBG("[announce] sendto %s:%d failed\n", gaddr.c_str(), gport);
+            for (const struct in_addr & ifaddr : egress) {
+                if (ifaddr.s_addr != htonl(INADDR_ANY)) {
+                    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, (const char *) &ifaddr, sizeof(ifaddr));
+                }
+                const ssize_t n = sendto(fd, payload.c_str(), payload.size(), 0, (const struct sockaddr *) &dst, sizeof(dst));
+                if (n < 0) {
+                    LOG_DBG("[announce] sendto %s:%d failed\n", gaddr.c_str(), gport);
+                }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         }
@@ -786,19 +822,24 @@ std::vector<std::pair<std::string, std::string>> rpc_discover_listen(const char 
         rpc_close_fd(fd);
         return out;
     }
-    struct ip_mreq mreq;
-    memset(&mreq, 0, sizeof(mreq));
-    mreq.imr_multiaddr.s_addr = inet_addr(gaddr.c_str());
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq, sizeof(mreq)) < 0) {
-        GGML_LOG_ERROR("failed to join multicast group %s\n", gaddr.c_str());
+    // join the group on EVERY local interface (loopback included, so same-host workers
+    // are heard) — a bare INADDR_ANY join covers only the default-route interface,
+    // which on a multi-homed coordinator is often not the worker LAN
+    int n_joined = 0;
+    for (const struct in_addr & ifaddr : rpc_local_ifaces()) {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr.s_addr = inet_addr(gaddr.c_str());
+        mreq.imr_interface       = ifaddr;
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq, sizeof(mreq)) == 0) {
+            n_joined++;
+        }
+    }
+    if (n_joined == 0) {
+        GGML_LOG_ERROR("failed to join multicast group %s on any interface\n", gaddr.c_str());
         rpc_close_fd(fd);
         return out;
     }
-    // also join via loopback (best effort) so same-host workers bound to 127.0.0.1 are heard
-    struct ip_mreq mreq_lo = mreq;
-    mreq_lo.imr_interface.s_addr = inet_addr("127.0.0.1");
-    setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq_lo, sizeof(mreq_lo));
 
     // poll in short slices until the window closes
 #ifdef _WIN32
