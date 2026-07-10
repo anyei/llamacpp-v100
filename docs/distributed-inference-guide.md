@@ -234,7 +234,30 @@ Everything here is automatic — no new flags on the happy path:
   async + events capability.
 - **Worker-to-worker transfers**: with two or more 4.2 workers in a layer
   split, cross-stage activations flow directly between workers (a fenced
-  pull) instead of bouncing through the coordinator. Requirements:
+  pull) instead of bouncing through the coordinator:
+
+  ```
+      llama-server --rpc A:50052,B:50052 -sm layer
+
+      COORDINATOR                WORKER A                 WORKER B
+      (sampler, embed)           (layers 0..N/2)          (layers N/2..N)
+      ────────────┬──            ───────┬────────         ───────┬───────
+                  │  activations        │                        │
+                  ├────────────────────▶│ compute stage 1        │
+                  │                     │                        │
+                  │              proto 4.2 (default):            │
+                  │                     │══ direct, fenced ═════▶│ B pulls A's
+                  │                     │   activation pull      │ output, then
+                  │                     │                        │ computes
+                  │  GGML_RPC_NO_W2W=1 (or peer unreachable):    │ stage 2
+                  │◀╌╌╌ stage-1 out ╌╌╌╌┤                        │
+                  ├╌╌╌╌ stage-1 out ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▶  (2 hops
+                  │                     │                        │  instead
+                  │◀─────────────────── logits ──────────────────┤  of 1)
+                  ▼ sample, repeat
+  ```
+
+  Requirements:
   - workers must be able to reach *each other* at the exact endpoint strings
     the coordinator uses (`--rpc a:port,b:port`) — same network/overlay, no
     NAT between them. If a worker cannot reach its peer, the copy silently
