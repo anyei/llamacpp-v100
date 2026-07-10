@@ -461,6 +461,46 @@ const char * ssd_buft_get_name(ggml_backend_buffer_type_t) {
     return "SSD_Stream";
 }
 
+// Full streaming-state reset. Fires from ssd_buffer_free (model unload): without
+// it, a server model swap leaks the VRAM slot pools + dup'd fds, and the stale
+// SLRU could madvise(MADV_DONTNEED) into a REUSED arena address range of the
+// NEXT model (cross-model corruption). Frees pools/ids scratches, closes fds,
+// clears the registry + SLRU + counters. Caller must NOT hold g_state.mutex.
+static void ssd_stream_reset() {
+    auto & st = g_state;
+    std::lock_guard<std::mutex> lock(st.mutex);
+    for (auto & kv : g_gpu_pools) {
+        if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+        if (kv.second.ctx) ggml_free(kv.second.ctx);
+    }
+    g_gpu_pools.clear();
+    for (auto & kv : g_gpu_nodes) {
+        if (kv.second.ids_buf) ggml_backend_buffer_free(kv.second.ids_buf);
+        if (kv.second.ids_ctx) ggml_free(kv.second.ids_ctx);
+    }
+    g_gpu_nodes.clear();
+#ifdef GGML_SSD_STREAM_SUPPORTED
+    for (auto & kv : st.fd_dup) {
+        close(kv.second);
+    }
+#endif
+    st.fd_dup.clear();
+    st.registry.clear();
+    st.probation.clear();
+    st.protectd.clear();
+    st.index.clear();
+    st.resident_bytes  = 0;
+    st.protected_bytes = 0;
+    st.odirect         = false;
+    if (st.debug) {
+        GGML_LOG_INFO("ggml_ssd_stream: state reset (model unload)\n");
+    }
+}
+
+// live ssd arena buffers (the loader may split weights across several); the
+// full state reset fires only when the LAST one goes away.
+std::atomic<int> g_ssd_buffers{0};
+
 void ssd_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (ssd_buffer_context *) buffer->context;
 #ifdef GGML_SSD_STREAM_SUPPORTED
@@ -469,6 +509,12 @@ void ssd_buffer_free(ggml_backend_buffer_t buffer) {
     }
 #endif
     delete ctx;
+    // the arena owned this model's streamed tensors: when the last arena goes,
+    // tear down the whole streaming state with it (pools/registry/SLRU would
+    // otherwise reference freed tensors and leak VRAM + fds across model swaps)
+    if (g_ssd_buffers.fetch_sub(1) == 1) {
+        ssd_stream_reset();
+    }
 }
 
 void * ssd_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -542,6 +588,7 @@ ggml_backend_buffer_t ssd_buft_alloc_buffer(ggml_backend_buffer_type_t buft, siz
     ctx->base = base;
     GGML_LOG_INFO("ggml_ssd_stream: arena reserved %.2f GB (virtual, MAP_NORESERVE)\n", size / 1e9);
 #endif
+    g_ssd_buffers.fetch_add(1);
     return ggml_backend_buffer_init(buft, ssd_buffer_iface, ctx, size);
 }
 
@@ -645,12 +692,28 @@ void ggml_ssd_stream_gpu_ensure_pool(const ggml_tensor * w, ggml_backend_t backe
     }
     // +1 pad slot: the CUDA MMQ path may over-read ~512 B past the last expert
     // (the reason copy_experts pads); the extra slot keeps that read in-bounds.
-    e.slots = ggml_new_tensor_3d(e.ctx, w->type, w->ne[0], w->ne[1], k + 1);
-    e.buf   = e.slots ? ggml_backend_alloc_ctx_tensors(e.ctx, backend) : nullptr;
-    if (e.buf == nullptr || e.slots == nullptr) {
-        GGML_LOG_ERROR("ggml_ssd_stream: GPU slot pool alloc failed (K=%d, %.2f GB)\n",
-                k, (double) k * slice / 1e9);
-        return;
+    // On VRAM pressure, halve K instead of failing outright: a smaller cache is
+    // strictly better than the first-token abort the missing pool would cause
+    // (the input_cpy reclaim removed the CPU-copy fallback for streamed experts).
+    while (true) {
+        e.slots = ggml_new_tensor_3d(e.ctx, w->type, w->ne[0], w->ne[1], k + 1);
+        e.buf   = e.slots ? ggml_backend_alloc_ctx_tensors(e.ctx, backend) : nullptr;
+        if (e.buf != nullptr && e.slots != nullptr) {
+            break;
+        }
+        if (k <= 8) {
+            GGML_LOG_ERROR("ggml_ssd_stream: GPU slot pool alloc failed even at K=%d\n", k);
+            return;
+        }
+        k /= 2;
+        GGML_LOG_WARN("ggml_ssd_stream: GPU slot pool alloc failed, retrying with K=%d "
+                "(reduce LLAMA_SSD_STREAM_VRAM_BUDGET to silence)\n", k);
+        ggml_free(e.ctx);
+        struct ggml_init_params ip2 = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+        e.ctx = ggml_init(ip2);
+        if (e.ctx == nullptr) {
+            return;
+        }
     }
     // GPU slot pool defaults to SLRU (scan resistance for skewed MoE routing);
     // LLAMA_SSD_STREAM_GPU_SLRU=0 forces plain LRU, LLAMA_SSD_STREAM_GPU_PROTECTED_PCT

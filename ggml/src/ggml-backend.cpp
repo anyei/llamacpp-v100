@@ -1401,7 +1401,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             // and only single-GPU (landing is a no-op under -sm layer; shrinking a
                             // copy whose node won't be bound would corrupt the CPU-compute fallback).
                             if (node->op == GGML_OP_MUL_MAT_ID && j == 0 &&
-                                ggml_backend_sched_n_gpu(sched) == 1) {
+                                ggml_backend_sched_n_gpu(sched) == 1 &&
+                                ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                                 ggml_ssd_stream_gpu_shrink_copy(tensor_copy, src, backend);
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
@@ -1640,7 +1641,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // Single-GPU only (must match the shrink gate in split_graph): with
                     // >1 GPU backend (-sm layer) landing stays a CPU-tier fallback.
                     const bool ssd_gpu = ggml_ssd_stream_gpu_enabled() &&
-                        ggml_ssd_stream_is_streamed(input) && ggml_backend_sched_n_gpu(sched) == 1;
+                        ggml_ssd_stream_is_streamed(input) && ggml_backend_sched_n_gpu(sched) == 1 &&
+                        ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
                     if (ssd_gpu) {
                         ids_tensor = (ggml_tensor *) ggml_ssd_stream_gpu_orig_ids(node, ids_tensor);
                     } else {
