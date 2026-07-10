@@ -89,8 +89,9 @@ docker compose -f docker-compose.mtp.yml logs 2>&1 | grep -E "print_timing"
 ```
 
 Other measured highlights: KV cache q8_0 = **0.5×** memory (lossless), 27B on a remote
-2-GPU RPC TP island **33 t/s** (loopback), and DeepSeek-V4 **81 GB streamed from SSD on
-one 32 GB V100** (see the SSD-streaming section below).
+2-GPU RPC TP island **33 t/s** (loopback), **real cross-host inference at ~2-4% network
+tax** (whole model on a GPU-less worker box over the LAN — see Distributed inference),
+and DeepSeek-V4 **81 GB streamed from SSD on one 32 GB V100** (SSD-streaming section).
 
 ## What this fork adds over upstream
 
@@ -162,6 +163,25 @@ them is V100-specific.
   `LLAMA_META_DUP_DEVICE` (genuine n-way tensor splits on one GPU).
 
 ### Distributed inference (experimental)
+
+**Validated on real hardware (2026-07-09)** — first cross-host inference, a
+GPU-less CPU worker box serving whole models over the LAN (0.15 ms RTT),
+decode t/s:
+
+| Model (whole model on the remote worker) | loopback | cross-network | tax |
+|---|---:|---:|---|
+| Qwen3-0.6B | 20.9 | 19.9-20.1 | ~4% |
+| Qwen3.6-35B-A3B (MoE) | 7.7 | 7.4-7.6 | ~2-4% |
+
+The model file lives only on the coordinator: the worker's share of weights
+streams once (23 GB ≈ 178 s at GbE) and is hash-cached on the worker's disk —
+warm reloads skip the transfer entirely; per-token traffic is just KB-scale
+activations + the logits row. Full lifecycle (with diagram): guide §0.
+
+- **Worker images for any box**: CUDA (`--build-arg CUDA_DOCKER_ARCH=<cc>`),
+  **CPU-only** (`cpu.Dockerfile --target rpc-worker`, no CUDA anywhere), and
+  **Vulkan** (Intel Arc/iGPU via `/dev/dri`). Compose profiles:
+  `docker-compose.rpc-worker{,-cpu,-vulkan}.yml`.
 - **TP islands**: `ggml-rpc-server --tensor-parallel` exposes all local GPUs
   as one tensor-parallel device over RPC; the coordinator automatically
   computes and uploads per-tensor split states (weights, KV, recurrent-state
