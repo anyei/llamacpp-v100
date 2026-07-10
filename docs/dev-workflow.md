@@ -95,8 +95,19 @@ Push only images a worker will actually pull, delete stale tags, and reclaim wit
 registry's garbage collector (deletes are enabled):
 
 ```bash
-docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml
+# 1. delete the tag's manifest — modern docker pushes OCI *indexes*, so the digest
+#    lookup MUST send the OCI index Accept header or the registry answers 404:
+digest=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  http://localhost:5000/v2/<repo>/manifests/<tag> | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
+curl -X DELETE http://localhost:5000/v2/<repo>/manifests/$digest
+# 2. reclaim the blobs + restart (the running registry caches blob metadata):
+docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml --delete-untagged
+docker restart llamacpp-registry
 ```
+
+Also prune the *local* side after pushing: the build tags and their `localhost:5000/`
+aliases (`docker rmi`), and the BuildKit cache (`docker builder prune`) — a full
+registry+local prune of two superseded image generations recovered ~20 GB (2026-07-10).
 
 ### 1c. Fast iteration: incremental builds in a dev container
 
