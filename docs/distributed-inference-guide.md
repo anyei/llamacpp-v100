@@ -22,6 +22,37 @@ attention + DeltaNet) unless noted; small-model checks use
 Rule of thumb: **tensor parallelism inside a box (NVLink), pipeline between
 boxes (Ethernet)**. Never `-sm tensor` across a network.
 
+## 0. How data moves — what crosses the network, and when
+
+The lifecycle of a coordinator + RPC worker, with real sizes:
+
+1. **First load — the worker's share of the weights crosses the wire, once.**
+   The coordinator reads the GGUF locally and `set_tensor`-streams every tensor
+   the scheduler placed on the RPC device. Whole-model-remote (`-ngl 99`, all
+   layers on the worker) sends the entire model (23 GB for the 35B ≈ ~3.5 min
+   on GbE); a layer split (`-sm layer -ts …`) sends only the worker's slice.
+   The worker never needs the model file.
+
+2. **Worker weight cache — the transfer happens only once.** With `-c` (and
+   `LLAMA_CACHE=/cache` + a volume in a container), the worker hashes and
+   persists every tensor it receives. On every later load the coordinator sends
+   just the hash (`SET_TENSOR_HASH`), the worker answers "have it," and loads
+   from local disk — restart-safe, re-stream-free.
+
+3. **Inference — only activations (and logits) cross, per step.** Per token
+   the coordinator sends the worker's boundary input activations and receives
+   its outputs: a few KB (0.6B) to tens of KB (35B) per hop. The largest
+   per-token transfer is the **logits row back to the sampler** (~vocab × 4 B
+   ≈ 0.6 MB for Qwen), which is why *small fast* models feel the network more
+   than big slow ones. In whole-model-remote even the KV cache lives on the
+   worker; the coordinator just orchestrates + samples. At sub-millisecond
+   LAN RTT this adds ~2×RTT + transfer per token — noise against a 130 ms CPU
+   token, a few percent against a fast GPU token.
+
+Measured cross-network (coordinator ↔ CPU worker at 0.15 ms RTT, 2026-07-09):
+0.6B whole-model-remote **19.9-20.1 t/s** vs 20.9 loopback — a **~4% network
+tax**; warm reload takes seconds (cache hit) vs the full stream cold.
+
 ## 1. Worker setup (the box that serves its GPUs)
 
 The production image ships the worker binary. Compose reference:
