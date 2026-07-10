@@ -1168,6 +1168,16 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     return fields;
 }
 
+// setenv is POSIX; MSVC has _putenv_s (the --ssd-* flags below hand their
+// values to libggml-base through the environment)
+static void common_set_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     // per-example default params
     // we define here to make sure it's included in llama-gen-docs
@@ -2418,7 +2428,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "sets LLAMA_SSD_STREAM_BUFFER",
         [](common_params & params) {
             params.use_mmap = false; // streamed experts skip the read; keep others resident
-            setenv("LLAMA_SSD_STREAM_BUFFER", "1", 1);
+            common_set_env("LLAMA_SSD_STREAM_BUFFER", "1");
         }
     ));
     add_opt(common_arg(
@@ -2426,7 +2436,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "RAM expert-cache byte budget for --ssd-streaming (default 8192). sets LLAMA_SSD_STREAM_BUDGET",
         [](common_params & params, const std::string & value) {
             (void) params;
-            setenv("LLAMA_SSD_STREAM_BUDGET", value.c_str(), 1);
+            common_set_env("LLAMA_SSD_STREAM_BUDGET", value.c_str());
         }
     ));
     add_opt(common_arg(
@@ -2435,7 +2445,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "the hot expert set fits VRAM; use with --ssd-streaming). sets LLAMA_SSD_STREAM_GPU",
         [](common_params & params) {
             (void) params;
-            setenv("LLAMA_SSD_STREAM_GPU", "1", 1);
+            common_set_env("LLAMA_SSD_STREAM_GPU", "1");
         }
     ));
     add_opt(common_arg(
@@ -2443,7 +2453,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "total VRAM budget for the --ssd-stream-gpu slot cache (default 4096). sets LLAMA_SSD_STREAM_VRAM_BUDGET",
         [](common_params & params, const std::string & value) {
             (void) params;
-            setenv("LLAMA_SSD_STREAM_VRAM_BUDGET", value.c_str(), 1);
+            common_set_env("LLAMA_SSD_STREAM_VRAM_BUDGET", value.c_str());
         }
     ));
     add_opt(common_arg(

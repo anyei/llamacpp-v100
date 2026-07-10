@@ -994,8 +994,12 @@ ggml_backend_buffer_type_t ggml_ssd_stream_buft(void) {
         // time streaming is used the wrapper is loaded in-process, so
         // RTLD_DEFAULT finds it in both DL and monolithic builds.
         typedef ggml_backend_dev_t (*dev_by_type_fn)(enum ggml_backend_dev_type);
-        static const dev_by_type_fn fn =
-            (dev_by_type_fn) dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_type");
+        // not `static const`: caching a null would permanently disable the device
+        // lookup if the first call raced the wrapper lib's load (GGML_BACKEND_DL)
+        static dev_by_type_fn fn = nullptr;
+        if (fn == nullptr) {
+            fn = (dev_by_type_fn) dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_type");
+        }
         if (fn != nullptr) {
             ssd_buft.device = fn(GGML_BACKEND_DEVICE_TYPE_CPU);
         }

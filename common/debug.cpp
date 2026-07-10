@@ -202,11 +202,20 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
                 }
             }
             if (dump && t->type == GGML_TYPE_F32) {
-                std::string path = std::string(dump_dir) + "/" + t->name + ".bin";
+                // tensor names can contain '/' (would land in a nonexistent subdir)
+                std::string fname = t->name;
+                for (char & c : fname) {
+                    if (c == '/' || c == '\\') {
+                        c = '_';
+                    }
+                }
+                std::string path = std::string(dump_dir) + "/" + fname + ".bin";
                 if (FILE * f = fopen(path.c_str(), "wb")) {
                     fwrite(t->ne, sizeof(t->ne[0]), GGML_MAX_DIMS, f);
                     fwrite(data, 1, ggml_nbytes(t), f);
                     fclose(f);
+                } else {
+                    LOG_WRN("%s: failed to open dump file %s\n", __func__, path.c_str());
                 }
             }
         }

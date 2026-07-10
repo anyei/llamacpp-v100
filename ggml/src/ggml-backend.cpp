@@ -782,6 +782,7 @@ struct ggml_backend_sched {
     bool is_alloc;
 
     int n_backends;
+    int n_gpu; // GPU device backends (cached; used by the SSD GPU-landing gates)
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
@@ -1034,14 +1035,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 // clean CPU-tier fallback instead of engaging (and crashing). `-sm tensor` uses one
 // meta backend, so it reads as 1 and never reaches the offload/copy path anyway.
 static int ggml_backend_sched_n_gpu(ggml_backend_sched_t sched) {
-    int n = 0;
-    for (int i = 0; i < sched->n_backends; i++) {
-        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            n++;
-        }
-    }
-    return n;
+    return sched->n_gpu; // computed once in sched_new (fixed for the sched lifetime)
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1834,6 +1828,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
+    sched->n_gpu = 0;
+    for (int i = 0; i < n_backends; i++) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            sched->n_gpu++;
+        }
+    }
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table

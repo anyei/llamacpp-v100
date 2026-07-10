@@ -152,8 +152,10 @@ struct common_speculative_impl {
 
     // LLAMA_SPEC_ADAPTIVE=1: cap each draft round near the measured acceptance
     // EMA instead of always drafting n_max, saving draft passes on content
-    // where acceptance runs cold. The verify batch shape is unaffected (drafts
-    // are padded to n_max, see pad_drafts), and this is sampling policy only -
+    // where acceptance runs cold. Batch-shape note: only the MTP impl pads
+    // drafts to n_max (pad_drafts), so only there is the verify shape stable;
+    // draft_simple/eagle3 already produce variable-length drafts (p_min early
+    // stop), so the cap adds no NEW shape variability. Sampling policy only -
     // the target model's temp-0 output is unchanged by construction.
     float acc_ema = 1e6f; // warm start above any cap: draft n_max until measured
 
