@@ -95,14 +95,28 @@ Push only images a worker will actually pull, delete stale tags, and reclaim wit
 registry's garbage collector (deletes are enabled):
 
 ```bash
-# 1. delete the tag's manifest — modern docker pushes OCI *indexes*, so the digest
-#    lookup MUST send the OCI index Accept header or the registry answers 404:
+# Modern docker pushes OCI *indexes*: the tag names an index whose CHILD manifests
+# hold the actual layers. Two traps (both hit 2026-07-10):
+#   - digest lookups must send the OCI index Accept header or the registry 404s;
+#   - NEVER run garbage-collect with --delete-untagged: registry:2's GC does not
+#     treat index children as referenced and DELETES manifests that live tags
+#     still need (breaks every remaining pull; recover by re-pushing the images).
+REPO=llamacpp-cuda TAG=75-oldtag URL=http://localhost:5000
+# 1. delete the child manifests, then the index itself:
+for d in $(curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' \
+             $URL/v2/$REPO/manifests/$TAG | grep -o 'sha256:[0-9a-f]*' | sort -u); do
+  curl -X DELETE $URL/v2/$REPO/manifests/$d
+done
 digest=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
-  http://localhost:5000/v2/<repo>/manifests/<tag> | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
-curl -X DELETE http://localhost:5000/v2/<repo>/manifests/$digest
-# 2. reclaim the blobs + restart (the running registry caches blob metadata):
-docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml --delete-untagged
+  $URL/v2/$REPO/manifests/$TAG | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
+curl -X DELETE $URL/v2/$REPO/manifests/$digest
+# 2. reclaim blobs (plain GC only!) + restart (the registry caches blob metadata):
+docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml
 docker restart llamacpp-registry
+# 3. sanity: every child of every SURVIVING tag must answer 200:
+#    curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' $URL/v2/<repo>/manifests/<tag> \
+#      | grep -o 'sha256:[0-9a-f]*' | xargs -I{} curl -s -o /dev/null -w '{} %{http_code}\n' \
+#        -H 'Accept: application/vnd.oci.image.manifest.v1+json' $URL/v2/<repo>/manifests/{}
 ```
 
 Also prune the *local* side after pushing: the build tags and their `localhost:5000/`
