@@ -1,0 +1,48 @@
+# CUDA RPC worker — distributed-inference worker for a box with an NVIDIA GPU.
+# Companion to docker-compose.rpc-worker{-cpu,-vulkan}.yml.
+#
+# Build the image ON THE WORKER BOX from this tree, targeting ITS GPU arch
+# (70=V100, 75=GTX16xx/RTX20xx, 86=RTX30xx, 89=RTX40xx):
+#   docker build -f .devops/cuda.Dockerfile --build-arg CUDA_DOCKER_ARCH=75 \
+#     --target full -t llamacpp-cuda:rpc-worker .
+# (needs the NVIDIA driver + nvidia-container-toolkit on the box)
+#
+# Then:  docker compose -f docker-compose.rpc-worker-cuda.yml up -d
+#
+# The coordinator connects the same as any worker:
+#   --rpc <workerhost>:50052 -sm layer -ngl 99
+#
+# VRAM note: layers assigned to this worker must fit its VRAM (e.g. a 6 GB
+# 1660 Ti holds ~a quarter of a 23 GB model — weight the split with -ts, or
+# run a small model whole). To expose the box's CPU alongside the GPU as a
+# second pipeline stage, add:  -d CUDA0,CPU  to the command below.
+#
+# The model file is NOT needed on the worker; weights stream from the
+# coordinator and are hash-cached under /cache.
+#
+# SECURITY: the RPC protocol has no auth or TLS. Bind only to a private or
+# WireGuard/overlay network, never a public interface.
+
+services:
+  llama-rpc-worker-cuda:
+    container_name: llama-rpc-worker-cuda
+    image: ${WORKER_IMAGE:-llamacpp-cuda:rpc-worker}
+    entrypoint: /app/ggml-rpc-server
+    network_mode: host              # direct sockets; see security note
+    volumes:
+      - ./cache-rpc:/cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=${WORKER_GPUS:-0}
+      - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+    command: >
+      -H ${WORKER_BIND:-0.0.0.0}
+      -p ${WORKER_PORT:-50052}
+      -c
+    restart: always
