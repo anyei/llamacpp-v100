@@ -6,6 +6,9 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+#include <cstdlib>
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -328,6 +331,21 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
+// See the comment on the declarations in fattn-common.cuh (GTX 16xx-class devices, TASKS.md #32).
+static std::atomic<bool> fattn_mma_disabled_flags[GGML_CUDA_MAX_DEVICES] = {};
+
+bool ggml_cuda_fattn_mma_disabled(int device) {
+    static const bool env_disabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_NO_MMA");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return env_disabled || fattn_mma_disabled_flags[device].load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_fattn_mma_disable(int device) {
+    fattn_mma_disabled_flags[device].store(true, std::memory_order_relaxed);
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
@@ -454,7 +472,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
-    if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    if (turing_mma_available(cc) && !ggml_cuda_fattn_mma_disabled(device) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
@@ -484,7 +502,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
-    if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    if (volta_mma_available(cc) && !ggml_cuda_fattn_mma_disabled(device) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }

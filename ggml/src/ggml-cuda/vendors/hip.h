@@ -75,6 +75,7 @@
 #define cudaGetDevice hipGetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
 #define cudaHostRegister hipHostRegister

@@ -27,8 +27,14 @@ static bool ggml_cuda_should_use_wmma_fattn(const int cc) {
 #if defined(GGML_USE_HIP) && !defined(GGML_HIP_ROCWMMA_FATTN)
     return false;
 #else
-    if ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_MTHREADS(cc)) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA) {
+        // The kernel's device code is only compiled for HIP+rocwmma (see the guard around
+        // flash_attn_ext_f16 in fattn-wmma-f16.cu) — selecting it on NVIDIA Volta hits
+        // NO_DEVICE_CODE. Unreachable while the volta_mma MMA branch wins in the kernel
+        // picker, but reachable when the MMA kernel is disabled for a device (fattn-common.cuh).
+        return false;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_MTHREADS(cc)) {
         return true;
     } else if (GGML_CUDA_CC_IS_CDNA(cc)){
 #if defined(GGML_HIP_ROCWMMA_FATTN) && (ROCWMMA_VERSION_MAJOR < 2 || ROCWMMA_VERSION_MINOR > 0 || ROCWMMA_VERSION_PATCH > 0)

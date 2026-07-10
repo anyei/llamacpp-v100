@@ -111,6 +111,13 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 |---|---|---|---|
 | `LLAMA_ATTN_ROT_DISABLE` | bool | off | Opt out of Hadamard-rotated KV quantization (auto-enabled whenever KV is quantized; the rotation is what makes q4_0 KV near-lossless). |
 
+## 8b. CUDA FlashAttention kernel selection (task 32)
+
+| Gate | Type | Default | What it does |
+|---|---|---|---|
+| `GGML_CUDA_FA_NO_MMA` | bool | off | Never select the MMA FlashAttention kernel (tile/vec instead). For devices that pass the cc gate but can't run it — GTX 16xx (TU116/117) is cc 7.5 without tensor cores. Set on the affected *worker*; without it the first failure self-heals per device (WARN + tile fallback) instead of aborting. |
+| `GGML_CUDA_FA_MMA_FORCE_SMEM_FAIL` | bool | off | Fault injection: pretend the MMA kernel's shared-memory opt-in failed, to exercise the fallback path on healthy hardware. |
+
 ## 9. Instrumentation & debug
 
 | Gate | Type | Default | What it does |

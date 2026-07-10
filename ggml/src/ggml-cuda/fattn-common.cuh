@@ -18,6 +18,14 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Some devices pass the compute-capability gates for the MMA FlashAttention kernel but cannot
+// actually run it: GTX 16xx (TU116/TU117) is cc 7.5 WITHOUT tensor cores and rejects the kernel's
+// dynamic shared-memory opt-in (cudaFuncSetAttribute fails). There is no CUDA API to query tensor
+// core availability, so the failed opt-in itself marks the device and kernel selection falls back
+// to the tile/vec kernels from then on. GGML_CUDA_FA_NO_MMA=1 pre-marks every device (defined in fattn.cu).
+bool ggml_cuda_fattn_mma_disabled(int device);
+void ggml_cuda_fattn_mma_disable (int device);
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,

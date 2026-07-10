@@ -3,6 +3,11 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
+#include <cstdlib>
+
+// defined in fattn-tile.cu; the fallback target when the MMA kernel cannot run on a device (see fattn-common.cuh)
+void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 using namespace ggml_cuda_mma;
 
 // Config options for the MMA kernel.
@@ -1938,26 +1943,33 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
-
-#if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
-        }
-#endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+    }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+    // one flag per kernel symbol (the softcap variants are distinct kernels)
+    static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {{false}};
+    bool & smem_limit_raised = shared_memory_limit_raised[logit_softcap == 0.0f ? 0 : 1][id];
+    if (!smem_limit_raised) {
+        cudaError_t err = cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+        if (getenv("GGML_CUDA_FA_MMA_FORCE_SMEM_FAIL") != nullptr) {
+            err = cudaErrorInvalidValue; // fault injection to validate the fallback path on healthy hardware
         }
-#endif // !defined(GGML_USE_MUSA)
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError(); // clear the error state so it does not trip the next CUDA_CHECK
+            GGML_LOG_WARN("%s: raising the dynamic shared-memory limit to %zu bytes failed on device %d "
+                          "(max opt-in %zu bytes): %s. Disabling the FlashAttention MMA kernel on this device "
+                          "(cc 7.5 without tensor cores, e.g. GTX 16xx?) and using the tile kernel instead.\n",
+                          __func__, nbytes_shared_total, id, ggml_cuda_info().devices[id].smpbo, cudaGetErrorString(err));
+            ggml_cuda_fattn_mma_disable(id);
+            ggml_cuda_flash_attn_ext_tile(ctx, dst); // same f16 K/V requirements as the MMA kernel, so the alloc geometry matches
+            return;
+        }
+        smem_limit_raised = true;
     }
+#endif // !defined(GGML_USE_MUSA)
 
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);

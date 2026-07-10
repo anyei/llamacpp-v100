@@ -364,8 +364,14 @@ Everything here is automatic — no new flags on the happy path:
   in §6). No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
-- **GTX 16xx workers (TU116/117) need `-fa off` on the coordinator**: those
-  cards are cc 7.5 WITHOUT tensor cores, and the flash-attention MMA kernel
-  selected by CC crashes the worker (`cudaFuncSetAttribute: invalid
-  argument`, TASKS.md #32). Verified: 35B layers on a 1660 Ti run fine with
-  `-fa off` and crash the worker with FA on.
+- **GTX 16xx workers (TU116/117)**: those cards are cc 7.5 WITHOUT tensor
+  cores; the flash-attention MMA kernel selected by CC used to kill the
+  worker process (`cudaFuncSetAttribute: invalid argument` → abort,
+  TASKS.md #32). Fixed 2026-07-10: the failed shared-memory opt-in now
+  disables the MMA kernel on that device (one-time WARN) and falls back to
+  the tile kernel, so FA can stay on. Set `GGML_CUDA_FA_NO_MMA=1` in the
+  worker's environment to skip even the first failed attempt. `-fa off` on
+  the coordinator remains the workaround for images older than this fix
+  (verified: 35B layers on the 1660 Ti run with `-fa off`). Real-hardware
+  confirmation of the new fallback on the 1660 Ti is still pending (needs a
+  fresh `CUDA_DOCKER_ARCH=75` image on that box).
