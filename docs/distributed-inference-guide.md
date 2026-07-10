@@ -203,6 +203,46 @@ The whole-model-remote numbers are the worst case — when the island only
 holds a layer slab (the intended topology), the RPC cost stays the same
 small constant while most compute remains local.
 
+### 3b. Measured: a real heterogeneous CPU/iGPU worker fleet (2026-07-10)
+
+First cross-host measurements on real hardware. Fleet: coordinator (V100 box),
+worker A = **i7-9750H** laptop (64 GB, `10.5.5.15`), worker B = **Core Ultra 9
+285H** (64 GB, Arc 140T iGPU, `10.5.5.11`); quiet LAN, 0.15-0.44 ms RTT.
+Decode / prefill t/s, whole-model-remote unless noted:
+
+| Config | 0.6B | 35B-A3B (MoE) |
+|---|---|---|
+| worker A CPU (9750H) | 19.9 / 134 | 7.4 / 11.3 |
+| worker B CPU (285H) | — | **10.4** / 10.7 |
+| worker B iGPU (Arc 140T, Vulkan) | 26.3 / 39.5 | 10.0 / 5.3 |
+| **both workers, `-sm layer` even split** | 17.9 / 86 | 7.4 / 10.7 |
+| both workers, `GGML_RPC_NO_W2W=1` | — | 7.8 / 9.1 |
+
+What these numbers teach (they generalize):
+
+- **The default split is memory-proportional, not speed-aware** — both boxes
+  report ~64 GB, so layers split ~50/50 and the pipeline runs at the *slower*
+  box's pace (7.4 = worker A's solo speed; worker B alone does 10.4). Weight
+  with `-ts`, or better: if the model fits the fastest box, run it there alone
+  — single-stream pipeline time is the *sum* of stage times, so adding a
+  slower box to a model that already fits can only slow the stream down.
+  A pipeline earns its keep for **capacity** (model > one box's RAM) and
+  **throughput** (stages overlap across concurrent requests), not latency.
+- **Worker-to-worker vs coordinator-bridged is indistinguishable at CPU
+  speeds** (7.4 vs 7.8, noise): the direct pull saves ~one LAN hop (~0.5 ms)
+  against ~135 ms tokens. W2W matters for fast GPU workers, not CPU fleets.
+  (`pipeline parallelism enabled` confirmed in the coordinator log — the
+  async machinery does engage.)
+- **An iGPU worker ≈ its host's CPU for decode** (10.0 vs 10.4): both drain
+  the same LPDDR5X pool and decode is bandwidth-bound. Its prefill is 2x
+  *worse* under Mesa/ANV Vulkan (no XMX matrix engines; see TASKS.md #27 for
+  the tentative SYCL/coopmat follow-up). Use the CPU worker unless you need
+  the cores free; only a **discrete** GPU (own VRAM bandwidth) meaningfully
+  beats its host CPU as a worker.
+- **Small models feel the network, big models don't**: 0.6B lost ~10% going
+  from one worker to a 2-hop pipeline (17.9 vs 19.9) and ~4% to the network
+  itself; the 35B lost ~2-4%.
+
 ## 4. Session state over islands (save/restore, prompt checkpoints)
 
 Server state features work transparently across RPC and are verified
