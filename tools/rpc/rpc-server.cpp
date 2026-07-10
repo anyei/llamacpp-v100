@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <clocale>
 #include <codecvt>
+#include <cstdlib>
 #include <filesystem>
 #include <regex>
 #include <stdio.h>
@@ -364,6 +365,17 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
+
+    // worker error containment (TASKS.md #29e): make CUDA errors during graph compute
+    // throw (caught at the RPC compute boundary) instead of aborting the whole worker.
+    // Set before the backends load; an explicit GGML_CUDA_ERROR_CONTAIN=0 wins.
+#ifdef _WIN32
+    if (getenv("GGML_CUDA_ERROR_CONTAIN") == nullptr) {
+        _putenv_s("GGML_CUDA_ERROR_CONTAIN", "1");
+    }
+#else
+    setenv("GGML_CUDA_ERROR_CONTAIN", "1", /*overwrite=*/ 0);
+#endif
 
     ggml_backend_load_all();
 

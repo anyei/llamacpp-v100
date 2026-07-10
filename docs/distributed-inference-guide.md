@@ -367,9 +367,14 @@ Everything here is automatic — no new flags on the happy path:
   split the model across whoever is present — the right mode for fleets
   where laptops come and go. Caveat: an explicit `-ts` maps to devices
   positionally and will not account for the dropped servers, so prefer the
-  default memory-proportional split with this flag. At runtime the protocol
-  still has no fault tolerance — a worker that dies mid-session aborts the
-  coordinator (TASKS.md #29 tracks reconnect/redistribution).
+  default memory-proportional split with this flag. At runtime, a
+  worker-side compute error (e.g. a CUDA fault) no longer kills the worker
+  process: it drops that coordinator's connection and keeps serving others,
+  and after 3 consecutive failures (poisoned CUDA context) it exits cleanly
+  so `restart: always` brings up a fresh process (task 29e). The
+  *coordinator* still treats a dropped connection mid-decode as fatal —
+  restart it; the worker's warm cache makes the reload cheap. Coordinator
+  reconnect/redistribution is TASKS.md #29 (b)/(c).
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 

@@ -77,6 +77,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <atomic>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -85,6 +86,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -101,6 +103,18 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    // Worker error containment (TASKS.md #29e): an rpc-server process arms
+    // GGML_CUDA_ERROR_CONTAIN so a CUDA failure unwinds (through C++ frames only) to the
+    // RPC compute boundary instead of killing the whole worker. Anything else —
+    // coordinators, standalone tools — keeps the default: abort with a stack trace.
+    static const bool contain = [] {
+        const char * env = getenv("GGML_CUDA_ERROR_CONTAIN");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (contain) {
+        (void) cudaGetLastError(); // clear the sticky error state where possible
+        throw std::runtime_error(std::string(GGML_CUDA_NAME " error: ") + msg + " (" + stmt + ")");
+    }
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
@@ -4615,6 +4629,21 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // fault injection for the RPC containment path (TASKS.md #29e): N > 0 fails the Nth
+    // graph compute of this process and every one after it (poisoned-backend scenario);
+    // N < 0 fails ONLY the |N|th (isolated-error scenario, the worker must recover)
+    static const int  inject_at = [] {
+        const char * env = getenv("GGML_CUDA_INJECT_COMPUTE_FAIL");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    if (inject_at != 0) {
+        static std::atomic<int> compute_count{0};
+        const int n = ++compute_count;
+        if ((inject_at > 0 && n >= inject_at) || (inject_at < 0 && n == -inject_at)) {
+            ggml_cuda_error("injected failure", __func__, __FILE__, __LINE__, "GGML_CUDA_INJECT_COMPUTE_FAIL");
+        }
+    }
 
     ggml_cuda_set_device(cuda_ctx->device);
 

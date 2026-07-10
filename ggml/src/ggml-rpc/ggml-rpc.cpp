@@ -6,7 +6,9 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1056,19 +1058,27 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
+    bool status;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        RPC_STATUS_ASSERT(status);
+        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+    }
+    if (!status) {
+        // a contained worker-side compute failure closes the connection (TASKS.md #29e) —
+        // fail this decode instead of aborting the whole coordinator; the caller sees
+        // GGML_STATUS_FAILED through the scheduler
+        GGML_LOG_ERROR("[%s] graph compute failed on %s — the worker dropped the connection "
+                       "(worker-side compute error or worker death)\n", __func__, rpc_ctx->endpoint);
+        rpc_dev_ctx->last_graph_uid = 0; // never RECOMPUTE against a failed/new connection
+        return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -1244,6 +1254,14 @@ public:
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+
+    // run a graph compute with error containment (TASKS.md #29e): a backend failure —
+    // including a CUDA error thrown under GGML_CUDA_ERROR_CONTAIN — fails THIS
+    // connection instead of killing the worker. Repeated failures mean the backend is
+    // unusable (e.g. a poisoned CUDA context) — exit so `restart: always` resurrects a
+    // clean process instead of leaving a zombie that fails every request.
+    bool compute_contained(uint32_t device, ggml_cgraph * graph, const char * what);
+    std::atomic<int> consecutive_compute_failures{0};
 
     struct local_tensor_ref {
         std::string file;
@@ -2081,10 +2099,36 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (!compute_contained(device, graph, __func__)) {
+        stored_graphs[device].graph = nullptr; // never RECOMPUTE a graph that failed
+        return false;
+    }
     stored_graphs[device].graph = graph;
     stored_graphs[device].owner_conn = current_conn;
+    return true;
+}
+
+bool rpc_server::compute_contained(uint32_t device, ggml_cgraph * graph, const char * what) {
+    ggml_status status = GGML_STATUS_FAILED;
+    try {
+        status = ggml_backend_graph_compute(backends[device], graph);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[%s] backend exception on device %u: %s\n", what, device, e.what());
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        const int failures = consecutive_compute_failures.fetch_add(1) + 1;
+        GGML_LOG_ERROR("[%s] graph computation failed on device %u (status %d) — "
+                       "dropping this connection, the worker stays up (failure %d/3)\n",
+                       what, device, (int) status, failures);
+        if (failures >= 3) {
+            GGML_LOG_ERROR("%d consecutive compute failures — the backend is likely unusable, "
+                           "exiting so the restart policy brings up a clean process\n", failures);
+            fflush(stderr);
+            std::_Exit(1); // no atexit/CUDA teardown — the context may be poisoned and hang
+        }
+        return false;
+    }
+    consecutive_compute_failures.store(0);
     return true;
 }
 
@@ -2105,8 +2149,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
-    ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (!compute_contained(device, graph, __func__)) {
+        stored_graphs[device].graph = nullptr; // never RECOMPUTE a graph that failed
+        return false;
+    }
     return true;
 }
 

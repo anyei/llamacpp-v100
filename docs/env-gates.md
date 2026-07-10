@@ -104,6 +104,8 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | bool | off | (= `--rpc-skip-unavailable`) Drop unreachable `--rpc` servers with a warning and split the model across the remaining devices, instead of exiting with an error. Load-time only — a worker that dies mid-session still aborts (TASKS.md #29). |
 | `LLAMA_ARG_RPC_DISCOVER` | bool | off | (= `--rpc-discover`) Discover RPC workers announcing themselves on the LAN (`rpc-server --announce`) and use them; composes with `--rpc`, duplicates skipped. Trusted networks only. |
 | `LLAMA_ARG_RPC_DISCOVER_GROUP` | str | built-in | (= `--rpc-discover-group`) Multicast group `ADDR:PORT` for discovery; must match the workers' `--announce-group`. |
+| `GGML_CUDA_ERROR_CONTAIN` | bool | off (rpc-server sets 1) | CUDA errors throw to the RPC compute boundary instead of aborting the process. Armed automatically by `rpc-server` (task 29e: a compute error drops one connection, the worker lives; 3 consecutive failures = poisoned backend → clean exit for the restart policy). Set `=0` on a worker to restore abort-with-backtrace. Never armed in coordinators/tools. |
+| `GGML_CUDA_INJECT_COMPUTE_FAIL` | int | off | Fault injection for the containment path: `N>0` fails the Nth graph compute and after (poisoned backend); `N<0` fails only the \|N\|th (isolated error — the worker must recover). |
 | `GGML_RDMA_DEV` / `GGML_RDMA_GID` | str | auto | RDMA device / GID selection for the RPC transport (when built with RDMA). |
 | `GGML_RPC_DEBUG` | bool | off | *(upstream)* RPC command logging. |
 
