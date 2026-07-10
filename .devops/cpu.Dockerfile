@@ -33,7 +33,7 @@ COPY . .
 COPY --from=web /app/tools/ui/dist tools/ui/dist
 
 RUN if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON; \
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_RPC=ON; \
     else \
         echo "Unsupported architecture"; \
         exit 1; \
@@ -109,6 +109,17 @@ COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion
 WORKDIR /app
 
 ENTRYPOINT [ "/app/llama-cli" ]
+
+### RPC worker (CPU) — distributed-inference worker for a CPU-only box.
+# The model file is NOT needed on the worker; weights stream from the
+# coordinator and are hash-cached (run with `-c` and a /cache volume).
+FROM base AS rpc-worker
+
+COPY --from=build /app/full/ggml-rpc-server /app
+
+WORKDIR /app
+
+ENTRYPOINT [ "/app/ggml-rpc-server" ]
 
 ### Server, Server only
 FROM base AS server

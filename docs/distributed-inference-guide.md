@@ -38,6 +38,8 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
 - `-c` enables the local weight cache — **always use it**: the first load
   streams the full model over the socket (~40 min for a 27B over the
   synchronous protocol); with the cache, every later load reads local disk.
+  **In a container, also set `LLAMA_CACHE=/cache`** and mount a volume there —
+  without the env, the cache lands inside the container and dies with it.
 - `--tensor-parallel` requires >= 2 local GPUs; the worker prints
   `tensor-parallel island: N devices exposed as one` and advertises itself
   as `Meta[N](...)`. NCCL/P2P AllReduce runs worker-locally between its GPUs.
@@ -45,6 +47,50 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
 
 **SECURITY**: the RPC protocol has no authentication or TLS. Bind only to a
 private network / WireGuard overlay. Never a public interface.
+
+### 1b. CPU-only worker (a box with no GPU)
+
+Validated 2026-07-09 (loopback). A GPU-less box can serve its **CPU + RAM** as a
+worker. Build the CPU image on that box from this tree (no CUDA anywhere):
+
+```bash
+docker build -f .devops/cpu.Dockerfile --target rpc-worker -t llamacpp-cpu:rpc-worker .
+docker compose -f docker-compose.rpc-worker-cpu.yml up -d
+```
+
+The coordinator connects exactly like a GPU worker (`--rpc host:50052 -sm layer
+-ngl 99`); layers assigned to the RPC device compute on the worker's CPU.
+
+Measured (loopback, worker + coordinator sharing one 20-core box — treat as the
+no-network upper bound):
+
+| Model | local CPU `-ngl 0 -t 20` | whole model on RPC CPU worker |
+|---|---:|---:|
+| Qwen3-0.6B | 16.5 t/s | 17.8 t/s |
+| Qwen3.6-35B-A3B (MoE) | 6.5 t/s | 7.7 t/s |
+
+- **The protocol hop is free at CPU speeds** (~3% on GPU workers; unmeasurable
+  when a token costs 130+ ms). Real networks add ~2× RTT/token — still minor
+  for `-sm layer` on 1-10 GbE.
+- **Worker threads**: rpc-server's default (half the cores) beat all-cores on
+  loopback (7.7 vs 7.0 t/s — oversubscription). On a dedicated worker box,
+  sweep half/physical/all (`WORKER_THREADS` in the compose) and keep the winner.
+- Use cases: pipeline a model's tail layers onto the remote box's RAM
+  (`-sm layer -ts …`), or serve small models entirely from the CPU box.
+
+### 1c. Vulkan worker (Intel Arc / iGPU, AMD via Mesa)
+
+Same pattern with the Vulkan image — the GPU enters the container via
+`/dev/dri`, not the nvidia runtime:
+
+```bash
+docker build -f .devops/vulkan.Dockerfile --target rpc-worker -t llamacpp-vulkan:rpc-worker .
+docker compose -f docker-compose.rpc-worker-vulkan.yml up -d
+```
+
+Start with a small model (Qwen3-0.6B) to validate the path — an Intel iGPU/Arc
+is far slower than a datacenter GPU, so it's a topology/protocol test bed, not
+a throughput contributor.
 
 ## 2. Coordinator setup (the box running llama-server)
 

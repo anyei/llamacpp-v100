@@ -32,6 +32,7 @@ services:
               capabilities: [gpu]
     environment:
       - CUDA_VISIBLE_DEVICES=0,1
+      - LLAMA_CACHE=/cache        # required for -c to land in the mounted volume
     command: >
       -H 0.0.0.0
       -p 50052

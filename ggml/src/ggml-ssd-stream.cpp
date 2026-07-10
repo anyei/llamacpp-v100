@@ -37,6 +37,7 @@
 // skewed enough); kept opt-in for more skewed workloads. See docs/ssd-streaming-plan.md.
 
 #if defined(__linux__)
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -875,8 +876,21 @@ bool ggml_ssd_stream_should_stream(const char * name) {
 
 ggml_backend_buffer_type_t ggml_ssd_stream_buft(void) {
     if (ssd_buft.device == nullptr) {
-        // schedule streamed-expert ops on the CPU backend (host weights)
-        ssd_buft.device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+#ifdef GGML_SSD_STREAM_SUPPORTED
+        // schedule streamed-expert ops on the CPU backend (host weights).
+        // Resolved at RUNTIME: this file lives in libggml-base, but the device
+        // registry (ggml_backend_dev_by_type) lives in the libggml wrapper when
+        // GGML_BACKEND_DL=ON - a direct call leaves libggml-base with an
+        // undefined symbol and breaks every DL-based image (cpu/vulkan). By the
+        // time streaming is used the wrapper is loaded in-process, so
+        // RTLD_DEFAULT finds it in both DL and monolithic builds.
+        typedef ggml_backend_dev_t (*dev_by_type_fn)(enum ggml_backend_dev_type);
+        static const dev_by_type_fn fn =
+            (dev_by_type_fn) dlsym(RTLD_DEFAULT, "ggml_backend_dev_by_type");
+        if (fn != nullptr) {
+            ssd_buft.device = fn(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+#endif
     }
     return &ssd_buft;
 }

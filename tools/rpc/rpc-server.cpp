@@ -298,9 +298,22 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
             fprintf(stderr, "warning: --tensor-parallel needs at least 2 devices, ignoring\n");
             return devices;
         }
+        // Resolved via the registry, not a direct call: the symbol lives in the
+        // RPC backend module, which is a separate dynamically-loaded .so when
+        // GGML_BACKEND_DL=ON (a direct reference fails to link the tool).
+        static auto split_state_lookup_fn = [] {
+            ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+            return rpc_reg ? (decltype(ggml_backend_rpc_split_state_lookup) *)
+                ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_split_state_lookup")
+                : nullptr;
+        }();
+        if (split_state_lookup_fn == nullptr) {
+            fprintf(stderr, "warning: RPC backend registry lookup failed, ignoring --tensor-parallel\n");
+            return devices;
+        }
         static const auto split_state_cb = [](const struct ggml_tensor * tensor, void * /*ud*/) {
             ggml_backend_meta_split_state state;
-            if (ggml_backend_rpc_split_state_lookup(tensor->name, &state)) {
+            if (split_state_lookup_fn(tensor->name, &state)) {
                 return state;
             }
             // mirrored fallback duplicates the tensor on every device - log the big ones

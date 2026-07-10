@@ -33,7 +33,7 @@ COPY . .
 
 COPY --from=web /app/tools/ui/dist tools/ui/dist
 
-RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON && \
+RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DLLAMA_BUILD_TESTS=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_RPC=ON && \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
@@ -112,6 +112,19 @@ COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion
 WORKDIR /app
 
 ENTRYPOINT [ "/app/llama-cli" ]
+
+### RPC worker (Vulkan) — distributed-inference worker for a Vulkan-GPU box
+# (e.g. Intel Arc/iGPU via Mesa ANV; mesa-vulkan-drivers ships in base).
+# Run with the GPU passed in:  docker run --device /dev/dri ...
+# The model file is NOT needed on the worker; weights stream from the
+# coordinator and are hash-cached (run with `-c`, LLAMA_CACHE=/cache + volume).
+FROM base AS rpc-worker
+
+COPY --from=build /app/full/ggml-rpc-server /app
+
+WORKDIR /app
+
+ENTRYPOINT [ "/app/ggml-rpc-server" ]
 
 ### Server, Server only
 FROM base AS server

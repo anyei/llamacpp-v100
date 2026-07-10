@@ -1,0 +1,38 @@
+# CPU-ONLY RPC worker — distributed-inference worker for a box with no GPU.
+# (docs/distributed-inference-plan.md; CPU-worker domain, 2026-07-09.)
+#
+# Build the image ON THE WORKER BOX from this tree (no CUDA needed):
+#   docker build -f .devops/cpu.Dockerfile --target rpc-worker -t llamacpp-cpu:rpc-worker .
+#
+# Then:  docker compose -f docker-compose.rpc-worker-cpu.yml up -d
+#
+# The coordinator (this fork's llama-server/cli on the GPU box) connects with:
+#   --rpc <workerhost>:50052 -sm layer -ngl 99         # whole model / layer tail on the worker
+#   --rpc <workerhost>:50052 -sm layer -ngl 99 -ts …   # explicit local/remote layer weights
+#
+# The model file is NOT needed on the worker — weights stream from the
+# coordinator on first load and are hash-cached under /cache (-c) afterwards,
+# so later loads are fast.
+#
+# SECURITY: the RPC protocol has no auth or TLS. Bind only to a private or
+# WireGuard/overlay network, never a public interface.
+
+services:
+  llama-rpc-worker-cpu:
+    container_name: llama-rpc-worker-cpu
+    image: ${WORKER_IMAGE:-llamacpp-cpu:rpc-worker}
+    network_mode: host              # direct sockets; see security note
+    volumes:
+      - ./cache-rpc:/cache
+    environment:
+      - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+    # WORKER_THREADS: CPU compute threads on the worker. rpc-server's default
+    # (half the cores) measured FASTER than all-cores on loopback (7.7 vs 7.0
+    # t/s, 35B A3B) — oversubscription hurts. On a dedicated worker box, sweep
+    # half/physical/all and keep the winner.
+    command: >
+      -H ${WORKER_BIND:-0.0.0.0}
+      -p ${WORKER_PORT:-50052}
+      -t ${WORKER_THREADS:-8}
+      -c
+    restart: always

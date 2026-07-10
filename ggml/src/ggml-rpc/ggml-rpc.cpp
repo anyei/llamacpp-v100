@@ -2611,6 +2611,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_set_split_states") == 0) {
         return (void *)ggml_backend_rpc_set_split_states;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_split_state_lookup") == 0) {
+        // rpc-server resolves this via the registry (a direct call would leave
+        // the tool with an undefined symbol when GGML_BACKEND_DL=ON)
+        return (void *)ggml_backend_rpc_split_state_lookup;
+    }
     return NULL;
 
     GGML_UNUSED(reg);

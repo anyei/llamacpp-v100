@@ -1,0 +1,37 @@
+# VULKAN RPC worker — distributed-inference worker for a box with a Vulkan GPU
+# (e.g. Intel Arc / iGPU via Mesa ANV). Companion to docker-compose.rpc-worker-cpu.yml.
+#
+# Build the image ON THE WORKER BOX from this tree (no CUDA needed):
+#   docker build -f .devops/vulkan.Dockerfile --target rpc-worker -t llamacpp-vulkan:rpc-worker .
+#
+# Then:  docker compose -f docker-compose.rpc-worker-vulkan.yml up -d
+#
+# The coordinator connects the same as any worker:
+#   --rpc <workerhost>:50052 -sm layer -ngl 99
+#
+# Notes:
+# - The GPU is passed via /dev/dri (Vulkan), NOT the nvidia runtime.
+# - An Intel iGPU/Arc is far slower than a datacenter GPU — start with a small
+#   model (e.g. Qwen3-0.6B) to validate the path before sizing up.
+# - The model file is NOT needed on the worker; weights stream from the
+#   coordinator and are hash-cached under /cache (-c + LLAMA_CACHE).
+#
+# SECURITY: the RPC protocol has no auth or TLS. Bind only to a private or
+# WireGuard/overlay network, never a public interface.
+
+services:
+  llama-rpc-worker-vulkan:
+    container_name: llama-rpc-worker-vulkan
+    image: ${WORKER_IMAGE:-llamacpp-vulkan:rpc-worker}
+    network_mode: host              # direct sockets; see security note
+    devices:
+      - /dev/dri:/dev/dri           # the Vulkan GPU
+    volumes:
+      - ./cache-rpc:/cache
+    environment:
+      - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+    command: >
+      -H ${WORKER_BIND:-0.0.0.0}
+      -p ${WORKER_PORT:-50052}
+      -c
+    restart: always
