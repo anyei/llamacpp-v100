@@ -42,16 +42,17 @@ COPY . .
 
 COPY --from=web /app/tools/ui/dist tools/ui/dist
 
-RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
-    export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
-    fi && \
-    cmake -B build -DGGML_CUDA=ON \
+# CUDA_DOCKER_ARCH selects the GPU architecture(s), numeric CC without the dot
+# (70=V100, 75=GTX16xx/RTX20xx, 86=RTX30xx, 89=RTX40xx; ";"-separated for fat
+# builds). Default 70 (the V100 fleet). NOTE: this used to be dead — it was
+# exported into CMAKE_ARGS (which cmake never reads) while the flag hard-coded 70.
+RUN cmake -B build -DGGML_CUDA=ON \
     -DGGML_CUDA_GRAPHS=ON \
     -DGGML_CUDA_NCCL=ON \
     -DGGML_CUDA_FA_ALL_QUANTS=ON \
     -DGGML_RPC=ON \
     -DGGML_NATIVE=ON \
-    -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DLLAMA_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
+    -DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH} -DGGML_BACKEND_DL=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DLLAMA_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
