@@ -49,7 +49,10 @@ are below the tables.
 
 Takeaways: MTP adds ~+40-50% (dense) up to ~+35% (MoE); tensor-split helps the dense 27B
 (32.8 → 48.8) more than the already-fast MoE; the MoE + MTP stack holds **~166 t/s**
-single stream, the dense 27B **~81 t/s** (server steady-state; both scale further at `-np 4`).
+single stream, the dense 27B **~81 t/s** (server steady-state). Concurrency multiplies
+throughput: 35B at **`-np 4` = ~263 t/s aggregate** (4 streams × ~69 t/s each, 24.2k
+tokens / 92 s wall, 86-89% draft acceptance — measured on the same compose with `-np 4`
+and four simultaneous code-gen requests).
 
 ¹ MTP rows marked ¹ are the **production server steady-state** (`docker-compose.mtp.yml`,
 full config + env gates, long generation, ~88.6% MTP draft acceptance, mean accepted len
