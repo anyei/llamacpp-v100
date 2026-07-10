@@ -26,6 +26,36 @@ boxes (Ethernet)**. Never `-sm tensor` across a network.
 
 The lifecycle of a coordinator + RPC worker, with real sizes:
 
+```
+    COORDINATOR (has the .gguf)                WORKER (no model file)
+    llama-server / llama-cli                   ggml-rpc-server -c
+    ──────────────────────────                 ─────────────────────
+
+ ①  FIRST LOAD ── the worker's share of the weights crosses ONCE
+    ┌──────────┐                                ┌───────────────┐
+    │ GGUF on  │ ══ set_tensor ════════════════▶│ worker RAM /  │
+    │ disk     │    whole model: 23 GB (35B)    │ VRAM          │
+    └──────────┘    ≈ 3.5 min @ GbE             └──────┬────────┘
+                    layer split: just the slice        │ hash + persist
+                                                       ▼
+                                                  /cache volume
+
+ ②  EVERY LATER LOAD ── hashes only, weights come from the worker's disk
+    ┌──────────┐                                ┌───────────────┐
+    │ GGUF     │ ── SET_TENSOR_HASH (~KB) ─────▶│ "have it"     │
+    └──────────┘                                │ load /cache   │
+                                                └───────────────┘
+
+ ③  INFERENCE ── per token, only boundary tensors cross
+    ┌──────────┐    activations (KB-tens of KB) ┌───────────────┐
+    │ sampler, │ ──────────────────────────────▶│ layer compute │
+    │ orchestr.│ ◀──────────────────────────────│ (KV cache     │
+    └────┬─────┘    logits row (~0.6 MB =       │  lives HERE)  │
+         │          vocab × 4 B)                └───────────────┘
+         └──▶ sample token, repeat
+              cost/token ≈ 2×RTT + transfer  (~0.5 ms on a quiet LAN)
+```
+
 1. **First load — the worker's share of the weights crosses the wire, once.**
    The coordinator reads the GGUF locally and `set_tensor`-streams every tensor
    the scheduler placed on the RPC device. Whole-model-remote (`-ngl 99`, all
@@ -49,9 +79,17 @@ The lifecycle of a coordinator + RPC worker, with real sizes:
    LAN RTT this adds ~2×RTT + transfer per token — noise against a 130 ms CPU
    token, a few percent against a fast GPU token.
 
-Measured cross-network (coordinator ↔ CPU worker at 0.15 ms RTT, 2026-07-09):
-0.6B whole-model-remote **19.9-20.1 t/s** vs 20.9 loopback — a **~4% network
-tax**; warm reload takes seconds (cache hit) vs the full stream cold.
+Measured cross-network (coordinator ↔ CPU worker at 0.15 ms RTT, 2026-07-09),
+whole-model-remote, decode t/s:
+
+| Model | loopback | network cold | network warm | network tax |
+|---|---:|---:|---:|---|
+| Qwen3-0.6B | 20.9 | 20.1 | 19.9 | ~4% |
+| Qwen3.6-35B-A3B (MoE) | 7.7 | 7.6 | 7.4 | ~2-4% |
+
+The 35B's cold run spent ~178 s streaming its 23 GB (≈130 MB/s, GbE-class
+saturation); the warm run loaded from the worker's cache instead. Decode speed
+is identical cold vs warm — the transfer is purely a load-time cost.
 
 ## 1. Worker setup (the box that serves its GPUs)
 
