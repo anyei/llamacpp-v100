@@ -1,8 +1,9 @@
-version: '3.8'
-
-# MTP (speculative decoding) profile — 2026-07-06 tuning round.
-# Measured (dev build, Qwen3.6-27B, 2x V100): 66 t/s single-stream, 125 t/s
-# aggregate at -np 4 (vs 48 / 89.6 nospec).
+# MTP (speculative decoding) profile.
+# Measured 2026-07-09/10 server steady-state (2x V100 tensor + MTP):
+#   Qwen3.6-27B  ~81 t/s single-stream (peak tg_3s 87)
+#   Qwen3.6-35B-A3B  ~166 t/s single-stream; ~263 t/s aggregate at -np 4
+# (swap -m to the 35B gguf + drop --mmproj for the MoE numbers; full tables
+# + reproduction in README "Benchmarks".)
 #
 # Image note: the aggregate -np 4 win and the decode graph cache need an image
 # rebuilt from commit 9bac6eead or later (plus the pending full-seq split fix

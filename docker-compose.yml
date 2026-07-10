@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Llama.cpp backend
   llama-tq:
@@ -43,13 +41,12 @@ services:
 #      --spec-draft-n-max 3
 #      --spec-draft-n-min 1
 #      --spec-draft-p-min 0.70
-# MTP re-enabled 2026-07-06 with p-min 0: the earlier loss (33.6 t/s) was caused by
-# variable draft lengths changing the batch shape every step, forcing a full graph
-# rebuild + tensor-parallel re-split per iteration. Fixed-length drafts (p-min 0)
-# keep the shape stable so graph reuse works: 65 t/s short ctx, 51 t/s at 25k ctx
-# (vs 47.9 / 42.5 without spec). Output quality is identical (exact-match verify).
-# Do NOT set p-min > 0 or n-min > 0: any draft-length variability reintroduces the
-# rebuild penalty. Known issue: -np > 1 with spec still degrades; needs a code fix.
+# NOTE (2026-07-10): this default profile is SUPERSEDED by docker-compose.mtp.yml,
+# which uses the tuned spec params (p-min 0.75 / n-min 1 — SAFE since commit
+# d2b706d1b pads drafts to n-max, so the old "any p-min > 0 rebuilds the graph"
+# advice below no longer applies) and carries the decode-graph-cache envs.
+# The old "-np > 1 with spec degrades" issue is also FIXED (full-seq ubatch
+# split; 4-conc spec aggregate 125+ t/s). Kept for reference; prefer mtp.yml.
     command: >
       -m /models/Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
       --mmproj /models/qwen3.6-27b-mmproj-f16.gguf

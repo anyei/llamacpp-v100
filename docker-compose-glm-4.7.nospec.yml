@@ -1,17 +1,16 @@
-version: '3.8'
-
-# Non-speculative profile — 2026-07-06 tuning round.
-# Measured (Qwen3.6-27B, 2x V100): 48 t/s single-stream, 89.6 t/s aggregate
-# at -np 4. Use this profile for heavy multi-client load on images older than
-# the full-seq split fix; otherwise the MTP profile is faster everywhere.
+# GLM-4.7-Flash-UD serving profile (single GPU, no speculation — GLM has no MTP head).
+# Measured 2026-07-09 (1x V100): 89.5 t/s decode / 185 pp single-stream.
+# Single-GPU is the recommended GLM config: tensor mode is byte-identical but
+# SLOWER for this A3B MoE (86-70 t/s, AllReduce overhead), and MLA's compact KV
+# (~10 GB for the FULL 202,752-token native context) fits one 32 GB card with
+# ~5 GB headroom — 2 GPUs add nothing. See TASKS.md item 13.
 #
-# KV cache q8_0 is verified lossless on this model (ppl 6.2922 vs 6.2904 f16
-# at 32k ctx, temp-0 output byte-identical) and halves KV memory at 262k ctx.
-# Remove the two --cache-type-* lines to trade that memory back for ~3% tg.
+# KV q8_0 (--cache-type-*) is verified-lossless on Qwen and halves KV memory;
+# with GLM's tiny MLA KV it matters less — remove the lines to trade back ~3% tg.
 
 services:
   llama-tq:
-    container_name: llama-tq-nospec-GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf
+    container_name: llama-tq-nospec-GLM-4.7-Flash-UD-Q4_K_XL
     image: llamacpp-local-v100:latest
     volumes:
       - ${MODELS_DIR:-./models}:/models
@@ -28,27 +27,21 @@ services:
               capabilities: [gpu]
     environment:
       - CUDA_VISIBLE_DEVICES=0
-      # one-shot P2P AllReduce over NVLink for small tensors (+1.2% tg),
-      # falls back to NCCL for large/unsupported cases
-      - GGML_CUDA_ALLREDUCE=p2p
       # small-batch decode graph cache (helps multi-slot shape churn even
       # without speculation; needs image >= commit 9bac6eead, ignored otherwise)
       - LLAMA_DECODE_GRAPH_CACHE=4
       - LLAMA_DECODE_GRAPH_CACHE_TOKENS=64
-      # meta-backend compute-container ring; must cover the cached graphs above
-      - GGML_META_MAX_GRAPHS=8
-#      --mmproj /models/qwen3.6-27b-mmproj-f16.gguf
-#      --rope-scaling yarn
-#      --rope-scale 1.4441
-#      --yarn-orig-ctx 262144
+    # -c 202752 = GLM's FULL native context; measured 27.6 GB peak on one V100
+    # (with default ubatch). If the 4096 ubatch pushes compute buffers into OOM,
+    # drop to -c 131072 or -ub 2048.
     command: >
-      -m /models/GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf
+      -m /models/GLM-4.7-Flash-UD-Q4_K_XL.gguf?download=true
       --host 0.0.0.0
       --port 8080
       -ngl 99
       -t 10
       -np 1
-      -c 50000
+      -c 202752
       --batch-size 4096
       --ubatch-size 4096
       --cont-batching

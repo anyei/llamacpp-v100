@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Non-speculative profile — 2026-07-06 tuning round.
 # Measured (Qwen3.6-27B, 2x V100): 48 t/s single-stream, 89.6 t/s aggregate
 # at -np 4. Use this profile for heavy multi-client load on images older than

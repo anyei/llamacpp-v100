@@ -1,5 +1,3 @@
-version: '3.8'
-
 # SSD-STREAMING SHOWCASE — run an 81 GB MoE on ONE 32 GB GPU (+ RAM + NVMe).
 #
 # DeepSeek-V4-Flash (81 GB, 77.9 GB of it experts) fits neither VRAM nor VRAM+RAM,

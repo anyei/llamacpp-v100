@@ -44,7 +44,7 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         && export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"; \
     fi && \
     echo "Building with dynamic libs" && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
+    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
     cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
@@ -146,6 +146,18 @@ COPY --from=build /app/full/llama /app/full/llama-cli /app/full/llama-completion
 WORKDIR /app
 
 ENTRYPOINT [ "/app/llama-cli" ]
+
+### RPC worker (SYCL) — distributed-inference worker for an Intel-GPU box.
+# SYCL uses the XMX matrix engines (unlike Mesa/ANV Vulkan) — see TASKS.md #27.
+# Run with the GPU passed in (/dev/dri) and LLAMA_CACHE=/cache + a volume.
+FROM base AS rpc-worker
+
+COPY --from=build /app/lib/ /app
+COPY --from=build /app/full/ggml-rpc-server /app
+
+WORKDIR /app
+
+ENTRYPOINT [ "/app/ggml-rpc-server" ]
 
 ### Server, Server only
 FROM base AS server
