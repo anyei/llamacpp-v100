@@ -49,3 +49,7 @@ bool rpc_announce_start(const char * group, const char * iface_host, std::functi
 
 // coordinator side: listen on the group for timeout_ms; returns unique (src_ip, payload) pairs.
 std::vector<std::pair<std::string, std::string>> rpc_discover_listen(const char * group, int timeout_ms);
+
+// short non-blocking TCP connect probe — reachability check for discovered candidates
+// (the OS-default blocking connect can stall for minutes on a firewalled host)
+bool rpc_probe_endpoint(const char * host, int port, int timeout_ms);

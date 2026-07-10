@@ -13,6 +13,8 @@
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <ifaddrs.h>
+#  include <fcntl.h>
+#  include <cerrno>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
@@ -881,4 +883,60 @@ std::vector<std::pair<std::string, std::string>> rpc_discover_listen(const char 
     }
     rpc_close_fd(fd);
     return out;
+}
+
+bool rpc_probe_endpoint(const char * host, int port, int timeout_ms) {
+    if (!rpc_transport_init()) {
+        return false;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    struct hostent * server = gethostbyname(host);
+    if (server == NULL) {
+        return false;
+    }
+    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+    sockfd_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (!is_valid_fd(fd)) {
+        return false;
+    }
+#ifdef _WIN32
+    u_long nonblock = 1;
+    ioctlsocket(fd, FIONBIO, &nonblock);
+#else
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+    bool ok = false;
+    if (::connect(fd, (struct sockaddr *) &addr, sizeof(addr)) == 0) {
+        ok = true;
+    } else {
+#ifdef _WIN32
+        const bool in_progress = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        const bool in_progress = errno == EINPROGRESS;
+#endif
+        if (in_progress) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv;
+            tv.tv_sec  = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            if (select((int) fd + 1, nullptr, &wfds, nullptr, &tv) == 1) {
+                int err = 0;
+#ifdef _WIN32
+                int errlen = sizeof(err);
+#else
+                socklen_t errlen = sizeof(err);
+#endif
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *) &err, &errlen);
+                ok = (err == 0);
+            }
+        }
+    }
+    rpc_close_fd(fd);
+    return ok;
 }

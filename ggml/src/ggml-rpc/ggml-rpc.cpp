@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <random>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -1076,7 +1077,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         // fail this decode instead of aborting the whole coordinator; the caller sees
         // GGML_STATUS_FAILED through the scheduler
         GGML_LOG_ERROR("[%s] graph compute failed on %s — the worker dropped the connection "
-                       "(worker-side compute error or worker death)\n", __func__, rpc_ctx->endpoint);
+                       "(worker-side compute error or worker death)\n", __func__, rpc_ctx->endpoint.c_str());
         rpc_dev_ctx->last_graph_uid = 0; // never RECOMPUTE against a failed/new connection
         return GGML_STATUS_FAILED;
     }
@@ -2663,7 +2664,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 
 // LAN presence beacon + discovery (TASKS.md #29d). The payload is a single
 // versioned text line; the coordinator derives the worker's IP from the
-// datagram source address, so only the port needs to be advertised.
+// datagram source address, so only the port needs to be advertised. The id
+// token identifies the worker PROCESS: a multi-homed worker beacons on every
+// interface and would otherwise be discovered once per interface.
 static constexpr const char * RPC_ANNOUNCE_MAGIC = "llama.cpp-rpc/1";
 
 bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
@@ -2674,8 +2677,12 @@ bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
         GGML_LOG_ERROR("invalid endpoint '%s'\n", endpoint);
         return false;
     }
+    const uint64_t instance_id = [] {
+        std::random_device rd;
+        return ((uint64_t) rd() << 32) | rd();
+    }();
     std::vector<ggml_backend_dev_t> devs(devices, devices + n_devices);
-    auto make_payload = [port, devs]() {
+    auto make_payload = [port, instance_id, devs]() {
         size_t free_total = 0;
         for (auto dev : devs) {
             size_t free = 0, total = 0;
@@ -2683,8 +2690,8 @@ bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
             free_total += free;
         }
         char buf[256];
-        snprintf(buf, sizeof(buf), "%s port=%d proto=%d.%d devs=%zu free_mib=%zu",
-                 RPC_ANNOUNCE_MAGIC, port, RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION,
+        snprintf(buf, sizeof(buf), "%s port=%d id=%016" PRIx64 " proto=%d.%d devs=%zu free_mib=%zu",
+                 RPC_ANNOUNCE_MAGIC, port, instance_id, RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION,
                  devs.size(), free_total / (1024 * 1024));
         return std::string(buf);
     };
@@ -2696,8 +2703,15 @@ int ggml_backend_rpc_discover(const char * group, int timeout_ms,
                               void * user_data) {
     const auto found = rpc_discover_listen(group, timeout_ms);
     const std::string magic  = std::string(RPC_ANNOUNCE_MAGIC) + " ";
-    std::unordered_set<std::string> endpoints;
-    int n = 0;
+
+    // group candidate endpoints by worker instance (multi-homed workers beacon from
+    // several source IPs); beacons without an id token (older workers) group by endpoint
+    struct candidate_group {
+        std::vector<std::string> endpoints;
+        std::string              payload;
+    };
+    std::vector<std::string> order; // stable output order
+    std::unordered_map<std::string, candidate_group> groups;
     for (const auto & [ip, payload] : found) {
         if (payload.compare(0, magic.size(), magic) != 0) {
             continue; // not a worker beacon
@@ -2711,9 +2725,44 @@ int ggml_backend_rpc_discover(const char * group, int timeout_ms,
             continue;
         }
         const std::string endpoint = ip + ":" + std::to_string(port);
-        if (endpoints.insert(endpoint).second) {
-            cb(endpoint.c_str(), payload.c_str(), user_data);
+        const size_t id_pos = payload.find(" id=");
+        const std::string key = id_pos != std::string::npos ? payload.substr(id_pos + 4, 16) : endpoint;
+        auto [it, inserted] = groups.try_emplace(key);
+        if (inserted) {
+            order.push_back(key);
+            it->second.payload = payload;
+        }
+        if (std::find(it->second.endpoints.begin(), it->second.endpoints.end(), endpoint) == it->second.endpoints.end()) {
+            it->second.endpoints.push_back(endpoint);
+        }
+    }
+
+    // probe each instance's candidate addresses with a short TCP connect and report the
+    // first reachable one — a beaconing-but-firewalled worker must not stall the load
+    // behind a minutes-long blocking connect later
+    int n = 0;
+    for (const auto & key : order) {
+        const candidate_group & g = groups.at(key);
+        bool reported = false;
+        for (const std::string & endpoint : g.endpoints) {
+            std::string host;
+            int port = 0;
+            if (!parse_endpoint(endpoint, host, port)) {
+                continue;
+            }
+            if (!rpc_probe_endpoint(host.c_str(), port, 3000)) {
+                GGML_LOG_WARN("discovered RPC worker %s does not accept connections "
+                              "(firewall blocking TCP %d?), skipping this address\n", endpoint.c_str(), port);
+                continue;
+            }
+            cb(endpoint.c_str(), g.payload.c_str(), user_data);
             n++;
+            reported = true;
+            break;
+        }
+        if (!reported && !g.endpoints.empty()) {
+            GGML_LOG_WARN("discovered RPC worker (beacon '%s') is unreachable on all %zu advertised addresses\n",
+                          g.payload.c_str(), g.endpoints.size());
         }
     }
     return n;
