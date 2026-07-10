@@ -1,20 +1,26 @@
 # CUDA RPC worker — distributed-inference worker for a box with an NVIDIA GPU.
 # Companion to docker-compose.rpc-worker{-cpu,-vulkan}.yml.
 #
-# Build the image ON THE WORKER BOX from this tree, targeting ITS GPU arch
+# Preferred: PULL the image from the fleet registry on the V100 box — CUDA arch
+# cross-builds fine from there and the worker boxes are slow builders
+# (docs/dev-workflow.md §1b; one-time: add 10.5.5.1:5000 to insecure-registries):
+#   docker pull 10.5.5.1:5000/llamacpp-cuda:75-<tag>
+#   WORKER_IMAGE=10.5.5.1:5000/llamacpp-cuda:75-<tag> docker compose -f docker-compose.rpc-worker-cuda.yml up -d
+#
+# Fallback — build on the worker box from this tree, targeting ITS GPU arch
 # (70=V100, 75=GTX16xx/RTX20xx, 86=RTX30xx, 89=RTX40xx):
 #   docker build -f .devops/cuda.Dockerfile --build-arg CUDA_DOCKER_ARCH=75 \
 #     --target full -t llamacpp-cuda:rpc-worker .
-# (needs the NVIDIA driver + nvidia-container-toolkit on the box)
-#
-# Then:  docker compose -f docker-compose.rpc-worker-cuda.yml up -d
+# (either way the box needs the NVIDIA driver + nvidia-container-toolkit)
 #
 # The coordinator connects the same as any worker:
 #   --rpc <workerhost>:50052 -sm layer -ngl 99
 #
-# GTX 16xx note (TU116/117, e.g. 1660 Ti): pass -fa off on the COORDINATOR -
-# these cards are cc 7.5 without tensor cores and the FA MMA kernel crashes
-# the worker (TASKS.md #32).
+# GTX 16xx note (TU116/117, e.g. 1660 Ti): cc 7.5 without tensor cores. On
+# images with the task-32 fix (> e08854d4b) the FA MMA kernel self-heals
+# (falls back to the tile kernel; set GGML_CUDA_FA_NO_MMA=1 below to skip
+# even the first attempt). On OLDER images it crashes the worker — pass
+# -fa off on the COORDINATOR there.
 #
 # VRAM note: layers assigned to this worker must fit its VRAM (e.g. a 6 GB
 # 1660 Ti holds ~a quarter of a 23 GB model — weight the split with -ts, or
