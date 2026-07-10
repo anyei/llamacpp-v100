@@ -1,0 +1,31 @@
+# Local Docker registry on the V100 box (TASKS.md #33).
+#
+# Purpose: the fleet's worker boxes are much slower builders than this machine —
+# they should `docker pull` images built here instead of rebuilding from source.
+# Full flow (push/pull commands, worker daemon.json, when a local build is still
+# required): docs/dev-workflow.md §"Local registry".
+#
+#   docker compose -f docker-compose.registry.yml up -d
+#
+# Bound to the private LAN interface only (same threat model as the RPC workers:
+# no auth/TLS, trusted network). Workers need this box in "insecure-registries".
+services:
+  registry:
+    image: registry:2
+    container_name: llamacpp-registry
+    restart: always
+    ports:
+      # localhost: push side on this box (docker's TLS exemption covers only localhost,
+      # and adding insecure-registries here would need a dockerd restart = kills prod containers)
+      - "127.0.0.1:5000:5000"
+      # LAN: pull side for the worker boxes (they add 10.5.5.1:5000 to insecure-registries)
+      - "10.5.5.1:5000:5000"
+    environment:
+      # allow DELETE of manifests so old tags can be pruned + garbage-collected
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry-data:/var/lib/registry
+
+volumes:
+  registry-data:
+    name: llamacpp-registry-data

@@ -56,6 +56,48 @@ Tag by the increment being tested, not `latest`, so A/B comparisons keep both im
 around; a new feature image should be diff-able against it. `:latest` is whatever was
 built last and is *not* reliable — always name the tag explicitly in a run.
 
+### 1b. Local registry — workers pull, they don't build (TASKS.md #33)
+
+The worker boxes are far slower builders than this machine, and worker images are not
+box-specific (the CUDA `ARG CUDA_DOCKER_ARCH` cross-builds any sm from here, and the
+CPU image uses `GGML_CPU_ALL_VARIANTS=ON` runtime dispatch). So this box runs a local
+registry and the fleet pulls from it; a worker builds locally only for a target this
+box genuinely can't produce (e.g. a future Intel Arc SYCL image).
+
+**Registry** (once, on this box): `docker compose -f docker-compose.registry.yml up -d`
+— `registry:2`, `restart: always`, volume `llamacpp-registry-data`, bound to
+`127.0.0.1:5000` (push side) **and** `10.5.5.1:5000` (LAN pull side only — no auth/TLS,
+same trusted-network model as the RPC workers).
+
+**Push from this box** — use `localhost:5000` (docker's TLS exemption covers only
+localhost; do NOT add insecure-registries here, the dockerd restart would kill the
+prod inference containers):
+
+```bash
+docker tag  llamacpp-cuda:75-mytag localhost:5000/llamacpp-cuda:75-mytag
+docker push localhost:5000/llamacpp-cuda:75-mytag
+```
+
+**Pull on a worker** — one-time setup: add this box to `/etc/docker/daemon.json` and
+restart dockerd (`{"insecure-registries": ["10.5.5.1:5000"]}`), then:
+
+```bash
+docker pull 10.5.5.1:5000/llamacpp-cuda:75-mytag
+# same repo the localhost push created — the registry ignores the hostname part
+```
+
+Browse what's available: `curl http://10.5.5.1:5000/v2/_catalog` and
+`curl http://10.5.5.1:5000/v2/<repo>/tags/list`.
+
+**Disk discipline**: the registry volume stores its own copy of every pushed image on
+this already-tight disk (~10 GB per CUDA image; the volume rides `/var/lib/docker`).
+Push only images a worker will actually pull, delete stale tags, and reclaim with the
+registry's garbage collector (deletes are enabled):
+
+```bash
+docker exec llamacpp-registry registry garbage-collect /etc/docker/registry/config.yml
+```
+
 ---
 
 ## 2. Models & data
