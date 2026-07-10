@@ -24,7 +24,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
-GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+// model_dir (optional, TASKS.md #26): directory of local GGUF files indexed by tensor-content
+// hash at startup; SET_TENSOR_HASH cache misses are then served from local disk instead of
+// streaming from the coordinator. A stale local file hash-misses and streams as before.
+GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir, const char * model_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);

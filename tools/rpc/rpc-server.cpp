@@ -176,6 +176,7 @@ struct rpc_server_params {
     bool                     tensor_parallel = false;
     bool                     announce    = false;
     std::string              announce_group; // empty = built-in default multicast group
+    std::string              model_dir;      // local GGUFs to serve tensors from (skips first-load streaming)
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -194,6 +195,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -a, --announce                   announce this worker on the LAN via UDP multicast so\n");
     fprintf(stderr, "                                   coordinators with --rpc-discover find it (trusted networks only)\n");
     fprintf(stderr, "  --announce-group ADDR:PORT       multicast group for --announce (default: built-in group)\n");
+    fprintf(stderr, "  -md, --model-dir DIR             serve tensors from local GGUF files in DIR when the coordinator's\n");
+    fprintf(stderr, "                                   model matches (skips the first-load network stream)\n");
     fprintf(stderr, "\n");
 }
 
@@ -251,6 +254,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
             params.announce = true;
             params.announce_group = argv[i];
+        } else if (arg == "-md" || arg == "--model-dir") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.model_dir = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -419,6 +427,8 @@ int main(int argc, char * argv[]) {
         }
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir,
+                    params.model_dir.empty() ? nullptr : params.model_dir.c_str(),
+                    params.n_threads, devices.size(), devices.data());
     return 0;
 }

@@ -114,6 +114,16 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
   synchronous protocol); with the cache, every later load reads local disk.
   **In a container, also set `LLAMA_CACHE=/cache`** and mount a volume there —
   without the env, the cache lands inside the container and dies with it.
+- `-md`/`--model-dir DIR` kills even the *first*-load stream when the worker
+  has its own copy of the GGUF: the worker indexes every GGUF under DIR by
+  tensor-content hash at startup (reads each file once, ~seconds/10 GB on
+  NVMe; the index persists in the cache dir so later starts are instant) and
+  serves hash-matched tensors from local disk instead of asking the
+  coordinator to stream them. A stale or different local file simply
+  hash-misses and streams as before — no version-skew failure mode. Only
+  tensors > 10 MiB go through the hash path (same threshold as the weight
+  cache), and tensor-parallel islands still stream (they receive slices,
+  which don't hash-match whole tensors).
 - `--tensor-parallel` requires >= 2 local GPUs; the worker prints
   `tensor-parallel island: N devices exposed as one` and advertises itself
   as `Meta[N](...)`. NCCL/P2P AllReduce runs worker-locally between its GPUs.

@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 #include "transport.h"
 
 #include <array>
@@ -1190,6 +1191,11 @@ public:
     }
     ~rpc_server();
 
+    // worker-local model sourcing (TASKS.md #26): index the tensors of local GGUF files
+    // by content hash so SET_TENSOR_HASH cache misses read from local disk instead of
+    // streaming from the coordinator. Call before serving — the index is immutable after.
+    void build_local_index(const char * model_dir);
+
     std::mutex exec_mutex;
     // set (under exec_mutex) by the serving thread before dispatching a command
     uint64_t current_conn = 0;
@@ -1238,6 +1244,16 @@ public:
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+
+    struct local_tensor_ref {
+        std::string file;
+        uint64_t    offset; // absolute file offset of the tensor data
+        uint64_t    size;
+    };
+    bool get_local_tensor(uint64_t hash, std::vector<uint8_t> & data);
+    // hash -> location in a local GGUF; built once at startup, read-only afterwards
+    std::unordered_map<uint64_t, local_tensor_ref> local_index;
+
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -1643,10 +1659,157 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     return true;
 }
 
+// worker-local model sourcing (TASKS.md #26)
+//
+// The index maps fnv_hash(tensor bytes) -> (file, offset, size) for every tensor of every
+// GGUF under --model-dir that is large enough for the coordinator's SET_TENSOR_HASH path
+// (> HASH_THRESHOLD). Hashing reads each file once (~seconds/10 GB on NVMe), so the result
+// is persisted in the cache dir keyed by (path, mtime, size) and reloaded instantly while
+// the file is unchanged. A stale or different file simply hash-misses at lookup time and
+// the coordinator streams as before — correct by construction, no version-skew failure mode.
+
+static uint64_t local_index_file_key(const std::string & path, uint64_t mtime, uint64_t size) {
+    std::string ident = path + "|" + std::to_string(mtime) + "|" + std::to_string(size);
+    return fnv_hash((const uint8_t *) ident.data(), ident.size());
+}
+
+void rpc_server::build_local_index(const char * model_dir) {
+    std::error_code ec;
+    if (model_dir == nullptr || !fs::is_directory(model_dir, ec)) {
+        GGML_LOG_ERROR("model dir '%s' is not a directory, skipping local index\n", model_dir ? model_dir : "");
+        return;
+    }
+    size_t n_files = 0;
+    for (auto it = fs::recursive_directory_iterator(model_dir, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) {
+            break;
+        }
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path path = it->path();
+        // GGUF files sometimes carry suffixes (e.g. "model.gguf?download=true") — match anywhere
+        if (path.filename().string().find(".gguf") == std::string::npos) {
+            continue;
+        }
+        const uint64_t f_size  = (uint64_t) fs::file_size(path, ec);
+        const uint64_t f_mtime = (uint64_t) fs::last_write_time(path, ec).time_since_epoch().count();
+        const std::string path_str = path.string();
+
+        // try the persisted index first
+        fs::path idx_file;
+        if (cache_dir) {
+            char key_str[17];
+            snprintf(key_str, sizeof(key_str), "%016" PRIx64, local_index_file_key(path_str, f_mtime, f_size));
+            idx_file = fs::path(cache_dir) / (std::string("modelidx-") + key_str);
+            std::ifstream ifs(idx_file);
+            if (ifs) {
+                std::string magic, file_line;
+                std::getline(ifs, magic);
+                if (magic == "rpc-model-index v1") {
+                    size_t n_loaded = 0;
+                    uint64_t hash, offset, size;
+                    while (ifs >> std::hex >> hash >> std::dec >> offset >> size) {
+                        local_index[hash] = { path_str, offset, size };
+                        n_loaded++;
+                    }
+                    GGML_LOG_INFO("local index: %s (%zu tensors, from cached index)\n", path_str.c_str(), n_loaded);
+                    n_files++;
+                    continue;
+                }
+            }
+        }
+
+        // parse + hash the GGUF (reads every large tensor once)
+        struct gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        struct gguf_context * gctx = gguf_init_from_file(path_str.c_str(), params);
+        if (gctx == nullptr) {
+            GGML_LOG_ERROR("local index: failed to parse %s, skipping\n", path_str.c_str());
+            continue;
+        }
+        std::ifstream f(path_str, std::ios::binary);
+        if (!f) {
+            GGML_LOG_ERROR("local index: failed to open %s, skipping\n", path_str.c_str());
+            gguf_free(gctx);
+            continue;
+        }
+        GGML_LOG_INFO("local index: hashing %s (%.1f GiB) ...\n", path_str.c_str(), f_size / (1024.0*1024.0*1024.0));
+        const size_t data_offset = gguf_get_data_offset(gctx);
+        std::vector<uint8_t> buf;
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> entries; // hash, offset, size
+        for (int64_t i = 0; i < gguf_get_n_tensors(gctx); i++) {
+            const size_t size = gguf_get_tensor_size(gctx, i);
+            if (size <= HASH_THRESHOLD) {
+                continue; // the coordinator only hashes tensors above the threshold
+            }
+            const uint64_t offset = data_offset + gguf_get_tensor_offset(gctx, i);
+            buf.resize(size);
+            f.seekg(offset);
+            if (!f.read((char *) buf.data(), size)) {
+                GGML_LOG_ERROR("local index: short read in %s at offset %" PRIu64 ", skipping file\n", path_str.c_str(), offset);
+                entries.clear();
+                break;
+            }
+            entries.emplace_back(fnv_hash(buf.data(), size), offset, size);
+        }
+        gguf_free(gctx);
+        for (const auto & [hash, offset, size] : entries) {
+            local_index[hash] = { path_str, offset, size };
+        }
+        GGML_LOG_INFO("local index: %s -> %zu tensors indexed\n", path_str.c_str(), entries.size());
+        if (!entries.empty()) {
+            n_files++;
+        }
+
+        // persist for the next start
+        if (cache_dir && !entries.empty()) {
+            std::ofstream ofs(idx_file);
+            if (ofs) {
+                ofs << "rpc-model-index v1\n";
+                for (const auto & [hash, offset, size] : entries) {
+                    char hash_str[17];
+                    snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+                    ofs << hash_str << " " << offset << " " << size << "\n";
+                }
+            } else {
+                GGML_LOG_ERROR("local index: failed to persist %s (re-hashing next start)\n", idx_file.string().c_str());
+            }
+        }
+    }
+    GGML_LOG_INFO("local index: %zu files, %zu tensors total%s\n", n_files, local_index.size(),
+                  cache_dir ? "" : " (no cache dir — the index is re-hashed every start)");
+}
+
+bool rpc_server::get_local_tensor(uint64_t hash, std::vector<uint8_t> & data) {
+    const auto it = local_index.find(hash);
+    if (it == local_index.end()) {
+        return false;
+    }
+    const local_tensor_ref & ref = it->second;
+    std::ifstream f(ref.file, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    data.resize(ref.size);
+    f.seekg(ref.offset);
+    if (!f.read((char *) data.data(), ref.size)) {
+        return false;
+    }
+    // the file may have changed since indexing — verify before serving
+    if (fnv_hash(data.data(), data.size()) != hash) {
+        GGML_LOG_ERROR("local index: %s changed on disk (hash mismatch at offset %" PRIu64 "), falling back to streaming\n",
+                       ref.file.c_str(), ref.offset);
+        return false;
+    }
+    LOG_DBG("[%s] hash %016" PRIx64 " served from %s (%" PRIu64 " bytes)\n", __func__, hash, ref.file.c_str(), ref.size);
+    return true;
+}
+
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
+    if (!get_cached_file(request.hash, cached_file) && !get_local_tensor(request.hash, cached_file)) {
         response.result = 0;
         return true;
     }
@@ -2367,7 +2530,7 @@ static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn
     server.free_owned(conn_id);
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir, const char * model_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
@@ -2380,6 +2543,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("  local models   : %s\n", model_dir ? model_dir : "n/a");
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -2426,6 +2590,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     // each connection is served by its own thread, execution is serialized by
     // the server's exec_mutex
     rpc_server server(backends, cache_dir);
+    if (model_dir != nullptr) {
+        server.build_local_index(model_dir);
+    }
     uint64_t next_conn_id = 1;
     while (true) {
         auto client_socket = server_socket->accept();
