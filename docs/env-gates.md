@@ -101,7 +101,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | Gate | Type | Default | What it does |
 |---|---|---|---|
 | `GGML_RPC_NO_W2W` | bool | off | Disable direct worker-to-worker tensor pull; fall back to bridged copies through the coordinator. |
-| `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | bool | off | (= `--rpc-skip-unavailable`) Drop unreachable `--rpc` servers with a warning and split the model across the remaining devices, instead of exiting with an error. Load-time only — a worker that dies mid-session still aborts (TASKS.md #29). |
+| `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | bool | off | (= `--rpc-skip-unavailable`) Drop unreachable `--rpc` servers with a warning and split the model across the remaining devices, instead of exiting with an error. Load-time; a worker dying mid-session is handled separately (29b: requests error cleanly, server exits for restart+rediscovery). |
 | `LLAMA_ARG_RPC_DISCOVER` | bool | off | (= `--rpc-discover`) Discover RPC workers announcing themselves on the LAN (`rpc-server --announce`) and use them; composes with `--rpc`, duplicates skipped. Trusted networks only. |
 | `LLAMA_KV_WORKER_HOST` | bool | off | KV annex (task 30): a worker exposing GPU+CPU (`rpc-server -d CUDA0,CPU`, e.g. `WORKER_EXTRA_ARGS="-d CUDA0,CPU"`) gets its CPU device reserved — no layers, but the KV cache of that worker's GPU layers lives there (worker RAM). Weights stay in VRAM → a small-VRAM card holds ~2× the layers; measured ~7% decode cost (0.6B/32k loopback). |
 | `LLAMA_ARG_RPC_DISCOVER_GROUP` | str | built-in | (= `--rpc-discover-group`) Multicast group `ADDR:PORT` for discovery; must match the workers' `--announce-group`. |
