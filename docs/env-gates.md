@@ -109,6 +109,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_CUDA_INJECT_COMPUTE_FAIL` | int | off | Fault injection for the containment path: `N>0` fails the Nth graph compute and after (poisoned backend); `N<0` fails only the \|N\|th (isolated error — the worker must recover). |
 | `GGML_RDMA_DEV` / `GGML_RDMA_GID` | str | auto | RDMA device / GID selection for the RPC transport (when built with RDMA). |
 | `GGML_RPC_DEBUG` | bool | off | *(upstream)* RPC command logging. |
+| `GGML_RPC_STATS` | bool | off | Client-side per-RPC-command call/byte counters, dumped to stderr at exit. Diagnostic; used to find the O(n^2) graph serialization and the per-row weight upload (task 28 increment 1). |
 
 ## 8. KV cache (task 10)
 

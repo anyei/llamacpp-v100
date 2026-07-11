@@ -93,7 +93,7 @@ Placement policy (the user-guidance dial, informed by #31):
 
 - **0. This document** — design + projections from measured facts. ✅
 - **1. Meta-over-RPC spike**: build a coordinator-side meta device whose
-  members are RPC devices (CPU workers); run Qwen3.6-35B-A3B with experts
+  members are RPC devices (CPU workers); run a MoE model with experts
   segmented across 2 workers, attention local. Gates: coherent temp-0 output;
   PPL == single-box reference; per-token wire bytes within 2× of §2 estimates.
   Feasibility probe (2026-07-11): **GO** — `ggml-backend-meta.cpp:2416` has a
@@ -103,6 +103,56 @@ Placement policy (the user-guidance dial, informed by #31):
   optimize later via W2W). Remaining risks: fallback perf, graph-build cost
   per layer, meta shadow bookkeeping over RPC buffer semantics (the TP-island
   work solved the inverse direction and is the reference).
+
+  **DONE (2026-07-11).** `-sm tensor` + `--rpc a,b --device RPCx,RPCy` builds
+  `Meta(RPC,RPC)` with no new subsystems; vehicle = GLM-4.7-Flash (MLA policy
+  already mirrors attention and splits only `ffn_*_exps` = exactly the EP
+  shape; the fallback reduce runs W2W via COPY_FROM_REMOTE, not bridged).
+  Bugs found and fixed on the way (all in the working tree):
+  1. *Meta static shadow-arena retirement* (`ggml-backend-meta.cpp`): a KV ctx
+     that exactly fills its arena (pure-attention models: 2*(1+n_stream)*n_layer
+     tensors) retired the static arena mid-creation; the per-member alloc walk
+     only sees the current arena -> silent NULL -> assert. Fixed: retirement
+     headroom + views-only contexts take the dummy-buffer branch. Hybrids
+     (27B/35B) undershoot the arena, which is why prod never hit it.
+  2. *O(n^2) graph serialization* (`ggml-rpc.cpp`): `serialize_graph` walked
+     src closures past subgraph boundaries, so each of the meta backend's
+     ~2/layer subgraph messages carried the whole model-graph closure:
+     measured **53 MB/token** on GLM (GGML_RPC_STATS). Fixed: leaf-cut
+     serialization (out-of-graph tensors serialize as data-only leaves; safe
+     for any server version).
+  3. *Graph re-serialization every token*: the single `last_graph_uid` reuse
+     slot never matches when ~96 subgraphs cycle per token. Fixed: proto 4.3
+     `GRAPH_COMPUTE_UID`/`GRAPH_RECOMPUTE_UID` + per-(device,uid) LRU cache
+     (server cap 512, client tracks half) — steady-state decode sends 16 B
+     per subgraph instead of the graph.
+  4. *Per-row weight upload*: the meta slicer's `set_tensor_2d` fell back to
+     one RPC SET_TENSOR per row — 12.0M calls / +4.3 GB descriptor overhead
+     per GLM load, and it defeated SET_TENSOR_HASH/--model-dir. Fixed: RPC
+     buffer `set_tensor_2d` gathers rows client-side into 32 MB chunks
+     (2064 calls; hash path engages again on whole/mirrored tensors).
+
+  **Gate results** (2 CPU workers .11 + .15, GbE; coordinator dev box):
+  - *Coherence*: PASS — 0.6B dense loopback and GLM fleet runs produce fluent
+    on-topic temp-0 output.
+  - *PPL* (wiki.test, 8 chunks): meta 8.1284 +/- 0.51 vs single-box 8.0294
+    +/- 0.49 (BOTH .11-only and .15-only give the identical 8.0294 — single-box
+    is hardware-independent). Attribution: LLAMA_META_DUP_DEVICE=2 against ONE
+    worker (same 2-way split arithmetic, no cross-worker wire) reproduces
+    **8.1284 exactly** — the delta is inherent to the 2-way split math
+    (segmented expert sums reorder additions -> near-tied router picks flip),
+    and the cross-worker transfer adds zero numerical error. PASS.
+  - *Wire bytes/token* (RPC_STATS, -n 1 vs -n 129 subtraction): mixed-proto
+    fleet (workers still 4.2 -> no uid cache): 2.9 MB/token coordinator tx,
+    2.75 MB of it legacy graph serialization. With proto 4.3 on both ends
+    (validated on loopback): ~140 KB/token tx + ~616 KB logits rx + ~770 KB
+    W2W reduce payloads = **~1.5 MB/token — inside the §2 band**, PASS.
+  - *Perf trail* (not a gate): GLM decode 0.7 -> 4.2 t/s from leaf-cut alone
+    (mixed fleet); loopback 0.6B 11.6 -> 18.1 t/s. Latency floor (§2) is now
+    the dominant cost: ~95 sequential subgraph+reduce boundaries/token.
+  - Fleet worker image with proto 4.3 pushed as
+    `10.5.5.1:5000/llamacpp-cpu:rpc-worker-uidcache`; workers need a manual
+    `docker compose up -d` with that WORKER_IMAGE (not yet applied).
 - **2. DeepSeek-81GB across the fleet**: the prize run. Gates: loads with
   experts RAM-resident across ≥3 workers (--model-dir makes this cheap);
   decode ≥ 3× the 2.7 t/s SSD baseline; coherent output; PPL sane.
