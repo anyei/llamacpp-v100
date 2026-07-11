@@ -162,7 +162,9 @@ Placement policy (the user-guidance dial, informed by #31):
   runs **coherently** RAM-resident across .11+.15+.25 (`-ts 4,3,1.5`):
   fluent on-topic CPU-pipeline explanation, uid-cache healthy (13.4k
   recomputes vs 564 full sends). Decode **0.4 t/s** vs the 8.1 gate (and
-  below the 2.7 SSD baseline; the 2-worker .11+.15 config did 1.2-1.3).
+  below the 2.7 SSD baseline). Clean 2-worker baseline (.11+.15, GbE only,
+  `-ts 3,2`): **1.0 t/s coherent** - META_TIMING ~175 ms compute +
+  ~40 ms reduce per graph piece, ~5 pieces/token, 10.8 boundaries/piece.
   Attribution, all actionable:
   1. **.25's 100-Mbit link sits in EVERY reduce boundary** - 3 members means
      2 butterfly steps/boundary and .25 carries transfers in both; #31's
