@@ -96,9 +96,13 @@ Placement policy (the user-guidance dial, informed by #31):
   members are RPC devices (CPU workers); run Qwen3.6-35B-A3B with experts
   segmented across 2 workers, attention local. Gates: coherent temp-0 output;
   PPL == single-box reference; per-token wire bytes within 2× of §2 estimates.
-  Known risks: meta assumes member backends support the reduce path it uses
-  (generic fallback is coordinator-bridged get/sum/set — correct, one extra
-  hop; optimize later via W2W); graph-build cost per layer.
+  Feasibility probe (2026-07-11): **GO** — `ggml-backend-meta.cpp:2416` has a
+  generic `allreduce_fallback` for members without the backend-specific comm
+  proc (only CUDA provides `ggml_backend_comm_allreduce_tensor`), so RPC/CPU
+  members reduce through it (coordinator-bridged — correct, one extra hop;
+  optimize later via W2W). Remaining risks: fallback perf, graph-build cost
+  per layer, meta shadow bookkeeping over RPC buffer semantics (the TP-island
+  work solved the inverse direction and is the reference).
 - **2. DeepSeek-81GB across the fleet**: the prize run. Gates: loads with
   experts RAM-resident across ≥3 workers (--model-dir makes this cheap);
   decode ≥ 3× the 2.7 t/s SSD baseline; coherent output; PPL sane.
