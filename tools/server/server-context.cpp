@@ -3704,6 +3704,28 @@ private:
                         }
                     }
 
+                    // a lost RPC worker makes the model's layer assignment unrecoverable
+                    // in-process (TASKS.md #29b): exit once the error responses have had a
+                    // moment to flush, so the restart policy reloads and --rpc-discover
+                    // re-splits across whatever workers are alive by then
+                    typedef bool (*rpc_any_failed_t)(void);
+                    static const rpc_any_failed_t rpc_any_failed_fn = []() -> rpc_any_failed_t {
+                        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+                        return reg != nullptr
+                            ? (rpc_any_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_any_endpoint_failed")
+                            : nullptr;
+                    }();
+                    if (rpc_any_failed_fn != nullptr && rpc_any_failed_fn()) {
+                        SRV_ERR("%s", "an RPC worker connection was lost - exiting in 2s for a clean restart "
+                                      "(restart policy + --rpc-discover re-enlist the live workers)\n");
+                        std::thread([]() {
+                            std::this_thread::sleep_for(std::chrono::seconds(2));
+                            fflush(stdout);
+                            fflush(stderr);
+                            std::_Exit(42);
+                        }).detach();
+                    }
+
                     // stop, do not retry with smaller batch size
                     throw std::runtime_error(err);
                 }

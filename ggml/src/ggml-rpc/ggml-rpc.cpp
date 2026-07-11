@@ -34,7 +34,34 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
+// TASKS.md #29b: a dropped/dead worker must fail the coordinator's REQUEST, not the
+// process. Any RPC failure marks the endpoint below; subsequent operations degrade to
+// cheap no-ops (outputs zeroed), graph_compute reports GGML_STATUS_FAILED, and the
+// caller (llama) surfaces a clean decode error. Restarting the coordinator re-splits
+// the model across the workers that are still alive (--rpc-discover +
+// --rpc-skip-unavailable make that fully automatic).
+static std::mutex g_rpc_failed_mutex;
+static std::unordered_set<std::string> g_rpc_failed_endpoints;
+
+static void rpc_mark_failed(const std::string & endpoint, const char * where) {
+    std::lock_guard<std::mutex> lock(g_rpc_failed_mutex);
+    if (g_rpc_failed_endpoints.insert(endpoint).second) {
+        GGML_LOG_ERROR("RPC worker '%s' failed in %s: connection lost or worker crashed. "
+                       "Failing the affected requests; restart the coordinator to re-split "
+                       "across the live workers.\n",
+                       endpoint.empty() ? "?" : endpoint.c_str(), where);
+    }
+}
+
+static bool rpc_endpoint_failed(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_rpc_failed_mutex);
+    return g_rpc_failed_endpoints.count(endpoint) > 0;
+}
+
+bool ggml_backend_rpc_any_endpoint_failed(void) {
+    std::lock_guard<std::mutex> lock(g_rpc_failed_mutex);
+    return !g_rpc_failed_endpoints.empty();
+}
 
 // all RPC structures must be packed
 #pragma pack(push, 1)
@@ -396,6 +423,7 @@ struct ggml_backend_rpc_async_state {
     uint64_t cmds_sent = 0;
     uint8_t  server_minor = 0; // from HELLO; gates use of 4.2+ commands
     uint64_t conn_id = 0;      // this socket's connection id on the server (0 = not fetched)
+    std::string endpoint;      // for failure attribution (set by get_socket)
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -486,7 +514,9 @@ static uint64_t rpc_ping_async(socket_ptr sock) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
     bool status = send_rpc_cmd_raw(sock, st, RPC_CMD_PING, nullptr, 0);
-    GGML_ASSERT(status && "failed to send RPC ping");
+    if (!status) {
+        rpc_mark_failed(st.endpoint, __func__);
+    }
     return ++st.pings_sent;
 }
 
@@ -496,7 +526,10 @@ static void rpc_sync_pings(socket_ptr sock, uint64_t seq) {
     std::lock_guard<std::mutex> lock(st.mutex);
     const uint64_t target = seq == 0 ? st.pings_sent : std::min(seq, st.pings_sent);
     bool status = rpc_drain_pings_locked(sock, st, target);
-    GGML_ASSERT(status && "RPC server crashed or returned malformed ping response");
+    if (!status) {
+        rpc_mark_failed(st.endpoint, __func__);
+        st.pings_done = target; // never re-wait for pongs that will not arrive
+    }
 }
 
 // RPC client-side implementation
@@ -511,7 +544,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     sock->get_caps(request.conn_caps);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("RPC HELLO failed: server dropped the connection\n");
+        return false;
+    }
 
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
@@ -538,7 +574,10 @@ static uint64_t rpc_get_conn_id(socket_ptr sock) {
     }
     rpc_msg_get_conn_id_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_CONN_ID, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(st.endpoint, __func__);
+        return 0; // callers treat 0 as "no fence available"
+    }
     std::lock_guard<std::mutex> lock(st.mutex);
     st.conn_id = response.conn_id;
     return st.conn_id;
@@ -575,6 +614,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    rpc_async_state(sock.get()).endpoint = endpoint;
     sockets[endpoint] = sock;
     return sock;
 }
@@ -583,7 +623,10 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        // the worker is gone and freed everything with the connection anyway
+        rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+    }
     delete ctx;
 }
 
@@ -595,7 +638,10 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
     rpc_msg_buffer_get_base_rsp response;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+        return nullptr;
+    }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
 }
@@ -657,7 +703,10 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
         request.tensor = serialize_tensor(tensor);
 
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -686,7 +735,10 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+            return;
+        }
         if (response.result) {
             // the server has the same data, no need to send it
             return;
@@ -699,7 +751,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -710,7 +764,10 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.offset = offset;
     request.size = size;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+        memset(data, 0, size); // deterministic instead of stale garbage
+    }
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -729,7 +786,10 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         request.dst = serialize_tensor(dst);
         rpc_msg_copy_tensor_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+            return false;
+        }
         return response.result;
     }
     return false;
@@ -739,7 +799,9 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+    }
 }
 
 static void ggml_backend_rpc_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
@@ -778,8 +840,15 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(buft_ctx->endpoint, __func__);
+        return nullptr;
+    }
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(buft_ctx->endpoint, __func__);
+        return nullptr;
+    }
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
@@ -795,7 +864,10 @@ static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t dev
     rpc_msg_get_alignment_req request = {device};
     rpc_msg_get_alignment_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(sock.get()).endpoint, __func__);
+        return 64; // ggml base alignment; the endpoint is poisoned anyway
+    }
     return response.alignment;
 }
 
@@ -808,7 +880,10 @@ static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t devi
     rpc_msg_get_max_size_req request = {device};
     rpc_msg_get_max_size_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(sock.get()).endpoint, __func__);
+        return SIZE_MAX;
+    }
     return response.max_size;
 }
 
@@ -837,6 +912,10 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
         auto sock = get_socket(buft_ctx->endpoint);
+        if (sock == nullptr) {
+            rpc_mark_failed(buft_ctx->endpoint, __func__);
+            return ggml_nbytes(tensor);
+        }
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -852,7 +931,10 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        if (!status) {
+            rpc_mark_failed(rpc_async_state(sock.get()).endpoint, __func__);
+            return ggml_nbytes(tensor);
+        }
 
         return response.alloc_size;
     }
@@ -886,6 +968,10 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     // graph_compute and set_tensor are sent without waiting; a fresh marker's
     // response proves everything sent so far has executed on the server
     auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        return; // the endpoint is poisoned; graph_compute reports the failure
+    }
     rpc_sync_pings(sock, rpc_ping_async(sock));
 }
 
@@ -927,6 +1013,9 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     }
     auto sock_src = get_socket(src_ctx->endpoint);
     auto sock_dst = get_socket(dst_ctx->endpoint);
+    if (sock_src == nullptr || sock_dst == nullptr) {
+        return false; // bridged fallback; that path is failure-contained
+    }
     ggml_backend_rpc_async_state & st_src = rpc_async_state(sock_src.get());
     ggml_backend_rpc_async_state & st_dst = rpc_async_state(sock_dst.get());
     if (st_src.server_minor < 2 || st_dst.server_minor < 2) {
@@ -974,7 +1063,10 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
 
     rpc_msg_copy_from_remote_rsp response;
     bool status = send_rpc_cmd(sock_dst, RPC_CMD_COPY_FROM_REMOTE, input.data(), input.size(), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(dst_ctx->endpoint, __func__);
+        return false; // the bridged fallback will fail-contained on the same endpoint
+    }
     // a failed pull (e.g. the destination worker cannot reach the source) falls
     // back to the coordinator-bridged copy
     return response.result != 0;
@@ -993,7 +1085,13 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_rpc_event_context * ectx = (ggml_backend_rpc_event_context *)event->context;
     ectx->endpoint = rpc_ctx->endpoint;
-    ectx->seq = rpc_ping_async(get_socket(rpc_ctx->endpoint));
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        ectx->seq = 0; // never recorded; waits on it are no-ops
+        return;
+    }
+    ectx->seq = rpc_ping_async(sock);
 }
 
 static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -1007,7 +1105,12 @@ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_eve
     }
     // cross-endpoint: the coordinator is the only bridge - block until the event's
     // server has executed past the marker before issuing more work here
-    rpc_sync_pings(get_socket(ectx->endpoint), ectx->seq);
+    auto sock = get_socket(ectx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(ectx->endpoint, __func__);
+        return;
+    }
+    rpc_sync_pings(sock, ectx->seq);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -1058,19 +1161,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    if (rpc_endpoint_failed(rpc_ctx->endpoint)) {
+        return GGML_STATUS_FAILED; // poisoned endpoint: fail the decode cleanly, don't touch the wire
+    }
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     bool status;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
-        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        status = sock != nullptr && send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        status = sock != nullptr && send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
     }
     if (!status) {
         // a contained worker-side compute failure closes the connection (TASKS.md #29e) —
@@ -1163,7 +1269,12 @@ static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t d
     request.device = device;
     rpc_msg_get_device_memory_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        rpc_mark_failed(rpc_async_state(sock.get()).endpoint, __func__);
+        *free  = 0;
+        *total = 0;
+        return;
+    }
     *free = response.free_mem;
     *total = response.total_mem;
 }
@@ -2829,7 +2940,12 @@ static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, gg
     if (ectx->seq == 0) {
         return;
     }
-    rpc_sync_pings(get_socket(ectx->endpoint), ectx->seq);
+    auto sock = get_socket(ectx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(ectx->endpoint, __func__);
+        return;
+    }
+    rpc_sync_pings(sock, ectx->seq);
     GGML_UNUSED(dev);
 }
 
@@ -2942,6 +3058,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_discover") == 0) {
         return (void *)ggml_backend_rpc_discover;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_any_endpoint_failed") == 0) {
+        return (void *)ggml_backend_rpc_any_endpoint_failed;
+    }
     return NULL;
 
     GGML_UNUSED(reg);
@@ -2972,7 +3091,10 @@ static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
     }
     rpc_msg_device_count_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!status) {
+        GGML_LOG_ERROR("Failed to query device count from %s\n", endpoint);
+        return 0;
+    }
     return response.device_count;
 }
 

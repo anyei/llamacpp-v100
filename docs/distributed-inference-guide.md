@@ -407,9 +407,14 @@ Everything here is automatic — no new flags on the happy path:
   process: it drops that coordinator's connection and keeps serving others,
   and after 3 consecutive failures (poisoned CUDA context) it exits cleanly
   so `restart: always` brings up a fresh process (task 29e). The
-  *coordinator* still treats a dropped connection mid-decode as fatal —
-  restart it; the worker's warm cache makes the reload cheap. Coordinator
-  reconnect/redistribution is TASKS.md #29 (b)/(c).
+  *coordinator* survives a worker dying mid-session too (task 29b): the
+  failed endpoint is poisoned (never aborts the process), in-flight
+  requests receive proper error responses (HTTP 500 "Compute error."), and
+  llama-server then exits with code 42 — a lost worker makes the layer
+  assignment unrecoverable in-process, so the restart policy reloads and
+  `--rpc-discover` re-splits across whatever workers are alive. Together:
+  a fully self-healing fleet with no manual intervention. Live
+  redistribution without a restart remains TASKS.md #29 (c).
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
