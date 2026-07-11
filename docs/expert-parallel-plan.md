@@ -157,8 +157,30 @@ Placement policy (the user-guidance dial, informed by #31):
   experts RAM-resident across ≥3 workers (--model-dir makes this cheap);
   decode ≥ 3× the 2.7 t/s SSD baseline; coherent output; PPL sane.
 
-  **IN PROGRESS (2026-07-11 afternoon) — loads and runs, decode still slow,
-  temp-0 output INCOHERENT (open bug). Everything learned so far:**
+  **GATE RESULT (2026-07-11 evening): capacity PROVEN, perf gate NOT met.**
+  With clean caches (see the cache-poisoning saga below) the 86.7 GB model
+  runs **coherently** RAM-resident across .11+.15+.25 (`-ts 4,3,1.5`):
+  fluent on-topic CPU-pipeline explanation, uid-cache healthy (13.4k
+  recomputes vs 564 full sends). Decode **0.4 t/s** vs the 8.1 gate (and
+  below the 2.7 SSD baseline; the 2-worker .11+.15 config did 1.2-1.3).
+  Attribution, all actionable:
+  1. **.25's 100-Mbit link sits in EVERY reduce boundary** - 3 members means
+     2 butterfly steps/boundary and .25 carries transfers in both; #31's
+     bandwidth-proportional law applies to LINKS, not just RAM: a
+     100-Mbit box must hold a tiny/cold share (true expert-parallel
+     placement, increment 3) or stay out of the hot path.
+  2. Sequential fenced W2W pulls (~3.4 ms/boundary at 2 members, worse at
+     3) - parallelize the pulls in allreduce_fallback.
+  3. Per-token client-side subgraph rebuild (uid==0 outer graphs) -
+     multi-build cache.
+  Also hit and fixed on the way: a fresh cache-miss load writes the
+  worker's full share to the cache dir and the DIRTY page cache stacks on
+  top of the weights - OOM-killed .15 (36 GB share, 64 GB box) at end of
+  load; fsync+fadvise(DONTNEED) per entry now caps the dirty set, and a
+  member alloc failure fails the load cleanly instead of aborting the
+  coordinator (c18e3dbbc).
+
+  **The debugging story that got here (for the record):**
 
   *The model is 86.7 GB on disk (not the 81 GB quoted above).* It loads
   RAM-resident: 3 workers (.11+.15+.25, `-ts 4,3,1.5`) in ~47 min — gated by
