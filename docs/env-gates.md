@@ -87,6 +87,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_META_DEBUG_REDUCE` | bool | off | Print AllReduce boundary placement (`partial N -> boundary M`). |
 | `GGML_META_MAX_GRAPHS` | count | 8 | Compute-ring shadow-container slots (raise if many decode graph shapes are cached). |
 | `GGML_META_TIMING` | bool | off | Per-step compute vs reduce timing for the meta device. |
+| `LLAMA_META_EP_ONLY` | bool | off | Expert-parallel split shape: segment only `ffn_*_exps` across meta members, mirror everything else (attention, dense FFN, shared experts, output head). Also a fault isolator for split-policy bugs (task 28). |
 | `LLAMA_META_DUP_DEVICE` | count | 1 | Duplicate the device list N times so ONE physical GPU runs a genuine N-way split (validation harness; e.g. `=2` reproduces 2-GPU exactness on one card). |
 
 ## 6. Decode graph cache (task 8)

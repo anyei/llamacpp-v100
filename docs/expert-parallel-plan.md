@@ -156,6 +156,70 @@ Placement policy (the user-guidance dial, informed by #31):
 - **2. DeepSeek-81GB across the fleet**: the prize run. Gates: loads with
   experts RAM-resident across ≥3 workers (--model-dir makes this cheap);
   decode ≥ 3× the 2.7 t/s SSD baseline; coherent output; PPL sane.
+
+  **IN PROGRESS (2026-07-11 afternoon) — loads and runs, decode still slow,
+  temp-0 output INCOHERENT (open bug). Everything learned so far:**
+
+  *The model is 86.7 GB on disk (not the 81 GB quoted above).* It loads
+  RAM-resident: 3 workers (.11+.15+.25, `-ts 4,3,1.5`) in ~47 min — gated by
+  .25's 100-Mbit link (TCP backpressure on .25's ~22 GB share serializes the
+  whole per-tensor upload loop); 2 workers (.11+.15 GbE, `-ts 3,2`) in ~13 min.
+  Slice-aware local sourcing is the fix (a worker can only hash-match WHOLE
+  tensors today; the split-state push used by TP islands is the template).
+  A worker indexes /local-models at STARTUP - restart it after staging a file.
+
+  *deepseek4 is DSA, not plain MLA — and that difference drove every failure:*
+  - GLM-4.7-Flash (deepseek2 = actual MLA) is fully coherent under this
+    machinery, so MLA per se is fine. DeepSeek-V4-Flash (deepseek4 = DSA:
+    MLA latents + per-token top-k indexer, custom `llama_kv_cache_dsv4`,
+    SWA semantics) does NOT report `is_mla()`, so the split policy's
+    mirror-attention branch never engaged.
+  - `attn_sinks.weight` then took the head-split path whose axis reference
+    (`attn_output.weight`) does not even exist in this arch -> load abort.
+    FIXED: DSA archs (DEEPSEEK4/DEEPSEEK32/GLM_DSA) mirror attention
+    explicitly, same rationale as MLA (llama-model.cpp `mirror_attn`).
+  - The deepseek4 graph is 33.6k nodes and the scheduler cuts it into ~5
+    pieces per token (the indexer bounces through the coordinator; GLM = 2).
+    Two meta-backend assumptions broke:
+    (a) a scheduler piece can END on a view of a coordinator-side host tensor
+        -> the subgraph walk never closed the trailing subgraph
+        (`i_start == n_nodes` assert). FIXED: close it, no split state.
+    (b) the meta backend cached ONE subgraph build keyed by the outer graph
+        uid; with multiple meta pieces cycling per token it rebuilt every
+        call with FRESH uids -> the proto-4.3 graph cache never hit -> a
+        full re-serialization per subgraph per token (measured 24 MB/token,
+        ~200 ms/graph). FIXED: subgraph uids are now a CONTENT HASH (ops,
+        shapes, op_params, flags, data + src addresses) - identical rebuilds
+        keep their uid, so RECOMPUTE_UID hits across rebuilds. Measured after:
+        14758 recomputes vs 564 full sends, compute 200 -> ~124 ms/graph,
+        decode 0.8 -> 1.2 t/s (2 workers).
+  - *OPEN: temp-0 output is word-salad* on deepseek4 in default tensor mode
+    (GLM identical config = coherent). Bisect tool added:
+    `LLAMA_META_EP_ONLY=1` mirrors everything except `ffn_*_exps` (which is
+    also increment 1's intended EP shape). **Bisect result: still garbage
+    under EP_ONLY** (1.2 t/s, same 10.8 boundaries/graph) -> the corruption
+    is in the EXPERT path or the CPU<->Meta seams, NOT a non-expert split.
+    V4-only deltas vs the validated GLM expert path, in suspicion order:
+    (a) the `arch == DEEPSEEK4` clamp branch runs `ggml_swiglu_split` on
+        AXIS-split expert activations (GLM never executes this op);
+    (b) the delayed-reduce pattern matcher (`get_i_delayed`) meeting a
+        V4-shaped expert-merge tree (ADD_ID/MUL/VIEW chain differs with
+        sigmoid+bias routing over 256 experts) - a mis-extended delay window
+        that lets a mirrored addend land BEFORE the reduce double-counts it;
+    (c) the 5 CPU<->Meta seams around the indexer (PARTIAL get sums members
+        and looked correct on inspection).
+    Next diagnostic: `GGML_META_DEBUG_REDUCE=1` boundary map on V4 vs GLM
+    (device-count-independent, so cheap to read), then per-layer numeric
+    divergence if needed.
+  - *Perf reality check vs §2:* META_TIMING shows ~3.4 ms per reduce boundary
+    (~54 boundaries/token = ~185 ms/token of reduce alone) vs the 0.3 ms RTT
+    the §3 projection assumed - the gap is per-boundary orchestration: the
+    allreduce fallback's fenced W2W pulls are SEQUENTIAL synchronous RPCs.
+    Next levers, in expected order of payoff: parallelize the fenced pulls in
+    `allreduce_fallback` (halves boundary latency), multi-build subgraph cache
+    (kills the per-token client rebuild of 33.6k shadows), EP batching (inc 4).
+    Even at zero overhead the 2-worker compute floor is ~4-5 t/s; the 8.1 t/s
+    gate likely needs 3 workers + the reduce-latency lever.
 - **3. Placement policy**: bandwidth-weighted then hot/cold (routing-stat
   export from the router — the ssd-stream debug counters are the template).
   Gate: measurable tail-latency reduction vs uniform placement.

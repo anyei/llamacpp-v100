@@ -2089,6 +2089,44 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// FNV-1a over every field that determines what a subgraph computes. Struct
+// addresses are deliberately excluded: shadow structs are recreated per rebuild,
+// but if ops, shapes, params, flags and data/src addresses all match, executing
+// the previously transmitted graph is byte-identical.
+static uint64_t ggml_backend_meta_subgraph_uid(const ggml_cgraph * g) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](const void * data, size_t n) {
+        const uint8_t * b = (const uint8_t *) data;
+        for (size_t k = 0; k < n; k++) {
+            h = (h ^ b[k]) * 1099511628211ULL;
+        }
+    };
+    auto mix_tensor = [&](const ggml_tensor * t) {
+        if (t == nullptr) {
+            const int none = -1;
+            mix(&none, sizeof(none));
+            return;
+        }
+        mix(&t->type, sizeof(t->type));
+        mix(t->ne, sizeof(t->ne));
+        mix(t->nb, sizeof(t->nb));
+        mix(&t->data, sizeof(t->data));
+        mix(&t->view_offs, sizeof(t->view_offs));
+    };
+    for (int k = 0; k < g->n_nodes; k++) {
+        const ggml_tensor * t = g->nodes[k];
+        mix(&t->op, sizeof(t->op));
+        mix(t->op_params, sizeof(t->op_params));
+        mix(&t->flags, sizeof(t->flags));
+        mix_tensor(t);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            mix_tensor(t->src[s]);
+        }
+        mix_tensor(t->view_src);
+    }
+    return h == 0 ? 1 : h;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2267,12 +2305,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
+                const bool host_view = node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
                         (node->view_src->buffer == nullptr /* e.g. coordinator-side CPU tensors over RPC */ ||
-                         ggml_backend_buffer_is_host(node->view_src->buffer))) {
+                         ggml_backend_buffer_is_host(node->view_src->buffer));
+                // a host view has no meta split state, but if it is the LAST node the
+                // trailing subgraph still has to be closed (scheduler splits can end
+                // on one - seen with the deepseek4 indexer handoff)
+                if (host_view && i + 1 < cgraph->n_nodes) {
                     continue;
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                ggml_backend_meta_split_state split_state;
+                split_state.axis = GGML_BACKEND_SPLIT_AXIS_NONE;
+                if (!host_view) {
+                    split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                }
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
@@ -2382,7 +2428,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                cgraph_ij->uid = ggml_graph_next_uid();
+                // content-derived uid: equal hashes mean the server-side execution is
+                // byte-identical (ops, shapes, params, flags, data and src addresses),
+                // so rebuilds keep the SAME uid for unchanged subgraphs and the RPC
+                // graph cache stays hot even when the scheduler re-splits the outer
+                // graph every token (deepseek4's multi-split graphs did exactly that:
+                // fresh uids each token = a full re-serialization per subgraph)
+                cgraph_ij->uid = ggml_backend_meta_subgraph_uid(cgraph_ij);
             }
         }
     }

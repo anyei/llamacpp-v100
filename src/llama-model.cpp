@@ -423,22 +423,49 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
+        }
+        if (tensor_axis_0 == nullptr) {
+            LLAMA_LOG_ERROR("%s: no split-axis reference '%s%s'%s%s%s for tensor '%s'\n", __func__,
+                            prefix.c_str(), suffix.c_str(),
+                            suffix_fallback.empty() ? "" : " (fallback '",
+                            suffix_fallback.empty() ? "" : suffix_fallback.c_str(),
+                            suffix_fallback.empty() ? "" : "')",
+                            tensor_name.c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // LLAMA_META_EP_ONLY=1: expert-parallel shape - segment ONLY the routed
+        // expert tensors across members, mirror everything else (attention, dense
+        // FFN, shared experts, output head). Also a fault isolator: coherent here
+        // + garbage in default tensor mode pins a bug to a non-expert split.
+        static const bool ep_only = [] {
+            const char * env = getenv("LLAMA_META_EP_ONLY");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (ep_only && tensor_name.find("_exps") == std::string::npos) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         // MLA models (deepseek2 family, e.g. GLM-4.7-Flash): the KV cache holds a single
         // shared latent head that cannot be split by heads. Mirror the whole attention
         // block on every device and split only the FFN/expert weights - attention is a
         // small fraction of compute for these models and the latent cache is tiny.
-        if (hparams.is_mla() &&
+        // DSA archs use a custom sparse-attention cache and do not report is_mla(),
+        // but their attention must be mirrored for the same reason (single latent
+        // head, no per-head split; attn_output.weight does not even exist)
+        const bool mirror_attn = hparams.is_mla() ||
+            ud->model->arch == LLM_ARCH_DEEPSEEK4  ||
+            ud->model->arch == LLM_ARCH_DEEPSEEK32 ||
+            ud->model->arch == LLM_ARCH_GLM_DSA;
+        if (mirror_attn &&
                 (std::regex_match(tensor_name, pattern_q_weight) ||
                  std::regex_match(tensor_name, pattern_kv_cache) ||
+                 std::regex_match(tensor_name, pattern_attn_sinks) ||
+                 std::regex_match(tensor_name, pattern_qk_norm) ||
                  std::regex_match(tensor_name, pattern_attn_out_weight) ||
                  std::regex_match(tensor_name, pattern_attn_out_bias))) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
