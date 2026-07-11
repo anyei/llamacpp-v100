@@ -24,6 +24,9 @@ services:
     network_mode: host              # direct sockets; see security note
     volumes:
       - ./cache-rpc:/cache
+      # optional worker-local GGUF dir for --model-dir (skips first-load streaming;
+      # point WORKER_MODELS_DIR at the dir holding your .gguf copies)
+      - ${WORKER_MODELS_DIR:-./models-local}:/local-models:ro
     environment:
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
     # WORKER_THREADS: CPU compute threads on the worker. rpc-server's default
@@ -39,4 +42,5 @@ services:
       -t ${WORKER_THREADS:-8}
       -c
       --announce
+      ${WORKER_EXTRA_ARGS:-}
     restart: always

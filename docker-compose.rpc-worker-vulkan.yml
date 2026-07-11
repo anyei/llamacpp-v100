@@ -28,6 +28,9 @@ services:
       - /dev/dri:/dev/dri           # the Vulkan GPU
     volumes:
       - ./cache-rpc:/cache
+      # optional worker-local GGUF dir for --model-dir (skips first-load streaming;
+      # point WORKER_MODELS_DIR at the dir holding your .gguf copies)
+      - ${WORKER_MODELS_DIR:-./models-local}:/local-models:ro
     environment:
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
     # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
@@ -38,4 +41,5 @@ services:
       -p ${WORKER_PORT:-50052}
       -c
       --announce
+      ${WORKER_EXTRA_ARGS:-}
     restart: always
