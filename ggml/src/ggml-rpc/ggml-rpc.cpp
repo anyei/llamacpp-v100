@@ -24,6 +24,10 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#ifndef _WIN32
+#    include <fcntl.h>
+#    include <unistd.h>
+#endif
 #include <algorithm>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -1954,6 +1958,17 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
             GGML_LOG_ERROR("[%s] failed to save '%s'\n", __func__, cache_file.string().c_str());
             fs::remove(tmp_file, ec);
         } else {
+#ifndef _WIN32
+            // flush + drop the pages now: a model-sized load otherwise accumulates
+            // model-sized DIRTY page cache on top of the weights themselves, enough
+            // to OOM a worker whose RAM share is sized near its capacity
+            int fd = open(cache_file.string().c_str(), O_RDONLY);
+            if (fd >= 0) {
+                fsync(fd);
+                posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                close(fd);
+            }
+#endif
             GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
         }
     }

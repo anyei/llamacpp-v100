@@ -1873,7 +1873,13 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
+        if (!meta_buf_ctx->bufs[i]) {
+            // a member's allocation failure (e.g. an OOM-killed RPC worker) fails the
+            // load cleanly instead of aborting the process
+            GGML_LOG_ERROR("%s: failed to allocate member %zu buffer (%s)\n", __func__, i, ggml_backend_buft_name(simple_buft));
+            ggml_backend_buffer_free(meta_buf);
+            return nullptr;
+        }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;
