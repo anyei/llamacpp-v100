@@ -272,6 +272,17 @@ small constant while most compute remains local.
 
 ### 3b. Measured: a real heterogeneous CPU/iGPU worker fleet (2026-07-10)
 
+**Split policy for CPU fleets (measured 2026-07-11, TASKS.md #31):** CPU decode
+is memory-bandwidth-bound, so a pipeline across CPU boxes *aggregates
+bandwidth* — and the optimal `-ts` is proportional to each box's **memory
+bandwidth**, not its RAM size (the default) or CPU specs. 35B across
+i7-8550U (DDR4) + i5-3210M (DDR3): all-on-fastest 0.88 t/s · memory-default
+1.2 · even 1.72 · **bandwidth-proportional `-ts 3,2` = 2.26** (the DDR4:DDR3
+ratio). Also measured: `-np` batching barely raises MoE aggregate on CPU
+(+27%) because batched tokens hit distinct experts. GPU-rich boxes are the
+opposite regime: never distribute a model that fits fast VRAM.
+
+
 First cross-host measurements on real hardware. Fleet: coordinator (V100 box),
 worker A = **i7-9750H** laptop (64 GB, `10.5.5.15`), worker B = **Core Ultra 9
 285H** (64 GB, Arc 140T iGPU, `10.5.5.11`); quiet LAN, 0.15-0.44 ms RTT.
