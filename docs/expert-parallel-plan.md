@@ -193,24 +193,35 @@ Placement policy (the user-guidance dial, informed by #31):
         keep their uid, so RECOMPUTE_UID hits across rebuilds. Measured after:
         14758 recomputes vs 564 full sends, compute 200 -> ~124 ms/graph,
         decode 0.8 -> 1.2 t/s (2 workers).
-  - *OPEN: temp-0 output is word-salad* on deepseek4 in default tensor mode
-    (GLM identical config = coherent). Bisect tool added:
-    `LLAMA_META_EP_ONLY=1` mirrors everything except `ffn_*_exps` (which is
-    also increment 1's intended EP shape). **Bisect result: still garbage
-    under EP_ONLY** (1.2 t/s, same 10.8 boundaries/graph) -> the corruption
-    is in the EXPERT path or the CPU<->Meta seams, NOT a non-expert split.
-    V4-only deltas vs the validated GLM expert path, in suspicion order:
-    (a) the `arch == DEEPSEEK4` clamp branch runs `ggml_swiglu_split` on
-        AXIS-split expert activations (GLM never executes this op);
-    (b) the delayed-reduce pattern matcher (`get_i_delayed`) meeting a
-        V4-shaped expert-merge tree (ADD_ID/MUL/VIEW chain differs with
-        sigmoid+bias routing over 256 experts) - a mis-extended delay window
-        that lets a mirrored addend land BEFORE the reduce double-counts it;
-    (c) the 5 CPU<->Meta seams around the indexer (PARTIAL get sums members
-        and looked correct on inspection).
-    Next diagnostic: `GGML_META_DEBUG_REDUCE=1` boundary map on V4 vs GLM
-    (device-count-independent, so cheap to read), then per-layer numeric
-    divergence if needed.
+  - *SOLVED: the "word-salad/DDDD" corruption was NEVER a split bug — it was
+    the rpc-server tensor cache (`-c`) serving unverified poisoned entries.*
+    The hunt, for the record (each step ~3 min once the model was truncatable
+    with `LLAMA_TRUNC_ARR=1` + `--override-kv deepseek4.block_count=int:6`):
+    EP_ONLY split: still garbage -> NO_DELAY (new `GGML_META_NO_DELAY=1`,
+    reduce at every PARTIAL): still garbage -> GGML_RPC_NO_W2W: still garbage
+    -> .11 SINGLE-DEVICE (no meta at all): STILL garbage, split exonerated ->
+    same single-device through the same worker image locally: CLEAN ->
+    .15 single-device: garbage; fresh Q2_K 0.6B on .11: first run plausible,
+    every later run catastrophic (PPL = n_vocab = uniform logits) -> the
+    common factor: fleet workers run `-c`; repeated/killed uploads during the
+    day's crashed loads left truncated cache entries, and `set_tensor_hash`
+    served whatever bytes were in the file - no size or content check (the
+    request does not even carry a size; upstream's cache has the same hole).
+    GLM survived because its cache entries were written by clean runs.
+    **Fix (verified end-to-end): cache writes go through tmp+rename (a partial
+    write can never land under the final name), and reads re-hash the entry
+    before serving - mismatch deletes the file and falls back to streaming,
+    so poisoned fleet caches self-heal on the next load.** Validated locally:
+    truncating a 127 MB entry to 1 KB -> "fails verification" log, identical
+    output, entry rewritten to full size on the same load.
+    Side finding: V4's split math is CLEAN - loopback dup-device (same split,
+    same RPC serialization) is token-identical to single-CPU; .11 and .15
+    agree with each other on fresh streams (cross-box variant rounding is a
+    legit small delta, GLM PPL was exactly equal either way).
+    Debug enablers added along the way: `LLAMA_TRUNC_ARR=1` (accept longer
+    per-layer arrays + partial tensor load, so `--override-kv
+    <arch>.block_count` can truncate any model into a minutes-scale
+    reproducer) and `GGML_META_NO_DELAY=1`.
   - *Perf reality check vs §2:* META_TIMING shows ~3.4 ms per reduce boundary
     (~54 boundaries/token = ~185 ms/token of reduce alone) vs the 0.3 ms RTT
     the §3 projection assumed - the gap is per-boundary orchestration: the

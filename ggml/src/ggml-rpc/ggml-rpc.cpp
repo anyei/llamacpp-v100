@@ -1938,11 +1938,24 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-        // save to cache_dir/hash_str
+        // save to cache_dir/hash_str via a temp file: a partial write (killed worker,
+        // full disk) must never land under the final name - an unverified truncated
+        // entry used to poison every later load of the tensor
         fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
+        fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
+        std::ofstream ofs(tmp_file, std::ios::binary);
         ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        ofs.close();
+        std::error_code ec;
+        if (ofs.good()) {
+            fs::rename(tmp_file, cache_file, ec);
+        }
+        if (!ofs.good() || ec) {
+            GGML_LOG_ERROR("[%s] failed to save '%s'\n", __func__, cache_file.string().c_str());
+            fs::remove(tmp_file, ec);
+        } else {
+            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
@@ -2119,6 +2132,21 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 {
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file) && !get_local_tensor(request.hash, cached_file)) {
+        response.result = 0;
+        return true;
+    }
+    // verify before serving: a truncated or stale entry (interrupted cache write,
+    // changed local file) must fall back to streaming, not corrupt the tensor.
+    // A bad cache file is deleted so the fallback SET_TENSOR rewrites it.
+    if (fnv_hash(cached_file.data(), cached_file.size()) != request.hash) {
+        GGML_LOG_ERROR("[%s] cached data for hash 0x%" PRIx64 " fails verification (%zu bytes) - falling back to streaming\n",
+                       __func__, request.hash, cached_file.size());
+        if (cache_dir) {
+            char hash_str[17];
+            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, request.hash);
+            std::error_code ec;
+            fs::remove(fs::path(cache_dir) / hash_str, ec);
+        }
         response.result = 0;
         return true;
     }

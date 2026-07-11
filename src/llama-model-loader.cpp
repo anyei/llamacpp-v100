@@ -461,7 +461,18 @@ namespace GGUFMeta {
                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
 
             if (n != arr_info.length) {
-                throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
+                // LLAMA_TRUNC_ARR=1: accept longer per-layer arrays and use the first n
+                // entries - lets --override-kv <arch>.block_count truncate a model for
+                // debugging (a full-size array is otherwise a hard error)
+                static const bool trunc_arr = [] {
+                    const char * env = getenv("LLAMA_TRUNC_ARR");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (!trunc_arr || arr_info.length < n) {
+                    throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
+                }
+                LLAMA_LOG_WARN("%s: key %s: using first %u of %u array entries (LLAMA_TRUNC_ARR)\n",
+                               __func__, key.c_str(), n, (uint32_t) arr_info.length);
             }
 
             return get_arr(key, result, required);
@@ -1331,7 +1342,13 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
     if (n_created < n_tensors) {
-        if (!partial) {
+        // LLAMA_TRUNC_ARR truncates block_count for debugging - the tail layers'
+        // tensors are then legitimately unused
+        static const bool trunc_arr = [] {
+            const char * env = getenv("LLAMA_TRUNC_ARR");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (!partial && !trunc_arr) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",

@@ -2203,6 +2203,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed = [&](const int i) -> int {
+                // GGML_META_NO_DELAY=1: reduce at every PARTIAL node (diagnostic - isolates
+                // the delay pattern matcher when hunting numerical corruption)
+                static const bool no_delay = getenv("GGML_META_NO_DELAY") != nullptr;
+                if (no_delay) {
+                    return i;
+                }
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
 
