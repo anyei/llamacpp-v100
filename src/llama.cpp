@@ -211,6 +211,25 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     case GGML_BACKEND_DEVICE_TYPE_GPU: {
                         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                         if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+                            // TASKS.md #30: with the KV annex enabled, a worker-CPU device
+                            // whose worker also exposes a GPU takes no layers — it exists
+                            // to host that GPU's KV cache in worker RAM
+                            if (llama_kv_worker_host_enabled() && llama_rpc_dev_is_worker_cpu(dev)) {
+                                // a worker-CPU device is an annex iff a same-endpoint GPU device exists
+                                bool is_annex = false;
+                                for (size_t j = 0; j < ggml_backend_dev_count(); ++j) {
+                                    ggml_backend_dev_t sib = ggml_backend_dev_get(j);
+                                    if (sib != dev && llama_rpc_kv_annex_for(sib) == dev) {
+                                        is_annex = true;
+                                        break;
+                                    }
+                                }
+                                if (is_annex) {
+                                    LLAMA_LOG_INFO("%s: reserving %s (%s) as a KV annex (no layers)\n",
+                                                   __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                                    break;
+                                }
+                            }
                             rpc_servers.push_back({false, dev});
                         } else {
                             // check if there is already a GPU with the same device id

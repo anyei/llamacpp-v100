@@ -286,6 +286,22 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+
+            // TASKS.md #30: a KV annex (worker-CPU sibling holding this device's KV in
+            // worker RAM) takes no layers so it is not in model.devices, but the
+            // scheduler still needs its backend to run ops on tensors it hosts
+            if (llama_kv_worker_host_enabled()) {
+                ggml_backend_dev_t annex = llama_rpc_kv_annex_for(dev.dev);
+                if (annex != nullptr) {
+                    ggml_backend_t annex_backend = ggml_backend_dev_init(annex, nullptr);
+                    if (annex_backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize KV annex backend %s", ggml_backend_dev_name(annex)));
+                    }
+                    LLAMA_LOG_INFO("%s: added KV annex backend %s (%s)\n", __func__,
+                                   ggml_backend_dev_name(annex), ggml_backend_dev_description(annex));
+                    backends.emplace_back(annex_backend);
+                }
+            }
         }
 
         // add ACCEL backends (such as BLAS)

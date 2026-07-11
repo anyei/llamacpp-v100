@@ -545,6 +545,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 // to the worker before allocation; no-op for all other devices
 void llama_rpc_push_split_states(const struct llama_model * model, ggml_backend_dev_t dev, struct ggml_context * ctx);
 
+// TASKS.md #30 KV annex (LLAMA_KV_WORKER_HOST=1): worker-CPU RPC devices take no
+// layers and host the KV of their sibling worker-GPU device instead
+bool llama_kv_worker_host_enabled();
+bool llama_rpc_dev_is_worker_cpu(ggml_backend_dev_t dev);
+ggml_backend_dev_t llama_rpc_kv_annex_for(ggml_backend_dev_t layer_dev);
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;

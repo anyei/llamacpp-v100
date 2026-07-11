@@ -165,6 +165,14 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
   interface of `-H`, so it never widens exposure beyond where the RPC port
   already listens. `--announce-group ADDR:PORT` overrides the default group
   (must match the coordinator's `--rpc-discover-group`).
+- **KV annex for small-VRAM cards (task 30)**: run the worker with
+  `-d CUDA0,CPU` and the coordinator with `LLAMA_KV_WORKER_HOST=1` — the
+  worker's CPU device takes no layers and instead hosts the KV cache of its
+  GPU layers in worker RAM, so the whole VRAM goes to weights (a 6 GB
+  1660 Ti holds ~2× the layers). Attention for those layers runs on the
+  worker CPU; GPU↔RAM handoffs stay worker-local. Measured cost: ~7%
+  decode (0.6B @32k, loopback). Without the env the extra CPU device is
+  just another (slow) layer target — don't expose it unless annexing.
 - The model file is only needed on the coordinator.
 
 **SECURITY**: the RPC protocol has no authentication or TLS. Bind only to a

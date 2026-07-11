@@ -711,6 +711,58 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     GGML_UNUSED(userdata);
 }
 
+// TASKS.md #30: KV annex. With LLAMA_KV_WORKER_HOST=1, a worker exposing BOTH its GPU
+// and its CPU (`rpc-server -d CUDA0,CPU`) gets the CPU device reserved as a KV ANNEX:
+// it takes no layers, and the KV cache of that worker's GPU layers is allocated on it
+// (worker RAM) — weights stay in VRAM, so a small-VRAM card holds ~2x the layers.
+// The GPU<->RAM traffic for attention stays worker-local (same rpc_server process).
+bool llama_kv_worker_host_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_KV_WORKER_HOST");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static const char * llama_rpc_dev_endpoint_of(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC")) {
+        return nullptr;
+    }
+    typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
+    auto * dev_endpoint = (dev_endpoint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint");
+    return dev_endpoint != nullptr ? dev_endpoint(dev) : nullptr;
+}
+
+bool llama_rpc_dev_is_worker_cpu(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC")) {
+        return false;
+    }
+    typedef bool (*is_cpu_t)(ggml_backend_dev_t);
+    auto * is_cpu = (is_cpu_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_worker_is_cpu");
+    return is_cpu != nullptr && is_cpu(dev);
+}
+
+// the same-endpoint worker-CPU device for a worker-GPU RPC device, or nullptr
+ggml_backend_dev_t llama_rpc_kv_annex_for(ggml_backend_dev_t layer_dev) {
+    const char * ep = llama_rpc_dev_endpoint_of(layer_dev);
+    if (ep == nullptr || llama_rpc_dev_is_worker_cpu(layer_dev)) {
+        return nullptr; // not RPC, or already the CPU side
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t cand = ggml_backend_dev_get(i);
+        if (cand == layer_dev || !llama_rpc_dev_is_worker_cpu(cand)) {
+            continue;
+        }
+        const char * cand_ep = llama_rpc_dev_endpoint_of(cand);
+        if (cand_ep != nullptr && strcmp(cand_ep, ep) == 0) {
+            return cand;
+        }
+    }
+    return nullptr;
+}
+
 void llama_rpc_push_split_states(const struct llama_model * model, ggml_backend_dev_t dev, struct ggml_context * ctx) {
     if (dev == nullptr || ctx == nullptr) {
         return;

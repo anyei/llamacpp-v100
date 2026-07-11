@@ -59,6 +59,10 @@ GGML_BACKEND_API int ggml_backend_rpc_discover(const char * group, int timeout_m
                                                void (*cb)(const char * endpoint, const char * payload, void * user_data),
                                                void * user_data);
 
+// true when this RPC device is backed by the worker's CPU (RAM) rather than a GPU —
+// side channel for placement policies (the device still reports type GPU to llama).
+GGML_BACKEND_API bool ggml_backend_rpc_dev_worker_is_cpu(ggml_backend_dev_t dev);
+
 // true once any RPC worker connection has failed (worker crash / network loss). The
 // model's layer assignment is unrecoverable in-process — the serving application should
 // fail in-flight requests and exit so its restart policy re-splits across live workers.

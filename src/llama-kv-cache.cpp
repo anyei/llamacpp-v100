@@ -229,6 +229,16 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
+
+            // TASKS.md #30: KV annex — put this layer's KV in the worker's RAM while the
+            // weights stay in its VRAM (worker must expose its CPU: rpc-server -d GPU,CPU)
+            if (llama_kv_worker_host_enabled()) {
+                ggml_backend_dev_t annex = llama_rpc_kv_annex_for(dev);
+                if (annex != nullptr) {
+                    dev = annex;
+                }
+            }
+
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);

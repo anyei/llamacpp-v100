@@ -63,6 +63,7 @@ bool ggml_backend_rpc_any_endpoint_failed(void) {
     return !g_rpc_failed_endpoints.empty();
 }
 
+
 // all RPC structures must be packed
 #pragma pack(push, 1)
 // ggml_tensor is serialized into rpc_tensor
@@ -287,6 +288,7 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     uint64_t    last_graph_uid;
+    bool        worker_is_cpu; // the worker-side device is its CPU (RAM), not a GPU
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -2299,7 +2301,11 @@ bool rpc_server::get_device_desc(const rpc_msg_get_device_desc_req & request, rp
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
-    snprintf(response.desc, sizeof(response.desc), "%s", ggml_backend_dev_description(dev));
+    // a "CPU|" prefix tells the coordinator this device is worker RAM, not a GPU —
+    // used by the KV-annex placement (TASKS.md #30); same pattern as "Meta[N](...)"
+    const bool is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    snprintf(response.desc, sizeof(response.desc), "%s%s",
+             is_cpu ? "CPU|" : "", ggml_backend_dev_description(dev));
     return true;
 }
 
@@ -2989,6 +2995,17 @@ const char * ggml_backend_rpc_dev_endpoint(ggml_backend_dev_t dev) {
     return ctx->endpoint.c_str();
 }
 
+// true when this RPC device is backed by the WORKER's CPU (its RAM) rather than a GPU.
+// The device still reports GGML_BACKEND_DEVICE_TYPE_GPU so llama schedules layers onto
+// pure-CPU workers exactly as before — this side channel exists for placement policies
+// that need the truth (TASKS.md #30 KV annex).
+bool ggml_backend_rpc_dev_worker_is_cpu(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return false;
+    }
+    return ((ggml_backend_rpc_device_context *) dev->context)->worker_is_cpu;
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -3060,6 +3077,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_any_endpoint_failed") == 0) {
         return (void *)ggml_backend_rpc_any_endpoint_failed;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_worker_is_cpu") == 0) {
+        return (void *)ggml_backend_rpc_dev_worker_is_cpu;
     }
     return NULL;
 
@@ -3134,12 +3154,18 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
                 dev_desc = std::string(response.desc) + " @ " + endpoint;
             }
         }
+        bool worker_is_cpu = false;
+        if (dev_desc.rfind("CPU|", 0) == 0) {
+            worker_is_cpu = true;
+            dev_desc = dev_desc.substr(4);
+        }
         ggml_backend_rpc_device_context * dev_ctx = new ggml_backend_rpc_device_context {
             /* .endpoint    = */    endpoint,
             /* .device      = */    ind,
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
             /* .last_graph_uid = */ 0,
+            /* .worker_is_cpu  = */ worker_is_cpu,
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
