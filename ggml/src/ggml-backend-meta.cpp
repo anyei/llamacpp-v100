@@ -1938,6 +1938,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_cpy_tensor_batch_async_t cpy_batch     = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1963,6 +1964,8 @@ struct ggml_backend_meta_context {
             if (comm_init != nullptr) {
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
             }
+            cpy_batch = (ggml_backend_cpy_tensor_batch_async_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_cpy_tensor_batch_async");
         }
         if (comm_ctx != nullptr) {
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
@@ -2509,6 +2512,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
+        // pulls of one reduce step are collected and flushed together: the batch
+        // proc (RPC) overlaps them on the wire, the per-pair path serializes on
+        // each blocking ack
+        struct w2w_copy {
+            ggml_backend_t backend_src;
+            ggml_backend_t backend_dst;
+            ggml_tensor *  src;
+            ggml_tensor *  dst;
+        };
+        std::vector<w2w_copy> pending_copies;
+        pending_copies.reserve(n_backends);
+
+        auto flush_copies = [&]() {
+            if (backend_ctx->cpy_batch != nullptr && pending_copies.size() > 1) {
+                std::vector<ggml_backend_t> backends_src;
+                std::vector<ggml_backend_t> backends_dst;
+                std::vector<ggml_tensor *>  srcs;
+                std::vector<ggml_tensor *>  dsts;
+                for (const w2w_copy & c : pending_copies) {
+                    backends_src.push_back(c.backend_src);
+                    backends_dst.push_back(c.backend_dst);
+                    srcs.push_back(c.src);
+                    dsts.push_back(c.dst);
+                }
+                backend_ctx->cpy_batch((int) pending_copies.size(), backends_src.data(), backends_dst.data(), srcs.data(), dsts.data());
+            } else {
+                for (const w2w_copy & c : pending_copies) {
+                    ggml_backend_tensor_copy_async(c.backend_src, c.backend_dst, c.src, c.dst);
+                }
+            }
+            pending_copies.clear();
+        };
+
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
@@ -2522,7 +2558,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            pending_copies.push_back({bcj_src.backend, bcj_dst.backend, node_src, node_tmp});
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
@@ -2550,6 +2586,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
             push_data(j_src, j_dst, i_buf);
+            flush_copies();
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
@@ -2568,6 +2605,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 push_data(j, j_other, i_buf);
             }
+            flush_copies();
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
                 if (step_cgraphs[j] == nullptr) {
@@ -2590,8 +2628,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            pending_copies.push_back({bcj_src.backend, bcj_dst.backend, node_src, node_dst});
         }
+        flush_copies();
 
         return GGML_STATUS_SUCCESS;
     };

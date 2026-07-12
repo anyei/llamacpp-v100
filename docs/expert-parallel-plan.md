@@ -173,6 +173,25 @@ Placement policy (the user-guidance dial, informed by #31):
      placement, increment 3) or stay out of the hot path.
   2. Sequential fenced W2W pulls (~3.4 ms/boundary at 2 members, worse at
      3) - parallelize the pulls in allreduce_fallback.
+     **DONE (2026-07-12, proto 4.4):** the pulls of one reduce step now go out
+     as a batch - all fences captured BEFORE any request is sent (an early
+     fence is safe: it already covers the compute that produced the src, and
+     excluding the sibling pulls is exactly what removes the serialization),
+     then all COPY_FROM_REMOTE requests, then the acks. Needed a server-side
+     fix: the 4.3 server held its per-process execution lock across the whole
+     pull, so two crossing in-flight pulls ABBA-deadlocked ACROSS processes
+     (each server's fenced-read serving thread needed the lock its own
+     COPY_FROM_REMOTE held while waiting on the other worker; found the hard
+     way - the first batched run wedged the loopback pair for its full
+     timeout). 4.4 servers run the remote fetch without the lock and take it
+     only for the local write, the same treatment GET_TENSOR_FENCED already
+     had. The client batches only when BOTH ends of every pull are >= 4.4;
+     mixed fleets silently keep the old sequential path (validated against a
+     4.3 server: no deadlock, no crash; an old dst pulling from a NEW src
+     refuses HELLO and degrades to the bridged copy until the fleet is
+     rolled). Gates: 0.6B loopback coherent 18.4 t/s (was 18.1); truncated-V4
+     meta run token-identical to single-CPU. Fleet numbers pending the 4.4
+     image roll.
   3. Per-token client-side subgraph rebuild (uid==0 outer graphs) -
      multi-build cache.
   Also hit and fixed on the way: a fresh cache-miss load writes the
@@ -251,8 +270,10 @@ Placement policy (the user-guidance dial, informed by #31):
     the §3 projection assumed - the gap is per-boundary orchestration: the
     allreduce fallback's fenced W2W pulls are SEQUENTIAL synchronous RPCs.
     Next levers, in expected order of payoff: parallelize the fenced pulls in
-    `allreduce_fallback` (halves boundary latency), multi-build subgraph cache
-    (kills the per-token client rebuild of 33.6k shadows), EP batching (inc 4).
+    `allreduce_fallback` (halves boundary latency) - **landed 2026-07-12 as
+    proto 4.4 batched pulls, see attribution item 2 above** - multi-build
+    subgraph cache (kills the per-token client rebuild of 33.6k shadows),
+    EP batching (inc 4).
     Even at zero overhead the 2-worker compute floor is ~4-5 t/s; the 8.1 t/s
     gate likely needs 3 workers + the reduce-latency lever.
 - **3. Placement policy**: bandwidth-weighted then hot/cold (routing-stat

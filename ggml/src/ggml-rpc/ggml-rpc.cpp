@@ -1065,21 +1065,27 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     GGML_UNUSED(backend);
 }
 
-// worker-to-worker activation transfer (proto 4.2): instead of bridging the bytes
-// through the coordinator (blocking GET from the source, then SET to the
-// destination), tell the destination worker to pull directly from the source.
-// The pull is fenced so it cannot read before the source has executed the compute
-// that produces the data (read-after-write); the blocking ack means the
-// coordinator queues no further source work until the read is out
-// (write-after-read) - the same contract the CUDA cross-device copy implements
-// with events, while the transfer itself takes one direct hop.
-static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+// a W2W pull that passed all fast-path checks and is ready to send; fence_seq is
+// written immediately before sending (the batch path captures ALL fences before
+// sending ANY request - see ggml_backend_rpc_cpy_tensor_batch_async)
+struct rpc_w2w_pull {
+    socket_ptr           sock_src;
+    socket_ptr           sock_dst;
+    std::string          dst_endpoint;
+    std::vector<uint8_t> input;
+    size_t               fence_seq_offset = 0;
+};
+
+// eligibility checks + request assembly shared by the single and batched W2W copy
+// paths; false = this pair must go through the regular (bridged) copy instead
+static bool rpc_prepare_w2w_pull(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, const ggml_tensor * dst, rpc_w2w_pull & pull) {
     static const bool disabled = getenv("GGML_RPC_NO_W2W") != nullptr;
     if (disabled) {
         return false; // escape hatch: force the coordinator-bridged copy
     }
-    if (backend_src->iface.get_name != ggml_backend_rpc_name) {
-        return false; // source is not an RPC backend
+    if (backend_src->iface.get_name != ggml_backend_rpc_name ||
+        backend_dst->iface.get_name != ggml_backend_rpc_name) {
+        return false; // either side is not an RPC backend
     }
     ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *)backend_src->context;
     ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *)backend_dst->context;
@@ -1112,12 +1118,6 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     if (fence_conn == 0) {
         return false;
     }
-    uint64_t fence_seq;
-    {
-        // everything sent to the source so far includes the compute producing src
-        std::lock_guard<std::mutex> lock(st_src.mutex);
-        fence_seq = st_src.cmds_sent;
-    }
     // views: resolve to root + byte offset, exactly like the get/set paths - view
     // links do not survive the wire
     size_t src_offset = 0;
@@ -1129,6 +1129,7 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     const uint64_t size = (uint64_t) ggml_nbytes(src);
     const std::string & ep = src_ctx->endpoint;
     const uint32_t ep_len = (uint32_t) ep.size();
+    const uint64_t fence_seq = 0; // placeholder, written at send time
 
     // | rpc_tensor src | rpc_tensor dst | src_offset | dst_offset | size | fence_conn | fence_seq | ep_len | ep |
     std::vector<uint8_t> input(2*sizeof(rpc_tensor) + 5*sizeof(uint64_t) + sizeof(uint32_t) + ep_len);
@@ -1139,19 +1140,130 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
     off64 = dst_offset;          memcpy(p, &off64, sizeof(off64)); p += sizeof(off64);
     memcpy(p, &size, sizeof(size));                p += sizeof(size);
     memcpy(p, &fence_conn, sizeof(fence_conn));    p += sizeof(fence_conn);
+    pull.fence_seq_offset = p - input.data();
     memcpy(p, &fence_seq, sizeof(fence_seq));      p += sizeof(fence_seq);
     memcpy(p, &ep_len, sizeof(ep_len));            p += sizeof(ep_len);
     memcpy(p, ep.data(), ep_len);
 
+    pull.sock_src     = sock_src;
+    pull.sock_dst     = sock_dst;
+    pull.dst_endpoint = dst_ctx->endpoint;
+    pull.input        = std::move(input);
+    return true;
+}
+
+// everything sent to the source so far includes the compute producing src
+static void rpc_w2w_pull_set_fence(rpc_w2w_pull & pull) {
+    ggml_backend_rpc_async_state & st_src = rpc_async_state(pull.sock_src.get());
+    std::lock_guard<std::mutex> lock(st_src.mutex);
+    memcpy(pull.input.data() + pull.fence_seq_offset, &st_src.cmds_sent, sizeof(st_src.cmds_sent));
+}
+
+// worker-to-worker activation transfer (proto 4.2): instead of bridging the bytes
+// through the coordinator (blocking GET from the source, then SET to the
+// destination), tell the destination worker to pull directly from the source.
+// The pull is fenced so it cannot read before the source has executed the compute
+// that produces the data (read-after-write); the blocking ack means the
+// coordinator queues no further source work until the read is out
+// (write-after-read) - the same contract the CUDA cross-device copy implements
+// with events, while the transfer itself takes one direct hop.
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    rpc_w2w_pull pull;
+    if (!rpc_prepare_w2w_pull(backend_src, backend_dst, src, dst, pull)) {
+        return false;
+    }
+    rpc_w2w_pull_set_fence(pull);
+
     rpc_msg_copy_from_remote_rsp response;
-    bool status = send_rpc_cmd(sock_dst, RPC_CMD_COPY_FROM_REMOTE, input.data(), input.size(), &response, sizeof(response));
+    bool status = send_rpc_cmd(pull.sock_dst, RPC_CMD_COPY_FROM_REMOTE, pull.input.data(), pull.input.size(), &response, sizeof(response));
     if (!status) {
-        rpc_mark_failed(dst_ctx->endpoint, __func__);
+        rpc_mark_failed(pull.dst_endpoint, __func__);
         return false; // the bridged fallback will fail-contained on the same endpoint
     }
     // a failed pull (e.g. the destination worker cannot reach the source) falls
     // back to the coordinator-bridged copy
     return response.result != 0;
+}
+
+// batched W2W pulls (the meta backend's reduce boundaries): capture every fence
+// BEFORE sending any request, then send all requests, then collect the acks. The
+// single-copy path above serializes opposite-direction pulls on their acks; a
+// fence captured up front is safe (it already covers the compute that produced
+// its src - dispatched before the reduce) and keeps each pull's request out of
+// its sibling's fence, which is exactly the chain that forced them sequential.
+static void ggml_backend_rpc_cpy_tensor_batch_async(int n_copies, ggml_backend_t * backends_src, ggml_backend_t * backends_dst, ggml_tensor ** srcs, ggml_tensor ** dsts) {
+    std::vector<rpc_w2w_pull> pulls(n_copies);
+    std::vector<bool>         fast(n_copies, false);
+    for (int k = 0; k < n_copies; k++) {
+        fast[k] = rpc_prepare_w2w_pull(backends_src[k], backends_dst[k], srcs[k], dsts[k], pulls[k]);
+        // a 4.3 server holds its execution lock across the whole pull, so two
+        // crossing in-flight pulls ABBA-deadlock; batch only when both ends
+        // release the lock during the fetch (proto 4.4)
+        if (fast[k] &&
+            (rpc_async_state(pulls[k].sock_src.get()).server_minor < 4 ||
+             rpc_async_state(pulls[k].sock_dst.get()).server_minor < 4)) {
+            fast[k] = false;
+        }
+        // one in-flight request per destination socket keeps the response
+        // bookkeeping trivial; a duplicate destination takes the blocking path
+        for (int m = 0; fast[k] && m < k; m++) {
+            if (fast[m] && pulls[m].sock_dst == pulls[k].sock_dst) {
+                fast[k] = false;
+            }
+        }
+    }
+    std::vector<int> order;
+    for (int k = 0; k < n_copies; k++) {
+        if (fast[k]) {
+            order.push_back(k);
+            rpc_w2w_pull_set_fence(pulls[k]);
+        }
+    }
+    {
+        // per-socket locks are held from send to ack so no other traffic can
+        // interleave; sorted acquisition (sockets are distinct, see above)
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return pulls[a].sock_dst.get() < pulls[b].sock_dst.get();
+        });
+        std::vector<std::unique_lock<std::mutex>> locks;
+        locks.reserve(order.size());
+        for (int k : order) {
+            ggml_backend_rpc_async_state & st = rpc_async_state(pulls[k].sock_dst.get());
+            locks.emplace_back(st.mutex);
+            LOG_DBG("[w2w_batch] send k=%d dst=%s pings=%" PRIu64 "/%" PRIu64 " cmds=%" PRIu64 "\n",
+                    k, pulls[k].dst_endpoint.c_str(), st.pings_done, st.pings_sent, st.cmds_sent);
+            if (!rpc_drain_pings_locked(pulls[k].sock_dst, st, st.pings_sent) ||
+                !send_rpc_cmd_raw(pulls[k].sock_dst, st, RPC_CMD_COPY_FROM_REMOTE, pulls[k].input.data(), pulls[k].input.size())) {
+                rpc_mark_failed(pulls[k].dst_endpoint, __func__);
+                fast[k] = false;
+            }
+            LOG_DBG("[w2w_batch] sent k=%d ok=%d\n", k, fast[k] ? 1 : 0);
+        }
+        for (int k : order) {
+            if (!fast[k]) {
+                continue;
+            }
+            LOG_DBG("[w2w_batch] recv k=%d dst=%s\n", k, pulls[k].dst_endpoint.c_str());
+            uint64_t out_size;
+            rpc_msg_copy_from_remote_rsp response;
+            if (!pulls[k].sock_dst->recv_data(&out_size, sizeof(out_size)) ||
+                out_size != sizeof(response) ||
+                !pulls[k].sock_dst->recv_data(&response, sizeof(response))) {
+                rpc_mark_failed(pulls[k].dst_endpoint, __func__);
+                fast[k] = false;
+                continue;
+            }
+            LOG_DBG("[w2w_batch] ack k=%d result=%d\n", k, (int) response.result);
+            if (response.result == 0) {
+                fast[k] = false; // soft failure: bridged fallback below
+            }
+        }
+    }
+    for (int k = 0; k < n_copies; k++) {
+        if (!fast[k]) {
+            ggml_backend_tensor_copy_async(backends_src[k], backends_dst[k], srcs[k], dsts[k]);
+        }
+    }
 }
 
 // events (proto 4.2): an event is a PING sequence number on the endpoint's
@@ -1652,19 +1764,6 @@ bool rpc_server::copy_from_remote(const std::vector<uint8_t> & input, rpc_msg_co
     }
     std::string src_endpoint((const char *) p, ep_len);
 
-    struct ggml_init_params params {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
-    GGML_ASSERT(ctx_ptr != nullptr);
-    ggml_tensor * dst = deserialize_tensor(ctx_ptr.get(), &rdst);
-    if (dst == nullptr || dst->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing dst tensor\n", __func__);
-        return false;
-    }
-
     // pull directly from the source worker - this process is a normal RPC client
     // there. Peer sockets are cached with strong references: the general registry
     // only holds weak_ptrs, and reconnecting (+ HELLO) per pull would add a round
@@ -1696,7 +1795,24 @@ bool rpc_server::copy_from_remote(const std::vector<uint8_t> & input, rpc_msg_co
         peer_socks.erase(src_endpoint); // dead peer socket: reconnect on the next pull
         return true; // soft failure
     }
-    ggml_backend_tensor_set(dst, data.data(), dst_offset, size);
+
+    // local write under the execution lock (the fetch above must run without it)
+    {
+        std::lock_guard<std::mutex> exec_lock(exec_mutex);
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_tensor * dst = deserialize_tensor(ctx_ptr.get(), &rdst);
+        if (dst == nullptr || dst->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing dst tensor\n", __func__);
+            return false;
+        }
+        ggml_backend_tensor_set(dst, data.data(), dst_offset, size);
+    }
     response.result = 1;
     return true;
 }
@@ -2667,6 +2783,26 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             server.mark_executed(conn_id);
             continue;
         }
+        if (cmd == RPC_CMD_COPY_FROM_REMOTE) {
+            // the remote fetch must happen WITHOUT the execution lock: with two
+            // crossing pulls in flight (batched reduce), each server's serving
+            // thread needs the OTHER server's lock for the fenced read - holding
+            // it across the fetch is an ABBA deadlock. copy_from_remote takes the
+            // lock itself, only around the local write.
+            std::vector<uint8_t> input;
+            if (!recv_msg(sock, input)) {
+                break;
+            }
+            rpc_msg_copy_from_remote_rsp response;
+            if (!server.copy_from_remote(input, response)) {
+                break;
+            }
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
         // one command executes at a time across all connections; the payload recv
         // inside each case is safe to hold the lock over - the client sends the
         // header and payload back-to-back
@@ -2843,18 +2979,8 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 break;
             }
             case RPC_CMD_COPY_FROM_REMOTE: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
-                    return;
-                }
-                rpc_msg_copy_from_remote_rsp response;
-                if (!server.copy_from_remote(input, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
-                }
-                break;
+                // handled above, without the execution lock
+                return;
             }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
@@ -3380,6 +3506,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_worker_is_cpu") == 0) {
         return (void *)ggml_backend_rpc_dev_worker_is_cpu;
+    }
+    if (std::strcmp(name, "ggml_backend_cpy_tensor_batch_async") == 0) {
+        return (void *)ggml_backend_rpc_cpy_tensor_batch_async;
     }
     return NULL;
 

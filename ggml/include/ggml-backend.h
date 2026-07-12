@@ -207,6 +207,11 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Batched cross-backend async copies (meta backend reduce fallback): a backend may
+    // overlap independent transfers that its cpy_tensor_async would serialize; pairs
+    // without a fast path fall back to ggml_backend_tensor_copy_async internally
+    typedef void   (*ggml_backend_cpy_tensor_batch_async_t)(int n_copies, ggml_backend_t * backends_src, ggml_backend_t * backends_dst, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
