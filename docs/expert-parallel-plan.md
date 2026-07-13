@@ -206,6 +206,23 @@ Placement policy (the user-guidance dial, informed by #31):
      562 ms/piece - .25's 100-Mbit link and slow CPU still gate everything,
      confirming increment 3 (tiny/cold share for slow-link boxes) over any
      further transport tuning.
+     **Perf lever 2 landed (2026-07-13, c20e432b4): multi-build subgraph
+     cache.** Builds keyed by a content hash of the outer graph (sched pieces
+     get a FRESH uid per split rebuild, so uid equality never matched and
+     every call redid shadow re-registration + split walk + subgraph
+     construction, ~30 ms/piece); shadow-ring rotation is the validity
+     horizon, and the galloc-facing init_tensor memoizes unchanged
+     re-registrations (otherwise per-token allocations grow the shadow arenas
+     forever once hits stop ring rotation). Fleet 2-worker V4: 0.98 -> 1.16
+     t/s timed / 1.20 -> 1.25 untimed, 128/128 hits steady-state; loopback
+     token-identical to the previous commit on 0.6B and V4-trunc. NOTE the
+     rebuild never showed in META_TIMING's compute bucket (tm_last starts
+     after the build block) - it was invisible inter-graph overhead, and in
+     untimed runs partially overlapped with async worker compute, which is
+     why the end-to-end gain is modest. The ~800 ms/token that remains is
+     per-boundary worker compute (mirrored attention runs FULLY on every
+     member + expert slices), so the next levers are increment 3 placement
+     and reduce/compute overlap, not client-side bookkeeping.
   3. Per-token client-side subgraph rebuild (uid==0 outer graphs) -
      multi-build cache.
   Also hit and fixed on the way: a fresh cache-miss load writes the
