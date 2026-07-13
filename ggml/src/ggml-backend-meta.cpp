@@ -2563,8 +2563,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return idr;
                 }
                 {
+                    // delaying past a consumer is only sound when it is the SOLE
+                    // consumer: any other user of the partial node would read the
+                    // UNREDUCED values (hyper-connection models feed the attention
+                    // output to several residual streams - found as gradual
+                    // member drift once dedicated attention made attn_out PARTIAL)
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_ADD_ID && next->src[0] == node &&
+                    if (n_used == 1 && next->op == GGML_OP_ADD_ID && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                             ggml_backend_meta_get_split_state(next->src[2], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
@@ -2580,7 +2585,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         return idr;
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op == GGML_OP_MUL && next->src[0] == node &&
+                    if (n_used == 1 && next->op == GGML_OP_MUL && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                         node = next;
                         id++;
