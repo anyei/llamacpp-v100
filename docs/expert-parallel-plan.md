@@ -310,6 +310,25 @@ Placement policy (the user-guidance dial, informed by #31):
 - **3. Placement policy**: bandwidth-weighted then hot/cold (routing-stat
   export from the router — the ssd-stream debug counters are the template).
   Gate: measurable tail-latency reduction vs uniform placement.
+
+  **Attribution result that reshapes this increment (2026-07-13).** Truncated
+  6-layer V4 on the fleet, three configs (single .11 = A+E; 2-worker
+  `-ts 1,1` = A+E/2+OH; `-ts 3,1` = A+0.75E+OH) solve the split:
+  E(experts) ~40 ms, A(mirrored attention/dense/indexer) ~47 ms,
+  OH(meta+RPC) ~63 ms per token. Scaled to the full 61-layer model this is
+  **attention ~473 ms (59%) / experts ~246 ms (31%) / overhead ~79 ms (10%)**
+  of the measured 798 ms/token - and mirrored attention is a CONSTANT: it
+  runs in full on every member (gated by the slowest), so no expert
+  re-weighting can push the CPU fleet past ~2.1 t/s, below the 3.54 t/s
+  single-box bar (2x V100 + -ncmoe). Conclusion: increment 3 must implement
+  the ORIGINAL design sketch - attention/router/dense LOCAL on the
+  coordinator's V100s (the ~7 GB non-expert stack fits one card), only
+  expert slices on the workers - i.e. a Meta(CUDA0,RPC,RPC) whose placement
+  DEDICATES attention to member 0 instead of mirroring it (the zero-share
+  slice machinery exists; the known `-ts 0` segfault, TASKS #30 note, is on
+  this path). Projection: GPU attention ~30-80 ms + expert share ~120-205 ms
+  + overhead ~80 ms = ~2.6-3.7 t/s at 2-4 workers, crossing the single-box
+  bar with placement + batching still to come.
 - **4. Batching/multi-stream**: EP naturally batches per-worker (all tokens'
   hits on a worker's experts in one call) — revisit the #31 -np finding here;
   EP is the path where MoE batch throughput CAN scale.
