@@ -802,6 +802,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[1];
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            {
+                // same-owner degenerate operands: PARTIAL is only wanted at the
+                // designated island EXIT (the dedicated attention out projection,
+                // dot-dim split by the policy - names must stay in sync with
+                // pattern_dsa_attn_exit in llama-model.cpp). Everything else
+                // (indexer scores, cache reads) stays on the owner - a broadcast
+                // there is pure boundary overhead.
+                const int owner0 = split_state_owner(src_ss[0]);
+                if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) &&
+                        !(tensor->src[0]->op == GGML_OP_NONE && strstr(tensor->src[0]->name, "attn_output_b") != nullptr)) {
+                    return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner0, tensor->ne[0]);
+                }
+            }
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
@@ -2836,6 +2849,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
+
+        {
+            // if only ONE member actually computed this boundary (dedicated
+            // attention exits, zero -ts shares), the sum IS its value: broadcast
+            // it and skip the zeroing and the butterfly entirely
+            size_t j_src   = 0;
+            int n_compute  = 0;
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                if (cg->nodes[cg->n_nodes - 1]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    j_src = j;
+                    n_compute++;
+                }
+            }
+            if (n_compute == 1) {
+                auto & bcs = backend_ctx->backend_configs[j_src];
+                ggml_tensor * node_src = bcs.cgraphs[i].cgraph_main->nodes[bcs.cgraphs[i].cgraph_main->n_nodes - 1];
+                std::vector<ggml_backend_t> backends_src, backends_dst;
+                std::vector<ggml_tensor *>  srcs, dsts;
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (j == j_src) {
+                        continue;
+                    }
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    backends_src.push_back(bcs.backend);
+                    backends_dst.push_back(bcj.backend);
+                    srcs.push_back(node_src);
+                    dsts.push_back(bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1]);
+                }
+                if (backend_ctx->cpy_batch != nullptr && srcs.size() > 1) {
+                    backend_ctx->cpy_batch((int) srcs.size(), backends_src.data(), backends_dst.data(), srcs.data(), dsts.data());
+                } else {
+                    for (size_t k = 0; k < srcs.size(); k++) {
+                        ggml_backend_tensor_copy_async(backends_src[k], backends_dst[k], srcs[k], dsts[k]);
+                    }
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        }
 
         // Zero out nodes that were disabled due to having a zero-sized slice:
         for (size_t j = 0; j < n_backends; j++) {
