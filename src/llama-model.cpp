@@ -380,6 +380,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
+    // TASKS #28 increment 3: the heavy attention-side weights of DSA archs, placed
+    // entirely on one member under LLAMA_META_ATTN_OWNER (degenerate split)
+    static const std::regex pattern_dsa_attn_heavy(
+        "blk\\.\\d*\\.(attn_q_a|attn_q_b|attn_kv|attn_output_a|indexer\\.attn_q_b|indexer_compressor_(kv|gate)|attn_compressor_(kv|gate|ape))\\.weight");
+    static const std::regex pattern_dsa_attn_exit("blk\\.\\d*\\.attn_output_b\\.weight");
+    static const std::regex pattern_dsv4_cache   ("dsv4_.*_l\\d*");
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -387,10 +394,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+        bool     dedicated = false; // full share on the LLAMA_META_ATTN_OWNER member, zero elsewhere
     };
 
     auto get_tensor_config_impl = [&](
-                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
+                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "",
+                const bool dedicated = false) -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
         auto get_il_eff = [&](const size_t il){
@@ -435,10 +444,37 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                             tensor_name.c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
-        return {axis, tensor_axis_0, il, rotation};
+        return {axis, tensor_axis_0, il, rotation, dedicated};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // TASKS #28 increment 3: dedicated attention. LLAMA_META_ATTN_OWNER=<j>
+        // places the heavy attention weights and the attention cache of DSA archs
+        // ENTIRELY on member j: non-owners get zero-size slices, so the zero-slice
+        // machinery disables their attention compute, and the exit projection is
+        // dot-dim split so its output derives PARTIAL - the existing delayed
+        // AllReduce then broadcasts the owner's activations (x + 0 = x) back to
+        // the mirrored world before the FFN/experts consume them. Composes with
+        // LLAMA_META_EP_ONLY (attention dedicated, experts split, rest mirrored).
+        static const int attn_owner = [] {
+            const char * env = getenv("LLAMA_META_ATTN_OWNER");
+            return env == nullptr ? -1 : atoi(env);
+        }();
+        const bool dsa_arch =
+            ud->model->arch == LLM_ARCH_DEEPSEEK4  ||
+            ud->model->arch == LLM_ARCH_DEEPSEEK32 ||
+            ud->model->arch == LLM_ARCH_GLM_DSA;
+        if (attn_owner >= 0 && (size_t) attn_owner < ud->n_devices && dsa_arch) {
+            if (std::regex_match(tensor_name, pattern_dsa_attn_heavy)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "", "", /*dedicated =*/ true);
+            }
+            if (std::regex_match(tensor_name, pattern_dsa_attn_exit)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+            }
+            if (std::regex_match(tensor_name, pattern_dsv4_cache) || std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+            }
+        }
         // LLAMA_META_EP_ONLY=1: expert-parallel shape - segment ONLY the routed
         // expert tensors across members, mirror everything else (attention, dense
         // FFN, shared experts, output head). Also a fault isolator: coherent here
@@ -697,6 +733,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
+    if (tc.dedicated && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // degenerate split: the owner takes every segment whole - no granularity
+        // rounding, no rotation - and every other member gets a zero-size slice
+        const int attn_owner = atoi(getenv("LLAMA_META_ATTN_OWNER")); // set, or tc.dedicated could not be
+        const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
+        for (size_t is = 0; is < segments.size(); is++) {
+            split_state.ne[is*ud->n_devices + attn_owner] = segments[is].first;
+            split_state.nr[is] = segments[is].second;
+        }
+        split_state.n_segments = segments.size();
+        return split_state;
+    }
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();

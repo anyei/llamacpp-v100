@@ -651,6 +651,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return true;
     };
 
+    // a DEGENERATE axis split holds every slice on ONE member (dedicated
+    // attention, TASKS #28 inc 3): rows and dot dimensions stay complete on the
+    // owner, so combinations that must be rejected for REAL feature-dim splits
+    // are exact for it - the owner computes the full op, everyone else follows
+    // the zero-slice path (compute disabled). Returns the owner index, or -1.
+    auto split_state_owner = [&](const ggml_backend_meta_split_state & ss) -> int {
+        if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+            return -1;
+        }
+        int owner = -1;
+        for (size_t j = 0; j < n_bufs; j++) {
+            int64_t sum = 0;
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                sum += ss.ne[s*n_bufs + j] * ss.nr[s];
+            }
+            if (sum != 0) {
+                if (owner >= 0) {
+                    return -1;
+                }
+                owner = (int) j;
+            }
+        }
+        return owner;
+    };
+    auto degenerate_state = [&](const int axis, const int owner, const int64_t ne_axis) -> ggml_backend_meta_split_state {
+        ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+        ret.ne[owner] = ne_axis;
+        return ret;
+    };
+
     auto handle_generic = [&](const std::vector<ggml_backend_meta_split_state> & src_ss, bool scalar_only) -> ggml_backend_meta_split_state {
         ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -659,24 +689,46 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
-            } else if (!split_states_equal(src_ss[i], ret)) {
-                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-                break;
+                continue;
             }
+            if (split_states_equal(src_ss[i], ret)) {
+                continue;
+            }
+            // mirrored operands combine with a same-owner degenerate one: the
+            // owner has everything, the rest are zero-size
+            const int owner_ret = split_state_owner(ret);
+            const int owner_i   = split_state_owner(src_ss[i]);
+            if (owner_i >= 0 && ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                ret = src_ss[i];
+                continue;
+            }
+            if (owner_ret >= 0 && (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || owner_i == owner_ret)) {
+                continue;
+            }
+            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            break;
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+        if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS && split_state_owner(ret) < 0) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_ABORT("unsupported generic split combination: %s[%s] srcs [%s,%s,%s]",
+                    tensor->name, ggml_op_name(tensor->op),
+                    tensor->src[0] ? ggml_backend_meta_split_axis_name(src_ss[0].axis) : "-",
+                    tensor->src[1] ? ggml_backend_meta_split_axis_name(src_ss[1].axis) : "-",
+                    tensor->src[2] ? ggml_backend_meta_split_axis_name(src_ss[2].axis) : "-");
+        }
         return ret;
     };
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        // a feature-dim split breaks row integrity - except degenerate, where the
+        // owner's rows are complete
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0 || split_state_owner(src_ss[0]) >= 0);
         return src_ss[0];
     };
 
@@ -691,11 +743,36 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return src_ss[0]; // GGML_OP_ADD_ID
         }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        {
+            const int owner0 = split_state_owner(src_ss[0]);
+            const int owner1 = split_state_owner(src_ss[1]);
+            if (owner0 >= 0 && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || owner1 == owner0)) {
+                return src_ss[0];
+            }
+            if (owner1 >= 0 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                // only the owner has the second operand; everyone else takes the
+                // zero-slice path
+                return degenerate_state(src_ss[1].axis, owner1, tensor->ne[src_ss[1].axis]);
+            }
+        }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
+        {
+            // dedicated attention: a degenerate operand makes the whole concat
+            // owner-only (mirrored operands are available there too)
+            int owner = split_state_owner(src_ss[0]);
+            if (owner < 0) {
+                owner = split_state_owner(src_ss[1]);
+            }
+            if (owner >= 0 &&
+                    (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state_owner(src_ss[0]) == owner) &&
+                    (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state_owner(src_ss[1]) == owner)) {
+                return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner, tensor->ne[0]);
+            }
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(concat_axis != src_ss[1].axis);
             return src_ss[1];
@@ -727,6 +804,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        {
+            // degenerate operands: the owner holds the full matrices, so mixing
+            // with mirrored or same-owner operands is exact on the owner
+            const int owner0 = split_state_owner(src_ss[0]);
+            const int owner1 = split_state_owner(src_ss[1]);
+            if (owner1 >= 0 && (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || owner0 == owner1)) {
+                return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner1, tensor->ne[0]);
+            }
+            if (owner0 >= 0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner0, tensor->ne[0]);
+            }
         }
         // note: do not print src names here - over RPC the src pointers of a lone
         // deserialized struct can dangle and turn this abort into a silent segfault
@@ -868,9 +957,42 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+        {
+            // dedicated attention: if any operand lives on one member and the rest
+            // are mirrored or on the same member, the whole write happens there
+            // (e.g. the dsv4 sparse mask: owner-computed top-k ids scatter into a
+            // mirrored mask that only the owner's attention consumes)
+            int owner = split_state_owner(src_ss[0]);
+            if (owner < 0) {
+                owner = split_state_owner(src_ss[1]);
+            }
+            if (owner < 0) {
+                owner = split_state_owner(src_ss[2]);
+            }
+            if (owner >= 0) {
+                bool consistent = true;
+                for (int i = 0; i < 3; i++) {
+                    consistent = consistent &&
+                        (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state_owner(src_ss[i]) == owner);
+                }
+                if (consistent) {
+                    if (split_state_owner(src_ss[2]) == owner) {
+                        return src_ss[2];
+                    }
+                    return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner, tensor->ne[0]);
+                }
+            }
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                !split_states_equal(src_ss[0], src_ss[2])) {
+            GGML_ABORT("unsupported set_rows split combination: %s srcs [%s,%s,%s] owners [%d,%d,%d]",
+                    tensor->name,
+                    ggml_backend_meta_split_axis_name(src_ss[0].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[1].axis),
+                    ggml_backend_meta_split_axis_name(src_ss[2].axis),
+                    split_state_owner(src_ss[0]), split_state_owner(src_ss[1]), split_state_owner(src_ss[2]));
+        }
         return src_ss[0];
     };
 
@@ -896,6 +1018,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        {
+            // dedicated attention: q/k/v (and mask/sinks, where present) all live
+            // on one member; the whole attention op runs there
+            const int owner0 = split_state_owner(src_ss[0]);
+            bool dedicated = owner0 >= 0;
+            for (int i = 1; i < 5 && dedicated; i++) {
+                if (tensor->src[i] == nullptr) {
+                    continue;
+                }
+                dedicated = src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state_owner(src_ss[i]) == owner0;
+            }
+            if (dedicated) {
+                return degenerate_state(GGML_BACKEND_SPLIT_AXIS_1, owner0, tensor->ne[1]);
+            }
         }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -2702,8 +2839,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
+            // FILL, not SCALE by 0: the disabled node's buffer holds recycled
+            // garbage that can be NaN/Inf, and 0.0f * NaN == NaN would poison the
+            // reduce (dedicated attention zeroes an exit on every non-owner, so
+            // this is hit on every layer, not just -ts corner cases)
             ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->op = GGML_OP_FILL;
             node_zero->src[0] = node;
             ggml_set_op_params_f32(node_zero, 0, 0.0f);
             node_zero->data = node->data;
