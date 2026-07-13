@@ -429,11 +429,16 @@ Everything here is automatic — no new flags on the happy path:
   *coordinator* survives a worker dying mid-session too (task 29b): the
   failed endpoint is poisoned (never aborts the process), in-flight
   requests receive proper error responses (HTTP 500 "Compute error."), and
-  llama-server then exits with code 42 — a lost worker makes the layer
-  assignment unrecoverable in-process, so the restart policy reloads and
-  `--rpc-discover` re-splits across whatever workers are alive. Together:
-  a fully self-healing fleet with no manual intervention. Live
-  redistribution without a restart remains TASKS.md #29 (c).
+  llama-server then either exits with code 42 (default — the restart policy
+  reloads and `--rpc-discover` re-splits across whatever workers are alive)
+  or, with `--rpc-reload` (env `LLAMA_ARG_RPC_RELOAD`), reloads the model
+  IN-PROCESS across the workers reachable at that moment (task 29c): dead
+  workers are dropped together with their positional `-ts` shares, a worker
+  that comes back is re-included by the next failure-triggered reload,
+  all-workers-dead degrades to local-only (loudly), and a load that cannot
+  succeed yet (fleet-sized model, no workers) retries every 10s. Same
+  process, HTTP endpoints and queue throughout — no orchestrator needed.
+  Together: a fully self-healing fleet with no manual intervention.
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
