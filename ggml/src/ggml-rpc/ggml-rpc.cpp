@@ -1266,6 +1266,91 @@ static void ggml_backend_rpc_cpy_tensor_batch_async(int n_copies, ggml_backend_t
     }
 }
 
+// batched blocking reads (the meta backend's star reduce): every request goes out
+// before any response is read, so the servers' compute tails and the transfers
+// overlap instead of paying one round trip per tensor. In-order serving makes each
+// GET an implicit fence on the compute that produced its tensor - no explicit
+// fence and no W2W machinery needed.
+static void ggml_backend_rpc_get_tensor_batch(int n_gets, ggml_backend_t * backends, const ggml_tensor ** tensors, void ** datas, size_t * sizes) {
+    struct get_req {
+        socket_ptr             sock;
+        std::string            endpoint;
+        rpc_msg_get_tensor_req request;
+    };
+    std::vector<get_req> reqs(n_gets);
+    std::vector<bool>    fast(n_gets, false);
+    for (int k = 0; k < n_gets; k++) {
+        if (backends[k]->iface.get_name != ggml_backend_rpc_name) {
+            continue;
+        }
+        const ggml_tensor * t = tensors[k];
+        if (t->buffer == nullptr || !ggml_backend_buffer_is_rpc(t->buffer)) {
+            continue;
+        }
+        ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[k]->context;
+        auto sock = get_socket(rpc_ctx->endpoint);
+        if (sock == nullptr || ((ggml_backend_rpc_buffer_context *) t->buffer->context)->sock != sock) {
+            continue;
+        }
+        size_t offset = 0;
+        const ggml_tensor * root = rpc_resolve_view(t, offset);
+        reqs[k].sock           = sock;
+        reqs[k].endpoint       = rpc_ctx->endpoint;
+        reqs[k].request.tensor = serialize_tensor(root);
+        reqs[k].request.offset = offset;
+        reqs[k].request.size   = sizes[k];
+        fast[k] = true;
+    }
+    // same-socket requests stay pipelined (the server answers in order); distinct
+    // sockets are sorted so the per-socket locks are acquired consistently
+    std::vector<int> order;
+    for (int k = 0; k < n_gets; k++) {
+        if (fast[k]) {
+            order.push_back(k);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return reqs[a].sock.get() < reqs[b].sock.get();
+    });
+    {
+        std::vector<std::unique_lock<std::mutex>> locks;
+        locks.reserve(order.size());
+        socket_t * locked  = nullptr;
+        bool       sock_ok = true;
+        for (int k : order) {
+            ggml_backend_rpc_async_state & st = rpc_async_state(reqs[k].sock.get());
+            if (reqs[k].sock.get() != locked) {
+                locks.emplace_back(st.mutex);
+                locked  = reqs[k].sock.get();
+                sock_ok = rpc_drain_pings_locked(reqs[k].sock, st, st.pings_sent);
+            }
+            if (!sock_ok ||
+                !send_rpc_cmd_raw(reqs[k].sock, st, RPC_CMD_GET_TENSOR, &reqs[k].request, sizeof(reqs[k].request))) {
+                rpc_mark_failed(reqs[k].endpoint, __func__);
+                sock_ok = false;
+                fast[k] = false;
+            }
+        }
+        for (int k : order) {
+            if (!fast[k]) {
+                continue;
+            }
+            uint64_t out_size;
+            if (!reqs[k].sock->recv_data(&out_size, sizeof(out_size)) ||
+                out_size != sizes[k] ||
+                !reqs[k].sock->recv_data(datas[k], sizes[k])) {
+                rpc_mark_failed(reqs[k].endpoint, __func__);
+                memset(datas[k], 0, sizes[k]); // deterministic instead of stale garbage
+            }
+        }
+    }
+    for (int k = 0; k < n_gets; k++) {
+        if (!fast[k]) {
+            ggml_backend_tensor_get(tensors[k], datas[k], 0, sizes[k]);
+        }
+    }
+}
+
 // events (proto 4.2): an event is a PING sequence number on the endpoint's
 // connection. Record = send a marker; synchronize/wait = drain to its response.
 // Waiting on an event of the SAME endpoint is a no-op: the server executes
@@ -3509,6 +3594,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_cpy_tensor_batch_async") == 0) {
         return (void *)ggml_backend_rpc_cpy_tensor_batch_async;
+    }
+    if (std::strcmp(name, "ggml_backend_get_tensor_batch") == 0) {
+        return (void *)ggml_backend_rpc_get_tensor_batch;
     }
     return NULL;
 

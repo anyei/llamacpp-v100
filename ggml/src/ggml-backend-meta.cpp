@@ -2138,6 +2138,12 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_cpy_tensor_batch_async_t cpy_batch     = nullptr;
+    ggml_backend_get_tensor_batch_t       get_batch     = nullptr;
+
+    // members whose reg provides the batched-get proc reach their data over a wire
+    // (RPC-class); a member without it is local and can root a star reduce
+    std::vector<bool>    wire_member;
+    std::vector<uint8_t> star_scratch; // host staging for star-reduce partials
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2166,8 +2172,21 @@ struct ggml_backend_meta_context {
             if (comm_init != nullptr) {
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
             }
-            cpy_batch = (ggml_backend_cpy_tensor_batch_async_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_cpy_tensor_batch_async");
+            // batch procs live on the RPC reg, which is not necessarily member 0
+            // (e.g. Meta(CUDA0,RPC,RPC)): take them from the first member that has them
+            wire_member.resize(n_devs, false);
+            for (size_t i = 0; i < n_devs; i++) {
+                ggml_backend_reg_t reg_i = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[i]));
+                void * cb = ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_cpy_tensor_batch_async");
+                void * gb = ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_get_tensor_batch");
+                wire_member[i] = gb != nullptr;
+                if (cpy_batch == nullptr) {
+                    cpy_batch = (ggml_backend_cpy_tensor_batch_async_t) cb;
+                }
+                if (get_batch == nullptr) {
+                    get_batch = (ggml_backend_get_tensor_batch_t) gb;
+                }
+            }
         }
         if (comm_ctx != nullptr) {
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
@@ -2889,6 +2908,69 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             return GGML_STATUS_SUCCESS;
+        }
+        // star reduce: with a local member available as root, fetch every computing
+        // member's partial in one batched read (requests overlap on the wire; each
+        // read is ordered behind its member's compute by the connection), sum on the
+        // host and broadcast identical result bytes with async writes. Replaces the
+        // fold+butterfly whose sequential blocking round trips per step dominated
+        // boundary latency at decode batch sizes. GGML_META_NO_STAR=1 restores the
+        // butterfly. Kept: butterfly for all-wire fleets (no local root).
+        static const bool no_star = getenv("GGML_META_NO_STAR") != nullptr;
+        if (!no_star && part.size() >= 2 && !backend_ctx->wire_member.empty()) {
+            int j_root = -1;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (!backend_ctx->wire_member[j]) {
+                    j_root = (int) j;
+                    break;
+                }
+            }
+            bool star_ok = j_root >= 0;
+            for (size_t k = 0; star_ok && k < part.size(); k++) {
+                ggml_tensor * node = boundary_node(part[k]);
+                star_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
+            }
+            if (star_ok) {
+                const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
+                const size_t n_vals = nbytes/sizeof(float);
+                auto & scratch = backend_ctx->star_scratch;
+                if (scratch.size() < part.size()*nbytes) {
+                    scratch.resize(part.size()*nbytes);
+                }
+                std::vector<ggml_backend_t>      get_backends(part.size());
+                std::vector<const ggml_tensor *> get_tensors(part.size());
+                std::vector<void *>              get_datas(part.size());
+                std::vector<size_t>              get_sizes(part.size(), nbytes);
+                for (size_t k = 0; k < part.size(); k++) {
+                    auto & bcj = backend_ctx->backend_configs[part[k]];
+                    if (!backend_ctx->wire_member[part[k]]) {
+                        // a local partial is read directly from device memory - order
+                        // it behind the compute that produced it
+                        ggml_backend_synchronize(bcj.backend);
+                    }
+                    get_backends[k] = bcj.backend;
+                    get_tensors[k]  = boundary_node(part[k]);
+                    get_datas[k]    = scratch.data() + k*nbytes;
+                }
+                if (backend_ctx->get_batch != nullptr) {
+                    backend_ctx->get_batch((int) part.size(), get_backends.data(), get_tensors.data(), get_datas.data(), get_sizes.data());
+                } else {
+                    for (size_t k = 0; k < part.size(); k++) {
+                        ggml_backend_tensor_get(get_tensors[k], get_datas[k], 0, nbytes);
+                    }
+                }
+                float * acc = (float *) scratch.data();
+                for (size_t k = 1; k < part.size(); k++) {
+                    const float * p = (const float *) (scratch.data() + k*nbytes);
+                    for (size_t v = 0; v < n_vals; v++) {
+                        acc[v] += p[v];
+                    }
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_tensor_set(boundary_node(j), acc, 0, nbytes);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
         }
         if (part.size() >= 2 && part.size() < n_backends) {
             // MEASURED (full V4, Meta(CUDA0,.11,.15), -ts 0,3,2): reducing only
