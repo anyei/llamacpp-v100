@@ -350,6 +350,24 @@ Placement policy (the user-guidance dial, informed by #31):
   hits on a worker's experts in one call) — revisit the #31 -np finding here;
   EP is the path where MoE batch throughput CAN scale.
 
+  **MEASURED 2026-07-13 - confirmed, no code needed (a property of the
+  design).** llama-batched-bench, full V4, dedicated-attention fleet config
+  (npp 64, ntg 32): TG aggregate 1.66 / 2.71 / 3.82 / 4.73 t/s at
+  B=1/2/4/8 - x2.85 at B=8 where the #31 pipeline measured +27%. The
+  boundary cost (reduce + turnaround, the fleet's dominant tax) is paid
+  once per decode STEP regardless of B, so batch tokens ride the same
+  boundaries; expert compute grows sublinearly (per-worker batched
+  mul_mat_id). Aggregate crosses the 3.54 single-box single-stream bar at
+  B=4. Coherence: llama-parallel -np 4, all four concurrent temp-0
+  responses fluent/on-topic. Caveat kept honest: the same bench on the
+  single box (2x V100 -ncmoe 99) scales x2.17 (3.85/5.37/7.07/8.35) and
+  stays ahead in absolute V4 throughput - V4 half-fits in coordinator RAM
+  with NVMe behind it. EP's absolute win is the capacity regime (no box
+  holds the experts); its batching win is the steeper scaling slope.
+  Slow-link async participation (batch-only .25) stays parked - the
+  per-boundary latency law keeps it out of the sync ring, and V4 does not
+  need its capacity.
+
 ## 6. Open questions (tracked, not blocking increment 1)
 
 - Router on coordinator needs each token's router logits before expert calls —
