@@ -190,8 +190,22 @@ Placement policy (the user-guidance dial, informed by #31):
      4.3 server: no deadlock, no crash; an old dst pulling from a NEW src
      refuses HELLO and degrades to the bridged copy until the fleet is
      rolled). Gates: 0.6B loopback coherent 18.4 t/s (was 18.1); truncated-V4
-     meta run token-identical to single-CPU. Fleet numbers pending the 4.4
-     image roll.
+     meta run token-identical to single-CPU.
+     **Fleet A/B (2026-07-13, fleet on 4.4 images, V4 2-worker .11+.15
+     `-ts 3,2`): reduce 40 -> 25.5-28.5 ms/graph piece (-35%, ~2.4 ms/boundary
+     at 10.8 boundaries/piece). Decode unchanged (timed 0.98 vs 1.0; untimed
+     1.20 vs 1.2-1.3): compute at 155-223 ms/piece is ~85% of token time, so
+     the reduce cut is masked - the multi-build subgraph cache (next lever) is
+     now decisively the bottleneck.** Note for reruns: on .15 pick its CPU
+     device explicitly (`--device RPC0,RPC2` - RPC1 is the 6 GB 1660 Ti and
+     `-ts` shares against it fail to alloc); every load re-verifies the
+     worker tensor caches (~9-17 min for .15's 36 GB share - the price of
+     verify-on-read).
+     3-worker rerun (+.25, `-ts 4,3,1.5`): 0.35 t/s (was 0.4), reduce
+     144 ms/piece (13.4 ms/boundary vs 2.4 on 2-worker) and compute
+     562 ms/piece - .25's 100-Mbit link and slow CPU still gate everything,
+     confirming increment 3 (tiny/cold share for slow-link boxes) over any
+     further transport tuning.
   3. Per-token client-side subgraph rebuild (uid==0 outer graphs) -
      multi-build cache.
   Also hit and fixed on the way: a fresh cache-miss load writes the
