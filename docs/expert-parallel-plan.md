@@ -225,6 +225,23 @@ Placement policy (the user-guidance dial, informed by #31):
      and reduce/compute overlap, not client-side bookkeeping.
   3. Per-token client-side subgraph rebuild (uid==0 outer graphs) -
      multi-build cache.
+     **Perf lever 3 landed (2026-07-13): star reduce (dispatch pipelining).**
+     On a topology with a local root (dedicated-attention Meta(CUDA0,RPC,RPC)),
+     a reduce boundary was a chain of sequential blocking steps: fold GET,
+     CUDA ADD, butterfly GET+SET pair, more ADDs, copy-out - each its own
+     round trip or device sync, ~2 ms/boundary x ~21.5 boundaries/graph.
+     Now: one batched read of all computing partials (new reg proc
+     `ggml_backend_get_tensor_batch` sends every GET_TENSOR request before
+     reading any response - the transfers and the workers' compute tails
+     overlap, and in-order serving is the fence), host f32 sum in the same
+     order the fold+butterfly used (fp add commutativity keeps it
+     bit-identical), then async SET broadcast of identical bytes to every
+     member. No protocol change; workers untouched; all-wire fleets keep the
+     butterfly; `GGML_META_NO_STAR=1` for A/B. Also fixed: batch procs were
+     looked up from member 0's reg only, so Meta(CUDA0,...) never found them.
+     Gates: loopback 12L V4 truncation token-identical star vs butterfly;
+     full-V4 fleet outputs byte-identical. Fleet decode 2.08/2.24 t/s vs
+     1.30/1.69 same-binary controls (prior best 1.82); prefill ~8.3 vs 7.55.
   Also hit and fixed on the way: a fresh cache-miss load writes the
   worker's full share to the cache dir and the DIRTY page cache stacks on
   top of the weights - OOM-killed .15 (36 GB share, 64 GB box) at end of
