@@ -65,8 +65,15 @@ GGML_BACKEND_API bool ggml_backend_rpc_dev_worker_is_cpu(ggml_backend_dev_t dev)
 
 // true once any RPC worker connection has failed (worker crash / network loss). The
 // model's layer assignment is unrecoverable in-process — the serving application should
-// fail in-flight requests and exit so its restart policy re-splits across live workers.
+// fail in-flight requests and either exit for its restart policy or unload the model and
+// reload across the live workers (see the two calls below).
 GGML_BACKEND_API bool ggml_backend_rpc_any_endpoint_failed(void);
+
+// forget past endpoint failures so a reload (after the model is destroyed) reconnects
+GGML_BACKEND_API void ggml_backend_rpc_reset_failed_endpoints(void);
+
+// probe whether an RPC device's endpoint accepts connections right now
+GGML_BACKEND_API bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev);
 
 #ifdef  __cplusplus
 }

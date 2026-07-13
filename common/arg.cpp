@@ -2493,6 +2493,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_RPC"));
         add_opt(common_arg(
+            {"--rpc-reload"},
+            "on RPC worker loss, fail the in-flight requests and reload the model in-process across the workers reachable at that moment (dead workers are dropped with their -ts shares; retries every 10s until a load succeeds), instead of exiting for the restart policy",
+            [](common_params & params) {
+                params.rpc_reload = true;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RPC_RELOAD"));
+        add_opt(common_arg(
             {"--rpc-discover"},
             "discover RPC workers announcing themselves on the LAN (rpc-server --announce) and use them; composes with --rpc (duplicates are skipped). Trusted networks only",
             [](common_params & params) {

@@ -471,6 +471,8 @@ struct common_params {
 
     bool rpc_skip_unavailable = false; // drop unreachable --rpc servers with a warning instead of erroring out
 
+    bool rpc_reload = false;           // server: on RPC worker loss, reload in-process across reachable workers instead of exiting
+
     bool        rpc_discover = false;  // discover RPC workers via their LAN multicast beacons (rpc-server --announce)
     std::string rpc_discover_group;    // multicast group override ("ADDR:PORT"; empty = built-in default)
 

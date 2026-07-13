@@ -982,6 +982,82 @@ private:
         sleeping = new_state;
     }
 
+    // TASKS.md #29c runtime redistribution: a lost RPC worker invalidates the model's
+    // member assignment; with --rpc-reload the server unloads the model and reloads it
+    // across the endpoints reachable RIGHT NOW instead of exiting for the restart
+    // policy. Dead workers drop out (with their positional -ts shares); a worker that
+    // comes back is re-probed and re-included by a later retry. KV/prompt state is
+    // rebuilt by client retries, exactly as with the restart path, but the process,
+    // HTTP state and queue live on.
+    bool rpc_reload_pending = false;
+
+    // reloads filter the device list, so keep the FULL pre-failure params as the
+    // probe base - a worker lost in an earlier reload stays re-includable
+    common_params params_full;
+    bool          params_full_set = false;
+
+    void rpc_reload_and_resplit() {
+        typedef void (*rpc_reset_failed_t)(void);
+        typedef bool (*rpc_dev_reachable_t)(ggml_backend_dev_t);
+        static ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        static const rpc_reset_failed_t reset_failed_fn = reg != nullptr
+            ? (rpc_reset_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_reset_failed_endpoints")
+            : nullptr;
+        static const rpc_dev_reachable_t dev_reachable_fn = reg != nullptr
+            ? (rpc_dev_reachable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_reachable")
+            : nullptr;
+
+        if (!params_full_set) {
+            params_full     = params_base;
+            params_full_set = true;
+        }
+
+        SRV_ERR("%s", "an RPC worker connection was lost - reloading in-process across the reachable workers (--rpc-reload)\n");
+        handle_sleeping_state(true); // destroy the model; buffers on live workers are freed remotely
+
+        for (int attempt = 1;; attempt++) {
+            if (reset_failed_fn != nullptr) {
+                reset_failed_fn();
+            }
+            common_params params_try = params_full;
+            if (!params_try.devices.empty() && dev_reachable_fn != nullptr) {
+                // the device list ends with a nullptr terminator ("then CPU", see
+                // parse_device_list) - it always survives the probe, so an all-dead
+                // list degrades to local-only, matching --rpc-skip-unavailable
+                auto & devs = params_try.devices;
+                size_t kept      = 0;
+                size_t kept_real = 0;
+                for (size_t i = 0; i < devs.size(); i++) {
+                    if (dev_reachable_fn(devs[i])) {
+                        devs[kept] = devs[i];
+                        params_try.tensor_split[kept] = params_full.tensor_split[i];
+                        kept++;
+                        kept_real += devs[i] != nullptr;
+                    } else {
+                        SRV_WRN("dropping unreachable device %s (and its -ts share) for this reload\n",
+                                ggml_backend_dev_name(devs[i]));
+                    }
+                }
+                if (kept_real == 0 && kept < devs.size()) {
+                    SRV_WRN("%s", "no configured worker is reachable - loading local-only for this reload "
+                                  "(workers rejoin on the next failure-triggered reload)\n");
+                }
+                for (size_t i = kept; i < devs.size(); i++) {
+                    params_try.tensor_split[i] = 0.0f;
+                }
+                devs.resize(kept);
+            }
+            if (load_model(params_try)) {
+                break;
+            }
+            SRV_ERR("in-process reload attempt %d failed (workers unreachable or the model no longer fits) - retrying in 10s\n", attempt);
+            destroy();
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+        sleeping = false;
+        SRV_INF("%s", "in-process reload complete - resuming serving\n");
+    }
+
     struct load_progress_data {
         server_context_impl * ctx;
         std::string stage;
@@ -2789,6 +2865,10 @@ private:
 #endif
 
     void update_slots() {
+        if (rpc_reload_pending) {
+            rpc_reload_pending = false;
+            rpc_reload_and_resplit();
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3669,21 +3749,31 @@ private:
 
         metrics.on_decoded(slots);
 
-        if (ret != 0) {
+        typedef bool (*rpc_any_failed_t)(void);
+        static const rpc_any_failed_t rpc_any_failed_fn = []() -> rpc_any_failed_t {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg != nullptr
+                ? (rpc_any_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_any_endpoint_failed")
+                : nullptr;
+        }();
+        // a worker lost between a successful compute and the logits read returns
+        // ret == 0 with zeroed logits - promote it to a compute error before a
+        // garbage token is sampled (TASKS.md #29b known gap, closed by #29c)
+        const bool rpc_lost = rpc_any_failed_fn != nullptr && rpc_any_failed_fn();
+
+        if (ret != 0 || rpc_lost) {
             {
                 std::string err;
 
-                if (n_batch == 1 && ret == 1) {
+                if (rpc_lost) {
+                    err = "Compute error.";
+                } else if (n_batch == 1 && ret == 1) {
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
-                }
-
-                if (ret == -1) {
+                } else if (ret == -1) {
                     err = "Invalid input batch.";
-                }
-
-                if (ret < -1) {
+                } else if (ret < -1) {
                     // TODO: update slot state based on llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
                     err = "Compute error.";
                 }
@@ -3704,26 +3794,27 @@ private:
                         }
                     }
 
-                    // a lost RPC worker makes the model's layer assignment unrecoverable
-                    // in-process (TASKS.md #29b): exit once the error responses have had a
-                    // moment to flush, so the restart policy reloads and --rpc-discover
-                    // re-splits across whatever workers are alive by then
-                    typedef bool (*rpc_any_failed_t)(void);
-                    static const rpc_any_failed_t rpc_any_failed_fn = []() -> rpc_any_failed_t {
-                        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
-                        return reg != nullptr
-                            ? (rpc_any_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_any_endpoint_failed")
-                            : nullptr;
-                    }();
-                    if (rpc_any_failed_fn != nullptr && rpc_any_failed_fn()) {
-                        SRV_ERR("%s", "an RPC worker connection was lost - exiting in 2s for a clean restart "
-                                      "(restart policy + --rpc-discover re-enlist the live workers)\n");
-                        std::thread([]() {
-                            std::this_thread::sleep_for(std::chrono::seconds(2));
-                            fflush(stdout);
-                            fflush(stderr);
-                            std::_Exit(42);
-                        }).detach();
+                    // a lost RPC worker makes the model's member assignment unrecoverable
+                    // without a reload (TASKS.md #29b/#29c): either reload in-process
+                    // across the reachable workers (--rpc-reload) or exit once the error
+                    // responses have had a moment to flush, so the restart policy reloads
+                    // and --rpc-discover re-splits across whatever workers are alive
+                    if (rpc_lost || (rpc_any_failed_fn != nullptr && rpc_any_failed_fn())) {
+                        if (params_base.rpc_reload) {
+                            rpc_reload_pending = true; // handled at the top of the next update_slots
+                            server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                            task.id = queue_tasks.get_new_id();
+                            queue_tasks.post(std::move(task));
+                        } else {
+                            SRV_ERR("%s", "an RPC worker connection was lost - exiting in 2s for a clean restart "
+                                          "(restart policy + --rpc-discover re-enlist the live workers)\n");
+                            std::thread([]() {
+                                std::this_thread::sleep_for(std::chrono::seconds(2));
+                                fflush(stdout);
+                                fflush(stderr);
+                                std::_Exit(42);
+                            }).detach();
+                        }
                     }
 
                     // stop, do not retry with smaller batch size

@@ -3517,6 +3517,26 @@ bool ggml_backend_rpc_dev_worker_is_cpu(ggml_backend_dev_t dev) {
     return ((ggml_backend_rpc_device_context *) dev->context)->worker_is_cpu;
 }
 
+// forget past endpoint failures so an in-process reload can reconnect (TASKS.md #29c).
+// Sockets are held only by buffer contexts, so once the model is destroyed the cached
+// connections expire and the next use dials fresh.
+void ggml_backend_rpc_reset_failed_endpoints(void) {
+    std::lock_guard<std::mutex> lock(g_rpc_failed_mutex);
+    if (!g_rpc_failed_endpoints.empty()) {
+        GGML_LOG_INFO("RPC: clearing %zu failed endpoint mark(s) for reload\n", g_rpc_failed_endpoints.size());
+        g_rpc_failed_endpoints.clear();
+    }
+}
+
+// probe: can this RPC device's endpoint be (re)connected right now?
+bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return true; // not an RPC device: nothing to probe
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    return get_socket(ctx->endpoint) != nullptr;
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -3591,6 +3611,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_worker_is_cpu") == 0) {
         return (void *)ggml_backend_rpc_dev_worker_is_cpu;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_reset_failed_endpoints") == 0) {
+        return (void *)ggml_backend_rpc_reset_failed_endpoints;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_reachable") == 0) {
+        return (void *)ggml_backend_rpc_dev_reachable;
     }
     if (std::strcmp(name, "ggml_backend_cpy_tensor_batch_async") == 0) {
         return (void *)ggml_backend_rpc_cpy_tensor_batch_async;
