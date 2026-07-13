@@ -2850,73 +2850,106 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
-        {
-            // if only ONE member actually computed this boundary (dedicated
-            // attention exits, zero -ts shares), the sum IS its value: broadcast
-            // it and skip the zeroing and the butterfly entirely
-            size_t j_src   = 0;
-            int n_compute  = 0;
-            for (size_t j = 0; j < n_backends; j++) {
-                ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
-                if (cg->nodes[cg->n_nodes - 1]->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                    j_src = j;
-                    n_compute++;
-                }
-            }
-            if (n_compute == 1) {
-                auto & bcs = backend_ctx->backend_configs[j_src];
-                ggml_tensor * node_src = bcs.cgraphs[i].cgraph_main->nodes[bcs.cgraphs[i].cgraph_main->n_nodes - 1];
-                std::vector<ggml_backend_t> backends_src, backends_dst;
-                std::vector<ggml_tensor *>  srcs, dsts;
-                for (size_t j = 0; j < n_backends; j++) {
-                    if (j == j_src) {
-                        continue;
-                    }
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    backends_src.push_back(bcs.backend);
-                    backends_dst.push_back(bcj.backend);
-                    srcs.push_back(node_src);
-                    dsts.push_back(bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1]);
-                }
-                if (backend_ctx->cpy_batch != nullptr && srcs.size() > 1) {
-                    backend_ctx->cpy_batch((int) srcs.size(), backends_src.data(), backends_dst.data(), srcs.data(), dsts.data());
-                } else {
-                    for (size_t k = 0; k < srcs.size(); k++) {
-                        ggml_backend_tensor_copy_async(backends_src[k], backends_dst[k], srcs[k], dsts[k]);
-                    }
-                }
-                return GGML_STATUS_SUCCESS;
-            }
-        }
+        auto boundary_node = [&](size_t j) -> ggml_tensor * {
+            ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+            return cg->nodes[cg->n_nodes - 1];
+        };
 
-        // Zero out nodes that were disabled due to having a zero-sized slice:
+        // members whose boundary node actually computed: zero-share members
+        // (dedicated attention exits, zero -ts slices) contribute exact zeros,
+        // so they take no part in the reduce and receive the result by copy
+        std::vector<size_t> part;
+        part.reserve(n_backends);
         for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
-            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                continue;
-            }
-            // FILL, not SCALE by 0: the disabled node's buffer holds recycled
-            // garbage that can be NaN/Inf, and 0.0f * NaN == NaN would poison the
-            // reduce (dedicated attention zeroes an exit on every non-owner, so
-            // this is hit on every layer, not just -ts corner cases)
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_FILL;
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
-
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+            if (boundary_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                part.push_back(j);
             }
         }
-        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+        if (part.empty()) {
+            // every member holds a zero-size slice: the reduced value is zero.
+            // FILL, not SCALE by 0: the buffers hold recycled garbage that can
+            // be NaN/Inf, and 0.0f * NaN == NaN
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_tensor * node = boundary_node(j);
+                ggml_tensor * node_zero = get_node_aux(node);
+                node_zero->op = GGML_OP_FILL;
+                node_zero->src[0] = node;
+                ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                node_zero->data = node->data;
+                node_zero->buffer = node->buffer;
+                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+                step_cgraphs[j] = get_cgraph_aux();
+                step_cgraphs[j]->nodes[0] = node_zero;
+                step_cgraphs[j]->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+        if (part.size() >= 2 && part.size() < n_backends) {
+            // MEASURED (full V4, Meta(CUDA0,.11,.15), -ts 0,3,2): reducing only
+            // among the computing workers looked cheaper on paper but ran 1.34
+            // vs 1.80 t/s - it trades coordinator-local star hops through the
+            // zeroed CUDA member for worker-to-worker fenced pulls over GbE plus
+            // a tail copy-out. Keep zero members in the butterfly (their slices
+            // are FILLed below); only the single-computer case skips it.
+            part.clear();
+            for (size_t j = 0; j < n_backends; j++) {
+                part.push_back(j);
+                ggml_tensor * node = boundary_node(j);
+                if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    continue;
+                }
+                // FILL, not SCALE by 0: recycled buffers hold NaN/Inf and
+                // 0.0f * NaN == NaN would poison the reduce
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_tensor * node_zero = get_node_aux(node);
+                node_zero->op = GGML_OP_FILL;
+                node_zero->src[0] = node;
+                ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                node_zero->data = node->data;
+                node_zero->buffer = node->buffer;
+                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+                step_cgraphs[j] = get_cgraph_aux();
+                step_cgraphs[j]->nodes[0] = node_zero;
+                step_cgraphs[j]->n_nodes = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+        }
+        if (part.size() == 1) {
+            // the sum IS the single computer's value: broadcast it
+            const size_t j_src = part[0];
+            auto & bcs = backend_ctx->backend_configs[j_src];
+            ggml_tensor * node_src = boundary_node(j_src);
+            std::vector<ggml_backend_t> backends_src, backends_dst;
+            std::vector<ggml_tensor *>  srcs, dsts;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (j == j_src) {
+                    continue;
+                }
+                backends_src.push_back(bcs.backend);
+                backends_dst.push_back(backend_ctx->backend_configs[j].backend);
+                srcs.push_back(node_src);
+                dsts.push_back(boundary_node(j));
+            }
+            if (backend_ctx->cpy_batch != nullptr && srcs.size() > 1) {
+                backend_ctx->cpy_batch((int) srcs.size(), backends_src.data(), backends_dst.data(), srcs.data(), dsts.data());
+            } else {
+                for (size_t k = 0; k < srcs.size(); k++) {
+                    ggml_backend_tensor_copy_async(backends_src[k], backends_dst[k], srcs[k], dsts[k]);
+                }
+            }
+            return GGML_STATUS_SUCCESS;
+        }
 
         // pulls of one reduce step are collected and flushed together: the batch
         // proc (RPC) overlaps them on the wire, the per-pair path serializes on
@@ -2981,17 +3014,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             step_cgraphs[j_dst] = cgraph_aux;
         };
 
-        size_t offset_j = n_backends/2;
-        while ((offset_j & (offset_j - 1)) != 0) {
-            offset_j--;
+        // fold/butterfly over the PARTICIPANTS only (indices map through part[])
+        const size_t n_part = part.size();
+        size_t offset_k = n_part/2;
+        while ((offset_k & (offset_k - 1)) != 0) {
+            offset_k--;
         }
-        const size_t offset_j_max = offset_j;
+        const size_t offset_k_max = offset_k;
         size_t i_buf = 0;
 
-        // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
-        for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
-            const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
+        // If n_part is not a power of 2, fold in the excess prior to butterfly reduction:
+        for (size_t k_src = 2*offset_k_max; k_src < n_part; k_src++) {
+            const size_t j_dst = part[k_src - 2*offset_k_max];
+            push_data(part[k_src], j_dst, i_buf);
             flush_copies();
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
@@ -3001,40 +3036,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         // Butterfly reduction:
-        for (; offset_j >= 1; offset_j /= 2) {
+        for (; offset_k >= 1; offset_k /= 2) {
             std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                const size_t j_other = j ^ offset_j;
-                if (j_other >= n_backends) {
+            for (size_t k = 0; k < 2*offset_k_max; k++) {
+                const size_t k_other = k ^ offset_k;
+                if (k_other >= n_part) {
                     continue;
                 }
-                push_data(j, j_other, i_buf);
+                push_data(part[k], part[k_other], i_buf);
             }
             flush_copies();
 
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                if (step_cgraphs[j] == nullptr) {
+            for (size_t k = 0; k < 2*offset_k_max; k++) {
+                if (step_cgraphs[part[k]] == nullptr) {
                     continue;
                 }
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                auto & bcj = backend_ctx->backend_configs[part[k]];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[part[k]]);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
             i_buf++;
         }
-        assert(i_buf == backend_ctx->n_reduce_steps);
+        assert(i_buf <= backend_ctx->n_reduce_steps);
 
-        // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
-        for (size_t j = 2*offset_j_max; j < n_backends; j++) {
-            auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
-            auto & bcj_dst = backend_ctx->backend_configs[j];
-
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            pending_copies.push_back({bcj_src.backend, bcj_dst.backend, node_src, node_dst});
+        // copy the reduced tensors back to the folded excess and OUT to the
+        // members that contributed exact zeros
+        for (size_t k = 2*offset_k_max; k < n_part; k++) {
+            auto & bcj_src = backend_ctx->backend_configs[part[k - 2*offset_k_max]];
+            pending_copies.push_back({bcj_src.backend, backend_ctx->backend_configs[part[k]].backend,
+                                      boundary_node(part[k - 2*offset_k_max]), boundary_node(part[k])});
+        }
+        {
+            size_t kp = 0;
+            auto & bcj_src = backend_ctx->backend_configs[part[0]];
+            for (size_t j = 0; j < n_backends; j++) {
+                if (kp < n_part && part[kp] == j) {
+                    kp++;
+                    continue;
+                }
+                pending_copies.push_back({bcj_src.backend, backend_ctx->backend_configs[j].backend,
+                                          boundary_node(part[0]), boundary_node(j)});
+            }
         }
         flush_copies();
 
