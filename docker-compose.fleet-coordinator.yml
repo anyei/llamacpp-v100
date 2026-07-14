@@ -40,8 +40,9 @@ services:
       - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
       # optional static workers in addition to discovery (comma-separated host:port)
       - LLAMA_ARG_RPC=${COORD_RPC:-}
+    entrypoint: /app/llama-server
     command: >
-      -m ${COORD_MODEL:-/models/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}
+      -m /models/${COORD_MODEL:-Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}
       --host 0.0.0.0
       --port ${COORD_PORT:-8090}
       -ngl 99
