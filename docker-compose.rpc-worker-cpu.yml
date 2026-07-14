@@ -29,6 +29,9 @@ services:
       - ${WORKER_MODELS_DIR:-./models-local}:/local-models:ro
     environment:
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+      # optional cache size cap (MiB): after each save, least-recently-USED entries
+      # are evicted until the cache fits. 0/unset = unlimited (old behavior).
+      - GGML_RPC_CACHE_LIMIT_MIB=${WORKER_CACHE_LIMIT_MIB:-0}
     # WORKER_THREADS: CPU compute threads on the worker. rpc-server's default
     # (half the cores) measured FASTER than all-cores on loopback (7.7 vs 7.0
     # t/s, 35B A3B) — oversubscription hurts. On a dedicated worker box, sweep

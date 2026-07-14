@@ -36,6 +36,8 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0,1
       - LLAMA_CACHE=/cache        # required for -c to land in the mounted volume
+      # optional cache size cap (MiB): LRU-evict after each save; 0/unset = unlimited
+      - GGML_RPC_CACHE_LIMIT_MIB=${WORKER_CACHE_LIMIT_MIB:-0}
     # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
     # coordinator with --rpc-discover finds this worker without a static --rpc list.
     # Remove the flag to opt out; --announce-group ADDR:PORT to use a custom group.

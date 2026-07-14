@@ -2100,6 +2100,62 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
+// opt-in cache size cap (GGML_RPC_CACHE_LIMIT_MIB): after a save, evict entries
+// oldest-mtime-first until the dir fits. Served entries refresh their mtime, so a
+// hot working set survives while superseded model generations age out.
+static void rpc_cache_enforce_limit(const char * cache_dir) {
+    static const long long limit_mib = []() {
+        const char * env = getenv("GGML_RPC_CACHE_LIMIT_MIB");
+        return env != nullptr ? atoll(env) : 0LL;
+    }();
+    if (limit_mib <= 0) {
+        return;
+    }
+    const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
+    struct cache_entry {
+        fs::path           path;
+        uint64_t           size;
+        fs::file_time_type mtime;
+    };
+    std::vector<cache_entry> entries;
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        cache_entry e { it->path(), it->file_size(ec), it->last_write_time(ec) };
+        if (ec) {
+            continue;
+        }
+        total += e.size;
+        entries.push_back(std::move(e));
+    }
+    if (total <= limit) {
+        return;
+    }
+    std::sort(entries.begin(), entries.end(), [](const cache_entry & a, const cache_entry & b) {
+        return a.mtime < b.mtime;
+    });
+    size_t   n_evicted = 0;
+    uint64_t freed     = 0;
+    for (const cache_entry & e : entries) {
+        if (total <= limit) {
+            break;
+        }
+        if (fs::remove(e.path, ec) && !ec) {
+            total -= e.size;
+            freed += e.size;
+            n_evicted++;
+        }
+    }
+    if (n_evicted > 0) {
+        GGML_LOG_INFO("[rpc cache] evicted %zu entries (%.1f MiB) to fit GGML_RPC_CACHE_LIMIT_MIB=%lld\n",
+                      n_evicted, freed / (1024.0*1024.0), limit_mib);
+    }
+}
+
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
@@ -2149,6 +2205,13 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         fs::path cache_file = fs::path(cache_dir) / hash_str;
         fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
         std::ofstream ofs(tmp_file, std::ios::binary);
+        if (!ofs.is_open()) {
+            // the cache dir can disappear at runtime (manual cleanup) - without this
+            // every later save fails silently and loads re-stream forever
+            std::error_code ec_mk;
+            fs::create_directories(fs::path(cache_dir), ec_mk);
+            ofs.open(tmp_file, std::ios::binary);
+        }
         ofs.write((const char *)data, size);
         ofs.close();
         std::error_code ec;
@@ -2171,6 +2234,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
             }
 #endif
             GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+            rpc_cache_enforce_limit(cache_dir);
         }
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
@@ -2194,6 +2258,8 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     ifs.seekg(0, std::ios::beg);
     data.resize(size);
     ifs.read((char *)data.data(), size);
+    // refresh mtime: the size-capped cache evicts by LRU and a served entry is hot
+    fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec);
     return true;
 }
 
