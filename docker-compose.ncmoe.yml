@@ -11,9 +11,20 @@
 # fleet EP profile (docker-compose.ep-fleet.yml) is measured against.
 #
 # Notes:
-#   - mmap stays ON (no --no-mmap): NVMe paging of cold experts is the mechanism;
+#   - mmap stays ON (no --no-mmap): NVMe paging of cold experts is the mechanism
+#     (the loader's "consider --no-mmap" warning assumes the CPU-side tensors fit
+#     in RAM - here they are ~80 GB vs 46 GB, so --no-mmap would OOM);
 #   - --no-warmup: warmup would touch all experts and stream the full 80 GB;
 #   - first tokens after start are cold - speed builds as the page cache warms.
+#
+# GPU-first expert placement: -ncmoe N keeps only the FIRST N layers' experts on
+# the CPU; the remaining layers' experts live in VRAM with their layer (fast).
+# NCMOE_LAYERS tunes the balance for V4 (43 MoE layers, ~1.9 GB experts/layer):
+#   99 = all experts on CPU (most RAM headroom, the 3.54 t/s baseline)
+#   ~20 (default) = ~23 layers' experts in VRAM, rest on CPU/mmap
+#   lower = more VRAM pressure. Tune by sweeping: lower until the load OOMs
+#   ("failed to allocate CUDA buffer"), then back off 1-2. Leave headroom on
+#   GPU0/GPU1 if another server shares the cards.
 
 services:
   llama-ncmoe:
@@ -36,7 +47,7 @@ services:
     command: >
       -m /models/${NCMOE_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
       -ngl 99
-      -ncmoe ${NCMOE_LAYERS:-99}
+      -ncmoe ${NCMOE_LAYERS:-20}
       -t ${NCMOE_THREADS:-10}
       -c ${NCMOE_CTX:-8192}
       --no-warmup
