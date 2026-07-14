@@ -1377,7 +1377,9 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         return false;
     }
     auto sock = get_socket(rpc_ctx->endpoint);
-    if (sock == nullptr || rpc_async_state(sock.get()).server_minor < 5) {
+    // 4.6, not 4.5: the chain format (uid LIST in the GRAPH segment) replaced the
+    // short-lived single-uid 4.5 layout - a 4.5 server would misparse it
+    if (sock == nullptr || rpc_async_state(sock.get()).server_minor < 6) {
         return false;
     }
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
