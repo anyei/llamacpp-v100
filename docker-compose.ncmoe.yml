@@ -1,0 +1,47 @@
+# Single-box big-MoE profile: non-expert stack (attention/dense/KV) layer-split
+# across BOTH GPUs, ALL routed experts in a CPU-side buffer via -ncmoe.
+# The 86.7 GB DeepSeek-V4-Flash runs on one box this way: ~46 GB RAM caches about
+# half the ~80 GB of experts, the rest pages from NVMe through mmap.
+#
+#   docker compose -f docker-compose.ncmoe.yml up -d
+#
+# Measured (2026-07-13, V4 on 2x V100-32GB): decode 3.09 t/s cold -> 3.54 warm
+# (page cache saturates ~41 GB), prefill ~1.6 t/s; batch scales x2.17 at -np 8
+# (3.85/5.37/7.07/8.35 t/s at B=1/2/4/8). This is the single-box reference the
+# fleet EP profile (docker-compose.ep-fleet.yml) is measured against.
+#
+# Notes:
+#   - mmap stays ON (no --no-mmap): NVMe paging of cold experts is the mechanism;
+#   - --no-warmup: warmup would touch all experts and stream the full 80 GB;
+#   - first tokens after start are cold - speed builds as the page cache warms.
+
+services:
+  llama-ncmoe:
+    container_name: llama-ncmoe
+    image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
+    volumes:
+      - ${MODELS_DIR:-/mnt/models/ollama37-k80/.ollama/custom-models}:/models:ro
+    ports:
+      - "${NCMOE_PORT:-8099}:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=${NCMOE_GPUS:-0,1}
+    entrypoint: /app/llama-server
+    command: >
+      -m /models/${NCMOE_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      -ngl 99
+      -ncmoe ${NCMOE_LAYERS:-99}
+      -t ${NCMOE_THREADS:-10}
+      -c ${NCMOE_CTX:-8192}
+      --no-warmup
+      --host 0.0.0.0
+      --port 8080
+      -np ${NCMOE_PARALLEL:-1}
+      -fit off
+    restart: always
