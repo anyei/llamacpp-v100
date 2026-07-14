@@ -1,0 +1,61 @@
+# Expert-parallel fleet coordinator (TASKS.md #28, dedicated-attention topology).
+# Serves a big MoE model with attention/KV on this box's GPU and the routed experts
+# split across RPC workers - the config that runs the 86.7 GB DeepSeek-V4-Flash
+# RAM-resident on the fleet.
+#
+#   docker compose -f docker-compose.ep-fleet.yml up -d
+#
+# Measured (2026-07-14/15, V4 on CUDA0 + .11 + .15 at -ts 0,3,2):
+#   decode 2.36-2.56 t/s single stream, prefill ~8 t/s; batch scales x2.85 at -np 8.
+#   Worker dies -> in-flight requests get clean 500s, then SURGICAL recovery (default,
+#   part of --rpc-reload): the returned worker's share replays from its own cache
+#   (~2 min for a 48 GB share) with a full in-process reload as fallback.
+#
+# Requirements:
+#   - workers up via docker-compose.rpc-worker-*.yml (their -c cache volume is what
+#     makes surgical recovery and fast reloads work);
+#   - member order: on .15 pick its CPU device explicitly (RPC1 is the 6 GB 1660 Ti),
+#     hence the default --device CUDA0,RPC0,RPC2 for workers .11,.15;
+#   - -ub 256 (not 512): the DSA compute reserve at ub 512 is ~67 GB virtual.
+#
+# The perf stack (star reduce, fused boundary pipeline, surgical recovery) is
+# default-on in images >= 026ea0ae9 - no env gates needed. Kill switches:
+# GGML_META_NO_STAR / GGML_META_NO_FUSED / LLAMA_RPC_NO_SURGICAL.
+
+services:
+  llama-ep-fleet:
+    container_name: llama-ep-fleet
+    image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
+    network_mode: host              # direct sockets to the workers; trusted LAN only
+    volumes:
+      - ${MODELS_DIR:-/mnt/models/ollama37-k80/.ollama/custom-models}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # attention/router/dense on member 0 (the local GPU), only experts on workers
+      - CUDA_VISIBLE_DEVICES=${COORD_GPU:-0}
+      - LLAMA_META_EP_ONLY=1
+      - LLAMA_META_ATTN_OWNER=0
+    entrypoint: /app/llama-server
+    command: >
+      -m /models/${EP_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      --rpc ${EP_WORKERS:-10.5.5.11:50052,10.5.5.15:50052}
+      --device ${EP_DEVICES:-CUDA0,RPC0,RPC2}
+      -sm tensor
+      -ts ${EP_TS:-0,3,2}
+      -ngl 99
+      --no-mmap
+      -c ${EP_CTX:-4096}
+      -ub 256
+      -b 256
+      --host 0.0.0.0
+      --port ${EP_PORT:-8098}
+      --rpc-reload
+      -np ${EP_PARALLEL:-1}
+      -fit off
+    restart: always
