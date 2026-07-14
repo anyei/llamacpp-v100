@@ -18,6 +18,7 @@
 #include <thread>
 #include <condition_variable>
 #include <chrono>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -346,6 +347,52 @@ struct ggml_backend_rpc_buffer_context {
     uint64_t remote_ptr;
 };
 
+// surgical re-provision journal (TASKS.md #29c refinement): while a weight-class
+// RPC buffer is populated, record enough to rebuild it on a RESTARTED worker at
+// the same endpoint without the coordinator re-reading the model - big writes as
+// (offset, size, hash) replayed via SET_TENSOR_HASH against the worker's local
+// cache, small writes as raw bytes (bounded). Offsets are relative to the buffer
+// base so the replay works at whatever address the fresh server hands out.
+struct rpc_buffer_journal {
+    struct set_entry {
+        rpc_tensor root;   // data field holds the OFFSET from base
+        uint64_t   offset;
+        uint64_t   size;
+        uint64_t   hash;      // valid when spill_off == UINT64_MAX
+        uint64_t   spill_off; // literal bytes at this offset of the spill file
+    };
+    std::map<uint64_t, set_entry> sets;         // keyed by resolved offset
+    std::vector<rpc_tensor>       init_tensors; // data field holds the OFFSET
+    // a fresh load zero-fills KV-class buffers; replay must too, or the re-created
+    // allocation serves recycled garbage (NaN-poisoning, the FILL-not-SCALE lesson)
+    bool    cleared     = false;
+    uint8_t clear_value = 0;
+    // small writes go to an anonymous temp file, not RAM: segmented tensors
+    // upload as thousands of strided per-row writes (hundreds of MB)
+    FILE *   spill      = nullptr;
+    uint64_t spill_size = 0;
+    bool     disabled   = false; // spill budget exceeded or unavailable
+
+    ~rpc_buffer_journal() {
+        if (spill != nullptr) {
+            fclose(spill);
+        }
+    }
+    rpc_buffer_journal() = default;
+    rpc_buffer_journal(const rpc_buffer_journal &) = delete;
+    rpc_buffer_journal & operator=(const rpc_buffer_journal &) = delete;
+};
+static std::mutex g_rpc_journal_mutex;
+static std::unordered_map<ggml_backend_buffer_t, rpc_buffer_journal> g_rpc_journals;
+
+static size_t rpc_journal_small_budget() {
+    static const size_t budget = []() {
+        const char * env = getenv("GGML_RPC_JOURNAL_MAX_MIB");
+        return (size_t) (env != nullptr ? atoll(env) : 4096) * 1024u * 1024u;
+    }();
+    return budget;
+}
+
 // RPC helper functions
 
 // Computes FNV-1a hash of the data
@@ -647,13 +694,13 @@ static uint64_t rpc_get_conn_id(socket_ptr sock) {
     return st.conn_id;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+static std::shared_ptr<socket_t> get_socket_impl(const std::string & endpoint, bool fresh) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
     auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
+    if (!fresh && it != sockets.end()) {
         if (auto sock = it->second.lock()) {
             return sock;
         }
@@ -683,7 +730,15 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return sock;
 }
 
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+    return get_socket_impl(endpoint, /*fresh =*/ false);
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
+        g_rpc_journals.erase(buffer);
+    }
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
@@ -766,6 +821,13 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
+        if (buffer->usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE && ctx->base_ptr != nullptr) {
+            std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
+            rpc_tensor jt = request.tensor;
+            jt.data -= (uint64_t)(uintptr_t) ctx->base_ptr; // offset from base for replay
+            g_rpc_journals[buffer].init_tensors.push_back(jt);
+        }
+
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
         if (!status) {
             rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
@@ -788,6 +850,55 @@ static const ggml_tensor * rpc_resolve_view(const ggml_tensor * tensor, size_t &
     return tensor;
 }
 
+// record a completed weight-class write so a restarted worker can be re-provisioned
+// without the coordinator re-reading the model (big writes replay by hash against
+// the worker's local cache, small writes replay literally, bounded)
+static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tensor & root, uint64_t offset,
+                                   const void * data, size_t size, uint64_t hash, bool have_hash) {
+    if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (ctx->base_ptr == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
+    rpc_buffer_journal & j = g_rpc_journals[buffer];
+    if (j.disabled) {
+        return;
+    }
+    rpc_buffer_journal::set_entry e;
+    e.root      = root;
+    e.root.data = root.data - (uint64_t)(uintptr_t) ctx->base_ptr;
+    e.offset    = offset;
+    e.size      = size;
+    e.hash      = hash;
+    e.spill_off = UINT64_MAX;
+    if (!have_hash) {
+        if (j.spill == nullptr) {
+            j.spill = tmpfile();
+        }
+        if (j.spill == nullptr || j.spill_size + size > rpc_journal_small_budget()) {
+            GGML_LOG_WARN("[rpc journal] small-write spill unavailable or budget exceeded - "
+                          "surgical re-provision disabled for a buffer (GGML_RPC_JOURNAL_MAX_MIB)\n");
+            j.disabled = true;
+            j.sets.clear();
+            j.init_tensors.clear();
+            return;
+        }
+        if (fseeko(j.spill, (off_t) j.spill_size, SEEK_SET) != 0 ||
+            fwrite(data, 1, size, j.spill) != size) {
+            j.disabled = true;
+            j.sets.clear();
+            j.init_tensors.clear();
+            return;
+        }
+        e.spill_off   = j.spill_size;
+        j.spill_size += size;
+    }
+    j.sets[offset] = std::move(e);
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     const ggml_tensor * root = rpc_resolve_view(tensor, offset);
@@ -797,6 +908,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         request.tensor = rpc_tensor;
         request.offset = offset;
         request.hash = fnv_hash((const uint8_t*)data, size);
+        rpc_journal_record_set(buffer, rpc_tensor, offset, data, size, request.hash, true);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         if (!status) {
@@ -807,6 +919,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             // the server has the same data, no need to send it
             return;
         }
+    } else {
+        rpc_journal_record_set(buffer, rpc_tensor, offset, data, size, 0, false);
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
@@ -885,6 +999,12 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (buffer->usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
+        rpc_buffer_journal & j = g_rpc_journals[buffer];
+        j.cleared     = true;
+        j.clear_value = value;
+    }
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
     if (!status) {
@@ -3872,6 +3992,188 @@ bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev) {
     return get_socket(ctx->endpoint) != nullptr;
 }
 
+// true when this RPC device's endpoint has failed this session
+bool ggml_backend_rpc_dev_failed(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return false;
+    }
+    return rpc_endpoint_failed(((ggml_backend_rpc_device_context *) dev->context)->endpoint);
+}
+
+// dial a FRESH connection (the cached socket may be a dead one still held by
+// buffers); success replaces the cache entry, ready for re-provisioning
+bool ggml_backend_rpc_endpoint_reprobe(const char * endpoint) {
+    return endpoint != nullptr && get_socket_impl(endpoint, /*fresh =*/ true) != nullptr;
+}
+
+void ggml_backend_rpc_clear_failed_endpoint(const char * endpoint) {
+    if (endpoint == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rpc_failed_mutex);
+    g_rpc_failed_endpoints.erase(endpoint);
+}
+
+// endpoint of an RPC buffer, null for buffers of any other backend
+const char * ggml_backend_rpc_buffer_endpoint(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_rpc(buffer)) {
+        return nullptr;
+    }
+    return ((ggml_backend_rpc_buffer_type_context *) buffer->buft->context)->endpoint.c_str();
+}
+
+// surgical re-provision (TASKS.md #29c refinement): re-create this buffer's remote
+// allocation on a freshly reconnected endpoint (same address, restarted worker) and
+// replay its weight journal - big writes via SET_TENSOR_HASH against the worker's
+// local cache, small writes literally. The buffer context is rebased IN PLACE; the
+// old and new bases are returned so the caller (the meta backend) can rebase its
+// shadow registrations. Buffers without a journal (KV/compute members) are
+// re-allocated empty. Returns false when anything cannot be restored.
+bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** old_base, void ** new_base) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_rpc(buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *) buffer->context;
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *) buffer->buft->context;
+    const std::string & endpoint = buft_ctx->endpoint;
+
+    // reuse the cache entry when a reprobe already dialed a fresh connection;
+    // dial one ourselves if the cache still holds this buffer's dead socket
+    std::shared_ptr<socket_t> sock = get_socket(endpoint);
+    if (sock == nullptr || sock.get() == ctx->sock.get()) {
+        sock = get_socket_impl(endpoint, /*fresh =*/ true);
+    }
+    if (sock == nullptr) {
+        return false;
+    }
+
+    rpc_msg_alloc_buffer_req alloc_req = { buft_ctx->device, ggml_backend_buffer_get_size(buffer) };
+    rpc_msg_alloc_buffer_rsp alloc_rsp;
+    if (!send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &alloc_req, sizeof(alloc_req), &alloc_rsp, sizeof(alloc_rsp)) ||
+        alloc_rsp.remote_ptr == 0) {
+        return false;
+    }
+    rpc_msg_buffer_get_base_req base_req = { alloc_rsp.remote_ptr };
+    rpc_msg_buffer_get_base_rsp base_rsp;
+    if (!send_rpc_cmd(sock, RPC_CMD_BUFFER_GET_BASE, &base_req, sizeof(base_req), &base_rsp, sizeof(base_rsp))) {
+        return false;
+    }
+
+    *old_base = ctx->base_ptr;
+    *new_base = reinterpret_cast<void *>(base_rsp.base_ptr);
+    ctx->sock       = sock;
+    ctx->remote_ptr = alloc_rsp.remote_ptr;
+    ctx->base_ptr   = *new_base;
+
+    rpc_msg_buffer_set_usage_req usage_req = { ctx->remote_ptr, (uint32_t) buffer->usage };
+    if (!send_rpc_cmd(sock, RPC_CMD_BUFFER_SET_USAGE, &usage_req, sizeof(usage_req), nullptr, 0)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
+    auto it = g_rpc_journals.find(buffer);
+    if (it == g_rpc_journals.end()) {
+        return true; // stateless member buffer (KV slice / compute arena): realloc is enough
+    }
+    rpc_buffer_journal & j = it->second;
+    if (j.disabled) {
+        return false;
+    }
+    const uint64_t nb = (uint64_t)(uintptr_t) *new_base;
+    if (j.cleared) {
+        rpc_msg_buffer_clear_req creq = { ctx->remote_ptr, j.clear_value };
+        if (!send_rpc_cmd(sock, RPC_CMD_BUFFER_CLEAR, &creq, sizeof(creq), nullptr, 0)) {
+            return false;
+        }
+    }
+    for (rpc_tensor jt : j.init_tensors) {
+        rpc_msg_init_tensor_req req;
+        req.tensor = jt;
+        req.tensor.data  += nb;
+        req.tensor.buffer = ctx->remote_ptr; // the journal recorded the DEAD allocation's id
+        if (!send_rpc_cmd(sock, RPC_CMD_INIT_TENSOR, &req, sizeof(req), nullptr, 0)) {
+            return false;
+        }
+    }
+    size_t   n_hash  = 0;
+    size_t   n_small = 0;
+    for (auto & kv : j.sets) {
+        const rpc_buffer_journal::set_entry & e = kv.second;
+        rpc_tensor root = e.root;
+        root.data  += nb;
+        root.buffer = ctx->remote_ptr; // the journal recorded the DEAD allocation's id
+        if (e.spill_off == UINT64_MAX) {
+            rpc_msg_set_tensor_hash_req req;
+            req.tensor = root;
+            req.offset = e.offset;
+            req.hash   = e.hash;
+            rpc_msg_set_tensor_hash_rsp rsp;
+            if (!send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_HASH, &req, sizeof(req), &rsp, sizeof(rsp)) || !rsp.result) {
+                // the restarted worker's cache does not hold these bytes - only a
+                // full reload can restore them
+                GGML_LOG_WARN("[%s] worker cache miss for hash 0x%" PRIx64 " - falling back to reload\n",
+                              __func__, e.hash);
+                return false;
+            }
+            n_hash++;
+        } else {
+            std::vector<uint8_t> input(sizeof(rpc_tensor) + sizeof(uint64_t) + e.size);
+            memcpy(input.data(), &root, sizeof(root));
+            memcpy(input.data() + sizeof(root), &e.offset, sizeof(e.offset));
+            if (fseeko(j.spill, (off_t) e.spill_off, SEEK_SET) != 0 ||
+                fread(input.data() + sizeof(root) + sizeof(e.offset), 1, e.size, j.spill) != e.size) {
+                return false;
+            }
+            if (!send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size())) {
+                return false;
+            }
+            n_small++;
+        }
+    }
+    // GGML_RPC_REPROVISION_VERIFY=1: read every replayed region back and compare
+    // hashes - a diagnostic for the replay itself (adds a full read of the share)
+    static const bool verify = getenv("GGML_RPC_REPROVISION_VERIFY") != nullptr;
+    if (verify) {
+        size_t n_bad = 0;
+        std::vector<uint8_t> readback;
+        for (auto & kv : j.sets) {
+            const rpc_buffer_journal::set_entry & e = kv.second;
+            rpc_tensor root = e.root;
+            root.data  += nb;
+            root.buffer = ctx->remote_ptr;
+            readback.resize(e.size);
+            rpc_msg_get_tensor_req greq;
+            greq.tensor = root;
+            greq.offset = e.offset;
+            greq.size   = e.size;
+            if (!send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &greq, sizeof(greq), readback.data(), e.size)) {
+                return false;
+            }
+            uint64_t want = e.hash;
+            if (e.spill_off != UINT64_MAX) {
+                std::vector<uint8_t> spill_bytes(e.size);
+                if (fseeko(j.spill, (off_t) e.spill_off, SEEK_SET) != 0 ||
+                    fread(spill_bytes.data(), 1, e.size, j.spill) != e.size) {
+                    return false;
+                }
+                want = fnv_hash(spill_bytes.data(), e.size);
+            }
+            if (fnv_hash(readback.data(), e.size) != want) {
+                GGML_LOG_ERROR("[%s] VERIFY MISMATCH at offset %" PRIu64 " size %" PRIu64 "\n",
+                               __func__, e.offset, e.size);
+                n_bad++;
+            }
+        }
+        GGML_LOG_INFO("[%s] verify: %zu regions, %zu mismatches\n", __func__, j.sets.size(), n_bad);
+        if (n_bad > 0) {
+            return false;
+        }
+    }
+    GGML_LOG_INFO("[%s] %s: buffer %zu MiB restored (%zu cache-replayed, %zu literal writes)\n",
+                  __func__, endpoint.c_str(), ggml_backend_buffer_get_size(buffer) / (1024*1024), n_hash, n_small);
+    return true;
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -3952,6 +4254,21 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_reachable") == 0) {
         return (void *)ggml_backend_rpc_dev_reachable;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_failed") == 0) {
+        return (void *)ggml_backend_rpc_dev_failed;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_endpoint_reprobe") == 0) {
+        return (void *)ggml_backend_rpc_endpoint_reprobe;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_clear_failed_endpoint") == 0) {
+        return (void *)ggml_backend_rpc_clear_failed_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_endpoint") == 0) {
+        return (void *)ggml_backend_rpc_buffer_endpoint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_reprovision") == 0) {
+        return (void *)ggml_backend_rpc_buffer_reprovision;
     }
     if (std::strcmp(name, "ggml_backend_cpy_tensor_batch_async") == 0) {
         return (void *)ggml_backend_rpc_cpy_tensor_batch_async;

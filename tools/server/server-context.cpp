@@ -996,6 +996,74 @@ private:
     common_params params_full;
     bool          params_full_set = false;
 
+    // surgical path (TASKS.md #29c refinement): every failed worker that returns at
+    // the same address within the wait window gets its member buffers re-created and
+    // its weight share replayed from its local cache - the model, all other members'
+    // state and the idle slots' KV survive untouched. Any failure falls through to
+    // the full in-process reload below.
+    bool rpc_try_surgical() {
+        // EXPERIMENTAL, opt-in: recovery is seconds instead of a reload and the
+        // journaled weight replay is hash-verified, but on deepseek4 truncations the
+        // post-surgical generation deterministically differs from the fresh state
+        // (unresolved - see TASKS.md #29c); default stays the full reload
+        if (getenv("LLAMA_RPC_SURGICAL") == nullptr) {
+            return false;
+        }
+        typedef bool         (*dev_failed_t)(ggml_backend_dev_t);
+        typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
+        typedef bool         (*reprobe_t)(const char *);
+        static ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        static const dev_failed_t dev_failed_fn = reg != nullptr
+            ? (dev_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_failed")
+            : nullptr;
+        static const dev_endpoint_t dev_endpoint_fn = reg != nullptr
+            ? (dev_endpoint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint")
+            : nullptr;
+        static const reprobe_t reprobe_fn = reg != nullptr
+            ? (reprobe_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_reprobe")
+            : nullptr;
+        if (dev_failed_fn == nullptr || dev_endpoint_fn == nullptr || reprobe_fn == nullptr) {
+            return false;
+        }
+        std::vector<const char *> failed;
+        for (ggml_backend_dev_t dev : params_base.devices) {
+            if (dev != nullptr && dev_failed_fn(dev)) {
+                const char * ep = dev_endpoint_fn(dev);
+                if (ep == nullptr) {
+                    return false;
+                }
+                failed.push_back(ep);
+            }
+        }
+        if (failed.empty()) {
+            return false;
+        }
+        static const int wait_s = getenv("LLAMA_RPC_SURGICAL_WAIT_S")
+            ? atoi(getenv("LLAMA_RPC_SURGICAL_WAIT_S")) : 120;
+        for (const char * ep : failed) {
+            SRV_INF("waiting up to %ds for worker %s to return for surgical re-provision\n", wait_s, ep);
+            const int64_t deadline = ggml_time_ms() + (int64_t) wait_s * 1000;
+            bool back = false;
+            while (ggml_time_ms() < deadline) {
+                if (reprobe_fn(ep)) {
+                    back = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+            if (!back) {
+                SRV_WRN("worker %s did not return in time - falling back to a full reload\n", ep);
+                return false;
+            }
+            if (!ggml_backend_meta_reprovision_endpoint(ep)) {
+                SRV_WRN("surgical re-provision of %s failed - falling back to a full reload\n", ep);
+                return false;
+            }
+            SRV_INF("worker %s surgically re-provisioned\n", ep);
+        }
+        return true;
+    }
+
     void rpc_reload_and_resplit() {
         typedef void (*rpc_reset_failed_t)(void);
         typedef bool (*rpc_dev_reachable_t)(ggml_backend_dev_t);
@@ -1006,6 +1074,11 @@ private:
         static const rpc_dev_reachable_t dev_reachable_fn = reg != nullptr
             ? (rpc_dev_reachable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_reachable")
             : nullptr;
+
+        if (rpc_try_surgical()) {
+            SRV_INF("%s", "surgical re-provision complete - resuming serving without a reload\n");
+            return;
+        }
 
         if (!params_full_set) {
             params_full     = params_base;

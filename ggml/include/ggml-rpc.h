@@ -75,6 +75,13 @@ GGML_BACKEND_API void ggml_backend_rpc_reset_failed_endpoints(void);
 // probe whether an RPC device's endpoint accepts connections right now
 GGML_BACKEND_API bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev);
 
+// surgical re-provision of a restarted worker (TASKS.md #29c refinement)
+GGML_BACKEND_API bool         ggml_backend_rpc_dev_failed(ggml_backend_dev_t dev);
+GGML_BACKEND_API bool         ggml_backend_rpc_endpoint_reprobe(const char * endpoint);
+GGML_BACKEND_API void         ggml_backend_rpc_clear_failed_endpoint(const char * endpoint);
+GGML_BACKEND_API const char * ggml_backend_rpc_buffer_endpoint(ggml_backend_buffer_t buffer);
+GGML_BACKEND_API bool         ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** old_base, void ** new_base);
+
 #ifdef  __cplusplus
 }
 #endif

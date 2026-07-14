@@ -14,6 +14,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -542,12 +543,24 @@ struct ggml_backend_meta_buffer_context {
 
     int debug;
 
+    // live-context registry so a surgical re-provision can enumerate every meta
+    // buffer's member buffers and shadow registrations (TASKS.md #29c refinement)
+    static std::mutex             & registry_mutex() { static std::mutex m; return m; }
+    static std::set<ggml_backend_meta_buffer_context *> & registry() {
+        static std::set<ggml_backend_meta_buffer_context *> r;
+        return r;
+    }
+
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
             const ggml_init_params & ctx_params,
             const int n_simple,
             const std::vector<ggml_backend_buffer_t> & bufs)
             : stc_static(std::move(stc_static)) {
+        {
+            std::lock_guard<std::mutex> lock(registry_mutex());
+            registry().insert(this);
+        }
         // note: should stay above LLAMA_DECODE_GRAPH_CACHE (llama-context.cpp) plus the
         // in-flight graphs, otherwise cached graphs churn through shadow recreation
         const char * GGML_META_MAX_GRAPHS = getenv("GGML_META_MAX_GRAPHS");
@@ -564,6 +577,11 @@ struct ggml_backend_meta_buffer_context {
         debug = GGML_META_DEBUG ? atoi(GGML_META_DEBUG) : 0;
     }
 
+    ~ggml_backend_meta_buffer_context() {
+        std::lock_guard<std::mutex> lock(registry_mutex());
+        registry().erase(this);
+    }
+
     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
@@ -576,6 +594,132 @@ static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     delete buf_ctx;
+}
+
+// surgical re-provision (TASKS.md #29c refinement): a worker at `endpoint` died and
+// came back at the same address. Re-create every member buffer that lived there,
+// replay the weight journal (worker-cache hash replay / journaled small writes) and
+// rebase this side's shadow registrations onto the fresh allocations. KV and
+// compute member buffers are re-allocated empty - safe in the EP topology, where a
+// worker member holds no cross-token state; a non-weight member buffer big enough
+// to plausibly hold real state fails the attempt (caller falls back to a reload).
+bool ggml_backend_meta_reprovision_endpoint(const char * endpoint) {
+    if (endpoint == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        return false;
+    }
+    typedef const char * (*buf_endpoint_t)(ggml_backend_buffer_t);
+    typedef bool (*buf_reprovision_t)(ggml_backend_buffer_t, void **, void **);
+    typedef void (*clear_failed_t)(const char *);
+    auto buf_endpoint_fn = (buf_endpoint_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_buffer_endpoint");
+    auto buf_reprov_fn   = (buf_reprovision_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_buffer_reprovision");
+    auto clear_failed_fn = (clear_failed_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_clear_failed_endpoint");
+    if (buf_endpoint_fn == nullptr || buf_reprov_fn == nullptr || clear_failed_fn == nullptr) {
+        return false;
+    }
+    static const long long max_state_mib = []() {
+        const char * env = getenv("GGML_META_SURGICAL_MAX_STATE_MIB");
+        return env != nullptr ? atoll(env) : 64LL;
+    }();
+
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_buffer_context::registry_mutex());
+    struct target {
+        ggml_backend_meta_buffer_context * ctx;
+        size_t                             j;
+        ggml_backend_buffer_t              buf;
+    };
+    std::vector<target> targets;
+    for (ggml_backend_meta_buffer_context * ctx : ggml_backend_meta_buffer_context::registry()) {
+        for (size_t j = 0; j < ctx->bufs.size(); j++) {
+            ggml_backend_buffer_t b = ctx->bufs[j].get();
+            const char * ep = buf_endpoint_fn(b);
+            if (ep == nullptr || strcmp(ep, endpoint) != 0) {
+                continue;
+            }
+            // compute members are exempt: galloc rebuilds their contents from the
+            // meta logical addresses every graph, nothing survives across tokens
+            if (b->usage == GGML_BACKEND_BUFFER_USAGE_ANY &&
+                ggml_backend_buffer_get_size(b) > (size_t) max_state_mib * 1024 * 1024) {
+                GGML_LOG_WARN("meta: %s holds a %zu MiB stateful member buffer - its contents died "
+                              "with the worker, only a reload can rebuild it\n",
+                              endpoint, ggml_backend_buffer_get_size(b) / (1024*1024));
+                return false;
+            }
+            targets.push_back({ctx, j, b});
+        }
+    }
+    if (targets.empty()) {
+        return false;
+    }
+    for (target & t : targets) {
+        void * old_base = nullptr;
+        void * new_base = nullptr;
+        if (!buf_reprov_fn(t.buf, &old_base, &new_base)) {
+            return false; // endpoint stays marked failed; the caller reloads
+        }
+        if (old_base == new_base) {
+            continue;
+        }
+        const char * ob = (const char *) old_base;
+        const size_t sz = ggml_backend_buffer_get_size(t.buf);
+        auto rebase = [&](ggml_backend_meta_simple_tensor_container & stc) {
+            for (auto & kv : stc.simple_tensors) {
+                auto & shadows = kv.second.shadows;
+                if (t.j >= shadows.size() || shadows[t.j] == nullptr) {
+                    continue;
+                }
+                char * d = (char *) shadows[t.j]->data;
+                if (d >= ob && d < ob + sz) {
+                    shadows[t.j]->data = (char *) new_base + (d - ob);
+                }
+            }
+        };
+        rebase(t.ctx->stc_static);
+        for (auto & stc : t.ctx->stc_compute) {
+            rebase(stc);
+        }
+        // graph-computed static state (e.g. deepseek4's hash-layer tables) never
+        // passes through the client, so the journal cannot restore it - copy
+        // MIRRORED entries of non-weight static buffers from a healthy member
+        // (mirrored bytes are identical on every member by definition)
+        if (t.buf->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            std::vector<uint8_t> tmp;
+            for (auto & kv : t.ctx->stc_static.simple_tensors) {
+                const ggml_backend_meta_simple_tensor_entry & entry = kv.second;
+                if (entry.split_state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                    kv.first->view_src != nullptr) {
+                    continue;
+                }
+                if (t.j >= entry.shadows.size() || entry.shadows[t.j] == nullptr ||
+                    entry.shadows[t.j]->buffer != t.buf) {
+                    continue;
+                }
+                ggml_tensor * src = nullptr;
+                for (size_t m = 0; m < entry.shadows.size(); m++) {
+                    if (m != t.j && entry.shadows[m] != nullptr) {
+                        const char * mep = buf_endpoint_fn(entry.shadows[m]->buffer);
+                        if (mep == nullptr || strcmp(mep, endpoint) != 0) {
+                            src = entry.shadows[m];
+                            break;
+                        }
+                    }
+                }
+                if (src == nullptr) {
+                    continue;
+                }
+                const size_t nbytes = ggml_nbytes(src);
+                tmp.resize(nbytes);
+                ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+                ggml_backend_tensor_set(entry.shadows[t.j], tmp.data(), 0, nbytes);
+            }
+        }
+    }
+    clear_failed_fn(endpoint);
+    GGML_LOG_INFO("meta: endpoint %s surgically re-provisioned (%zu member buffers)\n", endpoint, targets.size());
+    return true;
 }
 
 static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
@@ -1958,6 +2102,15 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+// propagate to the member buffers: usage distinguishes weight-class from
+// compute-class members for the surgical re-provision journal and guard
+static void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    for (auto & b : buf_ctx->bufs) {
+        ggml_backend_buffer_set_usage(b.get(), usage);
+    }
+}
+
 static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
@@ -1970,6 +2123,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
+    /* .set_usage       = */ ggml_backend_meta_buffer_set_usage,
 };
 
 bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
@@ -1991,7 +2145,18 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (bufs.back() == nullptr) {
+            // a member alloc can fail at runtime (e.g. a dead RPC worker during a
+            // sched re-reserve) - fail the allocation cleanly, the caller's error
+            // path (decode failure -> reload/surgical recovery) handles it
+            GGML_LOG_ERROR("%s: member %zu allocation of %zu bytes failed\n", __func__, i, size);
+            for (ggml_backend_buffer_t b : bufs) {
+                if (b != nullptr) {
+                    ggml_backend_buffer_free(b);
+                }
+            }
+            return nullptr;
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params, n_simple_bufts, bufs);
