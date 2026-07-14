@@ -1002,11 +1002,11 @@ private:
     // state and the idle slots' KV survive untouched. Any failure falls through to
     // the full in-process reload below.
     bool rpc_try_surgical() {
-        // EXPERIMENTAL, opt-in: recovery is seconds instead of a reload and the
-        // journaled weight replay is hash-verified, but on deepseek4 truncations the
-        // post-surgical generation deterministically differs from the fresh state
-        // (unresolved - see TASKS.md #29c); default stays the full reload
-        if (getenv("LLAMA_RPC_SURGICAL") == nullptr) {
+        // default-on since the fleet soak (TASKS.md #29c): recovery is the returned
+        // worker's cache re-verify instead of a full reload, replay is hash-verified
+        // and falls back to the reload on any failure. LLAMA_RPC_NO_SURGICAL=1
+        // restores reload-only behavior.
+        if (getenv("LLAMA_RPC_NO_SURGICAL") != nullptr) {
             return false;
         }
         typedef bool         (*dev_failed_t)(ggml_backend_dev_t);
