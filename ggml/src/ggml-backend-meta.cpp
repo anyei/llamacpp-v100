@@ -2886,9 +2886,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // graph_compute calls. Disabled in timing mode: tm_sync_all pings members while
     // a fused response is pending, which would desync the stream.
     static const bool no_fused = getenv("GGML_META_NO_FUSED") != nullptr;
+    // requires the star reduce: a carried fetch is only ever consumed by the star
+    // gather, so with GGML_META_NO_STAR the pipeline must stay off too
     const bool fused_enabled = !no_fused && !tm_enabled &&
+        getenv("GGML_META_NO_STAR") == nullptr &&
         backend_ctx->fused_send != nullptr && backend_ctx->fused_recv != nullptr;
-    std::vector<char> fused_carried(n_backends, 0);       // member's subgraph i dispatch already sent
+    std::vector<int>  fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
     std::vector<char> fused_fetch_pending(n_backends, 0); // member's boundary-i partial arrives via fused_recv
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
@@ -2898,6 +2901,66 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto boundary_node = [&](size_t j) -> ggml_tensor * {
             ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
             return cg->nodes[cg->n_nodes - 1];
+        };
+
+        // push `value` into every member's boundary node (except j_skip); a wire
+        // member's message also carries the CHAIN of its subgraphs up to and
+        // including the next reduce subgraph plus - when that boundary is
+        // star-eligible - the request for its partial, so the next reduce cycle
+        // needs no further coordinator round trip (fused pipeline, proto 4.5)
+        auto fused_distribute = [&](size_t j_skip, const void * value, size_t nbytes_v, bool allow_chain = true) {
+            const size_t i_next    = i + 1;
+            const bool   have_next = allow_chain && fused_enabled && i_next < backend_ctx->n_subgraphs;
+            size_t i_r = i_next; // first reduce subgraph at or after i_next
+            while (i_r < backend_ctx->n_subgraphs &&
+                   !backend_ctx->backend_configs[0].cgraphs[i_r].reduce) {
+                i_r++;
+            }
+            const bool   chain_full = have_next && i_r < backend_ctx->n_subgraphs;
+            const size_t chain_end  = chain_full ? i_r : backend_ctx->n_subgraphs - 1;
+            auto next_node = [&](size_t j) -> ggml_tensor * {
+                ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i_r].cgraph_main;
+                return cg->nodes[cg->n_nodes - 1];
+            };
+            bool   next_star   = false;
+            size_t next_nbytes = 0;
+            if (chain_full) {
+                size_t n_comp = 0;
+                bool   ok2    = true;
+                for (size_t j = 0; j < n_backends && ok2; j++) {
+                    ggml_tensor * node = next_node(j);
+                    if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                        n_comp++;
+                        ok2 = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
+                    }
+                }
+                next_star = ok2 && n_comp >= 2;
+                if (next_star) {
+                    next_nbytes = ggml_nbytes(next_node(0));
+                }
+            }
+            std::vector<ggml_cgraph *> chain;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (j == j_skip) {
+                    continue;
+                }
+                auto & bcj = backend_ctx->backend_configs[j];
+                if (have_next && backend_ctx->wire_member[j]) {
+                    chain.clear();
+                    for (size_t g = i_next; g <= chain_end; g++) {
+                        chain.push_back(bcj.cgraphs[g].cgraph_main);
+                    }
+                    const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
+                    if (backend_ctx->fused_send(bcj.backend, boundary_node(j), value, nbytes_v,
+                            chain.data(), (int) chain.size(),
+                            want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
+                        fused_carried[j]       = (int) chain.size();
+                        fused_fetch_pending[j] = want_fetch ? 1 : 0;
+                        continue;
+                    }
+                }
+                ggml_backend_tensor_set(boundary_node(j), value, 0, nbytes_v);
+            }
         };
 
         // members whose boundary node actually computed: zero-share members
@@ -3006,45 +3069,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         acc[v] += p[v];
                     }
                 }
-                // distribute; when enabled, a wire member's next subgraph (and the
-                // request for its next partial) rides in the same message
-                const size_t i_next    = i + 1;
-                const bool   have_next = fused_enabled && i_next < backend_ctx->n_subgraphs;
-                auto next_node = [&](size_t j) -> ggml_tensor * {
-                    ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i_next].cgraph_main;
-                    return cg->nodes[cg->n_nodes - 1];
-                };
-                bool   next_star   = false;
-                size_t next_nbytes = 0;
-                if (have_next && backend_ctx->backend_configs[0].cgraphs[i_next].reduce) {
-                    size_t n_comp = 0;
-                    bool   ok2    = true;
-                    for (size_t j = 0; j < n_backends && ok2; j++) {
-                        ggml_tensor * node = next_node(j);
-                        if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                            n_comp++;
-                            ok2 = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
-                        }
-                    }
-                    next_star = ok2 && n_comp >= 2;
-                    if (next_star) {
-                        next_nbytes = ggml_nbytes(next_node(0));
-                    }
-                }
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    if (have_next && backend_ctx->wire_member[j]) {
-                        const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
-                        if (backend_ctx->fused_send(bcj.backend, boundary_node(j), acc, nbytes,
-                                bcj.cgraphs[i_next].cgraph_main,
-                                want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
-                            fused_carried[j]       = 1;
-                            fused_fetch_pending[j] = want_fetch ? 1 : 0;
-                            continue;
-                        }
-                    }
-                    ggml_backend_tensor_set(boundary_node(j), acc, 0, nbytes);
-                }
+                fused_distribute(SIZE_MAX, acc, nbytes);
                 return GGML_STATUS_SUCCESS;
             }
         }
@@ -3088,6 +3113,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t j_src = part[0];
             auto & bcs = backend_ctx->backend_configs[j_src];
             ggml_tensor * node_src = boundary_node(j_src);
+            // local sole computer + fused pipeline: read the value once and push it
+            // with each wire member's next subgraph chain in one message (the copy
+            // path below pays a bridged copy per member and carries nothing)
+            // GGML_META_FUSED_BCAST: 0 = off, 1 = fused SET only, 2 = full chain
+            // carriage (default). Diagnostic A/B levels.
+            static const int fused_bcast = getenv("GGML_META_FUSED_BCAST") ? atoi(getenv("GGML_META_FUSED_BCAST")) : 2;
+            if (fused_bcast > 0 && fused_enabled && !backend_ctx->wire_member[j_src] &&
+                node_src->type == GGML_TYPE_F32 && ggml_is_contiguous(node_src)) {
+                const size_t nbytes = ggml_nbytes(node_src);
+                auto & scratch = backend_ctx->star_scratch;
+                if (scratch.size() < nbytes) {
+                    scratch.resize(nbytes);
+                }
+                ggml_backend_synchronize(bcs.backend);
+                ggml_backend_tensor_get(node_src, scratch.data(), 0, nbytes);
+                fused_distribute(j_src, scratch.data(), nbytes, /*allow_chain =*/ fused_bcast >= 2);
+                return GGML_STATUS_SUCCESS;
+            }
             std::vector<ggml_backend_t> backends_src, backends_dst;
             std::vector<ggml_tensor *>  srcs, dsts;
             for (size_t j = 0; j < n_backends; j++) {
@@ -3259,9 +3302,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            if (fused_carried[j]) {
-                // this subgraph's dispatch rode the previous boundary's fused message
-                fused_carried[j] = 0;
+            if (fused_carried[j] > 0) {
+                // this subgraph's dispatch rode a previous boundary's fused message
+                fused_carried[j]--;
                 continue;
             }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);

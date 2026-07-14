@@ -1368,7 +1368,7 @@ static void ggml_backend_rpc_get_tensor_batch(int n_gets, ggml_backend_t * backe
 // requested a FETCH with exactly one recv before any other blocking call.
 static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         ggml_tensor * set_tensor, const void * set_data, size_t set_size,
-        struct ggml_cgraph * cgraph, const ggml_tensor * fetch_tensor, size_t fetch_size) {
+        struct ggml_cgraph ** cgraphs, int n_graphs, const ggml_tensor * fetch_tensor, size_t fetch_size) {
     if (backend->iface.get_name != ggml_backend_rpc_name) {
         return false;
     }
@@ -1384,13 +1384,17 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *) rpc_dev->context;
 
     uint32_t flags = 0;
-    // GRAPH: only a uid the server already caches can be carried (same invariant
-    // as GRAPH_RECOMPUTE_UID); a fresh graph goes through the normal upload path
-    if (cgraph != nullptr) {
-        if (cgraph->uid == 0 ||
-            rpc_dev_ctx->sent_graph_uids_sock != sock.get() ||
-            rpc_dev_ctx->sent_graph_uids.count(cgraph->uid) == 0) {
+    // GRAPH chain: only uids the server already caches can be carried (same
+    // invariant as GRAPH_RECOMPUTE_UID); fresh graphs go through the upload path
+    if (n_graphs > 0) {
+        if (cgraphs == nullptr || rpc_dev_ctx->sent_graph_uids_sock != sock.get()) {
             return false;
+        }
+        for (int g = 0; g < n_graphs; g++) {
+            if (cgraphs[g] == nullptr || cgraphs[g]->uid == 0 ||
+                rpc_dev_ctx->sent_graph_uids.count(cgraphs[g]->uid) == 0) {
+                return false;
+            }
         }
         flags |= 2;
     }
@@ -1435,8 +1439,12 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         put(set_data, set_size);
     }
     if (flags & 2) {
-        uint64_t uid = cgraph->uid;
-        put(&uid, sizeof(uid));
+        uint32_t n_uids = (uint32_t) n_graphs;
+        put(&n_uids, sizeof(n_uids));
+        for (int g = 0; g < n_graphs; g++) {
+            uint64_t uid = cgraphs[g]->uid;
+            put(&uid, sizeof(uid));
+        }
     }
     if (flags & 4) {
         uint64_t sz = fetch_size;
@@ -2956,14 +2964,20 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
         pos += size;
     }
-    if (flags & 2) { // GRAPH (uid recompute)
-        uint64_t uid;
-        if (!take(&uid, sizeof(uid))) {
+    if (flags & 2) { // GRAPH chain (uid recomputes, in order)
+        uint32_t n_uids;
+        if (!take(&n_uids, sizeof(n_uids)) || n_uids == 0 || n_uids > 4096) {
             return false;
         }
-        rpc_msg_graph_recompute_uid_req req = { device, 0, uid };
-        if (!graph_recompute_uid(req)) {
-            return false;
+        for (uint32_t k = 0; k < n_uids; k++) {
+            uint64_t uid;
+            if (!take(&uid, sizeof(uid))) {
+                return false;
+            }
+            rpc_msg_graph_recompute_uid_req req = { device, 0, uid };
+            if (!graph_recompute_uid(req)) {
+                return false;
+            }
         }
     }
     if (flags & 4) { // FETCH

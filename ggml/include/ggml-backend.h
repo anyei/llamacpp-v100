@@ -222,7 +222,7 @@ extern "C" {
     // bytes are collected later with the recv call. send returning false means no
     // fast path - the caller must use the unfused operations instead. A pending recv
     // must be collected before any other blocking call on the same backend.
-    typedef bool   (*ggml_backend_boundary_fused_send_t)(ggml_backend_t backend, struct ggml_tensor * set_tensor, const void * set_data, size_t set_size, struct ggml_cgraph * cgraph, const struct ggml_tensor * fetch_tensor, size_t fetch_size);
+    typedef bool   (*ggml_backend_boundary_fused_send_t)(ggml_backend_t backend, struct ggml_tensor * set_tensor, const void * set_data, size_t set_size, struct ggml_cgraph ** cgraphs, int n_graphs, const struct ggml_tensor * fetch_tensor, size_t fetch_size);
     typedef bool   (*ggml_backend_boundary_fused_recv_t)(ggml_backend_t backend, void * data, size_t size);
 
     // Split buffer type for tensor parallelism (old)
