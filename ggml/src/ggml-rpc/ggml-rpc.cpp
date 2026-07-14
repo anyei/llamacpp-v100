@@ -3304,6 +3304,29 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             if (ggml_backend_set_n_threads_fn) {
                 ggml_backend_set_n_threads_fn(backend, n_threads);
             }
+            // GGML_RPC_THREADPOOL_POLL=N: attach a PERSISTENT threadpool (poll level
+            // N, 0-100) to CPU-class backends. Without one, every graph_compute
+            // creates and joins a disposable pool - thread create/join per subgraph
+            // is a dominant share of the per-boundary turnaround for EP workers
+            // (TASKS.md #28 attribution round 2). N>0 additionally busy-polls
+            // between subgraphs, trading idle cores for wake latency.
+            const char * poll_env = getenv("GGML_RPC_THREADPOOL_POLL");
+            if (poll_env != nullptr && *poll_env != '\0') {
+                typedef struct ggml_threadpool * (*threadpool_new_t)(struct ggml_threadpool_params *);
+                typedef void (*set_threadpool_t)(ggml_backend_t, struct ggml_threadpool *);
+                auto threadpool_new_fn = (threadpool_new_t) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+                auto set_threadpool_fn = (set_threadpool_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+                if (threadpool_new_fn && set_threadpool_fn) {
+                    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+                    tpp.poll = std::max(0, std::min(100, atoi(poll_env)));
+                    struct ggml_threadpool * tp = threadpool_new_fn(&tpp);
+                    if (tp != nullptr) {
+                        set_threadpool_fn(backend, tp); // lives for the server's lifetime
+                        printf("  %s: persistent threadpool attached (%zu threads, poll %d)\n",
+                               ggml_backend_dev_name(dev), n_threads, tpp.poll);
+                    }
+                }
+            }
         }
     }
 
