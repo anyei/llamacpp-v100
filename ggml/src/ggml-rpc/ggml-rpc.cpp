@@ -134,6 +134,12 @@ enum rpc_cmd {
     // instead of re-serializing every subgraph every token.
     RPC_CMD_GRAPH_COMPUTE_UID,
     RPC_CMD_GRAPH_RECOMPUTE_UID,
+    // proto 4.5: fused boundary command. One message optionally carries a small
+    // WRITE (the previous boundary's reduced value), a graph RECOMPUTE by uid and
+    // a boundary-tensor READ whose bytes come back in the response - the whole
+    // steady-state EP boundary cycle in one round trip instead of three commands
+    // plus a separate fetch turnaround.
+    RPC_CMD_GRAPH_FUSED,
     RPC_CMD_COUNT,
 };
 
@@ -1351,6 +1357,126 @@ static void ggml_backend_rpc_get_tensor_batch(int n_gets, ggml_backend_t * backe
     }
 }
 
+// fused boundary command, client side (proto 4.5): one message carries the
+// previous boundary's reduced value (SET), the next subgraph's recompute-by-uid
+// (GRAPH) and the request for its boundary partial (FETCH) whose bytes arrive
+// via ..._fused_recv. Returns false when the fast path is unavailable (old
+// server, uid not yet uploaded, non-RPC tensors) - the caller falls back to the
+// unfused commands. IMPORTANT contract for callers: while a fused response is
+// pending on a connection, do not synchronize that backend (a PING would read
+// the pending response frame and desync the stream) - pair every send that
+// requested a FETCH with exactly one recv before any other blocking call.
+static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
+        ggml_tensor * set_tensor, const void * set_data, size_t set_size,
+        struct ggml_cgraph * cgraph, const ggml_tensor * fetch_tensor, size_t fetch_size) {
+    if (backend->iface.get_name != ggml_backend_rpc_name) {
+        return false;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    if (rpc_endpoint_failed(rpc_ctx->endpoint)) {
+        return false;
+    }
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr || rpc_async_state(sock.get()).server_minor < 5) {
+        return false;
+    }
+    ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
+    ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *) rpc_dev->context;
+
+    uint32_t flags = 0;
+    // GRAPH: only a uid the server already caches can be carried (same invariant
+    // as GRAPH_RECOMPUTE_UID); a fresh graph goes through the normal upload path
+    if (cgraph != nullptr) {
+        if (cgraph->uid == 0 ||
+            rpc_dev_ctx->sent_graph_uids_sock != sock.get() ||
+            rpc_dev_ctx->sent_graph_uids.count(cgraph->uid) == 0) {
+            return false;
+        }
+        flags |= 2;
+    }
+    rpc_tensor set_rt = {}, fetch_rt = {};
+    uint64_t set_off = 0, fetch_off = 0;
+    if (set_tensor != nullptr) {
+        if (set_tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(set_tensor->buffer) ||
+            ((ggml_backend_rpc_buffer_context *) set_tensor->buffer->context)->sock != sock) {
+            return false;
+        }
+        size_t off = 0;
+        set_rt  = serialize_tensor(rpc_resolve_view(set_tensor, off));
+        set_off = off;
+        flags |= 1;
+    }
+    if (fetch_tensor != nullptr) {
+        if (fetch_tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(fetch_tensor->buffer) ||
+            ((ggml_backend_rpc_buffer_context *) fetch_tensor->buffer->context)->sock != sock) {
+            return false;
+        }
+        size_t off = 0;
+        fetch_rt  = serialize_tensor(rpc_resolve_view(fetch_tensor, off));
+        fetch_off = off;
+        flags |= 4;
+    }
+    if (flags == 0) {
+        return false;
+    }
+
+    std::vector<uint8_t> input;
+    input.reserve(2*sizeof(uint32_t) + 2*sizeof(rpc_tensor) + 5*sizeof(uint64_t) + set_size);
+    auto put = [&](const void * p, size_t n) {
+        input.insert(input.end(), (const uint8_t *) p, (const uint8_t *) p + n);
+    };
+    put(&rpc_ctx->device, sizeof(uint32_t));
+    put(&flags, sizeof(flags));
+    if (flags & 1) {
+        uint64_t sz = set_size;
+        put(&set_rt, sizeof(set_rt));
+        put(&set_off, sizeof(set_off));
+        put(&sz, sizeof(sz));
+        put(set_data, set_size);
+    }
+    if (flags & 2) {
+        uint64_t uid = cgraph->uid;
+        put(&uid, sizeof(uid));
+    }
+    if (flags & 4) {
+        uint64_t sz = fetch_size;
+        put(&fetch_rt, sizeof(fetch_rt));
+        put(&fetch_off, sizeof(fetch_off));
+        put(&sz, sizeof(sz));
+    }
+
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!rpc_drain_pings_locked(sock, st, st.pings_sent) ||
+        !send_rpc_cmd_raw(sock, st, RPC_CMD_GRAPH_FUSED, input.data(), input.size())) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * data, size_t size) {
+    GGML_ASSERT(backend->iface.get_name == ggml_backend_rpc_name);
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        memset(data, 0, size);
+        return false;
+    }
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size)) ||
+        out_size != size ||
+        !sock->recv_data(data, size)) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        memset(data, 0, size); // deterministic instead of stale garbage
+        return false;
+    }
+    return true;
+}
+
 // events (proto 4.2): an event is a PING sequence number on the endpoint's
 // connection. Record = send a marker; synchronize/wait = drain to its response.
 // Waiting on an event of the SAME endpoint is a no-op: the server executes
@@ -1712,6 +1838,7 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool graph_compute_uid(const std::vector<uint8_t> & input);
     bool graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & request);
+    bool graph_fused(const std::vector<uint8_t> & input, std::vector<uint8_t> & response);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -2769,6 +2896,93 @@ bool rpc_server::graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & req
     return true;
 }
 
+// fused boundary command (proto 4.5):
+// input:    | device u32 | flags u32
+//           | if flags&1 (SET):   rpc_tensor | u64 offset | u64 size | data[size]
+//           | if flags&2 (GRAPH): u64 uid  (recompute of a uid-cached graph)
+//           | if flags&4 (FETCH): rpc_tensor | u64 offset | u64 size |
+// response: | data[fetch size] |  (empty when no FETCH)
+// Failure semantics match the unfused commands: any error drops the connection.
+bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
+    size_t pos = 0;
+    auto take = [&](void * dst, size_t n) -> bool {
+        if (pos + n > input.size()) {
+            return false;
+        }
+        memcpy(dst, input.data() + pos, n);
+        pos += n;
+        return true;
+    };
+    uint32_t device, flags;
+    if (!take(&device, sizeof(device)) || !take(&flags, sizeof(flags)) || device >= backends.size()) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    auto bounds_ok = [&](const rpc_tensor * rt, ggml_tensor * t, uint64_t offset, uint64_t size) -> bool {
+        if (t == nullptr || t->buffer == nullptr) {
+            return false;
+        }
+        if (ggml_backend_buffer_is_meta(t->buffer)) {
+            return true; // logical split-space address, bounded by the meta layer
+        }
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(t->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(t->buffer);
+        return rt->data + offset >= p0 && rt->data + offset < p1 && size <= (p1 - rt->data - offset);
+    };
+
+    if (flags & 1) { // SET
+        rpc_tensor rt;
+        uint64_t offset, size;
+        if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
+            return false;
+        }
+        if (pos + size > input.size()) {
+            return false;
+        }
+        ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
+        if (!bounds_ok(&rt, tensor, offset, size)) {
+            GGML_LOG_ERROR("[%s] invalid SET segment\n", __func__);
+            return false;
+        }
+        ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
+        pos += size;
+    }
+    if (flags & 2) { // GRAPH (uid recompute)
+        uint64_t uid;
+        if (!take(&uid, sizeof(uid))) {
+            return false;
+        }
+        rpc_msg_graph_recompute_uid_req req = { device, 0, uid };
+        if (!graph_recompute_uid(req)) {
+            return false;
+        }
+    }
+    if (flags & 4) { // FETCH
+        rpc_tensor rt;
+        uint64_t offset, size;
+        if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
+            return false;
+        }
+        ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
+        if (!bounds_ok(&rt, tensor, offset, size)) {
+            GGML_LOG_ERROR("[%s] invalid FETCH segment\n", __func__);
+            return false;
+        }
+        response.resize(size, 0);
+        ggml_backend_tensor_get(tensor, response.data(), offset, size);
+    }
+    return true;
+}
+
 bool rpc_server::compute_contained(uint32_t device, ggml_cgraph * graph, const char * what) {
     ggml_status status = GGML_STATUS_FAILED;
     try {
@@ -3197,6 +3411,22 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                     return;
                 }
                 if (!server.graph_recompute_uid(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_FUSED: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!server.graph_fused(input, response)) {
+                    return;
+                }
+                // a response exists only when the message carried a FETCH - a
+                // SET+GRAPH message is fire-and-forget like its unfused parts
+                if (!response.empty() && !send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
@@ -3712,6 +3942,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_get_tensor_batch") == 0) {
         return (void *)ggml_backend_rpc_get_tensor_batch;
+    }
+    if (std::strcmp(name, "ggml_backend_boundary_fused_send") == 0) {
+        return (void *)ggml_backend_rpc_boundary_fused_send;
+    }
+    if (std::strcmp(name, "ggml_backend_boundary_fused_recv") == 0) {
+        return (void *)ggml_backend_rpc_boundary_fused_recv;
     }
     return NULL;
 

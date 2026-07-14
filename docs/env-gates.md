@@ -90,6 +90,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_META_EP_ONLY` | bool | off | Expert-parallel split shape: segment only `ffn_*_exps` across meta members, mirror everything else (attention, dense FFN, shared experts, output head). Also a fault isolator for split-policy bugs (task 28). |
 | `GGML_META_NO_DELAY` | bool | off | Reduce at every PARTIAL node instead of delaying AllReduce past the expert-merge tree. Diagnostic. |
 | `GGML_META_NO_STAR` | bool | off | Disable the star reduce (batched-read partials + host sum + async broadcast, used when a local member can root the reduce); fall back to the fold+butterfly. A/B + diagnostic. |
+| `GGML_META_NO_FUSED` | bool | off | Disable the fused boundary pipeline (proto 4.5: reduced value + next subgraph + next-partial request in ONE message per wire member per star boundary). Also auto-disabled under GGML_META_TIMING and against pre-4.5 workers. A/B + diagnostic. |
 | `LLAMA_TRUNC_ARR` | bool | off | Accept longer-than-n_layer per-layer arrays and partial tensor loads, so `--override-kv <arch>.block_count=int:N` can truncate a model into a small fast reproducer. Debug only. |
 | `LLAMA_META_DUP_DEVICE` | count | 1 | Duplicate the device list N times so ONE physical GPU runs a genuine N-way split (validation harness; e.g. `=2` reproduces 2-GPU exactness on one card). |
 

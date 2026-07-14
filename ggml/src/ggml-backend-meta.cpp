@@ -2139,6 +2139,8 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_cpy_tensor_batch_async_t cpy_batch     = nullptr;
     ggml_backend_get_tensor_batch_t       get_batch     = nullptr;
+    ggml_backend_boundary_fused_send_t    fused_send    = nullptr;
+    ggml_backend_boundary_fused_recv_t    fused_recv    = nullptr;
 
     // members whose reg provides the batched-get proc reach their data over a wire
     // (RPC-class); a member without it is local and can root a star reduce
@@ -2185,6 +2187,14 @@ struct ggml_backend_meta_context {
                 }
                 if (get_batch == nullptr) {
                     get_batch = (ggml_backend_get_tensor_batch_t) gb;
+                }
+                if (fused_send == nullptr) {
+                    fused_send = (ggml_backend_boundary_fused_send_t)
+                        ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_send");
+                }
+                if (fused_recv == nullptr) {
+                    fused_recv = (ggml_backend_boundary_fused_recv_t)
+                        ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_recv");
                 }
             }
         }
@@ -2865,6 +2875,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return ret;
     };
 
+    // GGML_META_TIMING is declared up here because it gates the fused pipeline below
+    static const bool tm_enabled = getenv("GGML_META_TIMING") != nullptr;
+
+    // fused boundary pipeline (RPC proto 4.5): at a star boundary each wire member's
+    // NEXT subgraph - and the request for its next partial - rides in the same
+    // message as this boundary's reduced value, collapsing the per-boundary exchange
+    // to one round trip. Entry is the first star boundary of a piece (plain gather),
+    // exit is the last subgraph (plain distribute); the pipeline never spans meta
+    // graph_compute calls. Disabled in timing mode: tm_sync_all pings members while
+    // a fused response is pending, which would desync the stream.
+    static const bool no_fused = getenv("GGML_META_NO_FUSED") != nullptr;
+    const bool fused_enabled = !no_fused && !tm_enabled &&
+        backend_ctx->fused_send != nullptr && backend_ctx->fused_recv != nullptr;
+    std::vector<char> fused_carried(n_backends, 0);       // member's subgraph i dispatch already sent
+    std::vector<char> fused_fetch_pending(n_backends, 0); // member's boundary-i partial arrives via fused_recv
+
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
@@ -2941,22 +2967,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<const ggml_tensor *> get_tensors(part.size());
                 std::vector<void *>              get_datas(part.size());
                 std::vector<size_t>              get_sizes(part.size(), nbytes);
+                size_t n_plain = 0;
                 for (size_t k = 0; k < part.size(); k++) {
-                    auto & bcj = backend_ctx->backend_configs[part[k]];
-                    if (!backend_ctx->wire_member[part[k]]) {
+                    const size_t j = part[k];
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    if (fused_fetch_pending[j]) {
+                        continue; // its partial arrives as a fused response, collected below
+                    }
+                    if (!backend_ctx->wire_member[j]) {
                         // a local partial is read directly from device memory - order
                         // it behind the compute that produced it
                         ggml_backend_synchronize(bcj.backend);
                     }
-                    get_backends[k] = bcj.backend;
-                    get_tensors[k]  = boundary_node(part[k]);
-                    get_datas[k]    = scratch.data() + k*nbytes;
+                    get_backends[n_plain] = bcj.backend;
+                    get_tensors[n_plain]  = boundary_node(j);
+                    get_datas[n_plain]    = scratch.data() + k*nbytes;
+                    n_plain++;
                 }
-                if (backend_ctx->get_batch != nullptr) {
-                    backend_ctx->get_batch((int) part.size(), get_backends.data(), get_tensors.data(), get_datas.data(), get_sizes.data());
+                if (backend_ctx->get_batch != nullptr && n_plain > 0) {
+                    backend_ctx->get_batch((int) n_plain, get_backends.data(), get_tensors.data(), get_datas.data(), get_sizes.data());
                 } else {
-                    for (size_t k = 0; k < part.size(); k++) {
+                    for (size_t k = 0; k < n_plain; k++) {
                         ggml_backend_tensor_get(get_tensors[k], get_datas[k], 0, nbytes);
+                    }
+                }
+                for (size_t k = 0; k < part.size(); k++) {
+                    const size_t j = part[k];
+                    if (fused_fetch_pending[j]) {
+                        backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                                scratch.data() + k*nbytes, nbytes);
+                        fused_fetch_pending[j] = 0;
                     }
                 }
                 float * acc = (float *) scratch.data();
@@ -2966,7 +3006,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         acc[v] += p[v];
                     }
                 }
+                // distribute; when enabled, a wire member's next subgraph (and the
+                // request for its next partial) rides in the same message
+                const size_t i_next    = i + 1;
+                const bool   have_next = fused_enabled && i_next < backend_ctx->n_subgraphs;
+                auto next_node = [&](size_t j) -> ggml_tensor * {
+                    ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i_next].cgraph_main;
+                    return cg->nodes[cg->n_nodes - 1];
+                };
+                bool   next_star   = false;
+                size_t next_nbytes = 0;
+                if (have_next && backend_ctx->backend_configs[0].cgraphs[i_next].reduce) {
+                    size_t n_comp = 0;
+                    bool   ok2    = true;
+                    for (size_t j = 0; j < n_backends && ok2; j++) {
+                        ggml_tensor * node = next_node(j);
+                        if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                            n_comp++;
+                            ok2 = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
+                        }
+                    }
+                    next_star = ok2 && n_comp >= 2;
+                    if (next_star) {
+                        next_nbytes = ggml_nbytes(next_node(0));
+                    }
+                }
                 for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    if (have_next && backend_ctx->wire_member[j]) {
+                        const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
+                        if (backend_ctx->fused_send(bcj.backend, boundary_node(j), acc, nbytes,
+                                bcj.cgraphs[i_next].cgraph_main,
+                                want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
+                            fused_carried[j]       = 1;
+                            fused_fetch_pending[j] = want_fetch ? 1 : 0;
+                            continue;
+                        }
+                    }
                     ggml_backend_tensor_set(boundary_node(j), acc, 0, nbytes);
                 }
                 return GGML_STATUS_SUCCESS;
@@ -3172,9 +3248,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // GGML_META_TIMING=1: attribute wall time to kernel compute vs AllReduce
     // boundaries. Adds explicit device syncs at each boundary, so it slightly
     // serializes execution - a diagnostic mode, not for production serving.
-    // Motivation: quantify the per-token synchronization tax (2 reduces/layer)
-    // before attempting reduce/compute overlap (see TASKS.md roadmap).
-    static const bool tm_enabled = getenv("GGML_META_TIMING") != nullptr;
+    // (tm_enabled itself is declared above the reduce lambda - it gates fusion.)
     const auto tm_sync_all = [&]() {
         for (size_t j = 0; j < n_backends; j++) {
             ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
@@ -3185,6 +3259,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            if (fused_carried[j]) {
+                // this subgraph's dispatch rode the previous boundary's fused message
+                fused_carried[j] = 0;
+                continue;
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;

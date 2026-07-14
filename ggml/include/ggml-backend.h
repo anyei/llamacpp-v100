@@ -217,6 +217,14 @@ extern "C" {
     // round trip each; tensors without a fast path fall back to ggml_backend_tensor_get
     typedef void   (*ggml_backend_get_tensor_batch_t)(int n_gets, ggml_backend_t * backends, const struct ggml_tensor ** tensors, void ** datas, size_t * sizes);
 
+    // Fused boundary cycle (meta backend EP pipeline): one wire message carrying an
+    // optional small write, an optional graph recompute and an optional read whose
+    // bytes are collected later with the recv call. send returning false means no
+    // fast path - the caller must use the unfused operations instead. A pending recv
+    // must be collected before any other blocking call on the same backend.
+    typedef bool   (*ggml_backend_boundary_fused_send_t)(ggml_backend_t backend, struct ggml_tensor * set_tensor, const void * set_data, size_t set_size, struct ggml_cgraph * cgraph, const struct ggml_tensor * fetch_tensor, size_t fetch_size);
+    typedef bool   (*ggml_backend_boundary_fused_recv_t)(ggml_backend_t backend, void * data, size_t size);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
