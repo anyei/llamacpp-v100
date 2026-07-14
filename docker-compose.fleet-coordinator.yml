@@ -40,6 +40,13 @@ services:
       - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
       # optional static workers in addition to discovery (comma-separated host:port)
       - LLAMA_ARG_RPC=${COORD_RPC:-}
+      # optional manual layer weighting, one value per device; unset = split by
+      # free memory. Device order: RPC workers FIRST (static COORD_RPC order,
+      # then discovered), local GPUs last — check the "load_tensors:" startup
+      # log. E.g. workers .11+.15 + 2 local V100s: COORD_TS=1,2,4,4
+      # (bare name when unset: the parser rejects an empty LLAMA_ARG_TENSOR_SPLIT,
+      # so the var must be absent, not empty)
+      - LLAMA_ARG_TENSOR_SPLIT${COORD_TS:+=${COORD_TS}}
     entrypoint: /app/llama-server
     command: >
       -m /models/${COORD_MODEL:-Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}
