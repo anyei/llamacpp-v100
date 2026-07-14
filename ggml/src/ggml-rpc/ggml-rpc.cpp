@@ -361,7 +361,11 @@ struct rpc_buffer_journal {
         uint64_t   hash;      // valid when spill_off == UINT64_MAX
         uint64_t   spill_off; // literal bytes at this offset of the spill file
     };
-    std::map<uint64_t, set_entry> sets;         // keyed by resolved offset
+    // keyed by BUFFER-relative start (root offset from base + write offset): the
+    // key must be unique per buffer region - keying by the tensor-relative offset
+    // alone collided across tensors (every tensor's chunk 0 is offset 0) and
+    // silently dropped all but the last tensor's chunks from the replay
+    std::map<uint64_t, set_entry> sets;
     std::vector<rpc_tensor>       init_tensors; // data field holds the OFFSET
     // a fresh load zero-fills KV-class buffers; replay must too, or the re-created
     // allocation serves recycled garbage (NaN-poisoning, the FILL-not-SCALE lesson)
@@ -896,7 +900,10 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
         e.spill_off   = j.spill_size;
         j.spill_size += size;
     }
-    j.sets[offset] = std::move(e);
+    // buffer-relative start: distinct tensors at the same tensor-relative offset
+    // must not collide (a rewrite of the same region still dedups to one entry)
+    const uint64_t key = e.root.data + offset;
+    j.sets[key] = std::move(e);
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -4169,8 +4176,17 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
             return false;
         }
     }
-    GGML_LOG_INFO("[%s] %s: buffer %zu MiB restored (%zu cache-replayed, %zu literal writes)\n",
-                  __func__, endpoint.c_str(), ggml_backend_buffer_get_size(buffer) / (1024*1024), n_hash, n_small);
+    // coverage is the tripwire for journal gaps: a weight buffer far below ~100%
+    // means writes were lost (or bypassed the journal) and the replay left fresh
+    // uninitialized bytes where weights should be
+    uint64_t covered = 0;
+    for (auto & kv : j.sets) {
+        covered += kv.second.size;
+    }
+    GGML_LOG_INFO("[%s] %s: buffer %zu MiB restored (%zu cache-replayed, %zu literal writes, "
+                  "journal covers %.1f%%)\n",
+                  __func__, endpoint.c_str(), ggml_backend_buffer_get_size(buffer) / (1024*1024), n_hash, n_small,
+                  100.0 * (double) covered / (double) ggml_backend_buffer_get_size(buffer));
     return true;
 }
 

@@ -681,11 +681,40 @@ bool ggml_backend_meta_reprovision_endpoint(const char * endpoint) {
         for (auto & stc : t.ctx->stc_compute) {
             rebase(stc);
         }
+        // rebase completeness check: every shadow registered on this member buffer
+        // must now point into the fresh allocation - a survivor outside it was
+        // derived from a base the range rebase does not know about
+        {
+            size_t n_stale = 0;
+            auto scan = [&](ggml_backend_meta_simple_tensor_container & stc) {
+                for (auto & kv : stc.simple_tensors) {
+                    auto & shadows = kv.second.shadows;
+                    if (t.j >= shadows.size() || shadows[t.j] == nullptr || shadows[t.j]->buffer != t.buf) {
+                        continue;
+                    }
+                    const char * d = (const char *) shadows[t.j]->data;
+                    if (ggml_nbytes(shadows[t.j]) > 0 &&
+                        (d < (const char *) new_base || d >= (const char *) new_base + sz)) {
+                        n_stale++;
+                    }
+                }
+            };
+            scan(t.ctx->stc_static);
+            for (auto & stc : t.ctx->stc_compute) {
+                scan(stc);
+            }
+            if (n_stale > 0) {
+                GGML_LOG_WARN("meta: %s: %zu shadow tensors on a re-provisioned member buffer "
+                              "still point outside the fresh allocation\n", endpoint, n_stale);
+            }
+        }
         // graph-computed static state (e.g. deepseek4's hash-layer tables) never
         // passes through the client, so the journal cannot restore it - copy
         // MIRRORED entries of non-weight static buffers from a healthy member
         // (mirrored bytes are identical on every member by definition)
         if (t.buf->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            size_t n_sibling  = 0;
+            size_t nb_sibling = 0;
             std::vector<uint8_t> tmp;
             for (auto & kv : t.ctx->stc_static.simple_tensors) {
                 const ggml_backend_meta_simple_tensor_entry & entry = kv.second;
@@ -714,7 +743,12 @@ bool ggml_backend_meta_reprovision_endpoint(const char * endpoint) {
                 tmp.resize(nbytes);
                 ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
                 ggml_backend_tensor_set(entry.shadows[t.j], tmp.data(), 0, nbytes);
+                n_sibling++;
+                nb_sibling += nbytes;
             }
+            GGML_LOG_INFO("meta: %s: sibling-restored %zu mirrored statics (%zu bytes) on a "
+                          "%zu MiB member buffer\n", endpoint, n_sibling, nb_sibling,
+                          ggml_backend_buffer_get_size(t.buf) / (1024*1024));
         }
     }
     clear_failed_fn(endpoint);
