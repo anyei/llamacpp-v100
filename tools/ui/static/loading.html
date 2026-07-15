@@ -3,6 +3,10 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!-- backstop: if the poll loop below ever stalls or JS is disabled, this
+		     still reloads periodically so the page recovers to the real UI once
+		     the model is ready (the server serves the app instead of this page). -->
+		<meta http-equiv="refresh" content="20" />
 		<title>Loading model…</title>
 		<style>
 			:root {
@@ -84,6 +88,13 @@
 			// remember each endpoint's last byte count + time to derive MB/s
 			const prev = Object.create(null);
 			const MiB = 1024 * 1024;
+			let inFlight = false; // don't stack fetches if the server stalls
+
+			function esc(s) {
+				return String(s).replace(/[&<>"]/g, (c) =>
+					({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]
+				);
+			}
 
 			function fmtBytes(n) {
 				if (n >= 1024 * MiB) return (n / (1024 * MiB)).toFixed(2) + ' GB';
@@ -93,6 +104,8 @@
 			}
 
 			async function tick() {
+				if (inFlight) return;
+				inFlight = true;
 				let d;
 				try {
 					const r = await fetch('./fleet/status', { cache: 'no-store' });
@@ -100,6 +113,8 @@
 					d = await r.json();
 				} catch (e) {
 					return; // server not answering yet — keep the current view, retry
+				} finally {
+					inFlight = false;
 				}
 
 				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading') {
@@ -134,10 +149,10 @@
 					const lat = w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—';
 					return (
 						'<div class="worker"><div class="wrow">' +
-						'<span class="ep">' + w.endpoint + '</span>' +
+						'<span class="ep">' + esc(w.endpoint) + '</span>' +
 						'<span class="rate">' + rate + '</span></div>' +
 						'<div class="meta">' + fmtBytes(w.bytes_sent) + ' uploaded · ' +
-						w.calls + ' calls · rtt ' + lat + '</div></div>'
+						(w.calls | 0) + ' calls · rtt ' + lat + '</div></div>'
 					);
 				}).join('');
 			}

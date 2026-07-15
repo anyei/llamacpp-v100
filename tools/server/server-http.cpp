@@ -183,11 +183,6 @@ bool server_http_context::init(const common_params & params) {
             "/models",
             "/v1/models",
             "/",
-            // fleet status is monitoring-only (topology/progress, same info the
-            // unauthenticated LAN beacons already carry) - keep it key-free so the
-            // loading page can show per-worker load progress before the model is
-            // ready. The sensitive fleet ops (/fleet/worker/log, .../restart) stay gated.
-            "/fleet/status",
         };
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
             endpoints.insert("/" + a.name);
@@ -195,7 +190,9 @@ bool server_http_context::init(const common_params & params) {
         return endpoints;
     }();
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_validate_api_key = [this, api_keys = params.api_keys,
+                                        fleet_status_path = params.api_prefix + "/fleet/status"](
+                                           const httplib::Request & req, httplib::Response & res) {
         // If API key is not set, skip validation
         if (api_keys.empty()) {
             return true;
@@ -203,6 +200,14 @@ bool server_http_context::init(const common_params & params) {
 
         // If path is public or a UI asset, skip validation
         if (get_public_endpoints.count(req.path)) {
+            return true;
+        }
+
+        // /fleet/status is key-free ONLY while the model is loading, so the loading
+        // page can show per-worker load progress before the server is ready. Once
+        // ready it requires the key (it then discloses the model path / topology).
+        // Uses the prefixed path so it composes with --api-prefix.
+        if (!is_ready.load() && req.path == fleet_status_path) {
             return true;
         }
 
