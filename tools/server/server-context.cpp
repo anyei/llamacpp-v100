@@ -5348,6 +5348,34 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // reload the coordinator to enlist newly discovered workers (TASKS.md #38):
+    // a JOIN cannot reuse the in-process reload - RPC device registration is
+    // parse-time only - so exit like the worker-loss path does and let the
+    // restart policy + --rpc-discover re-split over the grown fleet.
+    // Admin-gated: kills in-flight requests and reloads the whole model.
+    this->post_fleet_reload = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!params.fleet_admin || params.api_keys.empty()) {
+            res->error(format_error_response("fleet reload requires --fleet-admin AND an --api-key", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string ep = body.value("endpoint", "");
+        SRV_WRN("fleet-admin: reload requested%s%s - exiting in 2s for a clean restart "
+                "(restart policy + --rpc-discover re-split over the discovered workers)\n",
+                ep.empty() ? "" : " to enlist ", ep.c_str());
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            fflush(stdout);
+            fflush(stderr);
+            std::_Exit(42);
+        }).detach();
+        res->ok({
+            {"success", true},
+        });
+        return res;
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {

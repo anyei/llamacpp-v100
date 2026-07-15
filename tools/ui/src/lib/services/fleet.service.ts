@@ -54,4 +54,18 @@ export class FleetService {
 	static async restartWorker(endpoint: string): Promise<ApiFleetWorkerRestartResponse> {
 		return apiPost<ApiFleetWorkerRestartResponse>(API_FLEET.WORKER_RESTART, { endpoint });
 	}
+
+	/**
+	 * Reloads the coordinator to enlist newly discovered workers. The server
+	 * exits and its restart policy brings it back with rediscovery, so all
+	 * in-flight requests are dropped and the model reloads across the grown
+	 * fleet. Only allowed when the server runs with `--fleet-admin`.
+	 *
+	 * @param endpoint - The worker endpoint being enlisted (for the server log)
+	 * @returns Reload acknowledgement
+	 * @throws {Error} If the request fails or fleet admin is disabled
+	 */
+	static async reloadFleet(endpoint?: string): Promise<ApiFleetReloadResponse> {
+		return apiPost<ApiFleetReloadResponse>(API_FLEET.RELOAD, endpoint ? { endpoint } : {});
+	}
 }

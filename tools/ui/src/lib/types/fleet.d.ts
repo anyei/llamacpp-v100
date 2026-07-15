@@ -96,3 +96,8 @@ export interface ApiFleetWorkerRestartResponse {
 	success: boolean;
 	recovery: 'auto' | 'manual';
 }
+
+/** Response of `POST ./fleet/reload`. */
+export interface ApiFleetReloadResponse {
+	success: boolean;
+}

@@ -31,7 +31,8 @@ export const API_STREAM = {
 export const API_FLEET = {
 	STATUS: './fleet/status',
 	WORKER_LOG: './fleet/worker/log',
-	WORKER_RESTART: './fleet/worker/restart'
+	WORKER_RESTART: './fleet/worker/restart',
+	RELOAD: './fleet/reload'
 };
 
 /** CORS proxy endpoint path */

@@ -4,11 +4,15 @@
 	import { browser } from '$app/environment';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { AlertTriangle, Network, X } from '@lucide/svelte';
+	import { AlertTriangle, Network, Plus, X } from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
 	import { ActionIcon } from '$lib/components/app';
 	import { Badge } from '$lib/components/ui/badge';
+	import { Button } from '$lib/components/ui/button';
 	import * as Table from '$lib/components/ui/table';
+	import { DialogConfirmation } from '$lib/components/app/dialogs';
 	import { ROUTES } from '$lib/constants';
+	import { FleetService } from '$lib/services/fleet.service';
 	import { fleetStore } from '$lib/stores/fleet.svelte';
 	import { formatFileSize } from '$lib/utils';
 	import FleetDeviceCard from './FleetDeviceCard.svelte';
@@ -80,6 +84,38 @@
 
 	let logsOpen = $state(false);
 	let logsEndpoint = $state<string | null>(null);
+
+	let includeEndpoint = $state<string | null>(null);
+	let showIncludeDialog = $state(false);
+	let isReloading = $state(false);
+
+	function requestInclude(endpoint: string) {
+		includeEndpoint = endpoint;
+		showIncludeDialog = true;
+	}
+
+	async function handleIncludeConfirm() {
+		showIncludeDialog = false;
+		if (!includeEndpoint) return;
+
+		isReloading = true;
+
+		try {
+			const result = await FleetService.reloadFleet(includeEndpoint);
+
+			if (result.success) {
+				toast.success(
+					`Reloading the coordinator to enlist ${includeEndpoint} — the model reloads across the grown fleet`
+				);
+			} else {
+				toast.error('Fleet reload request failed');
+			}
+		} catch (error: unknown) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			isReloading = false;
+		}
+	}
 
 	let previousRouteId = $state<string | null>(null);
 
@@ -328,7 +364,28 @@
 										{#if worker.in_pipeline}
 											<Badge variant="secondary" class="text-[10px]">in pipeline</Badge>
 										{:else}
-											<Badge variant="outline" class="text-[10px]">available</Badge>
+											<div class="flex items-center gap-2">
+												<Badge variant="outline" class="text-[10px]">available</Badge>
+
+												{#if status?.server_state === 'ready'}
+													<span
+														title={status?.fleet_admin
+															? 'Reload the coordinator to include this worker'
+															: 'start server with --fleet-admin and an API key'}
+													>
+														<Button
+															variant="outline"
+															size="sm"
+															class="h-6 px-2 text-[10px]"
+															disabled={!status?.fleet_admin || isReloading}
+															onclick={() => requestInclude(worker.endpoint)}
+														>
+															<Plus class="h-3 w-3 {isReloading ? 'animate-spin' : ''}" />
+															Include
+														</Button>
+													</span>
+												{/if}
+											</div>
 										{/if}
 									</Table.Cell>
 								</Table.Row>
@@ -342,3 +399,14 @@
 </div>
 
 <FleetWorkerLogs bind:open={logsOpen} endpoint={logsEndpoint} />
+
+<DialogConfirmation
+	bind:open={showIncludeDialog}
+	title="Include worker in fleet"
+	description={`Enlist ${includeEndpoint} by reloading the coordinator? All in-flight requests are dropped and the model reloads across the grown fleet (the split is recomputed; every worker re-receives its share — fast when workers have a warm cache or --model-dir).`}
+	confirmText="Reload fleet"
+	variant="destructive"
+	icon={Plus}
+	onConfirm={handleIncludeConfirm}
+	onCancel={() => (showIncludeDialog = false)}
+/>
