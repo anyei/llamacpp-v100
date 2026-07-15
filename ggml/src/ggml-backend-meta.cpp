@@ -678,6 +678,9 @@ bool ggml_backend_meta_reprovision_endpoint(const char * endpoint) {
         }
     }
     if (targets.empty()) {
+        // no meta member buffers on this endpoint: layer-split (non-meta) topologies
+        // are not surgically re-provisionable - the caller falls back to the reload
+        GGML_LOG_INFO("meta: no member buffers on %s (layer split?) - surgical covers -sm tensor topologies only\n", endpoint);
         return false;
     }
     for (target & t : targets) {
@@ -2652,6 +2655,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    // The scheduler skips view ops when splitting, so views whose data lives on
+    // another backend (CPU-hosted weights via -ncmoe / partial -ngl, coordinator
+    // CPU tensors over RPC) sit positionally inside the meta split's node range.
+    // They are inert here - view ops are no-op kernels and the sched rewired all
+    // same-split consumers to local copies - but materializing shadows for them
+    // asserts on the non-meta buffer (TASKS.md #34). Drop them up front; the
+    // filter is deterministic, so uid/content-keyed build caching stays valid.
+    auto is_foreign_view = [](const ggml_tensor * node) {
+        return node->view_src != nullptr &&
+               (node->view_src->buffer == nullptr || !ggml_backend_buffer_is_meta(node->view_src->buffer));
+    };
+    bool any_foreign = false;
+    for (int i = 0; i < cgraph->n_nodes && !any_foreign; i++) {
+        any_foreign = is_foreign_view(cgraph->nodes[i]);
+    }
+    std::vector<ggml_tensor *> local_nodes;
+    ggml_cgraph cgraph_local;
+    if (any_foreign) {
+        local_nodes.reserve(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (!is_foreign_view(cgraph->nodes[i])) {
+                local_nodes.push_back(cgraph->nodes[i]);
+            }
+        }
+        cgraph_local = *cgraph;
+        cgraph_local.nodes   = local_nodes.data();
+        cgraph_local.n_nodes = (int) local_nodes.size();
+        cgraph = &cgraph_local;
+    }
 
     // park the active build's per-member state back into its cache entry so a
     // different build can be activated (or a fresh one written) in its place
