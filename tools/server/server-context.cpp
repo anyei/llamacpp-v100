@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "ggml-rpc.h"
+#include "gguf.h" // model header read for the fleet load plan (block_count)
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_model_n_devices / llama_model_get_device / llama_model_device_n_layers (fleet snapshot)
 #include "log.h"
@@ -872,6 +873,9 @@ struct server_metrics {
 // server_context_impl (private implementation)
 //
 
+// defined with the /fleet/* helpers below
+static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params);
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -915,6 +919,21 @@ public:
             int64_t     t_last_ms;
         };
         std::map<std::string, beacon_t> discovered; // endpoint -> last beacon heard
+
+        // load plan (TASKS.md #35a loading page): captured on the model thread at
+        // the START of load_model - what is being loaded and how it will be split -
+        // so the loading page can show it while weights stream. The end-of-load
+        // layer_map snapshot is the ACTUAL assignment; this one is the plan.
+        struct planned_dev_t {
+            std::string name;
+            std::string endpoint;   // empty = local device
+            double      split_frac; // normalized share of the split (0..1)
+            int32_t     n_layers;   // predicted repeating layers; -1 = n/a (tensor mode)
+        };
+        std::string                load_model_name;
+        size_t                     load_model_bytes = 0;
+        std::string                load_split_mode;
+        std::vector<planned_dev_t> load_plan;
 
         std::thread       listener;
         std::atomic<bool> stop{false};
@@ -1102,6 +1121,114 @@ private:
         return true;
     }
 
+    // load plan for the loading page (TASKS.md #35a): what is being loaded and how
+    // it will be split. Runs on the MODEL THREAD at the start of load_model, before
+    // any concurrent writer of params_base exists, and publishes under fleet.mutex -
+    // the loading page must never make the HTTP threads read main's params mid-load.
+    // For -sm layer this replicates llama's default split (explicit -ts, else free-
+    // memory-proportional) at layer granularity; the end-of-load layer_map snapshot
+    // then records the ACTUAL assignment. KV-annex / device-id-dedup edge cases are
+    // not modeled - the page labels these numbers as the plan.
+    void fleet_capture_load_plan() {
+        const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params_base);
+
+        // repeating-layer count from the GGUF header (metadata only, no tensor data)
+        uint32_t n_layer = 0;
+        {
+            gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+            gguf_context * g = gguf_init_from_file(params_base.model.path.c_str(), gp);
+            if (g != nullptr) {
+                const int64_t k_arch = gguf_find_key(g, "general.architecture");
+                if (k_arch >= 0) {
+                    const std::string key = std::string(gguf_get_val_str(g, k_arch)) + ".block_count";
+                    const int64_t k_bc = gguf_find_key(g, key.c_str());
+                    if (k_bc >= 0) {
+                        n_layer = gguf_get_val_u32(g, k_bc);
+                    }
+                }
+                gguf_free(g);
+            }
+        }
+
+        // split shares: explicit -ts wins, else free memory (llama's default). The
+        // RPC memory queries are cheap here - the load has not started streaming yet.
+        const size_t n = devs.size();
+        std::vector<double> splits(n, 0.0);
+        double ts_sum = 0.0;
+        for (size_t i = 0; i < n && i < llama_max_devices(); ++i) {
+            ts_sum += params_base.tensor_split[i];
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (ts_sum > 0.0) {
+                splits[i] = i < llama_max_devices() ? params_base.tensor_split[i] : 0.0;
+            } else {
+                size_t free_mem = 0, total_mem = 0;
+                ggml_backend_dev_memory(devs[i], &free_mem, &total_mem);
+                splits[i] = (double) free_mem;
+            }
+        }
+        double split_sum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            split_sum += splits[i];
+        }
+
+        // predicted repeating layers per device (llama-model.cpp load_tensors math)
+        std::vector<int32_t> layers(n, -1);
+        const bool layer_mode = params_base.split_mode == LLAMA_SPLIT_MODE_LAYER;
+        if (layer_mode && n_layer > 0 && n > 0 && split_sum > 0.0) {
+            std::vector<double> cum(n, 0.0);
+            double acc = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                acc += splits[i] / split_sum;
+                cum[i] = acc;
+            }
+            const int32_t ngl = params_base.n_gpu_layers;
+            const int32_t act = std::min<int32_t>(ngl < 0 ? (int32_t) n_layer + 1 : ngl, (int32_t) n_layer + 1);
+            const int32_t i_gpu_start = std::max<int32_t>((int32_t) n_layer + 1 - act, 0);
+            std::fill(layers.begin(), layers.end(), 0);
+            for (int32_t il = i_gpu_start; il < (int32_t) n_layer; ++il) {
+                const double x = (double) (il - i_gpu_start) / act;
+                size_t d = 0;
+                while (d + 1 < n && cum[d] <= x) {
+                    d++;
+                }
+                layers[d]++;
+            }
+        }
+
+        size_t model_bytes = 0;
+        {
+            std::ifstream f(params_base.model.path, std::ios::binary | std::ios::ate);
+            if (f.good()) {
+                model_bytes = (size_t) f.tellg();
+            }
+        }
+
+        typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
+        static const dev_endpoint_t dev_endpoint_fn = []() {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg != nullptr
+                ? (dev_endpoint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint")
+                : (dev_endpoint_t) nullptr;
+        }();
+
+        std::lock_guard<std::mutex> lock(fleet.mutex);
+        fleet.load_model_name  = std::filesystem::path(params_base.model.path).filename().string();
+        fleet.load_model_bytes = model_bytes;
+        fleet.load_split_mode  = params_base.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer"
+                               : params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "none";
+        fleet.load_plan.clear();
+        for (size_t i = 0; i < n; ++i) {
+            const char * ep = dev_endpoint_fn != nullptr ? dev_endpoint_fn(devs[i]) : nullptr;
+            fleet.load_plan.push_back({
+                ggml_backend_dev_name(devs[i]),
+                ep != nullptr ? ep : "",
+                split_sum > 0.0 ? splits[i] / split_sum : 0.0,
+                layers[i],
+            });
+        }
+    }
+
     // background beacon listener (TASKS.md #35b): keeps /fleet/status aware of every
     // worker present on the LAN, including those carrying no layers. Only runs with
     // --rpc-discover - it opens a UDP socket and TCP-probes beacon candidates.
@@ -1251,6 +1378,13 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        // fleet loading view (TASKS.md #35a): publish the load plan and start the
+        // beacon listener BEFORE the load so the loading page can show what is
+        // being loaded, the planned split, and live worker scores while weights
+        // stream (beacons carry bw_gbps/free_mib; the listener is idempotent)
+        fleet_capture_load_plan();
+        fleet_start_beacon_listener();
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -4863,13 +4997,21 @@ void server_routes::init_routes() {
         std::map<std::string, int32_t> layer_map;
         std::map<std::string, server_context_impl::fleet_state_t::beacon_t> beacons;
         std::string load_stage;
+        std::string load_model_name;
+        size_t      load_model_bytes = 0;
+        std::string load_split_mode;
+        std::vector<server_context_impl::fleet_state_t::planned_dev_t> load_plan;
         {
             std::lock_guard<std::mutex> lock(fleet.mutex);
             for (const auto & d : fleet.layer_map) {
                 layer_map[d.name] = d.n_layers;
             }
-            beacons    = fleet.discovered;
-            load_stage = fleet.load_stage;
+            beacons          = fleet.discovered;
+            load_stage       = fleet.load_stage;
+            load_model_name  = fleet.load_model_name;
+            load_model_bytes = fleet.load_model_bytes;
+            load_split_mode  = fleet.load_split_mode;
+            load_plan        = fleet.load_plan;
         }
 
         // read main's `params` only once the initial load has fully returned; until
@@ -5005,29 +5147,77 @@ void server_routes::init_routes() {
             body["model"]        = { {"path", params.model.path}, {"size_bytes", model_bytes} };
         } else {
             body["fleet_admin"]  = false;
-            body["split_mode"]   = nullptr;
+            // from the load-plan snapshot (model thread), NOT from params - the
+            // loading page shows what is being loaded without touching racy state
+            body["split_mode"]   = load_split_mode.empty() ? json(nullptr) : json(load_split_mode);
             body["n_gpu_layers"] = nullptr;
-            body["model"]        = nullptr;
+            body["model"]        = load_model_name.empty() ? json(nullptr)
+                                 : json({ {"path", load_model_name}, {"size_bytes", load_model_bytes} });
         }
         if (loading) {
             body["load_progress"] = { {"value", progress}, {"stage", load_stage} };
         }
         // per-worker load view (TASKS.md #35a): while the model is loading the
-        // params-gated devices[] is empty, so surface the RPC client's live
-        // per-endpoint counters instead - this is what the loading page polls to
-        // show which worker is still receiving weights and how fast. Race-free
-        // (global RPC state, no model-thread access), so it's valid mid-load.
-        if (!ready && procs.foreach_ep_stat != nullptr) {
+        // params-gated devices[] is empty, so merge the load PLAN (planned split
+        // share + predicted layers, captured on the model thread at load start)
+        // with the RPC client's LIVE per-endpoint counters and the beacon-carried
+        // scores/free-mem. Race-free: plan and beacons are mutex-copied above, the
+        // counters are global RPC state - nothing touches the loading model.
+        if (!ready) {
+            std::map<std::string, ggml_backend_rpc_ep_stats> live;
+            if (procs.foreach_ep_stat != nullptr) {
+                procs.foreach_ep_stat([](const char * ep, const ggml_backend_rpc_ep_stats * st, void * ud) {
+                    (*(std::map<std::string, ggml_backend_rpc_ep_stats> *) ud)[ep] = *st;
+                }, &live);
+            }
             json load_workers = json::array();
-            procs.foreach_ep_stat([](const char * ep, const ggml_backend_rpc_ep_stats * st, void * ud) {
-                ((json *) ud)->push_back({
-                    {"endpoint",        ep},
-                    {"bytes_sent",      st->bytes_sent},
-                    {"bytes_recv",      st->bytes_recv},
-                    {"calls",           st->n_calls},
-                    {"ewma_latency_us", st->ewma_latency_us},
-                });
-            }, &load_workers);
+            auto push_worker = [&](const std::string & name, const std::string & ep,
+                                   double split_frac, int32_t n_layers) {
+                json w = {
+                    {"name",       name},
+                    {"endpoint",   ep.empty() ? json(nullptr) : json(ep)},
+                    {"split_frac", split_frac > 0.0 ? json(split_frac) : json(nullptr)},
+                    {"n_layers",   n_layers >= 0 ? json(n_layers) : json(nullptr)},
+                    {"score",      nullptr},
+                    {"free_mib",   nullptr},
+                    {"bytes_sent", nullptr},
+                    {"calls",      nullptr},
+                    {"ewma_latency_us", nullptr},
+                };
+                if (!ep.empty()) {
+                    auto lit = live.find(ep);
+                    if (lit != live.end()) {
+                        w["bytes_sent"]      = lit->second.bytes_sent;
+                        w["calls"]           = lit->second.n_calls;
+                        w["ewma_latency_us"] = lit->second.ewma_latency_us;
+                    }
+                    std::string payload;
+                    auto bit = beacons.find(ep);
+                    if (bit != beacons.end()) {
+                        payload = bit->second.payload;
+                        if (auto v = fleet_beacon_num(payload, "free_mib")) {
+                            w["free_mib"] = (int64_t) *v;
+                        }
+                    }
+                    if (auto score = fleet_worker_score(ep, payload, false)) {
+                        w["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                    }
+                }
+                load_workers.push_back(std::move(w));
+            };
+            std::set<std::string> planned_eps;
+            for (const auto & p : load_plan) {
+                if (!p.endpoint.empty()) {
+                    planned_eps.insert(p.endpoint);
+                }
+                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers);
+            }
+            // endpoints with traffic but no plan entry (e.g. a draft model's worker)
+            for (const auto & [ep, st] : live) {
+                if (planned_eps.count(ep) == 0) {
+                    push_worker(ep, ep, 0.0, -1);
+                }
+            }
             body["load_workers"] = std::move(load_workers);
         }
         res->ok(body);

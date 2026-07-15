@@ -70,17 +70,23 @@
 			.rate { font-size: 0.85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 			.meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
 			.empty { color: var(--muted); font-size: 0.8rem; padding: 0.75rem 0; }
+			.badges { display: flex; gap: 0.35rem; margin-top: 0.3rem; flex-wrap: wrap; }
+			.badge {
+				font-size: 0.65rem; padding: 0.05rem 0.4rem; border-radius: 0.6rem;
+				border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+			}
+			.badge.score { color: var(--fg); font-weight: 600; }
 		</style>
 	</head>
 	<body>
 		<main>
 			<h1><span class="dot"></span>Loading model across the fleet</h1>
-			<p class="sub">The UI will open automatically when the model is ready.</p>
+			<p class="sub" id="model">The UI will open automatically when the model is ready.</p>
 
 			<div class="stage" id="stage">Initializing…</div>
 			<div class="track"><div id="bar"></div></div>
 
-			<h2>Workers receiving weights</h2>
+			<h2 id="workers-title">Workers</h2>
 			<div id="workers"><div class="empty">Connecting to workers…</div></div>
 		</main>
 
@@ -122,6 +128,15 @@
 					return;
 				}
 
+				// what is being loaded + how it will be split
+				if (d.model && d.model.path) {
+					document.getElementById('model').textContent =
+						d.model.path +
+						(d.model.size_bytes ? ' · ' + fmtBytes(d.model.size_bytes) : '') +
+						(d.split_mode ? ' · split: ' + d.split_mode : '') +
+						' — the UI will open automatically when ready.';
+				}
+
 				const lp = d.load_progress || {};
 				document.getElementById('stage').textContent =
 					'Stage: ' + (lp.stage || '…') +
@@ -131,7 +146,14 @@
 
 				const now = performance.now();
 				const workers = Array.isArray(d.load_workers) ? d.load_workers.slice() : [];
-				workers.sort((a, b) => (a.endpoint < b.endpoint ? -1 : 1));
+				// fastest first, more free memory breaking ties; unscored sink below,
+				// local devices (no endpoint) keep their pipeline position at the end
+				workers.sort((a, b) => {
+					const as = a.score ? a.score.bw_gbps : -1;
+					const bs = b.score ? b.score.bw_gbps : -1;
+					if (as !== bs) return bs - as;
+					return (b.free_mib ?? -1) - (a.free_mib ?? -1);
+				});
 
 				const host = document.getElementById('workers');
 				if (workers.length === 0) {
@@ -139,20 +161,33 @@
 					return;
 				}
 				host.innerHTML = workers.map((w) => {
-					const p = prev[w.endpoint];
-					let rate = '—';
-					if (p && now > p.t) {
-						const bps = ((w.bytes_sent - p.bytes) / (now - p.t)) * 1000; // bytes/s
-						rate = bps > 0 ? (bps / MiB).toFixed(1) + ' MB/s' : 'idle';
+					const key = w.endpoint || w.name;
+					const label = w.endpoint ? w.name + ' · ' + w.endpoint : w.name + ' · local';
+					let rate = '';
+					if (w.bytes_sent != null) {
+						const p = prev[key];
+						rate = '…';
+						if (p && now > p.t) {
+							const bps = ((w.bytes_sent - p.bytes) / (now - p.t)) * 1000; // bytes/s
+							rate = bps > 0 ? (bps / MiB).toFixed(1) + ' MB/s' : 'idle';
+						}
+						prev[key] = { bytes: w.bytes_sent, t: now };
 					}
-					prev[w.endpoint] = { bytes: w.bytes_sent, t: now };
-					const lat = w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—';
+					const badges = [];
+					if (w.score) badges.push('<span class="badge score">' + w.score.bw_gbps.toFixed(1) + ' GB/s</span>');
+					if (w.n_layers != null) badges.push('<span class="badge">' + w.n_layers + ' layers</span>');
+					if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
+					if (w.free_mib != null) badges.push('<span class="badge">' + (w.free_mib / 1024).toFixed(1) + ' GiB free</span>');
+					const meta = w.bytes_sent != null
+						? fmtBytes(w.bytes_sent) + ' uploaded · ' + (w.calls | 0) + ' calls · rtt ' +
+						  (w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—')
+						: (w.endpoint ? 'waiting for first transfer…' : 'local device');
 					return (
 						'<div class="worker"><div class="wrow">' +
-						'<span class="ep">' + esc(w.endpoint) + '</span>' +
+						'<span class="ep">' + esc(label) + '</span>' +
 						'<span class="rate">' + rate + '</span></div>' +
-						'<div class="meta">' + fmtBytes(w.bytes_sent) + ' uploaded · ' +
-						(w.calls | 0) + ' calls · rtt ' + lat + '</div></div>'
+						'<div class="badges">' + badges.join('') + '</div>' +
+						'<div class="meta">' + meta + '</div></div>'
 					);
 				}).join('');
 			}
