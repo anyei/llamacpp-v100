@@ -440,6 +440,13 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
 static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor * tensor, struct buffer_address buf_addr) {
     void * base = ggml_backend_buffer_get_base(buf->chunks[buf_addr.chunk]);
+    if (base == NULL && ggml_nbytes(tensor) > 0) {
+        // an empty (dummy) chunk legitimately has no base, but only zero-byte
+        // tensors may be placed in one
+        GGML_LOG_ERROR("%s: buffer '%s' returned a NULL base for tensor '%s' (%zu bytes, chunk %d, offset %zu)\n",
+                __func__, ggml_backend_buffer_name(buf->chunks[buf_addr.chunk]), tensor->name,
+                ggml_nbytes(tensor), buf_addr.chunk, (size_t) buf_addr.offset);
+    }
     void * addr = (char *)base + buf_addr.offset;
     ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr);
 }
@@ -980,15 +987,17 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             ggml_backend_view_init(tensor);
         }
     } else {
-        if (tensor->data == NULL) {
+        if (tensor->data == NULL && tensor->buffer == NULL) {
+            // note: a zero-byte tensor placed in an empty (dummy) chunk keeps
+            // data == NULL after this init - checking the buffer instead of the
+            // data keeps a repeated init (the same tensor can be a node of two
+            // splits) from re-allocating it
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
         } else {
-            if (tensor->buffer == NULL) {
-                // this tensor was allocated without ggml-backend
-                return;
-            }
+            // already initialized, or allocated without ggml-backend
+            return;
         }
     }
 }

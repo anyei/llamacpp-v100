@@ -120,6 +120,9 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_RDMA_DEV` / `GGML_RDMA_GID` | str | auto | RDMA device / GID selection for the RPC transport (when built with RDMA). |
 | `GGML_RPC_DEBUG` | bool | off | *(upstream)* RPC command logging. |
 | `GGML_RPC_STATS` | bool | off | Client-side per-RPC-command call/byte counters, dumped to stderr at exit. Diagnostic; used to find the O(n^2) graph serialization and the per-row weight upload (task 28 increment 1). |
+| `GGML_RPC_DEBUG_FAIL_ALLOC` | `EP:SKIP:COUNT` | off | Fault injection: on endpoint `EP`, skip the first SKIP buffer allocations, fail the next COUNT, pass the rest (and log every request). Reproduces a worker rejecting a compute-buffer alloc (task 37 Run-B scenario: fail the PP compute buffer, let the no-pipeline retry pass). |
+| `GGML_RPC_DEBUG_BUF` | bool | off | Client-side buffer lifecycle log: every remote alloc (endpoint, remote_ptr, size) and free. Used to find the zero-size-chunk dummy buffer in task 37. |
+| `LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB` | MiB | 2% of model, clamped [512, 2048] | Override the per-device compute-buffer allowance `--rpc-auto-weight` subtracts from every device cap (task 37; KV is estimated from the GGUF header separately). |
 
 ## 8. KV cache (task 10)
 

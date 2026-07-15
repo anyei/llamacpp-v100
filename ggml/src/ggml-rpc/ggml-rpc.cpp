@@ -976,6 +976,10 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     }
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
+    if (getenv("GGML_RPC_DEBUG_BUF") != nullptr) {
+        GGML_LOG_INFO("[rpc-buf-debug] free %s buffer 0x%" PRIx64 "\n",
+                rpc_async_state(ctx->sock.get()).endpoint.c_str(), ctx->remote_ptr);
+    }
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     if (!status) {
         // the worker is gone and freed everything with the connection anyway
@@ -995,6 +999,10 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     if (!status) {
         rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
         return nullptr;
+    }
+    if (response.base_ptr == 0) {
+        GGML_LOG_ERROR("[%s] worker %s returned NULL base for buffer 0x%" PRIx64 " - the worker no longer knows this buffer\n",
+                __func__, rpc_async_state(ctx->sock.get()).endpoint.c_str(), ctx->remote_ptr);
     }
     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
     return ctx->base_ptr;
@@ -1283,6 +1291,42 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+    // fault injection: GGML_RPC_DEBUG_FAIL_ALLOC=ENDPOINT:SKIP:COUNT skips the
+    // first SKIP allocations on ENDPOINT, fails the next COUNT, passes the rest
+    // (and logs every request) - reproduces a worker rejecting a specific
+    // buffer allocation (e.g. the pipeline-parallel compute buffer)
+    static const char * fail_env = getenv("GGML_RPC_DEBUG_FAIL_ALLOC");
+    if (fail_env != nullptr) {
+        static std::mutex fail_mutex;
+        static std::string fail_ep;
+        static int64_t fail_skip  = 0;
+        static int64_t fail_count = 0;
+        static int64_t seen       = 0;
+        bool fail = false;
+        {
+            std::lock_guard<std::mutex> lock(fail_mutex);
+            if (fail_ep.empty()) {
+                // parse from the right: the endpoint itself contains a colon
+                std::string spec = fail_env;
+                size_t c2 = spec.rfind(':');
+                size_t c1 = c2 != std::string::npos ? spec.rfind(':', c2 - 1) : std::string::npos;
+                if (c1 != std::string::npos) {
+                    fail_ep    = spec.substr(0, c1);
+                    fail_skip  = atoll(spec.c_str() + c1 + 1);
+                    fail_count = atoll(spec.c_str() + c2 + 1);
+                }
+            }
+            if (buft_ctx->endpoint == fail_ep) {
+                fail = seen >= fail_skip && seen < fail_skip + fail_count;
+                seen++;
+            }
+        }
+        GGML_LOG_INFO("[rpc-alloc-debug] %s ep=%s size=%zu%s\n",
+                      buft_ctx->name.c_str(), buft_ctx->endpoint.c_str(), size, fail ? " INJECTED-FAIL" : "");
+        if (fail) {
+            return nullptr;
+        }
+    }
     rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
@@ -1296,6 +1340,10 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
         return nullptr;
     }
     if (response.remote_ptr != 0) {
+        if (getenv("GGML_RPC_DEBUG_BUF") != nullptr) {
+            GGML_LOG_INFO("[rpc-buf-debug] alloc %s buffer 0x%" PRIx64 " size %zu\n",
+                    buft_ctx->endpoint.c_str(), response.remote_ptr, size);
+        }
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
             new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
@@ -1906,13 +1954,50 @@ static rpc_tensor serialize_tensor_leaf(const ggml_tensor * tensor) {
     return result;
 }
 
+// The scheduler skips view ops when splitting (they execute as no-ops on every
+// backend), so a view of another backend's tensor can sit positionally inside
+// this split's node range - e.g. DSV4 creates state reshapes for ALL layers up
+// front and views of the previous layer's l_out. All same-split consumers were
+// rewired to local input copies, so such nodes are dead weight here - but their
+// foreign addresses would make the worker reject the whole graph (TASKS.md #37).
+static bool rpc_is_foreign_view_node(const ggml_tensor * node, const std::string & endpoint, uint32_t device) {
+    const bool is_view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+    if (!is_view_op) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = node->view_src != nullptr ? node->view_src->buffer : node->buffer;
+    if (buf == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    if (buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
+        return true; // coordinator-local buffer: not resolvable on any worker
+    }
+    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
+    return buft_ctx->endpoint != endpoint || buft_ctx->device != device;
+}
+
+// the split's nodes minus foreign view ops (see rpc_is_foreign_view_node)
+static void collect_local_nodes(const ggml_cgraph * cgraph, const std::string & endpoint, uint32_t device,
+                                std::vector<const ggml_tensor *> & nodes) {
+    nodes.reserve(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (rpc_is_foreign_view_node(node, endpoint, device)) {
+            continue;
+        }
+        nodes.push_back(node);
+    }
+}
+
 // collect the graph's nodes (with op links) plus everything they reference as leaves
-static void collect_graph_tensors(const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors) {
-    const uint32_t n_nodes = cgraph->n_nodes;
+static void collect_graph_tensors(const std::vector<const ggml_tensor *> & nodes, std::vector<rpc_tensor> & tensors) {
+    const uint32_t n_nodes = nodes.size();
     std::unordered_set<const ggml_tensor*> node_set;
     node_set.reserve(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        node_set.insert(cgraph->nodes[i]);
+        node_set.insert(nodes[i]);
     }
     std::unordered_set<const ggml_tensor*> visited;
     auto add_leaf = [&](const ggml_tensor * t) {
@@ -1923,7 +2008,7 @@ static void collect_graph_tensors(const ggml_cgraph * cgraph, std::vector<rpc_te
         tensors.push_back(serialize_tensor_leaf(t));
     };
     for (uint32_t i = 0; i < n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
+        const ggml_tensor * node = nodes[i];
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             add_leaf(node->src[j]);
         }
@@ -1935,10 +2020,10 @@ static void collect_graph_tensors(const ggml_cgraph * cgraph, std::vector<rpc_te
 }
 
 // proto 4.3 serialization: same wire layout as serialize_graph but prefixed with the graph uid
-static void serialize_graph_uid(uint32_t device, uint64_t uid, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
-    const uint32_t n_nodes = cgraph->n_nodes;
+static void serialize_graph_uid(uint32_t device, uint64_t uid, const std::vector<const ggml_tensor *> & nodes, std::vector<uint8_t> & output) {
+    const uint32_t n_nodes = nodes.size();
     std::vector<rpc_tensor> tensors;
-    collect_graph_tensors(cgraph, tensors);
+    collect_graph_tensors(nodes, tensors);
     const uint32_t n_tensors = tensors.size();
     const size_t output_size = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t)
         + sizeof(n_nodes) + n_nodes*sizeof(uint64_t) + sizeof(n_tensors) + n_tensors*sizeof(rpc_tensor);
@@ -1950,17 +2035,17 @@ static void serialize_graph_uid(uint32_t device, uint64_t uid, const ggml_cgraph
     memcpy(dest, &uid, sizeof(uid));          dest += sizeof(uid);
     memcpy(dest, &n_nodes, sizeof(n_nodes));  dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        memcpy(dest + i*sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
+        memcpy(dest + i*sizeof(uint64_t), &nodes[i], sizeof(uint64_t));
     }
     dest += n_nodes*sizeof(uint64_t);
     memcpy(dest, &n_tensors, sizeof(n_tensors)); dest += sizeof(n_tensors);
     memcpy(dest, tensors.data(), n_tensors*sizeof(rpc_tensor));
 }
 
-static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
-    uint32_t n_nodes = cgraph->n_nodes;
+static void serialize_graph(uint32_t device, const std::vector<const ggml_tensor *> & nodes, std::vector<uint8_t> & output) {
+    uint32_t n_nodes = nodes.size();
     std::vector<rpc_tensor> tensors;
-    collect_graph_tensors(cgraph, tensors);
+    collect_graph_tensors(nodes, tensors);
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
@@ -1972,7 +2057,7 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        memcpy(dest + i * sizeof(uint64_t), &cgraph->nodes[i], sizeof(uint64_t));
+        memcpy(dest + i * sizeof(uint64_t), &nodes[i], sizeof(uint64_t));
     }
     dest += n_nodes * sizeof(uint64_t);
     memcpy(dest, &n_tensors, sizeof(n_tensors));
@@ -2009,8 +2094,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             rpc_msg_graph_recompute_uid_req request = { rpc_ctx->device, 0, cgraph->uid };
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE_UID, &request, sizeof(request));
         } else {
+            std::vector<const ggml_tensor *> nodes;
+            collect_local_nodes(cgraph, rpc_ctx->endpoint, rpc_ctx->device, nodes);
+            if (nodes.empty()) {
+                return GGML_STATUS_SUCCESS; // only foreign view ops: nothing to compute here
+            }
             std::vector<uint8_t> input;
-            serialize_graph_uid(rpc_ctx->device, cgraph->uid, cgraph, input);
+            serialize_graph_uid(rpc_ctx->device, cgraph->uid, nodes, input);
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_UID, input.data(), input.size());
             if (status) {
                 // client tracking cap must stay below the server cache cap so a
@@ -2032,8 +2122,14 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         } else {
             rpc_dev_ctx->last_graph_uid = cgraph->uid;
+            std::vector<const ggml_tensor *> nodes;
+            collect_local_nodes(cgraph, rpc_ctx->endpoint, rpc_ctx->device, nodes);
+            if (nodes.empty()) {
+                rpc_dev_ctx->last_graph_uid = 0; // an empty graph was never stored: don't RECOMPUTE it
+                return GGML_STATUS_SUCCESS;
+            }
             std::vector<uint8_t> input;
-            serialize_graph(rpc_ctx->device, cgraph, input);
+            serialize_graph(rpc_ctx->device, nodes, input);
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         }
     }
@@ -3094,7 +3190,8 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         return nullptr;
     }
     if (result->buffer == nullptr && result->data != nullptr) {
-        GGML_LOG_ERROR("[%s] invalid data ptr", __func__);
+        GGML_LOG_ERROR("[%s] invalid data ptr: tensor '%s' (op %s) references unknown buffer 0x%" PRIx64 ", data 0x%" PRIx64 "\n",
+                       __func__, tensor->name, ggml_op_name((ggml_op) tensor->op), tensor->buffer, tensor->data);
         return nullptr;
     }
     tensor_map[id] = result;

@@ -1216,30 +1216,81 @@ static void apply_rpc_auto_weight(common_params & params) {
         return;
     }
 
-    // -sm layer allocates WHOLE layers: a fractional-share cap can round UP by
-    // nearly one layer of real tensors and overflow a tight device (observed: a
-    // 6 GB card capped to 4.9 GB of share got a 5.9 GB allocation -> load abort).
-    // Shrink every cap by one layer's worth so the rounded allocation still fits.
+    // The caps must cover everything a device hosts, not just weights (task 37 -
+    // weight-only caps passed the load and then failed compute-buffer reserve at
+    // context init or the first prompt, and the degraded no-pipeline retry took
+    // workers down):
+    //  - KV cache: grows with the device's layer share; estimated from the header
+    //    (n_ctx x per-layer KV rows x cache type size), folded in by scaling the
+    //    caps from weight-bytes to weight+kv-bytes space.
+    //  - compute buffer: per-device, roughly model-scale; a flat allowance
+    //    (2% of the model, clamped to [512 MiB, 2 GiB], env-overridable).
+    //  - whole-layer rounding: -sm layer allocates WHOLE layers, a fractional
+    //    cap can round UP by nearly one layer (observed: a 6 GB card capped to
+    //    4.9 GB of share got a 5.9 GB allocation -> load abort); shrink every
+    //    cap by one layer's worth.
     {
-        uint32_t n_layer = 0;
+        uint32_t n_layer   = 0;
+        double   kv_per_tok = 0.0; // bytes per context token, summed over all layers
         gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
         gguf_context * g = gguf_init_from_file(params.model.path.c_str(), gp);
+        uint32_t n_ctx_train = 0;
         if (g != nullptr) {
             const int64_t k_arch = gguf_find_key(g, "general.architecture");
             if (k_arch >= 0) {
-                const std::string key = std::string(gguf_get_val_str(g, k_arch)) + ".block_count";
-                const int64_t k_bc = gguf_find_key(g, key.c_str());
-                if (k_bc >= 0) {
-                    n_layer = gguf_get_val_u32(g, k_bc);
+                const std::string arch = gguf_get_val_str(g, k_arch);
+                auto get_u32 = [&](const char * suffix, uint32_t def) -> uint32_t {
+                    const int64_t k = gguf_find_key(g, (arch + suffix).c_str());
+                    return k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, k) : def;
+                };
+                n_layer     = get_u32(".block_count", 0);
+                n_ctx_train = get_u32(".context_length", 0);
+                const double ts_k = (double) ggml_type_size(params.cache_type_k) / ggml_blck_size(params.cache_type_k);
+                const double ts_v = (double) ggml_type_size(params.cache_type_v) / ggml_blck_size(params.cache_type_v);
+                const uint32_t kv_lora_rank = get_u32(".attention.kv_lora_rank", 0);
+                if (kv_lora_rank > 0) {
+                    // MLA: one shared latent (rank + rope dims) per layer, no V cache
+                    kv_per_tok = (double) n_layer * (kv_lora_rank + get_u32(".rope.dimension_count", 0)) * ts_k;
+                } else {
+                    const uint32_t n_head   = get_u32(".attention.head_count", 1);
+                    const uint32_t n_embd   = get_u32(".embedding_length", 0);
+                    const uint32_t len_k    = get_u32(".attention.key_length",   n_head > 0 ? n_embd / n_head : 0);
+                    const uint32_t len_v    = get_u32(".attention.value_length", n_head > 0 ? n_embd / n_head : 0);
+                    // head_count_kv is per-layer for hybrid models (0 on recurrent layers)
+                    double hckv_sum = 0.0;
+                    const int64_t k_hckv = gguf_find_key(g, (arch + ".attention.head_count_kv").c_str());
+                    if (k_hckv >= 0 && gguf_get_kv_type(g, k_hckv) == GGUF_TYPE_ARRAY &&
+                        gguf_get_arr_type(g, k_hckv) == GGUF_TYPE_UINT32) {
+                        const uint32_t * a = (const uint32_t *) gguf_get_arr_data(g, k_hckv);
+                        const size_t an = std::min<size_t>(gguf_get_arr_n(g, k_hckv), n_layer);
+                        for (size_t i = 0; i < an; ++i) {
+                            hckv_sum += a[i];
+                        }
+                    } else {
+                        hckv_sum = (double) n_layer * get_u32(".attention.head_count_kv", n_head);
+                    }
+                    kv_per_tok = hckv_sum * (len_k * ts_k + len_v * ts_v);
                 }
             }
             gguf_free(g);
         }
+        const uint32_t n_ctx = params.n_ctx > 0 ? (uint32_t) params.n_ctx : (n_ctx_train > 0 ? n_ctx_train : 4096);
+        const double kv_bytes = kv_per_tok * n_ctx;
+        constexpr double MiB = 1024.0 * 1024.0;
+        double compute_bytes = std::min(2048.0 * MiB, std::max(512.0 * MiB, 0.02 * w_bytes));
+        if (const char * env = getenv("LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB")) {
+            compute_bytes = atof(env) * MiB;
+        }
         // unreadable header: assume few (= large) layers so the margin over-covers
         const double layer_bytes = w_bytes / std::max<uint32_t>(n_layer, 24);
+        // KV follows the layer share, so it scales caps from weight space to
+        // weight+kv space; the compute allowance is flat per device
+        const double kv_scale = w_bytes / (w_bytes + kv_bytes);
         for (size_t i = 0; i < n; ++i) {
-            cap_bytes[i] = std::max(0.0, cap_bytes[i] - layer_bytes);
+            cap_bytes[i] = std::max(0.0, (cap_bytes[i] - compute_bytes) * kv_scale - layer_bytes);
         }
+        LOG_INF("--rpc-auto-weight: reserving %.0f MiB KV total (n_ctx %u) + %.0f MiB compute headroom per device\n",
+                kv_bytes / MiB, n_ctx, compute_bytes / MiB);
     }
 
     // shares proportional to score, water-filled against per-device capacity

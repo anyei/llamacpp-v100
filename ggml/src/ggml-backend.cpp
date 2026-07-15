@@ -2074,10 +2074,12 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->buffer == NULL);
     GGML_ASSERT(tensor->view_src != NULL);
     GGML_ASSERT(tensor->view_src->buffer != NULL);
-    GGML_ASSERT(tensor->view_src->data != NULL);
+    // a zero-byte tensor in an empty (dummy) chunk has no data; views of it are
+    // zero-byte themselves and keep a NULL data pointer
+    GGML_ASSERT(tensor->view_src->data != NULL || ggml_nbytes(tensor) == 0);
 
     tensor->buffer = tensor->view_src->buffer;
-    tensor->data = (char *)tensor->view_src->data + tensor->view_offs;
+    tensor->data = tensor->view_src->data != NULL ? (char *)tensor->view_src->data + tensor->view_offs : NULL;
     return ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
 }
 
