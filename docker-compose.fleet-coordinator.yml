@@ -54,7 +54,8 @@ services:
       # TASKS.md #35d: COORD_FLEET_ADMIN=1 + COORD_API_KEY enable restarting
       # workers from the web UI's Fleet section (POST /fleet/worker/restart)
       - LLAMA_ARG_FLEET_ADMIN${COORD_FLEET_ADMIN:+=1}
-      - LLAMA_ARG_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
+      # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
+      - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server
     command: >
       -m /models/${COORD_MODEL:-Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}

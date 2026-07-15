@@ -48,7 +48,8 @@ services:
       # default). Both unset = open on the trusted LAN, restart disabled. Same
       # COORD_* names as docker-compose.fleet-coordinator.yml. Needs the 4.7 image.
       - LLAMA_ARG_FLEET_ADMIN${COORD_FLEET_ADMIN:+=1}
-      - LLAMA_ARG_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
+      # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
+      - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server
     command: >
       -m /models/${EP_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}

@@ -21,7 +21,7 @@
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
 
-COORD_IMAGE=llamacpp-local-v100:286d2def1 \
+COORD_IMAGE=llamacpp-local-v100:94b7ba5dc \
 COORD_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
@@ -30,6 +30,7 @@ COORD_UB=256 \
 COORD_BATCH=256 \
 COORD_PORT=8099 \
 COORD_API_KEY=anyei \
+COORD_FLEET_ADMIN=1 \
   docker compose -f docker-compose.fleet-coordinator.yml up
 
 # Fleet UI + chat:  http://<this-box>:8099/   (EP static run stays on :8098)
