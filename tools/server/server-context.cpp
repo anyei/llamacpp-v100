@@ -926,9 +926,10 @@ public:
         // layer_map snapshot is the ACTUAL assignment; this one is the plan.
         struct planned_dev_t {
             std::string name;
-            std::string endpoint;   // empty = local device
-            double      split_frac; // normalized share of the split (0..1)
-            int32_t     n_layers;   // predicted repeating layers; -1 = n/a (tensor mode)
+            std::string endpoint;      // empty = local device
+            double      split_frac;    // normalized share of the split (0..1)
+            int32_t     n_layers;      // predicted repeating layers; -1 = n/a (tensor mode)
+            bool        worker_is_cpu; // RPC device backed by the worker's CPU/RAM
         };
         std::string                load_model_name;
         size_t                     load_model_bytes = 0;
@@ -1205,11 +1206,18 @@ private:
         }
 
         typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
+        typedef bool (*worker_is_cpu_t)(ggml_backend_dev_t);
         static const dev_endpoint_t dev_endpoint_fn = []() {
             ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
             return reg != nullptr
                 ? (dev_endpoint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint")
                 : (dev_endpoint_t) nullptr;
+        }();
+        static const worker_is_cpu_t worker_is_cpu_fn = []() {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg != nullptr
+                ? (worker_is_cpu_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_worker_is_cpu")
+                : (worker_is_cpu_t) nullptr;
         }();
 
         std::lock_guard<std::mutex> lock(fleet.mutex);
@@ -1225,6 +1233,7 @@ private:
                 ep != nullptr ? ep : "",
                 split_sum > 0.0 ? splits[i] / split_sum : 0.0,
                 layers[i],
+                ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
             });
         }
     }
@@ -5032,6 +5041,18 @@ void server_routes::init_routes() {
                 const char * ep     = procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
                 const bool   is_rpc = ep != nullptr;
                 const bool   failed = is_rpc && procs.dev_failed != nullptr && procs.dev_failed(dev);
+                // a GPU worker's CPU sibling shares the endpoint; the per-endpoint
+                // score was measured on the GPU and must not be shown on the sibling
+                bool cpu_sibling = false;
+                if (is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)) {
+                    for (ggml_backend_dev_t other : devs) {
+                        const char * oep = other != dev ? procs.dev_endpoint(other) : nullptr;
+                        if (oep != nullptr && strcmp(oep, ep) == 0 && !procs.dev_worker_is_cpu(other)) {
+                            cpu_sibling = true;
+                            break;
+                        }
+                    }
+                }
                 // bounded reachability, never the blocking cached-socket path: one dead
                 // worker must not stall this handler (it polls every 2s from the UI)
                 const bool   reachable = !is_rpc ? true
@@ -5081,8 +5102,10 @@ void server_routes::init_routes() {
                             break;
                         }
                     }
-                    if (auto score = fleet_worker_score(ep, payload, !reachable)) {
-                        d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                    if (!cpu_sibling) {
+                        if (auto score = fleet_worker_score(ep, payload, !reachable)) {
+                            d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                        }
                     }
                 }
                 devices.push_back(std::move(d));
@@ -5172,12 +5195,14 @@ void server_routes::init_routes() {
             }
             json load_workers = json::array();
             auto push_worker = [&](const std::string & name, const std::string & ep,
-                                   double split_frac, int32_t n_layers) {
+                                   double split_frac, int32_t n_layers, json worker_is_cpu,
+                                   bool suppress_score) {
                 json w = {
                     {"name",       name},
                     {"endpoint",   ep.empty() ? json(nullptr) : json(ep)},
                     {"split_frac", split_frac > 0.0 ? json(split_frac) : json(nullptr)},
                     {"n_layers",   n_layers >= 0 ? json(n_layers) : json(nullptr)},
+                    {"worker_is_cpu", std::move(worker_is_cpu)}, // null = unknown (unplanned endpoint)
                     {"score",      nullptr},
                     {"free_mib",   nullptr},
                     {"bytes_sent", nullptr},
@@ -5199,8 +5224,10 @@ void server_routes::init_routes() {
                             w["free_mib"] = (int64_t) *v;
                         }
                     }
-                    if (auto score = fleet_worker_score(ep, payload, false)) {
-                        w["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                    if (!suppress_score) {
+                        if (auto score = fleet_worker_score(ep, payload, false)) {
+                            w["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                        }
                     }
                 }
                 load_workers.push_back(std::move(w));
@@ -5210,12 +5237,21 @@ void server_routes::init_routes() {
                 if (!p.endpoint.empty()) {
                     planned_eps.insert(p.endpoint);
                 }
-                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers);
+                bool sibling = false;
+                if (p.worker_is_cpu && !p.endpoint.empty()) {
+                    for (const auto & q : load_plan) {
+                        if (&q != &p && q.endpoint == p.endpoint && !q.worker_is_cpu) {
+                            sibling = true;
+                            break;
+                        }
+                    }
+                }
+                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers, p.worker_is_cpu, sibling);
             }
             // endpoints with traffic but no plan entry (e.g. a draft model's worker)
             for (const auto & [ep, st] : live) {
                 if (planned_eps.count(ep) == 0) {
-                    push_worker(ep, ep, 0.0, -1);
+                    push_worker(ep, ep, 0.0, -1, nullptr, false);
                 }
             }
             body["load_workers"] = std::move(load_workers);

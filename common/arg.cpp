@@ -1299,9 +1299,13 @@ static void apply_rpc_auto_weight(common_params & params) {
     LOG_INF("--rpc-auto-weight: split by measured speed (capacity-capped):\n");
     for (size_t i = 0; i < n; ++i) {
         params.tensor_split[i] = (float) share[i];
-        LOG_INF("  %-8s %s %6.2f GB/s -> %5.1f%%%s\n",
+        // device-kind postfix (TASKS.md #36): worker-CPU devices masquerade as
+        // GPUs to the backend, make the kind visible where icons can't be
+        const char * kind = i < n_rpc ? (worker_is_cpu_fn(devs[i]) ? "(cpu)" : "(gpu)") : "(gpu)";
+        LOG_INF("  %-8s %s %s %6.2f GB/s -> %5.1f%%%s\n",
                 ggml_backend_dev_name(devs[i]),
                 i < n_rpc ? dev_endpoint_fn(devs[i]) : "(local)",
+                kind,
                 score[i], 100.0 * share[i] / (share_sum > 0 ? share_sum : 1.0),
                 capped[i] ? " (memory-capped)" : "");
     }

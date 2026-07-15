@@ -26,6 +26,24 @@
 	let rpcDevices = $derived(devices.filter((device) => device.is_rpc));
 	let hasRpcDevices = $derived(rpcDevices.length > 0);
 
+	// a worker can expose several devices on one endpoint (e.g. -d CUDA0,CPU);
+	// count + index them so sibling cards read as one box with two roles
+	let endpointSiblings = $derived.by(() => {
+		const counts: Record<string, number> = {};
+		for (const device of devices) {
+			if (device.endpoint) counts[device.endpoint] = (counts[device.endpoint] ?? 0) + 1;
+		}
+		const seen: Record<string, number> = {};
+		const index: Record<string, number> = {};
+		for (const device of devices) {
+			if (device.endpoint && (counts[device.endpoint] ?? 0) > 1) {
+				seen[device.endpoint] = (seen[device.endpoint] ?? 0) + 1;
+				index[device.name] = seen[device.endpoint];
+			}
+		}
+		return { counts, index };
+	});
+
 	let modelName = $derived.by(() => {
 		const path = status?.model?.path;
 		if (!path) return null;
@@ -51,8 +69,10 @@
 		}
 
 		if (fastest !== slowest) {
-			ranks[fastest.endpoint!] = 'fastest';
-			ranks[slowest.endpoint!] = 'slowest';
+			// key by device name, not endpoint: a GPU worker's CPU sibling shares
+			// the endpoint and must not inherit the GPU's rank badge
+			ranks[fastest.name] = 'fastest';
+			ranks[slowest.name] = 'slowest';
 		}
 
 		return ranks;
@@ -240,7 +260,11 @@
 							{device}
 							fleetAdmin={status?.fleet_admin ?? false}
 							rates={fleetStore.getRates(device.endpoint)}
-							rank={device.endpoint ? (deviceRanks[device.endpoint] ?? null) : null}
+							rank={deviceRanks[device.name] ?? null}
+							siblingIndex={endpointSiblings.index[device.name] ?? null}
+							siblingCount={device.endpoint
+								? (endpointSiblings.counts[device.endpoint] ?? null)
+								: null}
 							onShowLogs={showLogs}
 						/>
 					{/each}

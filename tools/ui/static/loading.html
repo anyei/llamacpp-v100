@@ -66,7 +66,8 @@
 				background: var(--card); padding: 0.6rem 0.75rem; margin-bottom: 0.5rem;
 			}
 			.wrow { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-			.ep { font-weight: 600; font-size: 0.85rem; }
+			.ep { font-weight: 600; font-size: 0.85rem; display: inline-flex; align-items: center; gap: 0.4rem; }
+			.ep svg { width: 0.95rem; height: 0.95rem; flex: none; color: var(--muted); }
 			.rate { font-size: 0.85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 			.meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
 			.empty { color: var(--muted); font-size: 0.8rem; padding: 0.75rem 0; }
@@ -100,6 +101,27 @@
 				return String(s).replace(/[&<>"]/g, (c) =>
 					({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]
 				);
+			}
+
+			// device-kind icons (lucide Gpu / Cpu, inlined - no libraries on this page)
+			const SVG_OPEN =
+				'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+				'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
+			const ICON_GPU = SVG_OPEN +
+				'<path d="M2 21V3"/><path d="M2 5h18a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2.26"/>' +
+				'<path d="M7 17v3a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-3"/>' +
+				'<circle cx="16" cy="11" r="2"/><circle cx="8" cy="11" r="2"/></svg>';
+			const ICON_CPU = SVG_OPEN +
+				'<path d="M12 20v2"/><path d="M12 2v2"/><path d="M17 20v2"/><path d="M17 2v2"/>' +
+				'<path d="M2 12h2"/><path d="M2 17h2"/><path d="M2 7h2"/><path d="M20 12h2"/>' +
+				'<path d="M20 17h2"/><path d="M20 7h2"/><path d="M7 20v2"/><path d="M7 2v2"/>' +
+				'<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="8" y="8" width="8" height="8" rx="1"/></svg>';
+
+			function kindIcon(w) {
+				// worker_is_cpu: true = worker CPU/RAM, false = GPU, null/undefined = unknown
+				if (w.worker_is_cpu === true) return ICON_CPU;
+				if (w.worker_is_cpu === false) return ICON_GPU;
+				return w.endpoint ? '' : ICON_GPU; // local pipeline devices are GPUs
 			}
 
 			function fmtBytes(n) {
@@ -184,7 +206,7 @@
 						: (w.endpoint ? 'waiting for first transfer…' : 'local device');
 					return (
 						'<div class="worker"><div class="wrow">' +
-						'<span class="ep">' + esc(label) + '</span>' +
+						'<span class="ep">' + kindIcon(w) + esc(label) + '</span>' +
 						'<span class="rate">' + rate + '</span></div>' +
 						'<div class="badges">' + badges.join('') + '</div>' +
 						'<div class="meta">' + meta + '</div></div>'

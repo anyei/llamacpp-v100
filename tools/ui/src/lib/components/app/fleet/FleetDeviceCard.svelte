@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { RotateCcw, ScrollText } from '@lucide/svelte';
+	import { Cpu, Gpu, RotateCcw, ScrollText } from '@lucide/svelte';
 	import { toast } from 'svelte-sonner';
 	import * as Card from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
@@ -15,10 +15,26 @@
 		fleetAdmin: boolean;
 		rates?: FleetEndpointRates;
 		rank?: 'fastest' | 'slowest' | null;
+		/** 1-based position among devices sharing this endpoint, when > 1 total. */
+		siblingIndex?: number | null;
+		/** How many devices this worker (endpoint) exposes. */
+		siblingCount?: number | null;
 		onShowLogs?: (endpoint: string) => void;
 	}
 
-	let { device, fleetAdmin, rates, rank = null, onShowLogs }: Props = $props();
+	let {
+		device,
+		fleetAdmin,
+		rates,
+		rank = null,
+		siblingIndex = null,
+		siblingCount = null,
+		onShowLogs
+	}: Props = $props();
+
+	// worker-CPU devices masquerade as GPUs to the backend; the flag is the truth
+	let KindIcon = $derived(device.worker_is_cpu ? Cpu : Gpu);
+	let kindLabel = $derived(device.worker_is_cpu ? 'CPU (worker RAM)' : 'GPU');
 
 	let showRestartDialog = $state(false);
 	let isRestarting = $state(false);
@@ -84,7 +100,9 @@
 	<div class="flex items-start justify-between gap-2">
 		<div class="min-w-0">
 			<div class="flex items-center gap-2">
-				<h3 class="truncate text-sm font-semibold">{device.name}</h3>
+				<KindIcon class="h-4 w-4 shrink-0 text-muted-foreground" aria-label={kindLabel} />
+
+				<h3 class="truncate text-sm font-semibold" title={kindLabel}>{device.name}</h3>
 
 				<div class="flex items-center gap-1.5" title={statusText()}>
 					<div class="h-2 w-2 shrink-0 rounded-full {statusColor()}"></div>
@@ -109,6 +127,16 @@
 
 			{#if device.worker_is_cpu}
 				<Badge variant="tertiary" class="text-[10px]">CPU (RAM)</Badge>
+			{/if}
+
+			{#if siblingCount != null && siblingCount > 1 && siblingIndex != null}
+				<Badge
+					variant="outline"
+					class="text-[10px]"
+					title="this worker exposes {siblingCount} devices on {device.endpoint}"
+				>
+					box {siblingIndex}/{siblingCount}
+				</Badge>
 			{/if}
 
 			{#if device.score}
