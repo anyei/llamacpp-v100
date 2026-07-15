@@ -63,5 +63,7 @@ services:
       -ngl 99
       -sm layer
       -c ${COORD_CTX:-16384}
+      -ub ${COORD_UB:-512}
+      -b ${COORD_BATCH:-2048}
       --no-mmap
     restart: unless-stopped
