@@ -15,12 +15,12 @@
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
 
-COORD_IMAGE=llamacpp-local-v100:2a64d2cc6 \
+COORD_IMAGE=llamacpp-local-v100:279269489 \
 COORD_API_KEY=anyei \
 EP_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 EP_WORKERS=10.5.5.11:50052,10.5.5.15:50052 \
 EP_DEVICES=CUDA0,CUDA1,RPC0,RPC2 \
-EP_TS=0,0,3,2 \
+EP_TS=0,3,3,2 \
 EP_CTX=4096 \
 EP_PORT=8098 \
 COORD_GPU=0,1 \
