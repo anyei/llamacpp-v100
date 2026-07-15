@@ -21,10 +21,10 @@
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
 
-COORD_IMAGE=llamacpp-local-v100:68d91c065 \
+COORD_IMAGE=llamacpp-local-v100:3b49fe6da \
 COORD_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 COORD_AUTO_WEIGHT=1 \
-COORD_GPUS=0 \
+COORD_GPUS=0,1 \
 COORD_CTX=4096 \
 COORD_UB=256 \
 COORD_BATCH=256 \

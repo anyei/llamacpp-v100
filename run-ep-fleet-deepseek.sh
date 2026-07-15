@@ -15,16 +15,16 @@
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
 
-COORD_IMAGE=llamacpp-local-v100:68d91c065 \
+COORD_IMAGE=llamacpp-local-v100:3b49fe6da \
 COORD_API_KEY=anyei \
 EP_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 EP_WORKERS=10.5.5.11:50052,10.5.5.15:50052 \
-EP_DEVICES=CUDA0,RPC0,RPC2 \
-EP_TS=0,3,2 \
+EP_DEVICES=CUDA0,CUDA1,RPC0,RPC2 \
+EP_TS=0,0,3,2 \
 EP_CTX=4096 \
 EP_PORT=8098 \
-COORD_GPU=0 \
-  docker compose -f docker-compose.ep-fleet.yml up
+COORD_GPU=0,1 \
+  docker compose -f docker-compose.ep-fleet.yml up --force-recreate
 
 echo
 echo "Coordinator up. Fleet UI + chat:  http://$(hostname -I | awk '{print $1}'):8098/"
