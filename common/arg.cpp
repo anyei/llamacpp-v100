@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "gguf.h" // model header read (block_count) for --rpc-auto-weight's layer-granularity margin
 #include "json-schema-to-grammar.h"
 #include "log.h"
 #include "sampling.h"
@@ -1083,15 +1084,18 @@ static void apply_rpc_auto_weight(common_params & params) {
     typedef bool (*get_score_t)(const char * endpoint, float * bw_gbps, float * mm_gflops);
     typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t dev);
     typedef bool (*benchmark_t)(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops);
-    get_score_t    get_score_fn    = nullptr;
-    dev_endpoint_t dev_endpoint_fn = nullptr;
-    benchmark_t    benchmark_fn    = nullptr;
+    typedef bool (*worker_is_cpu_t)(ggml_backend_dev_t dev);
+    get_score_t     get_score_fn     = nullptr;
+    dev_endpoint_t  dev_endpoint_fn  = nullptr;
+    benchmark_t     benchmark_fn     = nullptr;
+    worker_is_cpu_t worker_is_cpu_fn = nullptr;
     if (rpc_reg != nullptr) {
-        get_score_fn    = (get_score_t)    ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_worker_score");
-        dev_endpoint_fn = (dev_endpoint_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_endpoint");
-        benchmark_fn    = (benchmark_t)    ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_benchmark_device");
+        get_score_fn     = (get_score_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_worker_score");
+        dev_endpoint_fn  = (dev_endpoint_t)  ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_endpoint");
+        benchmark_fn     = (benchmark_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_benchmark_device");
+        worker_is_cpu_fn = (worker_is_cpu_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_worker_is_cpu");
     }
-    if (get_score_fn == nullptr || dev_endpoint_fn == nullptr || benchmark_fn == nullptr) {
+    if (get_score_fn == nullptr || dev_endpoint_fn == nullptr || benchmark_fn == nullptr || worker_is_cpu_fn == nullptr) {
         LOG_WRN("--rpc-auto-weight: RPC backend hooks unavailable, skipping\n");
         return;
     }
@@ -1157,6 +1161,28 @@ static void apply_rpc_auto_weight(common_params & params) {
         float bw = 0.0f, fl = 0.0f;
         if (i < n_rpc) {
             const char * ep = dev_endpoint_fn(devs[i]);
+            // a worker exposing GPU+CPU (rpc-server -d CUDA0,CPU) publishes ONE
+            // score, measured on its PRIMARY device - crediting the CPU sibling
+            // with the GPU's bandwidth mis-weighted it ~10x (observed: a laptop
+            // CPU handed 18% of an 87 GB model). The sibling gets no layer share;
+            // its role is the KV annex / spillover, not a scored pipeline stage.
+            bool is_cpu_sibling = false;
+            if (ep != nullptr && worker_is_cpu_fn(devs[i])) {
+                for (size_t j = 0; j < n_rpc; ++j) {
+                    const char * ep_j = j != i ? dev_endpoint_fn(devs[j]) : nullptr;
+                    if (ep_j != nullptr && strcmp(ep_j, ep) == 0 && !worker_is_cpu_fn(devs[j])) {
+                        is_cpu_sibling = true;
+                        break;
+                    }
+                }
+            }
+            if (is_cpu_sibling) {
+                LOG_WRN("--rpc-auto-weight: %s (%s) is the worker's CPU sibling of a GPU device - "
+                        "the worker's score belongs to the GPU, giving the sibling no layer share\n",
+                        ggml_backend_dev_name(devs[i]), ep);
+                score[i] = 0.0;
+                continue;
+            }
             if (ep == nullptr || !get_score_fn(ep, &bw, &fl)) {
                 LOG_WRN("--rpc-auto-weight: worker %s has no score (run rpc-server with --score); "
                         "falling back to the default memory-proportional split\n", ep ? ep : "?");
@@ -1188,6 +1214,32 @@ static void apply_rpc_auto_weight(common_params & params) {
         LOG_WRN("--rpc-auto-weight: model file '%s' not readable yet (remote model?); "
                 "cannot size the memory caps, keeping the default split\n", params.model.path.c_str());
         return;
+    }
+
+    // -sm layer allocates WHOLE layers: a fractional-share cap can round UP by
+    // nearly one layer of real tensors and overflow a tight device (observed: a
+    // 6 GB card capped to 4.9 GB of share got a 5.9 GB allocation -> load abort).
+    // Shrink every cap by one layer's worth so the rounded allocation still fits.
+    {
+        uint32_t n_layer = 0;
+        gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+        gguf_context * g = gguf_init_from_file(params.model.path.c_str(), gp);
+        if (g != nullptr) {
+            const int64_t k_arch = gguf_find_key(g, "general.architecture");
+            if (k_arch >= 0) {
+                const std::string key = std::string(gguf_get_val_str(g, k_arch)) + ".block_count";
+                const int64_t k_bc = gguf_find_key(g, key.c_str());
+                if (k_bc >= 0) {
+                    n_layer = gguf_get_val_u32(g, k_bc);
+                }
+            }
+            gguf_free(g);
+        }
+        // unreadable header: assume few (= large) layers so the margin over-covers
+        const double layer_bytes = w_bytes / std::max<uint32_t>(n_layer, 24);
+        for (size_t i = 0; i < n; ++i) {
+            cap_bytes[i] = std::max(0.0, cap_bytes[i] - layer_bytes);
+        }
     }
 
     // shares proportional to score, water-filled against per-device capacity
