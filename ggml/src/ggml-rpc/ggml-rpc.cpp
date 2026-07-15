@@ -608,11 +608,15 @@ struct rpc_ep_stat {
     }
 };
 
+// file-scope so the per-endpoint enumerator (fleet load view) can walk it; an
+// endpoint appears the moment the client first connects to it, so during a
+// streamed first load this map IS the live list of workers receiving weights.
+static std::mutex g_rpc_ep_stat_mutex;
+static std::unordered_map<std::string, std::unique_ptr<rpc_ep_stat>> g_rpc_ep_stats;
+
 static rpc_ep_stat * rpc_ep_stat_get(const std::string & endpoint) {
-    static std::mutex mutex;
-    static std::unordered_map<std::string, std::unique_ptr<rpc_ep_stat>> stats;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto & e = stats[endpoint];
+    std::lock_guard<std::mutex> lock(g_rpc_ep_stat_mutex);
+    auto & e = g_rpc_ep_stats[endpoint];
     if (!e) {
         e = std::make_unique<rpc_ep_stat>();
     }
@@ -629,6 +633,33 @@ bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_
     out->n_calls         = st->n_calls.load(std::memory_order_relaxed);
     out->ewma_latency_us = st->ewma_latency_us.load(std::memory_order_relaxed);
     return true;
+}
+
+// enumerate every endpoint the client has talked to, with its live counters
+// (TASKS.md #35a load view). Race-free: no model-thread state, just the global
+// stats map - safe to call from an HTTP thread while the model is still loading.
+void ggml_backend_rpc_foreach_endpoint_stat(
+        void (*cb)(const char * endpoint, const struct ggml_backend_rpc_ep_stats * st, void * user_data),
+        void * user_data) {
+    if (cb == nullptr) {
+        return;
+    }
+    std::vector<std::pair<std::string, ggml_backend_rpc_ep_stats>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_ep_stat_mutex);
+        snapshot.reserve(g_rpc_ep_stats.size());
+        for (const auto & [ep, st] : g_rpc_ep_stats) {
+            ggml_backend_rpc_ep_stats s;
+            s.bytes_sent      = st->bytes_sent.load(std::memory_order_relaxed);
+            s.bytes_recv      = st->bytes_recv.load(std::memory_order_relaxed);
+            s.n_calls         = st->n_calls.load(std::memory_order_relaxed);
+            s.ewma_latency_us = st->ewma_latency_us.load(std::memory_order_relaxed);
+            snapshot.emplace_back(ep, s);
+        }
+    }
+    for (const auto & [ep, s] : snapshot) {
+        cb(ep.c_str(), &s, user_data);
+    }
 }
 
 // worker-side log ring served by RPC_CMD_GET_LOG (TASKS.md #35c). rpc-server wires
@@ -4741,6 +4772,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_endpoint_stats") == 0) {
         return (void *)ggml_backend_rpc_endpoint_stats;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_foreach_endpoint_stat") == 0) {
+        return (void *)ggml_backend_rpc_foreach_endpoint_stat;
     }
     if (std::strcmp(name, "ggml_backend_rpc_endpoint_reachable") == 0) {
         return (void *)ggml_backend_rpc_endpoint_reachable;

@@ -1,12 +1,149 @@
 <!DOCTYPE html>
-<html>
-    <head>
-        <meta http-equiv="refresh" content="5">
-    </head>
-    <body>
-        <div id="loading">
-            The model is loading. Please wait.<br/>
-            The user interface will appear soon.
-        </div>
-    </body>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Loading model…</title>
+		<style>
+			:root {
+				color-scheme: light dark;
+				--bg: #ffffff;
+				--fg: #0a0a0a;
+				--muted: #6b7280;
+				--card: #f4f4f5;
+				--border: #e4e4e7;
+				--bar: #18181b;
+				--track: #e4e4e7;
+				--ok: #16a34a;
+			}
+			@media (prefers-color-scheme: dark) {
+				:root {
+					--bg: #09090b;
+					--fg: #fafafa;
+					--muted: #a1a1aa;
+					--card: #18181b;
+					--border: #27272a;
+					--bar: #fafafa;
+					--track: #27272a;
+					--ok: #22c55e;
+				}
+			}
+			* { box-sizing: border-box; }
+			body {
+				margin: 0;
+				font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+				background: var(--bg);
+				color: var(--fg);
+				display: flex;
+				justify-content: center;
+				padding: 2rem 1rem;
+			}
+			main { width: 100%; max-width: 46rem; }
+			h1 { font-size: 1.15rem; margin: 0 0 0.25rem; display: flex; align-items: center; gap: 0.5rem; }
+			.dot {
+				width: 0.6rem; height: 0.6rem; border-radius: 50%;
+				background: var(--ok); flex: none;
+				animation: pulse 1.2s ease-in-out infinite;
+			}
+			@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+			.sub { color: var(--muted); font-size: 0.8rem; margin: 0 0 1.25rem; }
+			.stage { font-size: 0.8rem; color: var(--muted); margin: 0 0 0.35rem; }
+			.track {
+				height: 0.5rem; border-radius: 0.5rem; background: var(--track);
+				overflow: hidden; margin-bottom: 1.5rem;
+			}
+			.track > div {
+				height: 100%; background: var(--bar); border-radius: 0.5rem;
+				width: 0%; transition: width 0.4s ease;
+			}
+			h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 0.5rem; }
+			.worker {
+				border: 1px solid var(--border); border-radius: 0.5rem;
+				background: var(--card); padding: 0.6rem 0.75rem; margin-bottom: 0.5rem;
+			}
+			.wrow { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+			.ep { font-weight: 600; font-size: 0.85rem; }
+			.rate { font-size: 0.85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+			.meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
+			.empty { color: var(--muted); font-size: 0.8rem; padding: 0.75rem 0; }
+		</style>
+	</head>
+	<body>
+		<main>
+			<h1><span class="dot"></span>Loading model across the fleet</h1>
+			<p class="sub">The UI will open automatically when the model is ready.</p>
+
+			<div class="stage" id="stage">Initializing…</div>
+			<div class="track"><div id="bar"></div></div>
+
+			<h2>Workers receiving weights</h2>
+			<div id="workers"><div class="empty">Connecting to workers…</div></div>
+		</main>
+
+		<script>
+			// remember each endpoint's last byte count + time to derive MB/s
+			const prev = Object.create(null);
+			const MiB = 1024 * 1024;
+
+			function fmtBytes(n) {
+				if (n >= 1024 * MiB) return (n / (1024 * MiB)).toFixed(2) + ' GB';
+				if (n >= MiB) return (n / MiB).toFixed(1) + ' MB';
+				if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+				return n + ' B';
+			}
+
+			async function tick() {
+				let d;
+				try {
+					const r = await fetch('./fleet/status', { cache: 'no-store' });
+					if (!r.ok) throw new Error(r.status);
+					d = await r.json();
+				} catch (e) {
+					return; // server not answering yet — keep the current view, retry
+				}
+
+				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading') {
+					location.href = './'; // ready/sleeping — the real UI is served now
+					return;
+				}
+
+				const lp = d.load_progress || {};
+				document.getElementById('stage').textContent =
+					'Stage: ' + (lp.stage || '…') +
+					(typeof lp.value === 'number' ? '  ·  ' + Math.round(lp.value * 100) + '%' : '');
+				document.getElementById('bar').style.width =
+					(typeof lp.value === 'number' ? Math.max(2, lp.value * 100) : 2) + '%';
+
+				const now = performance.now();
+				const workers = Array.isArray(d.load_workers) ? d.load_workers.slice() : [];
+				workers.sort((a, b) => (a.endpoint < b.endpoint ? -1 : 1));
+
+				const host = document.getElementById('workers');
+				if (workers.length === 0) {
+					host.innerHTML = '<div class="empty">Connecting to workers…</div>';
+					return;
+				}
+				host.innerHTML = workers.map((w) => {
+					const p = prev[w.endpoint];
+					let rate = '—';
+					if (p && now > p.t) {
+						const bps = ((w.bytes_sent - p.bytes) / (now - p.t)) * 1000; // bytes/s
+						rate = bps > 0 ? (bps / MiB).toFixed(1) + ' MB/s' : 'idle';
+					}
+					prev[w.endpoint] = { bytes: w.bytes_sent, t: now };
+					const lat = w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—';
+					return (
+						'<div class="worker"><div class="wrow">' +
+						'<span class="ep">' + w.endpoint + '</span>' +
+						'<span class="rate">' + rate + '</span></div>' +
+						'<div class="meta">' + fmtBytes(w.bytes_sent) + ' uploaded · ' +
+						w.calls + ' calls · rtt ' + lat + '</div></div>'
+					);
+				}).join('');
+			}
+
+			tick();
+			setInterval(tick, 1500);
+		</script>
+	</body>
 </html>

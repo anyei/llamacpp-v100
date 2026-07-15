@@ -123,6 +123,12 @@ struct ggml_backend_rpc_ep_stats {
 };
 GGML_BACKEND_API bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_rpc_ep_stats * out);
 
+// enumerate all endpoints the client has connected to, with live counters. Safe to
+// call while a model is still loading (used for the Fleet UI's per-worker load view).
+GGML_BACKEND_API void ggml_backend_rpc_foreach_endpoint_stat(
+    void (*cb)(const char * endpoint, const struct ggml_backend_rpc_ep_stats * st, void * user_data),
+    void * user_data);
+
 #ifdef  __cplusplus
 }
 #endif

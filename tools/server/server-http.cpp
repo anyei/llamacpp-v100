@@ -183,6 +183,11 @@ bool server_http_context::init(const common_params & params) {
             "/models",
             "/v1/models",
             "/",
+            // fleet status is monitoring-only (topology/progress, same info the
+            // unauthenticated LAN beacons already carry) - keep it key-free so the
+            // loading page can show per-worker load progress before the model is
+            // ready. The sensitive fleet ops (/fleet/worker/log, .../restart) stay gated.
+            "/fleet/status",
         };
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
             endpoints.insert("/" + a.name);
@@ -249,6 +254,12 @@ bool server_http_context::init(const common_params & params) {
                 req.path == "/" || (!tmp.empty() && tmp.back() == "html")) {
                 if (const llama_ui_asset * a = llama_ui_find_asset("loading.html")) {
                     res.status = 503;
+                    // the embedded asset is gzip-compressed in a gzip build - it must
+                    // be advertised as such or the browser renders raw gzip bytes
+                    // (every browser sends Accept-Encoding: gzip, so this is safe)
+                    if (llama_ui_use_gzip()) {
+                        res.set_header("Content-Encoding", "gzip");
+                    }
                     res.set_content(reinterpret_cast<const char*>(a->data), a->size, "text/html; charset=utf-8");
                     return false;
                 }

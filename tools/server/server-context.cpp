@@ -4697,6 +4697,7 @@ struct fleet_rpc_procs {
     bool (*shutdown_worker)(const char *)                                           = nullptr;
     bool (*get_score)(const char *, float *, float *)                               = nullptr;
     bool (*reachable)(const char *, int)                                            = nullptr;
+    void (*foreach_ep_stat)(void (*)(const char *, const struct ggml_backend_rpc_ep_stats *, void *), void *) = nullptr;
 };
 
 static const fleet_rpc_procs & fleet_procs() {
@@ -4713,6 +4714,7 @@ static const fleet_rpc_procs & fleet_procs() {
             p.shutdown_worker   = (decltype(p.shutdown_worker))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_shutdown_worker");
             p.get_score         = (decltype(p.get_score))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_worker_score");
             p.reachable         = (decltype(p.reachable))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_reachable");
+            p.foreach_ep_stat   = (decltype(p.foreach_ep_stat))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_foreach_endpoint_stat");
         }
         return p;
     }();
@@ -5009,6 +5011,24 @@ void server_routes::init_routes() {
         }
         if (loading) {
             body["load_progress"] = { {"value", progress}, {"stage", load_stage} };
+        }
+        // per-worker load view (TASKS.md #35a): while the model is loading the
+        // params-gated devices[] is empty, so surface the RPC client's live
+        // per-endpoint counters instead - this is what the loading page polls to
+        // show which worker is still receiving weights and how fast. Race-free
+        // (global RPC state, no model-thread access), so it's valid mid-load.
+        if (!ready && procs.foreach_ep_stat != nullptr) {
+            json load_workers = json::array();
+            procs.foreach_ep_stat([](const char * ep, const ggml_backend_rpc_ep_stats * st, void * ud) {
+                ((json *) ud)->push_back({
+                    {"endpoint",        ep},
+                    {"bytes_sent",      st->bytes_sent},
+                    {"bytes_recv",      st->bytes_recv},
+                    {"calls",           st->n_calls},
+                    {"ewma_latency_us", st->ewma_latency_us},
+                });
+            }, &load_workers);
+            body["load_workers"] = std::move(load_workers);
         }
         res->ok(body);
         return res;
