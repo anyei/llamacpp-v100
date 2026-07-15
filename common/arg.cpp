@@ -1068,11 +1068,15 @@ static void apply_rpc_auto_weight(common_params & params) {
             return;
         }
     }
-    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
-        LOG_WRN("--rpc-auto-weight only applies to -sm layer, skipping\n");
+    // -sm layer: shares are whole-layer pipeline stages. -sm tensor: shares are
+    // the meta device's per-member expert/weight slices (the EP topology,
+    // TASKS.md #28 increment 3 - bandwidth-weighted placement).
+    const bool tensor_mode = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && !tensor_mode) {
+        LOG_WRN("--rpc-auto-weight only applies to -sm layer or -sm tensor, skipping\n");
         return;
     }
-    if (getenv("LLAMA_KV_WORKER_HOST") != nullptr) {
+    if (!tensor_mode && getenv("LLAMA_KV_WORKER_HOST") != nullptr) {
         // KV-annex worker-CPU devices take no layers, which shifts the -ts:device
         // mapping this function predicts - bail rather than mis-weight
         LOG_WRN("--rpc-auto-weight does not compose with LLAMA_KV_WORKER_HOST yet, skipping\n");
@@ -1101,47 +1105,68 @@ static void apply_rpc_auto_weight(common_params & params) {
     }
 
     // the split must line up with the ACTUAL device order the model will use.
-    // With --device set, that order is params.devices verbatim (llama uses it as
-    // given, no reorder/dedup); auto-weighting a different predicted order would
-    // apply each -ts share to the wrong device (OOM or a badly skewed split), so
-    // bail. Without --device, llama auto-discovers registry GPUs RPC-first, which
-    // is what we predict below.
-    if (!params.devices.empty()) {
-        LOG_WRN("--rpc-auto-weight does not compose with an explicit --device list yet "
-                "(set -ts by hand for that case), skipping\n");
-        return;
-    }
+    // With --device set that order is params.devices verbatim (llama uses it as
+    // given, no reorder/dedup), so adopt it directly. Without --device, predict
+    // llama's default discovery below (layer: registry GPUs RPC-first; tensor:
+    // registry order minus CPU-buffer devices).
+    auto dev_is_rpc = [](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+    };
     std::vector<ggml_backend_dev_t> devs;
     std::vector<ggml_backend_dev_t> locals;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-            continue;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev != nullptr) { // the trailing nullptr terminator means "then CPU"
+                devs.push_back(dev);
+            }
         }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+    } else if (tensor_mode) {
+        // llama's tensor branch takes every device whose buffer is not the CPU's,
+        // in plain registry order (no RPC-first reorder, no device_id dedup) -
+        // these become the meta device's members, and -ts maps to them 1:1
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                continue;
+            }
             devs.push_back(dev);
-        } else {
-            // llama dedups local GPUs that report the same device_id (e.g. the same
-            // card exposed via two backends); mirror that so our order matches
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
-            bool dup = false;
-            for (ggml_backend_dev_t seen : locals) {
-                ggml_backend_dev_props sp;
-                ggml_backend_dev_get_props(seen, &sp);
-                if (props.device_id && sp.device_id && strcmp(props.device_id, sp.device_id) == 0) {
-                    dup = true;
-                    break;
+        }
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            if (dev_is_rpc(dev)) {
+                devs.push_back(dev);
+            } else {
+                // llama dedups local GPUs that report the same device_id (e.g. the same
+                // card exposed via two backends); mirror that so our order matches
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                bool dup = false;
+                for (ggml_backend_dev_t seen : locals) {
+                    ggml_backend_dev_props sp;
+                    ggml_backend_dev_get_props(seen, &sp);
+                    if (props.device_id && sp.device_id && strcmp(props.device_id, sp.device_id) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    locals.push_back(dev);
                 }
             }
-            if (!dup) {
-                locals.push_back(dev);
-            }
         }
+        devs.insert(devs.end(), locals.begin(), locals.end());
     }
-    const size_t n_rpc = devs.size();
-    devs.insert(devs.end(), locals.begin(), locals.end());
+    size_t n_rpc = 0;
+    std::vector<bool> is_rpc(devs.size(), false);
+    for (size_t i = 0; i < devs.size(); ++i) {
+        is_rpc[i] = dev_is_rpc(devs[i]);
+        n_rpc += is_rpc[i];
+    }
     const size_t n = devs.size();
     if (n < 2) {
         LOG_INF("--rpc-auto-weight: fewer than 2 split devices, nothing to weight\n");
@@ -1152,24 +1177,45 @@ static void apply_rpc_auto_weight(common_params & params) {
         return;
     }
 
+    // EP topologies dedicate the attention owner (LLAMA_META_ATTN_OWNER=<member>)
+    // to attention/KV via degenerate splits - it gets no expert share
+    int attn_owner = -1;
+    if (tensor_mode) {
+        if (const char * env = getenv("LLAMA_META_ATTN_OWNER")) {
+            attn_owner = atoi(env);
+            if (attn_owner < 0 || attn_owner >= (int) n) {
+                LOG_WRN("--rpc-auto-weight: LLAMA_META_ATTN_OWNER=%d is out of range for %zu members, ignoring\n",
+                        attn_owner, n);
+                attn_owner = -1;
+            }
+        }
+    }
+
     std::vector<double> score(n, 0.0);
     std::vector<double> cap_bytes(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_memory(devs[i], &free_mem, &total_mem);
         cap_bytes[i] = free_mem * 0.9; // headroom for KV/compute buffers
+        if ((int) i == attn_owner) {
+            LOG_INF("--rpc-auto-weight: %s is the attention owner (LLAMA_META_ATTN_OWNER) - no expert share\n",
+                    ggml_backend_dev_name(devs[i]));
+            continue;
+        }
         float bw = 0.0f, fl = 0.0f;
-        if (i < n_rpc) {
+        if (is_rpc[i]) {
             const char * ep = dev_endpoint_fn(devs[i]);
             // a worker exposing GPU+CPU (rpc-server -d CUDA0,CPU) publishes ONE
             // score, measured on its PRIMARY device - crediting the CPU sibling
             // with the GPU's bandwidth mis-weighted it ~10x (observed: a laptop
-            // CPU handed 18% of an 87 GB model). The sibling gets no layer share;
-            // its role is the KV annex / spillover, not a scored pipeline stage.
+            // CPU handed 18% of an 87 GB model). Under -sm layer the sibling gets
+            // no layer share (its role is the KV annex / spillover, not a scored
+            // pipeline stage); under -sm tensor RAM members ARE the point, so the
+            // rule does not apply.
             bool is_cpu_sibling = false;
-            if (ep != nullptr && worker_is_cpu_fn(devs[i])) {
-                for (size_t j = 0; j < n_rpc; ++j) {
-                    const char * ep_j = j != i ? dev_endpoint_fn(devs[j]) : nullptr;
+            if (!tensor_mode && ep != nullptr && worker_is_cpu_fn(devs[i])) {
+                for (size_t j = 0; j < n; ++j) {
+                    const char * ep_j = j != i && is_rpc[j] ? dev_endpoint_fn(devs[j]) : nullptr;
                     if (ep_j != nullptr && strcmp(ep_j, ep) == 0 && !worker_is_cpu_fn(devs[j])) {
                         is_cpu_sibling = true;
                         break;
@@ -1281,16 +1327,27 @@ static void apply_rpc_auto_weight(common_params & params) {
         if (const char * env = getenv("LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB")) {
             compute_bytes = atof(env) * MiB;
         }
-        // unreadable header: assume few (= large) layers so the margin over-covers
-        const double layer_bytes = w_bytes / std::max<uint32_t>(n_layer, 24);
-        // KV follows the layer share, so it scales caps from weight space to
-        // weight+kv space; the compute allowance is flat per device
-        const double kv_scale = w_bytes / (w_bytes + kv_bytes);
-        for (size_t i = 0; i < n; ++i) {
-            cap_bytes[i] = std::max(0.0, (cap_bytes[i] - compute_bytes) * kv_scale - layer_bytes);
+        if (tensor_mode) {
+            // EP: shares are sub-layer weight slices, so no whole-layer rounding
+            // margin, and the KV/state lives with the attention owner (or mirrored
+            // statics already inside the 10% headroom) - reserve compute only
+            for (size_t i = 0; i < n; ++i) {
+                cap_bytes[i] = std::max(0.0, cap_bytes[i] - compute_bytes);
+            }
+            LOG_INF("--rpc-auto-weight: reserving %.0f MiB compute headroom per member (EP/tensor mode)\n",
+                    compute_bytes / MiB);
+        } else {
+            // unreadable header: assume few (= large) layers so the margin over-covers
+            const double layer_bytes = w_bytes / std::max<uint32_t>(n_layer, 24);
+            // KV follows the layer share, so it scales caps from weight space to
+            // weight+kv space; the compute allowance is flat per device
+            const double kv_scale = w_bytes / (w_bytes + kv_bytes);
+            for (size_t i = 0; i < n; ++i) {
+                cap_bytes[i] = std::max(0.0, (cap_bytes[i] - compute_bytes) * kv_scale - layer_bytes);
+            }
+            LOG_INF("--rpc-auto-weight: reserving %.0f MiB KV total (n_ctx %u) + %.0f MiB compute headroom per device\n",
+                    kv_bytes / MiB, n_ctx, compute_bytes / MiB);
         }
-        LOG_INF("--rpc-auto-weight: reserving %.0f MiB KV total (n_ctx %u) + %.0f MiB compute headroom per device\n",
-                kv_bytes / MiB, n_ctx, compute_bytes / MiB);
     }
 
     // shares proportional to score, water-filled against per-device capacity
@@ -1335,8 +1392,9 @@ static void apply_rpc_auto_weight(common_params & params) {
         return;
     }
 
-    // #31 law 1: never distribute a model that fits fast local VRAM
-    if (n_rpc > 0 && !locals.empty() && w_bytes > 0.0) {
+    // #31 law 1: never distribute a model that fits fast local VRAM. Layer
+    // pipelines only - EP/tensor is the capacity play by construction.
+    if (!tensor_mode && n_rpc > 0 && !locals.empty() && w_bytes > 0.0) {
         double local_cap = 0.0;
         for (size_t i = n_rpc; i < n; ++i) {
             local_cap += cap_bytes[i];
@@ -1347,18 +1405,20 @@ static void apply_rpc_auto_weight(common_params & params) {
         }
     }
 
-    LOG_INF("--rpc-auto-weight: split by measured speed (capacity-capped):\n");
+    LOG_INF("--rpc-auto-weight: split by measured speed (capacity-capped)%s:\n",
+            tensor_mode ? " over the meta device's members" : "");
     for (size_t i = 0; i < n; ++i) {
         params.tensor_split[i] = (float) share[i];
         // device-kind postfix (TASKS.md #36): worker-CPU devices masquerade as
         // GPUs to the backend, make the kind visible where icons can't be
-        const char * kind = i < n_rpc ? (worker_is_cpu_fn(devs[i]) ? "(cpu)" : "(gpu)") : "(gpu)";
-        LOG_INF("  %-8s %s %s %6.2f GB/s -> %5.1f%%%s\n",
+        const char * kind = is_rpc[i] ? (worker_is_cpu_fn(devs[i]) ? "(cpu)" : "(gpu)") : "(gpu)";
+        LOG_INF("  %-8s %s %s %6.2f GB/s -> %5.1f%%%s%s\n",
                 ggml_backend_dev_name(devs[i]),
-                i < n_rpc ? dev_endpoint_fn(devs[i]) : "(local)",
+                is_rpc[i] ? dev_endpoint_fn(devs[i]) : "(local)",
                 kind,
                 score[i], 100.0 * share[i] / (share_sum > 0 ? share_sum : 1.0),
-                capped[i] ? " (memory-capped)" : "");
+                capped[i] ? " (memory-capped)" : "",
+                (int) i == attn_owner ? " (attention owner)" : "");
     }
 }
 

@@ -21,6 +21,11 @@
 # The perf stack (star reduce, fused boundary pipeline, surgical recovery) is
 # default-on in images >= 026ea0ae9 - no env gates needed. Kill switches:
 # GGML_META_NO_STAR / GGML_META_NO_FUSED / LLAMA_RPC_NO_SURGICAL.
+#
+# Expert shares: hand-tuned -ts by default (EP_TS). To let the coordinator split
+# by each worker's measured bandwidth score instead (TASKS.md #28 increment 3;
+# workers must run --score, the attention owner keeps a 0 share automatically):
+#   EP_AUTO_WEIGHT=--rpc-auto-weight docker compose -f docker-compose.ep-fleet.yml up
 
 services:
   llama-ep-fleet:
@@ -56,7 +61,7 @@ services:
       --rpc ${EP_WORKERS:-10.5.5.11:50052,10.5.5.15:50052}
       --device ${EP_DEVICES:-CUDA0,RPC0,RPC2}
       -sm tensor
-      -ts ${EP_TS:-0,3,2}
+      ${EP_AUTO_WEIGHT:--ts ${EP_TS:-0,3,2}}
       -ngl 99
       --no-mmap
       -c ${EP_CTX:-4096}
