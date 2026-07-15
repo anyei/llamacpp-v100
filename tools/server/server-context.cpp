@@ -1083,8 +1083,21 @@ private:
         if (dev_failed_fn == nullptr || dev_endpoint_fn == nullptr || reprobe_fn == nullptr) {
             return false;
         }
+        // probe base: explicit --device list if given, else every registered RPC
+        // device - with plain --rpc / discovery params.devices is EMPTY and the
+        // failed worker would never be found here (TASKS.md #29c gap)
+        std::vector<ggml_backend_dev_t> probe = params_base.devices;
+        if (probe.empty()) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                ggml_backend_reg_t  r  = ggml_backend_dev_backend_reg(dev);
+                if (r != nullptr && strcmp(ggml_backend_reg_name(r), "RPC") == 0) {
+                    probe.push_back(dev);
+                }
+            }
+        }
         std::vector<const char *> failed;
-        for (ggml_backend_dev_t dev : params_base.devices) {
+        for (ggml_backend_dev_t dev : probe) {
             if (dev != nullptr && dev_failed_fn(dev)) {
                 const char * ep = dev_endpoint_fn(dev);
                 if (ep == nullptr) {
@@ -1300,6 +1313,60 @@ private:
                 reset_failed_fn();
             }
             common_params params_try = params_full;
+            if (params_try.devices.empty() && dev_reachable_fn != nullptr &&
+                params_try.split_mode == LLAMA_SPLIT_MODE_LAYER &&
+                getenv("LLAMA_KV_WORKER_HOST") == nullptr) {
+                // no explicit --device (plain --rpc / discovery): llama's default
+                // discovery at load would re-include the dead endpoint, so every
+                // reload attempt fails on its buffers (TASKS.md #29c gap).
+                // Synthesize the list llama builds by default - RPC GPUs first,
+                // then device_id-deduped local GPUs, iGPUs only without dGPUs,
+                // trailing nullptr = "then CPU" - so the probe below filters it.
+                // Positional -ts shares stay aligned: they were computed against
+                // this same order. KV-annex setups keep the old behavior (the
+                // annex rule would shift the mapping).
+                std::vector<ggml_backend_dev_t> rpc, locals, igpus;
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    const auto type = ggml_backend_dev_type(dev);
+                    if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                        if (igpus.empty()) {
+                            igpus.push_back(dev);
+                        }
+                        continue;
+                    }
+                    if (type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        continue;
+                    }
+                    ggml_backend_reg_t r = ggml_backend_dev_backend_reg(dev);
+                    if (r != nullptr && strcmp(ggml_backend_reg_name(r), "RPC") == 0) {
+                        rpc.push_back(dev);
+                    } else {
+                        ggml_backend_dev_props props;
+                        ggml_backend_dev_get_props(dev, &props);
+                        bool dup = false;
+                        for (ggml_backend_dev_t seen : locals) {
+                            ggml_backend_dev_props sp;
+                            ggml_backend_dev_get_props(seen, &sp);
+                            if (props.device_id && sp.device_id && strcmp(props.device_id, sp.device_id) == 0) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) {
+                            locals.push_back(dev);
+                        }
+                    }
+                }
+                if (!rpc.empty()) {
+                    params_try.devices = std::move(rpc);
+                    params_try.devices.insert(params_try.devices.end(), locals.begin(), locals.end());
+                    if (locals.empty()) {
+                        params_try.devices.insert(params_try.devices.end(), igpus.begin(), igpus.end());
+                    }
+                    params_try.devices.push_back(nullptr);
+                }
+            }
             if (!params_try.devices.empty() && dev_reachable_fn != nullptr) {
                 // the device list ends with a nullptr terminator ("then CPU", see
                 // parse_device_list) - it always survives the probe, so an all-dead
