@@ -41,5 +41,7 @@ services:
       -p ${WORKER_PORT:-50052}
       -c
       --announce
+      --score
+      --allow-shutdown
       ${WORKER_EXTRA_ARGS:-}
     restart: always

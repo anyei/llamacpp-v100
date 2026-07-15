@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    6
+#define RPC_PROTO_MINOR_VERSION    7
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
@@ -81,6 +81,47 @@ GGML_BACKEND_API bool         ggml_backend_rpc_endpoint_reprobe(const char * end
 GGML_BACKEND_API void         ggml_backend_rpc_clear_failed_endpoint(const char * endpoint);
 GGML_BACKEND_API const char * ggml_backend_rpc_buffer_endpoint(ggml_backend_buffer_t buffer);
 GGML_BACKEND_API bool         ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** old_base, void ** new_base);
+
+// fleet introspection + worker ops (proto 4.7, TASKS.md #35). The three commands
+// behind these are handled OUTSIDE the worker's exec lock so they respond even
+// while a graph is computing (a hung worker can still be shut down / inspected).
+
+// worker side: append a line to the in-memory log ring served by RPC_CMD_GET_LOG
+// (rpc-server wires its ggml log callback here; ~64 KiB retained)
+GGML_BACKEND_API void ggml_backend_rpc_log_append(const char * text);
+
+// coordinator side: fetch the tail of a worker's log ring over a dedicated
+// connection (never queues behind compute traffic on the cached socket)
+GGML_BACKEND_API bool ggml_backend_rpc_fetch_log(const char * endpoint, char * buf, size_t buf_size, size_t * out_len);
+
+// coordinator side: ask a worker process to exit(0) so its supervisor (docker
+// restart policy / systemd) restarts it; --rpc-reload then re-provisions it.
+// The worker refuses unless it opted in via ggml_backend_rpc_set_shutdown_enabled.
+GGML_BACKEND_API bool ggml_backend_rpc_shutdown_worker(const char * endpoint);
+// worker side: allow remote shutdown (OFF by default - RPC is unauthenticated)
+GGML_BACKEND_API void ggml_backend_rpc_set_shutdown_enabled(bool enabled);
+
+// bounded TCP reachability probe (timeout_ms); safe to call from an HTTP thread,
+// unlike ggml_backend_rpc_dev_reachable which can block on the cached socket
+GGML_BACKEND_API bool ggml_backend_rpc_endpoint_reachable(const char * endpoint, int timeout_ms);
+
+// worker speed score (TASKS.md #31/#35f): a short matvec benchmark measures the
+// effective memory bandwidth of a device — decode t/s is bandwidth-bound, so
+// this is the right weight for splitting work across unequal workers
+GGML_BACKEND_API bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops);
+// worker side: publish this worker's score (beacon field + RPC_CMD_GET_SCORE)
+GGML_BACKEND_API void ggml_backend_rpc_set_worker_score(float bw_gbps, float mm_gflops);
+// coordinator side: query a worker's score; false if unscored or proto < 4.7
+GGML_BACKEND_API bool ggml_backend_rpc_get_worker_score(const char * endpoint, float * bw_gbps, float * mm_gflops);
+
+// client-side per-endpoint transfer counters (accumulated since process start)
+struct ggml_backend_rpc_ep_stats {
+    uint64_t bytes_sent;      // command payloads, headers included
+    uint64_t bytes_recv;      // blocking-command responses
+    uint64_t n_calls;         // commands sent
+    uint64_t ewma_latency_us; // EWMA (alpha 1/8) of blocking round-trip latency
+};
+GGML_BACKEND_API bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_rpc_ep_stats * out);
 
 #ifdef  __cplusplus
 }

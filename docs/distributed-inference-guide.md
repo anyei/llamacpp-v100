@@ -259,6 +259,34 @@ the RPC protocol itself. Compose reference:
 optional static list), paired with the `docker-compose.rpc-worker*.yml`
 workers, which all `--announce` by default.
 
+**Fleet web UI + API** (TASKS.md #35): the server web UI has a **Fleet**
+section (sidebar network icon, `#/fleet`) backed by three endpoints:
+
+- `GET /fleet/status` — per-device cards: memory, split share, layers,
+  transfer counters (bytes, EWMA round-trip latency), speed score, plus every
+  worker beaconing on the LAN (in the pipeline or not). Answers **during**
+  model load (reports fleet-wide load progress) and during `--rpc-reload`
+  recovery.
+- `GET /fleet/worker/log?ep=host:port` — tails the worker's in-memory log
+  ring over a dedicated RPC connection (proto 4.7 `GET_LOG`, served outside
+  the worker's exec lock so it answers even mid-compute).
+- `POST /fleet/worker/restart {"endpoint": ...}` — asks the worker to
+  `exit(0)` so its restart policy brings it back and `--rpc-reload`
+  re-provisions it. Requires `--fleet-admin` AND an `--api-key` (it is a
+  remote-kill primitive; RPC itself is unauthenticated).
+
+**Speed scores + auto-weighted splits** (TASKS.md #31/#35f): workers started
+with `--score` (all `docker-compose.rpc-worker*.yml` do) run a ~1 s matvec
+benchmark at startup — effective memory bandwidth, the quantity that bounds
+decode — and publish it in their beacon and over RPC. The coordinator flag
+`--rpc-auto-weight` (`COORD_AUTO_WEIGHT=1` in the compose) then fills an
+unset `-ts` proportionally to the scores, water-filled against each device's
+free memory so shares never exceed capacity; local GPUs are benchmarked at
+startup. #31 measured bandwidth-weighted splits ~2x faster than the
+free-memory default on a heterogeneous CPU fleet. An explicit `-ts`/`COORD_TS`
+always wins, and a warning fires when the model would fit the local GPUs
+alone (#31 law 1: distribution loses in that regime).
+
 ## 3. What to expect (measured, loopback worst case)
 
 | Scenario | tg t/s | Notes |

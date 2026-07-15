@@ -47,6 +47,14 @@ services:
       # (bare name when unset: the parser rejects an empty LLAMA_ARG_TENSOR_SPLIT,
       # so the var must be absent, not empty)
       - LLAMA_ARG_TENSOR_SPLIT${COORD_TS:+=${COORD_TS}}
+      # TASKS.md #35f: COORD_AUTO_WEIGHT=1 splits by each worker's measured speed
+      # score (workers must run --score; see docker-compose.rpc-worker*.yml) capped
+      # by free memory, instead of the memory-proportional default. COORD_TS wins.
+      - LLAMA_ARG_RPC_AUTO_WEIGHT${COORD_AUTO_WEIGHT:+=1}
+      # TASKS.md #35d: COORD_FLEET_ADMIN=1 + COORD_API_KEY enable restarting
+      # workers from the web UI's Fleet section (POST /fleet/worker/restart)
+      - LLAMA_ARG_FLEET_ADMIN${COORD_FLEET_ADMIN:+=1}
+      - LLAMA_ARG_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server
     command: >
       -m /models/${COORD_MODEL:-Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf}

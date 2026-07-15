@@ -128,6 +128,9 @@ struct server_routes {
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
+    server_http_context::handler_t get_fleet_status;
+    server_http_context::handler_t get_fleet_worker_log;
+    server_http_context::handler_t post_fleet_worker_restart;
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;

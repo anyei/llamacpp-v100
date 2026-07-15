@@ -237,8 +237,13 @@ bool server_http_context::init(const common_params & params) {
         return false;
     };
 
-    auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_server_state = [this, fleet_status_path = params.api_prefix + "/fleet/status"](const httplib::Request & req, httplib::Response & res) {
         if (!is_ready.load()) {
+            // /fleet/status reports fleet-wide load progress BY DESIGN - it reads
+            // only self-synchronized fleet state, never the loading model
+            if (req.path == fleet_status_path) {
+                return true;
+            }
 #if defined(LLAMA_UI_HAS_ASSETS)
             if (const auto tmp = string_split<std::string>(req.path, '.');
                 req.path == "/" || (!tmp.empty() && tmp.back() == "html")) {

@@ -27,5 +27,12 @@ export const API_STREAM = {
 	LOOKUP: './v1/streams/lookup'
 };
 
+// fleet monitoring routes; worker restart requires --fleet-admin and an API key
+export const API_FLEET = {
+	STATUS: './fleet/status',
+	WORKER_LOG: './fleet/worker/log',
+	WORKER_RESTART: './fleet/worker/restart'
+};
+
 /** CORS proxy endpoint path */
 export const CORS_PROXY_ENDPOINT = '/cors-proxy';

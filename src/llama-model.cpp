@@ -2923,6 +2923,20 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
+int32_t llama_model_device_n_layers(const struct llama_model * model, int i) {
+    ggml_backend_dev_t dev = llama_model_get_device(model, i);
+    if (dev == nullptr) {
+        return 0;
+    }
+    int32_t n = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (model->dev_layer(il) == dev) {
+            n++;
+        }
+    }
+    return n;
+}
+
 //
 // llama_model_base
 //

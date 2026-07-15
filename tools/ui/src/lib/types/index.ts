@@ -99,6 +99,21 @@ export type {
 	SettingsSection
 } from './settings';
 
+// Fleet types
+export type {
+	ApiFleetDeviceStats,
+	ApiFleetDeviceScore,
+	ApiFleetDevice,
+	ApiFleetDiscoveredWorker,
+	ApiFleetLoadProgress,
+	ApiFleetReloadState,
+	ApiFleetModelInfo,
+	ApiFleetServerState,
+	ApiFleetStatusResponse,
+	ApiFleetWorkerLogResponse,
+	ApiFleetWorkerRestartResponse
+} from './fleet';
+
 // Common types
 export type {
 	KeyValuePair,

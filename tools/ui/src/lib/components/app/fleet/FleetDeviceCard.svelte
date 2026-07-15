@@ -1,0 +1,204 @@
+<script lang="ts">
+	import { RotateCcw, ScrollText } from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
+	import * as Card from '$lib/components/ui/card';
+	import { Badge } from '$lib/components/ui/badge';
+	import { Button } from '$lib/components/ui/button';
+	import { DialogConfirmation } from '$lib/components/app/dialogs';
+	import { FleetService } from '$lib/services/fleet.service';
+	import type { FleetEndpointRates } from '$lib/stores/fleet.svelte';
+	import { FLEET_RATE_HISTORY_LENGTH } from '$lib/stores/fleet.svelte';
+	import FleetSparkline from './FleetSparkline.svelte';
+
+	interface Props {
+		device: ApiFleetDevice;
+		fleetAdmin: boolean;
+		rates?: FleetEndpointRates;
+		rank?: 'fastest' | 'slowest' | null;
+		onShowLogs?: (endpoint: string) => void;
+	}
+
+	let { device, fleetAdmin, rates, rank = null, onShowLogs }: Props = $props();
+
+	let showRestartDialog = $state(false);
+	let isRestarting = $state(false);
+
+	let memoryUsedMib = $derived(Math.max(0, device.memory_total_mib - device.memory_free_mib));
+	let memoryUsedPercent = $derived(
+		device.memory_total_mib > 0 ? (memoryUsedMib / device.memory_total_mib) * 100 : 0
+	);
+
+	let splitPercent = $derived(
+		typeof device.split_frac === 'number' ? Math.round(device.split_frac * 100) : null
+	);
+
+	let latencyMs = $derived(device.stats ? (device.stats.ewma_latency_us / 1000).toFixed(1) : null);
+
+	function statusColor(): string {
+		if (device.failed) return 'bg-red-500';
+		if (!device.reachable) return 'bg-gray-500';
+
+		return 'bg-green-500';
+	}
+
+	function statusText(): string {
+		if (device.failed) return 'FAILED';
+		if (!device.reachable) return 'unreachable';
+
+		return 'reachable';
+	}
+
+	function handleShowLogs() {
+		if (device.endpoint) {
+			onShowLogs?.(device.endpoint);
+		}
+	}
+
+	async function handleRestartConfirm() {
+		if (!device.endpoint) return;
+
+		showRestartDialog = false;
+		isRestarting = true;
+
+		try {
+			const result = await FleetService.restartWorker(device.endpoint);
+
+			if (result.success) {
+				toast.success(`Restart requested for ${device.endpoint} (${result.recovery} recovery)`);
+			} else {
+				toast.error(`Restart failed for ${device.endpoint}`);
+			}
+		} catch (error: unknown) {
+			toast.error(error instanceof Error ? error.message : String(error));
+		} finally {
+			isRestarting = false;
+		}
+	}
+</script>
+
+<Card.Root
+	class="!gap-3 p-4 {device.worker_is_cpu
+		? 'border-dashed bg-muted/10'
+		: 'bg-muted/30'} {device.failed ? 'border-destructive/50' : ''}"
+>
+	<div class="flex items-start justify-between gap-2">
+		<div class="min-w-0">
+			<div class="flex items-center gap-2">
+				<h3 class="truncate text-sm font-semibold">{device.name}</h3>
+
+				<div class="flex items-center gap-1.5" title={statusText()}>
+					<div class="h-2 w-2 shrink-0 rounded-full {statusColor()}"></div>
+
+					{#if device.failed}
+						<Badge variant="destructive" class="text-[10px]">FAILED</Badge>
+					{/if}
+				</div>
+			</div>
+
+			<p class="truncate text-xs text-muted-foreground">{device.description}</p>
+
+			{#if device.endpoint}
+				<p class="truncate font-mono text-[10px] text-muted-foreground">{device.endpoint}</p>
+			{/if}
+		</div>
+
+		<div class="flex shrink-0 flex-wrap justify-end gap-1">
+			<Badge variant={device.is_rpc ? 'secondary' : 'outline'} class="text-[10px]">
+				{device.is_rpc ? 'RPC' : 'Local'}
+			</Badge>
+
+			{#if device.worker_is_cpu}
+				<Badge variant="tertiary" class="text-[10px]">CPU (RAM)</Badge>
+			{/if}
+
+			{#if device.score}
+				<Badge variant="outline" class="text-[10px]">
+					{device.score.bw_gbps.toFixed(1)} GB/s
+				</Badge>
+			{/if}
+
+			{#if rank === 'fastest'}
+				<Badge class="text-[10px]">fastest</Badge>
+			{:else if rank === 'slowest'}
+				<Badge variant="tertiary" class="text-[10px]">slowest</Badge>
+			{/if}
+		</div>
+	</div>
+
+	<div class="space-y-1">
+		<div class="flex justify-between text-[10px] text-muted-foreground">
+			<span>Memory</span>
+
+			<span>
+				{device.memory_free_mib.toLocaleString()} / {device.memory_total_mib.toLocaleString()} MiB free
+			</span>
+		</div>
+
+		<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+			<div
+				class="h-full rounded-full {memoryUsedPercent > 90 ? 'bg-destructive' : 'bg-primary'}"
+				style="width: {memoryUsedPercent.toFixed(1)}%"
+			></div>
+		</div>
+	</div>
+
+	{#if device.n_layers != null || splitPercent !== null}
+		<p class="text-xs text-muted-foreground">
+			{[
+				device.n_layers != null ? `${device.n_layers} layers` : null,
+				splitPercent !== null ? `${splitPercent}%` : null
+			]
+				.filter(Boolean)
+				.join(' · ')}
+		</p>
+	{/if}
+
+	{#if device.stats}
+		<div class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+			<span class="truncate">
+				in {(rates?.inMbps ?? 0).toFixed(2)} MB/s · out {(rates?.outMbps ?? 0).toFixed(2)} MB/s
+				{#if latencyMs !== null}
+					· {latencyMs} ms
+				{/if}
+			</span>
+
+			<FleetSparkline
+				values={rates?.history ?? []}
+				capacity={FLEET_RATE_HISTORY_LENGTH}
+				class="shrink-0"
+			/>
+		</div>
+	{/if}
+
+	{#if device.is_rpc && device.endpoint}
+		<div class="mt-auto flex justify-end gap-2">
+			<Button variant="outline" size="sm" onclick={handleShowLogs}>
+				<ScrollText class="h-3.5 w-3.5" />
+				Logs
+			</Button>
+
+			<span title={fleetAdmin ? undefined : 'start server with --fleet-admin and an API key'}>
+				<Button
+					variant="outline"
+					size="sm"
+					disabled={!fleetAdmin || isRestarting}
+					onclick={() => (showRestartDialog = true)}
+				>
+					<RotateCcw class="h-3.5 w-3.5 {isRestarting ? 'animate-spin' : ''}" />
+					Restart
+				</Button>
+			</span>
+		</div>
+	{/if}
+</Card.Root>
+
+<DialogConfirmation
+	bind:open={showRestartDialog}
+	title="Restart worker"
+	description={`Restart the RPC worker at ${device.endpoint}? In-flight work on this worker will be interrupted while it re-provisions.`}
+	confirmText="Restart"
+	variant="destructive"
+	icon={RotateCcw}
+	onConfirm={handleRestartConfirm}
+	onCancel={() => (showRestartDialog = false)}
+/>

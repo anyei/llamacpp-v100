@@ -476,6 +476,8 @@ struct common_params {
     bool        rpc_discover = false;  // discover RPC workers via their LAN multicast beacons (rpc-server --announce)
     std::string rpc_discover_group;    // multicast group override ("ADDR:PORT"; empty = built-in default)
 
+    bool rpc_auto_weight = false;      // fill an unset -ts from worker speed scores, capped by free memory (TASKS.md #35f)
+
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
@@ -659,6 +661,7 @@ struct common_params {
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
+    bool fleet_admin      = false; // allow POST /fleet/worker/restart (also needs an --api-key)
 
     // enable built-in tools
     std::vector<std::string> server_tools;

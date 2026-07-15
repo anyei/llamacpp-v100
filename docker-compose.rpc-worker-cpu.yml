@@ -48,5 +48,7 @@ services:
       -t ${WORKER_THREADS:-8}
       -c
       --announce
+      --score
+      --allow-shutdown
       ${WORKER_EXTRA_ARGS:-}
     restart: always

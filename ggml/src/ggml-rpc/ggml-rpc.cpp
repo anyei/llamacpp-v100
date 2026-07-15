@@ -141,6 +141,12 @@ enum rpc_cmd {
     // steady-state EP boundary cycle in one round trip instead of three commands
     // plus a separate fetch turnaround.
     RPC_CMD_GRAPH_FUSED,
+    // proto 4.7 (TASKS.md #35 fleet UI): worker introspection + ops. All three are
+    // handled OUTSIDE the exec lock in the serve loop so they respond even while a
+    // graph is computing (a hung worker can still be inspected and shut down).
+    RPC_CMD_GET_LOG,
+    RPC_CMD_SHUTDOWN,
+    RPC_CMD_GET_SCORE,
     RPC_CMD_COUNT,
 };
 
@@ -163,6 +169,30 @@ struct rpc_msg_hello_rsp {
 
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
+};
+
+// proto 4.7 fleet commands. GET_LOG's response is raw variable-size text
+// (the standard | size(8) | data | framing carries the length).
+struct rpc_msg_get_log_req {
+    uint64_t max_bytes;
+};
+
+// refuse a stray/garbage SHUTDOWN unless it carries the magic
+#define RPC_SHUTDOWN_MAGIC 0x35464C45u // "5FLE"
+
+struct rpc_msg_shutdown_req {
+    uint32_t magic;
+};
+
+struct rpc_msg_shutdown_rsp {
+    uint8_t ok;
+};
+
+struct rpc_msg_get_score_rsp {
+    float   bw_gbps;
+    float   mm_gflops;
+    uint8_t valid;
+    uint8_t padding[3];
 };
 
 struct rpc_msg_get_alloc_size_req {
@@ -512,6 +542,7 @@ struct ggml_backend_rpc_async_state {
     uint8_t  server_minor = 0; // from HELLO; gates use of 4.2+ commands
     uint64_t conn_id = 0;      // this socket's connection id on the server (0 = not fetched)
     std::string endpoint;      // for failure attribution (set by get_socket)
+    struct rpc_ep_stat * stat = nullptr; // per-endpoint counters (set with endpoint)
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -561,10 +592,103 @@ static rpc_client_stats * rpc_stats() {
     return &st;
 }
 
+// per-endpoint transfer counters (TASKS.md #35e), always on: a handful of atomic
+// adds per command is noise next to a socket round trip. Entries are never freed
+// (an endpoint's identity outlives its sockets, and fleets are small).
+struct rpc_ep_stat {
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> n_calls{0};
+    std::atomic<uint64_t> ewma_latency_us{0};
+
+    void observe_latency(uint64_t us) {
+        // EWMA alpha 1/8; a racing store may drop one sample - fine for a gauge
+        uint64_t prev = ewma_latency_us.load(std::memory_order_relaxed);
+        ewma_latency_us.store(prev == 0 ? us : (prev * 7 + us) / 8, std::memory_order_relaxed);
+    }
+};
+
+static rpc_ep_stat * rpc_ep_stat_get(const std::string & endpoint) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::unique_ptr<rpc_ep_stat>> stats;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & e = stats[endpoint];
+    if (!e) {
+        e = std::make_unique<rpc_ep_stat>();
+    }
+    return e.get();
+}
+
+bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_rpc_ep_stats * out) {
+    if (endpoint == nullptr || out == nullptr) {
+        return false;
+    }
+    rpc_ep_stat * st = rpc_ep_stat_get(endpoint);
+    out->bytes_sent      = st->bytes_sent.load(std::memory_order_relaxed);
+    out->bytes_recv      = st->bytes_recv.load(std::memory_order_relaxed);
+    out->n_calls         = st->n_calls.load(std::memory_order_relaxed);
+    out->ewma_latency_us = st->ewma_latency_us.load(std::memory_order_relaxed);
+    return true;
+}
+
+// worker-side log ring served by RPC_CMD_GET_LOG (TASKS.md #35c). rpc-server wires
+// its ggml log callback to ggml_backend_rpc_log_append; the server-lifecycle logs in
+// this file go through GGML_LOG_* and land here the same way.
+static constexpr size_t RPC_LOG_RING_CAP = 64 * 1024;
+static std::mutex  g_rpc_log_mutex;
+static std::string g_rpc_log_ring;
+
+void ggml_backend_rpc_log_append(const char * text) {
+    if (text == nullptr || *text == '\0') {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rpc_log_mutex);
+    g_rpc_log_ring += text;
+    if (g_rpc_log_ring.size() > RPC_LOG_RING_CAP) {
+        // trim to the first line boundary that fits the cap
+        size_t cut = g_rpc_log_ring.size() - RPC_LOG_RING_CAP;
+        size_t nl  = g_rpc_log_ring.find('\n', cut);
+        g_rpc_log_ring.erase(0, nl == std::string::npos ? cut : nl + 1);
+    }
+}
+
+static std::string rpc_log_tail(size_t max_bytes) {
+    std::lock_guard<std::mutex> lock(g_rpc_log_mutex);
+    if (g_rpc_log_ring.size() <= max_bytes) {
+        return g_rpc_log_ring;
+    }
+    return g_rpc_log_ring.substr(g_rpc_log_ring.size() - max_bytes);
+}
+
+// worker-side speed score, published by rpc-server after its startup benchmark
+// (TASKS.md #35f); read by the beacon payload and RPC_CMD_GET_SCORE
+static std::atomic<float> g_worker_score_bw{0.0f};
+static std::atomic<float> g_worker_score_fl{0.0f};
+static std::atomic<bool>  g_worker_score_valid{false};
+
+void ggml_backend_rpc_set_worker_score(float bw_gbps, float mm_gflops) {
+    g_worker_score_bw.store(bw_gbps);
+    g_worker_score_fl.store(mm_gflops);
+    g_worker_score_valid.store(true);
+}
+
+// remote shutdown is OFF by default (TASKS.md #35d review): RPC is unauthenticated,
+// so a peer that can reach the compute port must not be able to kill the process.
+// rpc-server opts in with --allow-shutdown when it runs under a supervisor.
+static std::atomic<bool> g_worker_shutdown_enabled{false};
+
+void ggml_backend_rpc_set_shutdown_enabled(bool enabled) {
+    g_worker_shutdown_enabled.store(enabled);
+}
+
 static bool send_rpc_cmd_raw(socket_ptr sock, ggml_backend_rpc_async_state & st, enum rpc_cmd cmd, const void * input, size_t input_size) {
     if (rpc_client_stats * s = rpc_stats()) {
         s->count[cmd]++;
         s->bytes[cmd] += input_size;
+    }
+    if (st.stat != nullptr) {
+        st.stat->n_calls.fetch_add(1, std::memory_order_relaxed);
+        st.stat->bytes_sent.fetch_add(input_size + sizeof(uint8_t) + sizeof(uint64_t), std::memory_order_relaxed);
     }
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
@@ -608,6 +732,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
         return false;
     }
+    const auto t_start = std::chrono::steady_clock::now();
     if (!send_rpc_cmd_raw(sock, st, cmd, input, input_size)) {
         return false;
     }
@@ -620,6 +745,11 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     }
     if (!sock->recv_data(output, output_size)) {
         return false;
+    }
+    if (st.stat != nullptr) {
+        st.stat->bytes_recv.fetch_add(output_size + sizeof(uint64_t), std::memory_order_relaxed);
+        st.stat->observe_latency(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_start).count());
     }
     return true;
 }
@@ -664,12 +794,16 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
-        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
-                       response.major, response.minor, response.patch);
+    if (response.major != RPC_PROTO_MAJOR_VERSION) {
+        GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d (need major %d)\n",
+                       response.major, response.minor, response.patch, RPC_PROTO_MAJOR_VERSION);
         return false;
     }
-    rpc_async_state(sock.get()).server_minor = response.minor;
+    // forward-tolerant: a server with a HIGHER minor is fine - it is a strict
+    // superset, and we only ever use commands up to OUR minor. Clamping here (vs
+    // the old `minor > ours -> reject`) keeps mixed-minor fleets working so a
+    // rolling upgrade in either order never takes the fleet down (TASKS.md #35).
+    rpc_async_state(sock.get()).server_minor = std::min<uint8_t>(response.minor, RPC_PROTO_MINOR_VERSION);
 
     sock->update_caps(response.conn_caps);
     return true;
@@ -729,9 +863,75 @@ static std::shared_ptr<socket_t> get_socket_impl(const std::string & endpoint, b
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    rpc_async_state(sock.get()).endpoint = endpoint;
+    {
+        ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+        st.endpoint = endpoint;
+        st.stat     = rpc_ep_stat_get(endpoint);
+    }
     sockets[endpoint] = sock;
     return sock;
+}
+
+// dedicated one-shot connection for fleet ops (log fetch / shutdown / score):
+// deliberately NOT registered in the socket cache, so it can never displace or
+// interleave with the compute connection, and works while that one is busy.
+// A short TCP probe FIRST bounds the wait: without it a dead worker would block
+// the caller (an HTTP thread) for the full ~130s kernel SYN timeout.
+static std::shared_ptr<socket_t> rpc_connect_ephemeral(const std::string & endpoint) {
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
+        return nullptr;
+    }
+    if (!rpc_transport_init()) {
+        return nullptr;
+    }
+    if (!rpc_probe_endpoint(host.c_str(), port, 1500)) {
+        return nullptr; // unreachable now - do not sink an HTTP thread into a blocking connect
+    }
+    auto sock = socket_t::connect(host.c_str(), port);
+    if (sock == nullptr) {
+        return nullptr;
+    }
+    rpc_async_state_reset(sock.get());
+    if (!negotiate_hello(sock)) {
+        // drop the async-state entry so an ephemeral connection never leaks it
+        // (the compute path erases on socket reuse; ephemeral sockets never reuse)
+        rpc_async_state_reset(sock.get());
+        return nullptr;
+    }
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    st.endpoint = endpoint;
+    // no st.stat: fleet polling must not pollute the compute transfer counters
+    return sock;
+}
+
+// erases an ephemeral socket's async-state registry entry on scope exit; without
+// it g_rpc_async_reg grows unbounded (fleet polling dials a fresh socket each op,
+// and ephemeral sockets never reuse an address to trigger the reset-on-create)
+struct rpc_ephemeral_guard {
+    socket_t * sock;
+    ~rpc_ephemeral_guard() { if (sock != nullptr) { rpc_async_state_reset(sock); } }
+};
+
+// bounded reachability probe for fleet callers (proto 4.7): a plain TCP connect
+// with a timeout, so an HTTP status poll never blocks on a dead worker. Unlike
+// ggml_backend_rpc_dev_reachable (which goes through the blocking cached-socket
+// path), this cannot stall.
+bool ggml_backend_rpc_endpoint_reachable(const char * endpoint, int timeout_ms) {
+    if (endpoint == nullptr) {
+        return false;
+    }
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        return false;
+    }
+    if (!rpc_transport_init()) {
+        return false;
+    }
+    return rpc_probe_endpoint(host.c_str(), port, timeout_ms);
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -3311,6 +3511,60 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             server.mark_executed(conn_id);
             continue;
         }
+        // proto 4.7 fleet commands run WITHOUT the execution lock: they only touch
+        // their own mutex-guarded globals, and they must respond while a graph is
+        // computing (a hung worker must still be inspectable and restartable)
+        if (cmd == RPC_CMD_GET_LOG) {
+            rpc_msg_get_log_req request;
+            if (!recv_msg(sock, &request, sizeof(request))) {
+                break;
+            }
+            std::string tail = rpc_log_tail(std::min<uint64_t>(request.max_bytes, RPC_LOG_RING_CAP));
+            if (!send_msg(sock, tail.data(), tail.size())) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
+        if (cmd == RPC_CMD_GET_SCORE) {
+            if (!recv_msg(sock, nullptr, 0)) {
+                break;
+            }
+            rpc_msg_get_score_rsp response = {};
+            response.valid     = g_worker_score_valid.load() ? 1 : 0;
+            response.bw_gbps   = g_worker_score_bw.load();
+            response.mm_gflops = g_worker_score_fl.load();
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
+        if (cmd == RPC_CMD_SHUTDOWN) {
+            rpc_msg_shutdown_req request;
+            if (!recv_msg(sock, &request, sizeof(request))) {
+                break;
+            }
+            rpc_msg_shutdown_rsp response = {};
+            // must carry the magic AND the worker must have opted in (--allow-shutdown):
+            // RPC is unauthenticated, so this stays off unless a supervisor will restart us
+            const bool allowed = request.magic == RPC_SHUTDOWN_MAGIC && g_worker_shutdown_enabled.load();
+            response.ok = allowed ? 1 : 0;
+            if (!allowed && request.magic == RPC_SHUTDOWN_MAGIC) {
+                GGML_LOG_WARN("%s", "refused an RPC shutdown request - start rpc-server with --allow-shutdown to permit it\n");
+            }
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            if (allowed) {
+                GGML_LOG_INFO("shutdown requested over RPC (conn %" PRIu64 ") - exiting for supervisor restart\n", conn_id);
+                fflush(stdout);
+                fflush(stderr);
+                exit(0);
+            }
+            continue;
+        }
         // one command executes at a time across all connections; the payload recv
         // inside each case is safe to hold the lock over - the client sends the
         // header and payload back-to-back
@@ -3738,12 +3992,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             return;
         }
         const uint64_t conn_id = next_conn_id++;
-        printf("Accepted client connection %" PRIu64 "\n", conn_id);
-        fflush(stdout);
+        // GGML_LOG so the lines reach the fleet log ring (rpc-server's log callback)
+        GGML_LOG_INFO("Accepted client connection %" PRIu64 "\n", conn_id);
         std::thread([&server, client_socket, conn_id]() {
             rpc_serve_client(server, client_socket, conn_id);
-            printf("Client connection %" PRIu64 " closed\n", conn_id);
-            fflush(stdout);
+            GGML_LOG_INFO("Client connection %" PRIu64 " closed\n", conn_id);
         }).detach();
     }
     rpc_transport_shutdown();
@@ -3780,9 +4033,15 @@ bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
             free_total += free;
         }
         char buf[256];
-        snprintf(buf, sizeof(buf), "%s port=%d id=%016" PRIx64 " proto=%d.%d devs=%zu free_mib=%zu",
+        int len = snprintf(buf, sizeof(buf), "%s port=%d id=%016" PRIx64 " proto=%d.%d devs=%zu free_mib=%zu",
                  RPC_ANNOUNCE_MAGIC, port, instance_id, RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION,
                  devs.size(), free_total / (1024 * 1024));
+        // speed score (TASKS.md #35f), present once the startup benchmark published it;
+        // extra key=value tokens are ignored by older coordinators
+        if (g_worker_score_valid.load() && len > 0 && (size_t) len < sizeof(buf)) {
+            snprintf(buf + len, sizeof(buf) - len, " bw_gbps=%.2f mm_gflops=%.1f",
+                     g_worker_score_bw.load(), g_worker_score_fl.load());
+        }
         return std::string(buf);
     };
     return rpc_announce_start(group, host.c_str(), std::move(make_payload));
@@ -3856,6 +4115,169 @@ int ggml_backend_rpc_discover(const char * group, int timeout_ms,
         }
     }
     return n;
+}
+
+// fleet ops (proto 4.7, TASKS.md #35). Each uses a dedicated ephemeral connection:
+// the cached compute socket may be busy inside a long graph_compute round trip and
+// its stream must never carry interleaved responses.
+
+bool ggml_backend_rpc_fetch_log(const char * endpoint, char * buf, size_t buf_size, size_t * out_len) {
+    if (endpoint == nullptr || buf == nullptr || buf_size == 0 || out_len == nullptr) {
+        return false;
+    }
+    *out_len = 0;
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    if (st.server_minor < 7) {
+        GGML_LOG_WARN("worker %s speaks proto 4.%d < 4.7, no log fetch\n", endpoint, st.server_minor);
+        return false;
+    }
+    rpc_msg_get_log_req request = { buf_size };
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GET_LOG, &request, sizeof(request))) {
+        return false;
+    }
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    if (out_size > buf_size) {
+        return false; // server ignored max_bytes - do not trust the stream
+    }
+    if (out_size > 0 && !sock->recv_data(buf, out_size)) {
+        return false;
+    }
+    *out_len = out_size;
+    return true;
+}
+
+bool ggml_backend_rpc_shutdown_worker(const char * endpoint) {
+    if (endpoint == nullptr) {
+        return false;
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    if (rpc_async_state(sock.get()).server_minor < 7) {
+        GGML_LOG_WARN("worker %s speaks proto 4.%d < 4.7, no remote shutdown\n",
+                      endpoint, rpc_async_state(sock.get()).server_minor);
+        return false;
+    }
+    rpc_msg_shutdown_req request  = { RPC_SHUTDOWN_MAGIC };
+    rpc_msg_shutdown_rsp response = {};
+    if (!send_rpc_cmd(sock, RPC_CMD_SHUTDOWN, &request, sizeof(request), &response, sizeof(response))) {
+        return false;
+    }
+    return response.ok != 0;
+}
+
+bool ggml_backend_rpc_get_worker_score(const char * endpoint, float * bw_gbps, float * mm_gflops) {
+    if (endpoint == nullptr || bw_gbps == nullptr || mm_gflops == nullptr) {
+        return false;
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    if (rpc_async_state(sock.get()).server_minor < 7) {
+        return false;
+    }
+    rpc_msg_get_score_rsp response = {};
+    if (!send_rpc_cmd(sock, RPC_CMD_GET_SCORE, nullptr, 0, &response, sizeof(response))) {
+        return false;
+    }
+    if (!response.valid) {
+        return false;
+    }
+    *bw_gbps   = response.bw_gbps;
+    *mm_gflops = response.mm_gflops;
+    return true;
+}
+
+// device speed benchmark (TASKS.md #31/#35f): a chain of large f32 matvecs. A
+// matvec streams the whole matrix once per multiply, so tokens/s here IS the
+// device's effective memory bandwidth - the same quantity that bounds decode -
+// and the measurement is identical in kind for CPU and GPU devices.
+bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops) {
+    if (dev == nullptr || bw_gbps == nullptr || mm_gflops == nullptr) {
+        return false;
+    }
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+    // 4096^2 f32 = 64 MiB; fall back to 2048^2 (16 MiB) on tiny devices
+    const int64_t n     = (free_mem == 0 || free_mem > 96 * 1024 * 1024) ? 4096 : 2048;
+    const int     chain = 8;
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) {
+        return false;
+    }
+    // CPU-class devices: bench with all cores, like real serving
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg != nullptr) {
+        auto set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads_fn != nullptr) {
+            set_n_threads_fn(backend, std::max(1u, std::thread::hardware_concurrency()));
+        }
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (chain + 4) + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    ggml_context * ctx = ctx_ptr.get();
+    if (ctx == nullptr) {
+        ggml_backend_free(backend);
+        return false;
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+    ggml_tensor * cur = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (int i = 0; i < chain; i++) {
+        cur = ggml_mul_mat(ctx, w, cur);
+        ggml_build_forward_expand(gf, cur);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+    if (buf == nullptr) {
+        ggml_backend_free(backend);
+        return false;
+    }
+    // fill with 0x3c bytes: 0x3c3c3c3c is a small normal f32 (~0.011), avoiding
+    // both denormal stalls and all-zero fast paths
+    ggml_backend_buffer_clear(buf, 0x3c);
+
+    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS; // warmup
+    int  reps = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    double elapsed_s = 0.0;
+    while (ok && reps < 64) {
+        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        reps++;
+        elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (elapsed_s > 0.25) {
+            break;
+        }
+    }
+    if (ok && reps > 0 && elapsed_s > 0.0) {
+        const double bytes = (double) n * n * sizeof(float) * chain * reps;
+        const double flops = 2.0 * n * n * chain * reps;
+        *bw_gbps   = (float) (bytes / elapsed_s / 1e9);
+        *mm_gflops = (float) (flops / elapsed_s / 1e9);
+    } else {
+        ok = false;
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(backend);
+    return ok;
 }
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
@@ -4297,6 +4719,34 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_boundary_fused_recv") == 0) {
         return (void *)ggml_backend_rpc_boundary_fused_recv;
+    }
+    // fleet introspection + worker ops (proto 4.7, TASKS.md #35)
+    if (std::strcmp(name, "ggml_backend_rpc_log_append") == 0) {
+        return (void *)ggml_backend_rpc_log_append;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_fetch_log") == 0) {
+        return (void *)ggml_backend_rpc_fetch_log;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_shutdown_worker") == 0) {
+        return (void *)ggml_backend_rpc_shutdown_worker;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_benchmark_device") == 0) {
+        return (void *)ggml_backend_rpc_benchmark_device;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_worker_score") == 0) {
+        return (void *)ggml_backend_rpc_set_worker_score;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_worker_score") == 0) {
+        return (void *)ggml_backend_rpc_get_worker_score;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_endpoint_stats") == 0) {
+        return (void *)ggml_backend_rpc_endpoint_stats;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_endpoint_reachable") == 0) {
+        return (void *)ggml_backend_rpc_endpoint_reachable;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_shutdown_enabled") == 0) {
+        return (void *)ggml_backend_rpc_set_shutdown_enabled;
     }
     return NULL;
 

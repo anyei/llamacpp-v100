@@ -22,6 +22,8 @@ export const ROUTES = {
 	CHAT: '#/chat',
 	/** MCP servers. */
 	MCP_SERVERS: '#/mcp-servers',
+	/** Fleet — RPC worker fleet monitoring. */
+	FLEET: '#/fleet',
 	/** Settings base — for dynamic settings URLs use RouterService. */
 	SETTINGS: '#/settings',
 	/** Search — mobile-only full-page conversation search. */

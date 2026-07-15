@@ -579,6 +579,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 //
 
 static void discover_rpc_devices(const std::string & group);
+static void apply_rpc_auto_weight(common_params & params);
 
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
@@ -710,6 +711,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // runs after parsing so it composes with --rpc/--rpc-skip-unavailable in any order
     if (params.rpc_discover) {
         discover_rpc_devices(params.rpc_discover_group);
+    }
+    // after discovery so every registered worker gets weighted (TASKS.md #35f)
+    if (params.rpc_auto_weight) {
+        apply_rpc_auto_weight(params);
     }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
@@ -1047,6 +1052,207 @@ static void discover_rpc_devices(const std::string & group) {
     }
     // a worker can vanish between its last beacon and the connect — always skip, never abort
     add_rpc_devices(servers, /*skip_unavailable=*/ true);
+}
+
+// speed-weighted tensor split (TASKS.md #35f). The free-memory default hands work
+// to whoever has ROOM; #31 measured that ~2x slower than bandwidth-proportional on
+// a heterogeneous CPU fleet (decode is bandwidth-bound). Here: -ts_i proportional to score_i,
+// water-filled against each device's free memory so a fast-but-small device never
+// gets more bytes than fit (using the GGUF file size as the weight-bytes proxy).
+// Only fills an UNSET -ts; an explicit -ts always wins.
+static void apply_rpc_auto_weight(common_params & params) {
+    for (size_t i = 0; i < llama_max_devices(); ++i) {
+        if (params.tensor_split[i] != 0.0f) {
+            LOG_WRN("--rpc-auto-weight: explicit -ts is set, leaving it untouched\n");
+            return;
+        }
+    }
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        LOG_WRN("--rpc-auto-weight only applies to -sm layer, skipping\n");
+        return;
+    }
+    if (getenv("LLAMA_KV_WORKER_HOST") != nullptr) {
+        // KV-annex worker-CPU devices take no layers, which shifts the -ts:device
+        // mapping this function predicts - bail rather than mis-weight
+        LOG_WRN("--rpc-auto-weight does not compose with LLAMA_KV_WORKER_HOST yet, skipping\n");
+        return;
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    typedef bool (*get_score_t)(const char * endpoint, float * bw_gbps, float * mm_gflops);
+    typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t dev);
+    typedef bool (*benchmark_t)(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops);
+    get_score_t    get_score_fn    = nullptr;
+    dev_endpoint_t dev_endpoint_fn = nullptr;
+    benchmark_t    benchmark_fn    = nullptr;
+    if (rpc_reg != nullptr) {
+        get_score_fn    = (get_score_t)    ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_worker_score");
+        dev_endpoint_fn = (dev_endpoint_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_endpoint");
+        benchmark_fn    = (benchmark_t)    ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_benchmark_device");
+    }
+    if (get_score_fn == nullptr || dev_endpoint_fn == nullptr || benchmark_fn == nullptr) {
+        LOG_WRN("--rpc-auto-weight: RPC backend hooks unavailable, skipping\n");
+        return;
+    }
+
+    // the split must line up with the ACTUAL device order the model will use.
+    // With --device set, that order is params.devices verbatim (llama uses it as
+    // given, no reorder/dedup); auto-weighting a different predicted order would
+    // apply each -ts share to the wrong device (OOM or a badly skewed split), so
+    // bail. Without --device, llama auto-discovers registry GPUs RPC-first, which
+    // is what we predict below.
+    if (!params.devices.empty()) {
+        LOG_WRN("--rpc-auto-weight does not compose with an explicit --device list yet "
+                "(set -ts by hand for that case), skipping\n");
+        return;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    std::vector<ggml_backend_dev_t> locals;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+            devs.push_back(dev);
+        } else {
+            // llama dedups local GPUs that report the same device_id (e.g. the same
+            // card exposed via two backends); mirror that so our order matches
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            bool dup = false;
+            for (ggml_backend_dev_t seen : locals) {
+                ggml_backend_dev_props sp;
+                ggml_backend_dev_get_props(seen, &sp);
+                if (props.device_id && sp.device_id && strcmp(props.device_id, sp.device_id) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                locals.push_back(dev);
+            }
+        }
+    }
+    const size_t n_rpc = devs.size();
+    devs.insert(devs.end(), locals.begin(), locals.end());
+    const size_t n = devs.size();
+    if (n < 2) {
+        LOG_INF("--rpc-auto-weight: fewer than 2 split devices, nothing to weight\n");
+        return;
+    }
+    if (n > llama_max_devices()) {
+        LOG_WRN("--rpc-auto-weight: %zu devices exceed the -ts capacity, skipping\n", n);
+        return;
+    }
+
+    std::vector<double> score(n, 0.0);
+    std::vector<double> cap_bytes(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(devs[i], &free_mem, &total_mem);
+        cap_bytes[i] = free_mem * 0.9; // headroom for KV/compute buffers
+        float bw = 0.0f, fl = 0.0f;
+        if (i < n_rpc) {
+            const char * ep = dev_endpoint_fn(devs[i]);
+            if (ep == nullptr || !get_score_fn(ep, &bw, &fl)) {
+                LOG_WRN("--rpc-auto-weight: worker %s has no score (run rpc-server with --score); "
+                        "falling back to the default memory-proportional split\n", ep ? ep : "?");
+                return;
+            }
+            LOG_INF("--rpc-auto-weight: %s (%s): %.2f GB/s\n", ggml_backend_dev_name(devs[i]), ep, bw);
+        } else {
+            LOG_INF("--rpc-auto-weight: benchmarking local device %s...\n", ggml_backend_dev_name(devs[i]));
+            if (!benchmark_fn(devs[i], &bw, &fl)) {
+                LOG_WRN("--rpc-auto-weight: benchmark of %s failed, falling back to the default split\n",
+                        ggml_backend_dev_name(devs[i]));
+                return;
+            }
+            LOG_INF("--rpc-auto-weight: %s: %.2f GB/s\n", ggml_backend_dev_name(devs[i]), bw);
+        }
+        score[i] = bw;
+    }
+
+    // weight-bytes proxy: the GGUF file size (weights dominate it). The file must
+    // exist NOW - for -hf/--model-url the download runs later, so w_bytes would be
+    // 0 and every memory cap silently disabled (a fast-but-small worker could then
+    // be handed more than fits -> OOM). Bail to the capacity-safe default instead.
+    double w_bytes = 0.0;
+    std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
+    if (f.good()) {
+        w_bytes = (double) f.tellg();
+    }
+    if (w_bytes <= 0.0) {
+        LOG_WRN("--rpc-auto-weight: model file '%s' not readable yet (remote model?); "
+                "cannot size the memory caps, keeping the default split\n", params.model.path.c_str());
+        return;
+    }
+
+    // shares proportional to score, water-filled against per-device capacity
+    std::vector<double> share(n, 0.0);
+    std::vector<bool>   capped(n, false);
+    for (size_t pass = 0; pass < n; ++pass) {
+        double free_share = 1.0;
+        double score_sum  = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (capped[i]) {
+                free_share -= share[i];
+            } else {
+                score_sum += score[i];
+            }
+        }
+        if (score_sum <= 0.0) {
+            break;
+        }
+        bool newly_capped = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (capped[i]) {
+                continue;
+            }
+            share[i] = free_share * score[i] / score_sum;
+            if (w_bytes > 0.0 && share[i] * w_bytes > cap_bytes[i]) {
+                share[i] = cap_bytes[i] / w_bytes;
+                capped[i] = true;
+                newly_capped = true;
+            }
+        }
+        if (!newly_capped) {
+            break;
+        }
+    }
+    double share_sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        share_sum += share[i];
+    }
+    if (share_sum < 0.999 && w_bytes > 0.0) {
+        LOG_WRN("--rpc-auto-weight: the model (%.1f GiB) does not fit the fleet's free memory "
+                "at 90%% headroom, keeping the default split\n", w_bytes / (1024.0 * 1024.0 * 1024.0));
+        return;
+    }
+
+    // #31 law 1: never distribute a model that fits fast local VRAM
+    if (n_rpc > 0 && !locals.empty() && w_bytes > 0.0) {
+        double local_cap = 0.0;
+        for (size_t i = n_rpc; i < n; ++i) {
+            local_cap += cap_bytes[i];
+        }
+        if (local_cap >= w_bytes) {
+            LOG_WRN("--rpc-auto-weight: the model fits the local GPUs alone - distributing it will "
+                    "likely REDUCE t/s (TASKS.md #31 law 1); consider dropping the RPC workers\n");
+        }
+    }
+
+    LOG_INF("--rpc-auto-weight: split by measured speed (capacity-capped):\n");
+    for (size_t i = 0; i < n; ++i) {
+        params.tensor_split[i] = (float) share[i];
+        LOG_INF("  %-8s %s %6.2f GB/s -> %5.1f%%%s\n",
+                ggml_backend_dev_name(devs[i]),
+                i < n_rpc ? dev_endpoint_fn(devs[i]) : "(local)",
+                score[i], 100.0 * share[i] / (share_sum > 0 ? share_sum : 1.0),
+                capped[i] ? " (memory-capped)" : "");
+    }
 }
 
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
@@ -2514,6 +2720,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.rpc_discover_group = value;
             }
         ).set_env("LLAMA_ARG_RPC_DISCOVER_GROUP"));
+        add_opt(common_arg(
+            {"--rpc-auto-weight"},
+            "when -ts is unset, weight the split by each worker's measured speed score (rpc-server --score), "
+            "capped by free memory, instead of the free-memory-proportional default; local GPUs are benchmarked "
+            "at startup (TASKS.md #31: bandwidth-weighted splits measured ~2x faster than memory-weighted on CPU fleets)",
+            [](common_params & params) {
+                params.rpc_auto_weight = true;
+            }
+        ).set_env("LLAMA_ARG_RPC_AUTO_WEIGHT"));
     }
     add_opt(common_arg(
         {"--mlock"},
@@ -3357,6 +3572,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.endpoint_slots = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
+    add_opt(common_arg(
+        {"--fleet-admin"},
+        string_format("allow restarting RPC workers via POST /fleet/worker/restart; requires an --api-key (default: %s)", params.fleet_admin ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.fleet_admin = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FLEET_ADMIN"));
     add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",

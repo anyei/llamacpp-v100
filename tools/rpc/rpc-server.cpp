@@ -176,6 +176,8 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     bool                     tensor_parallel = false;
     bool                     announce    = false;
+    bool                     score       = false; // startup speed benchmark (TASKS.md #35f)
+    bool                     allow_shutdown = false; // permit remote restart via RPC (TASKS.md #35d)
     std::string              announce_group; // empty = built-in default multicast group
     std::string              model_dir;      // local GGUFs to serve tensors from (skips first-load streaming)
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
@@ -198,6 +200,12 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  --announce-group ADDR:PORT       multicast group for --announce (default: built-in group)\n");
     fprintf(stderr, "  -md, --model-dir DIR             serve tensors from local GGUF files in DIR when the coordinator's\n");
     fprintf(stderr, "                                   model matches (skips the first-load network stream)\n");
+    fprintf(stderr, "  -sc, --score                     benchmark this worker's memory bandwidth at startup (~1s) and\n");
+    fprintf(stderr, "                                   publish it in the beacon + over RPC so coordinators with\n");
+    fprintf(stderr, "                                   --rpc-auto-weight can split work by speed (env: GGML_RPC_SCORE=1)\n");
+    fprintf(stderr, "  --allow-shutdown                 permit the coordinator to restart this worker over RPC (the\n");
+    fprintf(stderr, "                                   process exits; use ONLY under a supervisor that restarts it -\n");
+    fprintf(stderr, "                                   RPC is unauthenticated) (env: GGML_RPC_ALLOW_SHUTDOWN=1)\n");
     fprintf(stderr, "\n");
 }
 
@@ -247,6 +255,10 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.use_cache = true;
         } else if (arg == "-tp" || arg == "--tensor-parallel") {
             params.tensor_parallel = true;
+        } else if (arg == "-sc" || arg == "--score") {
+            params.score = true;
+        } else if (arg == "--allow-shutdown") {
+            params.allow_shutdown = true;
         } else if (arg == "-a" || arg == "--announce") {
             params.announce = true;
         } else if (arg == "--announce-group") {
@@ -422,6 +434,64 @@ int main(int argc, char * argv[]) {
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
+    }
+
+    // tee ggml logs into the RPC log ring so coordinators can tail this worker
+    // over RPC_CMD_GET_LOG (TASKS.md #35c). Resolved via the registry: the symbol
+    // lives in the RPC module, a separate .so when GGML_BACKEND_DL=ON.
+    {
+        static auto log_append_fn = (decltype(ggml_backend_rpc_log_append)*)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_log_append");
+        static ggml_log_callback prev_cb   = nullptr;
+        static void *            prev_data = nullptr;
+        if (log_append_fn != nullptr) {
+            ggml_log_get(&prev_cb, &prev_data);
+            ggml_log_set([](enum ggml_log_level level, const char * text, void * user_data) {
+                log_append_fn(text);
+                if (prev_cb != nullptr) {
+                    prev_cb(level, text, user_data);
+                } else {
+                    fputs(text, stderr);
+                    fflush(stderr);
+                }
+            }, prev_data);
+        }
+    }
+
+    // opt in to remote restart (TASKS.md #35d): only meaningful under a supervisor
+    if (params.allow_shutdown || getenv("GGML_RPC_ALLOW_SHUTDOWN") != nullptr) {
+        auto set_shutdown_fn = (decltype(ggml_backend_rpc_set_shutdown_enabled)*)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_shutdown_enabled");
+        if (set_shutdown_fn != nullptr) {
+            set_shutdown_fn(true);
+            fprintf(stderr, "remote shutdown ENABLED (coordinator may restart this worker over RPC)\n");
+        }
+    }
+
+    // speed score (TASKS.md #35f): measure effective memory bandwidth - the
+    // quantity that bounds decode t/s - and publish it BEFORE the announcer
+    // starts so every beacon carries it
+    if (params.score || getenv("GGML_RPC_SCORE") != nullptr) {
+        auto benchmark_fn = (decltype(ggml_backend_rpc_benchmark_device)*)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_benchmark_device");
+        auto set_score_fn = (decltype(ggml_backend_rpc_set_worker_score)*)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_worker_score");
+        if (benchmark_fn == nullptr || set_score_fn == nullptr) {
+            fprintf(stderr, "warning: RPC backend lacks the benchmark hooks, --score disabled\n");
+        } else {
+            // score the primary device: layer placement is per device, and the
+            // fleet's workers expose one compute device each (annex CPUs aside)
+            float bw_gbps = 0.0f, mm_gflops = 0.0f;
+            fprintf(stderr, "benchmarking %s (%s)...\n",
+                    ggml_backend_dev_name(devices[0]), ggml_backend_dev_description(devices[0]));
+            if (benchmark_fn(devices[0], &bw_gbps, &mm_gflops)) {
+                set_score_fn(bw_gbps, mm_gflops);
+                fprintf(stderr, "worker score: %.2f GB/s effective bandwidth, %.1f GFLOPS matvec\n",
+                        bw_gbps, mm_gflops);
+            } else {
+                fprintf(stderr, "warning: benchmark failed, worker stays unscored\n");
+            }
+        }
     }
 
     if (params.announce) {

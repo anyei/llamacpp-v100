@@ -10,7 +10,9 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-rpc.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_model_n_devices / llama_model_get_device / llama_model_device_n_layers (fleet snapshot)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <optional>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -889,6 +892,41 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // fleet introspection (TASKS.md #35): read by the /fleet/* handlers from HTTP
+    // threads. Everything here is self-synchronized and the handlers never touch
+    // the model - the layer map is snapshotted on the model thread at load time.
+    struct fleet_state_t {
+        std::atomic<float> load_progress{-1.0f}; // 0..1 while a load is in flight, else -1
+        std::atomic<bool>  reload_active{false}; // --rpc-reload recovery in flight
+        // set once the initial load_model(params) has fully returned, so the status
+        // handler (exempt from the loading-503 gate) never reads main's `params`
+        // while the model thread is still assigning `params = params_base`
+        std::atomic<bool>  ready{false};
+
+        mutable std::mutex mutex; // guards the fields below
+        std::string load_stage;
+        struct dev_layers_t {
+            std::string name;
+            int32_t     n_layers;
+        };
+        std::vector<dev_layers_t> layer_map; // refreshed on every successful load
+        struct beacon_t {
+            std::string payload;
+            int64_t     t_last_ms;
+        };
+        std::map<std::string, beacon_t> discovered; // endpoint -> last beacon heard
+
+        std::thread       listener;
+        std::atomic<bool> stop{false};
+
+        ~fleet_state_t() {
+            stop.store(true);
+            if (listener.joinable()) {
+                listener.join();
+            }
+        }
+    } fleet;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -1064,6 +1102,37 @@ private:
         return true;
     }
 
+    // background beacon listener (TASKS.md #35b): keeps /fleet/status aware of every
+    // worker present on the LAN, including those carrying no layers. Only runs with
+    // --rpc-discover - it opens a UDP socket and TCP-probes beacon candidates.
+    void fleet_start_beacon_listener() {
+        if (!params_base.rpc_discover || fleet.listener.joinable()) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        if (reg == nullptr) {
+            return;
+        }
+        typedef int (*discover_t)(const char *, int, void (*)(const char *, const char *, void *), void *);
+        auto discover_fn = (discover_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_discover");
+        if (discover_fn == nullptr) {
+            return;
+        }
+        fleet.listener = std::thread([this, discover_fn, group = params_base.rpc_discover_group]() {
+            while (!fleet.stop.load()) {
+                discover_fn(group.empty() ? nullptr : group.c_str(), /*timeout_ms=*/ 2500,
+                    [](const char * ep, const char * payload, void * ud) {
+                        auto * self = (server_context_impl *) ud;
+                        std::lock_guard<std::mutex> lock(self->fleet.mutex);
+                        self->fleet.discovered[ep] = { payload, ggml_time_ms() };
+                    }, this);
+                for (int i = 0; i < 30 && !fleet.stop.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+            }
+        });
+    }
+
     void rpc_reload_and_resplit() {
         typedef void (*rpc_reset_failed_t)(void);
         typedef bool (*rpc_dev_reachable_t)(ggml_backend_dev_t);
@@ -1075,8 +1144,10 @@ private:
             ? (rpc_dev_reachable_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_reachable")
             : nullptr;
 
+        fleet.reload_active.store(true);
         if (rpc_try_surgical()) {
             SRV_INF("%s", "surgical re-provision complete - resuming serving without a reload\n");
+            fleet.reload_active.store(false);
             return;
         }
 
@@ -1128,6 +1199,7 @@ private:
             std::this_thread::sleep_for(std::chrono::seconds(10));
         }
         sleeping = false;
+        fleet.reload_active.store(false);
         SRV_INF("%s", "in-process reload complete - resuming serving\n");
     }
 
@@ -1152,6 +1224,11 @@ private:
                 return true;
             }
             t_last = t_now;
+        }
+        d->ctx->fleet.load_progress.store(progress);
+        {
+            std::lock_guard<std::mutex> lock(d->ctx->fleet.mutex);
+            d->ctx->fleet.load_stage = d->stage;
         }
         if (d->ctx->callback_state) {
             d->ctx->callback_state(SERVER_STATE_LOADING, {
@@ -1607,8 +1684,30 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        // fleet snapshot (TASKS.md #35a/b): per-device layer counts for /fleet/status,
+        // taken here on the model thread so the HTTP handlers never touch the model
+        {
+            std::lock_guard<std::mutex> lock(fleet.mutex);
+            fleet.layer_map.clear();
+            if (model_tgt != nullptr) {
+                const int32_t n_dev = llama_model_n_devices(model_tgt);
+                for (int32_t i = 0; i < n_dev; ++i) {
+                    ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                    fleet.layer_map.push_back({
+                        dev != nullptr ? ggml_backend_dev_name(dev) : "?",
+                        llama_model_device_n_layers(model_tgt, i),
+                    });
+                }
+            }
+        }
+        fleet.load_progress.store(-1.0f);
+        fleet_start_beacon_listener();
+
         // propagate new defaults back to caller
         params = params_base;
+        // main's `params` is now fully written and never reassigned again (reloads
+        // operate on a separate params object); the status handler may read it
+        fleet.ready.store(true);
 
         if (!is_resume) {
             return init();
@@ -4583,6 +4682,145 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     return res;
 }
 
+//
+// /fleet/* helpers (TASKS.md #35)
+//
+
+// RPC backend hooks, resolved once; every pointer may be null (no RPC backend)
+struct fleet_rpc_procs {
+    const char * (*dev_endpoint)(ggml_backend_dev_t)                                = nullptr;
+    bool (*dev_worker_is_cpu)(ggml_backend_dev_t)                                   = nullptr;
+    bool (*dev_failed)(ggml_backend_dev_t)                                          = nullptr;
+    bool (*any_failed)(void)                                                        = nullptr;
+    bool (*ep_stats)(const char *, struct ggml_backend_rpc_ep_stats *)              = nullptr;
+    bool (*fetch_log)(const char *, char *, size_t, size_t *)                       = nullptr;
+    bool (*shutdown_worker)(const char *)                                           = nullptr;
+    bool (*get_score)(const char *, float *, float *)                               = nullptr;
+    bool (*reachable)(const char *, int)                                            = nullptr;
+};
+
+static const fleet_rpc_procs & fleet_procs() {
+    static const fleet_rpc_procs procs = []() {
+        fleet_rpc_procs p;
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+        if (reg != nullptr) {
+            p.dev_endpoint      = (decltype(p.dev_endpoint))      ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_endpoint");
+            p.dev_worker_is_cpu = (decltype(p.dev_worker_is_cpu)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_worker_is_cpu");
+            p.dev_failed        = (decltype(p.dev_failed))        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_failed");
+            p.any_failed        = (decltype(p.any_failed))        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_any_endpoint_failed");
+            p.ep_stats          = (decltype(p.ep_stats))          ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_stats");
+            p.fetch_log         = (decltype(p.fetch_log))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_fetch_log");
+            p.shutdown_worker   = (decltype(p.shutdown_worker))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_shutdown_worker");
+            p.get_score         = (decltype(p.get_score))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_worker_score");
+            p.reachable         = (decltype(p.reachable))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_reachable");
+        }
+        return p;
+    }();
+    return procs;
+}
+
+// devices the model places layers on: the configured list when set, else the
+// registry's GPU devices RPC-first (mirrors llama_prepare_model_devices' default)
+static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params) {
+    std::vector<ggml_backend_dev_t> devs;
+    if (!params.devices.empty()) {
+        for (ggml_backend_dev_t dev : params.devices) {
+            if (dev != nullptr) {
+                devs.push_back(dev);
+            }
+        }
+        return devs;
+    }
+    std::vector<ggml_backend_dev_t> locals;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+            devs.push_back(dev);
+        } else {
+            locals.push_back(dev);
+        }
+    }
+    devs.insert(devs.end(), locals.begin(), locals.end());
+    return devs;
+}
+
+// pull a numeric key=value token out of a beacon payload line; nullopt if absent
+static std::optional<double> fleet_beacon_num(const std::string & payload, const std::string & key) {
+    const std::string token = " " + key + "=";
+    const size_t pos = payload.find(token);
+    if (pos == std::string::npos) {
+        return std::nullopt;
+    }
+    try {
+        return std::stod(payload.substr(pos + token.size()));
+    } catch (const std::exception &) {
+        return std::nullopt;
+    }
+}
+
+// device memory over RPC costs a worker round trip - refresh at most every 5s
+static void fleet_dev_memory_cached(ggml_backend_dev_t dev, bool is_rpc, size_t * free_mem, size_t * total_mem) {
+    struct entry { int64_t t_ms; size_t free_mem; size_t total_mem; };
+    static std::mutex mutex;
+    static std::map<ggml_backend_dev_t, entry> cache;
+    if (is_rpc) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(dev);
+        if (it != cache.end() && ggml_time_ms() - it->second.t_ms < 5000) {
+            *free_mem  = it->second.free_mem;
+            *total_mem = it->second.total_mem;
+            return;
+        }
+    }
+    ggml_backend_dev_memory(dev, free_mem, total_mem);
+    if (is_rpc) {
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[dev] = { ggml_time_ms(), *free_mem, *total_mem };
+    }
+}
+
+// worker scores: beacons carry them for free; static-listed workers get a lazy
+// RPC query cached for 60s (an ephemeral connect, cheap on a LAN)
+static std::optional<std::pair<float,float>> fleet_worker_score(const std::string & endpoint, const std::string & beacon_payload, bool failed) {
+    if (!beacon_payload.empty()) {
+        auto bw = fleet_beacon_num(beacon_payload, "bw_gbps");
+        auto fl = fleet_beacon_num(beacon_payload, "mm_gflops");
+        if (bw.has_value()) {
+            return std::make_pair((float) *bw, (float) fl.value_or(0.0));
+        }
+    }
+    if (failed || fleet_procs().get_score == nullptr) {
+        return std::nullopt;
+    }
+    struct entry { int64_t t_ms; bool ok; float bw; float fl; };
+    static std::mutex mutex;
+    static std::map<std::string, entry> cache;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(endpoint);
+        if (it != cache.end() && ggml_time_ms() - it->second.t_ms < 60000) {
+            if (!it->second.ok) {
+                return std::nullopt;
+            }
+            return std::make_pair(it->second.bw, it->second.fl);
+        }
+    }
+    float bw = 0.0f, fl = 0.0f;
+    const bool ok = fleet_procs().get_score(endpoint.c_str(), &bw, &fl);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[endpoint] = { ggml_time_ms(), ok, bw, fl };
+    }
+    if (!ok) {
+        return std::nullopt;
+    }
+    return std::make_pair(bw, fl);
+}
+
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
@@ -4609,6 +4847,258 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    // fleet status (TASKS.md #35a/b/e): registry + fleet-state snapshot only, never
+    // the model - it must answer during load and during --rpc-reload recovery
+    this->get_fleet_status = [this](const server_http_req &) {
+        auto res = create_response(true);
+        const auto & procs = fleet_procs();
+        const auto & fleet = ctx_server.fleet;
+
+        // copy the mutex-guarded state up front
+        std::map<std::string, int32_t> layer_map;
+        std::map<std::string, server_context_impl::fleet_state_t::beacon_t> beacons;
+        std::string load_stage;
+        {
+            std::lock_guard<std::mutex> lock(fleet.mutex);
+            for (const auto & d : fleet.layer_map) {
+                layer_map[d.name] = d.n_layers;
+            }
+            beacons    = fleet.discovered;
+            load_stage = fleet.load_stage;
+        }
+
+        // read main's `params` only once the initial load has fully returned; until
+        // then the model thread may still be assigning it (the status endpoint is
+        // exempt from the loading-503 gate, so this handler can run concurrently)
+        const bool ready = fleet.ready.load();
+
+        std::set<std::string> pipeline_eps;
+        json devices = json::array();
+        if (ready) {
+            const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params);
+            double ts_sum = 0.0;
+            for (size_t i = 0; i < devs.size() && i < llama_max_devices(); ++i) {
+                ts_sum += params.tensor_split[i];
+            }
+            for (size_t i = 0; i < devs.size(); ++i) {
+                ggml_backend_dev_t dev = devs[i];
+                const char * ep     = procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
+                const bool   is_rpc = ep != nullptr;
+                const bool   failed = is_rpc && procs.dev_failed != nullptr && procs.dev_failed(dev);
+                // bounded reachability, never the blocking cached-socket path: one dead
+                // worker must not stall this handler (it polls every 2s from the UI)
+                const bool   reachable = !is_rpc ? true
+                    : (failed ? false
+                       : (procs.reachable != nullptr ? procs.reachable(ep, 800) : true));
+                size_t free_mem = 0, total_mem = 0;
+                if (reachable) {
+                    fleet_dev_memory_cached(dev, is_rpc, &free_mem, &total_mem);
+                }
+
+                json d = {
+                    {"name",             ggml_backend_dev_name(dev)},
+                    {"description",      ggml_backend_dev_description(dev)},
+                    {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
+                    {"is_rpc",           is_rpc},
+                    {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)},
+                    {"reachable",        reachable},
+                    {"failed",           failed},
+                    {"memory_free_mib",  free_mem  / (1024 * 1024)},
+                    {"memory_total_mib", total_mem / (1024 * 1024)},
+                    {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
+                    {"n_layers",         nullptr},
+                    {"stats",            nullptr},
+                    {"score",            nullptr},
+                };
+                auto lit = layer_map.find(ggml_backend_dev_name(dev));
+                if (lit != layer_map.end()) {
+                    d["n_layers"] = lit->second;
+                }
+                if (is_rpc) {
+                    pipeline_eps.insert(ep);
+                    if (procs.ep_stats != nullptr) {
+                        ggml_backend_rpc_ep_stats st;
+                        if (procs.ep_stats(ep, &st)) {
+                            d["stats"] = {
+                                {"bytes_sent",      st.bytes_sent},
+                                {"bytes_recv",      st.bytes_recv},
+                                {"calls",           st.n_calls},
+                                {"ewma_latency_us", st.ewma_latency_us},
+                            };
+                        }
+                    }
+                    std::string payload;
+                    for (const auto & [bep, b] : beacons) {
+                        if (bep == ep) {
+                            payload = b.payload;
+                            break;
+                        }
+                    }
+                    if (auto score = fleet_worker_score(ep, payload, !reachable)) {
+                        d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                    }
+                }
+                devices.push_back(std::move(d));
+            }
+        }
+
+        json discovered = json::array();
+        const int64_t t_now = ggml_time_ms();
+        for (const auto & [ep, b] : beacons) {
+            json e = {
+                {"endpoint",     ep},
+                {"payload",      b.payload},
+                {"last_seen_ms", t_now - b.t_last_ms},
+                {"in_pipeline",  pipeline_eps.count(ep) > 0},
+                {"free_mib",     nullptr},
+                {"devs",         nullptr},
+                {"proto",        nullptr},
+                {"bw_gbps",      nullptr},
+            };
+            if (auto v = fleet_beacon_num(b.payload, "free_mib")) { e["free_mib"] = (int64_t) *v; }
+            if (auto v = fleet_beacon_num(b.payload, "devs"))     { e["devs"]     = (int64_t) *v; }
+            if (auto v = fleet_beacon_num(b.payload, "proto"))    { e["proto"]    = *v;           }
+            if (auto v = fleet_beacon_num(b.payload, "bw_gbps"))  { e["bw_gbps"]  = *v;           }
+            discovered.push_back(std::move(e));
+        }
+
+        const float progress = fleet.load_progress.load();
+        const bool  loading  = progress >= 0.0f;
+        std::string state = "loading";
+        if (fleet.reload_active.load()) {
+            state = "reloading";
+        } else if (loading) {
+            state = "loading";
+        } else if (!ready) {
+            state = "loading";
+        } else if (queue_tasks.is_sleeping()) {
+            state = "sleeping";
+        } else {
+            state = "ready";
+        }
+
+        json body = {
+            {"server_state", state},
+            {"reload", {
+                {"pending",       fleet.reload_active.load()},
+                {"any_endpoint_failed", procs.any_failed != nullptr && procs.any_failed()},
+                {"auto_recovery", ready && params.rpc_reload},
+            }},
+            {"devices",    std::move(devices)},
+            {"discovered", std::move(discovered)},
+        };
+        if (ready) {
+            // the model's file size never changes for a given load - stat it once
+            static const size_t model_bytes = [&]() -> size_t {
+                std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
+                return f.good() ? (size_t) f.tellg() : 0;
+            }();
+            body["fleet_admin"]  = params.fleet_admin && !params.api_keys.empty();
+            body["split_mode"]   = params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer"
+                                 : params.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "none";
+            body["n_gpu_layers"] = params.n_gpu_layers;
+            body["model"]        = { {"path", params.model.path}, {"size_bytes", model_bytes} };
+        } else {
+            body["fleet_admin"]  = false;
+            body["split_mode"]   = nullptr;
+            body["n_gpu_layers"] = nullptr;
+            body["model"]        = nullptr;
+        }
+        if (loading) {
+            body["load_progress"] = { {"value", progress}, {"stage", load_stage} };
+        }
+        res->ok(body);
+        return res;
+    };
+
+    // tail a worker's log ring over RPC (TASKS.md #35c)
+    this->get_fleet_worker_log = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const auto & procs = fleet_procs();
+        const std::string ep = req.get_param("ep");
+        if (ep.empty()) {
+            res->error(format_error_response("missing 'ep' query parameter (worker endpoint host:port)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        // only endpoints this server actually knows: pipeline devices or beacons
+        bool known = false;
+        for (ggml_backend_dev_t dev : fleet_device_list(params)) {
+            const char * dep = procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
+            if (dep != nullptr && ep == dep) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            std::lock_guard<std::mutex> lock(ctx_server.fleet.mutex);
+            known = ctx_server.fleet.discovered.count(ep) > 0;
+        }
+        if (!known) {
+            res->error(format_error_response("unknown worker endpoint", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        size_t max_bytes = 65536;
+        const std::string max_str = req.get_param("max");
+        if (!max_str.empty()) {
+            max_bytes = std::max((size_t) 512, std::min((size_t) 65536, (size_t) std::atoll(max_str.c_str())));
+        }
+        std::vector<char> buf(max_bytes);
+        size_t out_len = 0;
+        if (procs.fetch_log == nullptr || !procs.fetch_log(ep.c_str(), buf.data(), buf.size(), &out_len)) {
+            res->error(format_error_response("failed to fetch the worker log (worker offline, or its rpc-server predates proto 4.7)", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->ok({
+            {"endpoint", ep},
+            {"log",      std::string(buf.data(), out_len)},
+        });
+        return res;
+    };
+
+    // restart a worker (TASKS.md #35d): worker exits 0, its supervisor restarts it,
+    // --rpc-reload's surgical path re-provisions it. Admin-gated: remote kill.
+    this->post_fleet_worker_restart = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const auto & procs = fleet_procs();
+        if (!params.fleet_admin || params.api_keys.empty()) {
+            res->error(format_error_response("worker restart requires --fleet-admin AND an --api-key", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        const std::string ep = body.value("endpoint", "");
+        if (ep.empty()) {
+            res->error(format_error_response("missing 'endpoint' in request body", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        bool known = false;
+        for (ggml_backend_dev_t dev : fleet_device_list(params)) {
+            const char * dep = procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
+            if (dep != nullptr && ep == dep) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            std::lock_guard<std::mutex> lock(ctx_server.fleet.mutex);
+            known = ctx_server.fleet.discovered.count(ep) > 0;
+        }
+        if (!known) {
+            res->error(format_error_response("unknown worker endpoint", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        SRV_WRN("fleet-admin: restarting worker %s\n", ep.c_str());
+        const bool ok = procs.shutdown_worker != nullptr && procs.shutdown_worker(ep.c_str());
+        if (!ok) {
+            res->error(format_error_response("worker did not accept the shutdown (offline, or its rpc-server predates proto 4.7)", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->ok({
+            {"success",  true},
+            {"recovery", params.rpc_reload ? "auto" : "manual"},
+        });
         return res;
     };
 

@@ -3,6 +3,7 @@ export * from './badges';
 export * from './chat';
 export * from './content';
 export * from './dialogs';
+export * from './fleet';
 export * from './forms';
 export * from './mcp';
 export * from './misc';
