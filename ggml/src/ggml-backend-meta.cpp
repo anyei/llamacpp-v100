@@ -607,25 +607,51 @@ bool ggml_backend_meta_reprovision_endpoint(const char * endpoint) {
     if (endpoint == nullptr) {
         return false;
     }
-    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
-    if (rpc_reg == nullptr) {
-        return false;
-    }
     typedef const char * (*buf_endpoint_t)(ggml_backend_buffer_t);
     typedef bool (*buf_reprovision_t)(ggml_backend_buffer_t, void **, void **);
     typedef void (*clear_failed_t)(const char *);
-    auto buf_endpoint_fn = (buf_endpoint_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_buffer_endpoint");
-    auto buf_reprov_fn   = (buf_reprovision_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_buffer_reprovision");
-    auto clear_failed_fn = (clear_failed_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_clear_failed_endpoint");
-    if (buf_endpoint_fn == nullptr || buf_reprov_fn == nullptr || clear_failed_fn == nullptr) {
-        return false;
-    }
+    buf_endpoint_t    buf_endpoint_fn = nullptr;
+    buf_reprovision_t buf_reprov_fn   = nullptr;
+    clear_failed_t    clear_failed_fn = nullptr;
+
     static const long long max_state_mib = []() {
         const char * env = getenv("GGML_META_SURGICAL_MAX_STATE_MIB");
         return env != nullptr ? atoll(env) : 64LL;
     }();
 
     std::lock_guard<std::mutex> lock(ggml_backend_meta_buffer_context::registry_mutex());
+
+    // Resolve the RPC reg from a member buffer's device rather than
+    // ggml_backend_reg_by_name(): that lookup lives in the loader library, which
+    // ggml-base does not link against in GGML_BACKEND_DL builds (undefined-symbol
+    // link error). ggml_backend_dev_backend_reg + get_proc_address are base-safe,
+    // the same pattern the comm/W2W proc resolution below uses.
+    for (ggml_backend_meta_buffer_context * ctx : ggml_backend_meta_buffer_context::registry()) {
+        for (auto & bp : ctx->bufs) {
+            ggml_backend_buffer_t b = bp.get();
+            if (b == nullptr) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b));
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg == nullptr) {
+                continue;
+            }
+            auto fn = (buf_endpoint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_endpoint");
+            if (fn != nullptr) {
+                buf_endpoint_fn = fn;
+                buf_reprov_fn   = (buf_reprovision_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_buffer_reprovision");
+                clear_failed_fn = (clear_failed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_clear_failed_endpoint");
+                break;
+            }
+        }
+        if (buf_endpoint_fn != nullptr) {
+            break;
+        }
+    }
+    if (buf_endpoint_fn == nullptr || buf_reprov_fn == nullptr || clear_failed_fn == nullptr) {
+        return false;
+    }
     struct target {
         ggml_backend_meta_buffer_context * ctx;
         size_t                             j;
