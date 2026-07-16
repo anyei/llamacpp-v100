@@ -201,6 +201,17 @@
 					if (w.n_layers != null) badges.push('<span class="badge">' + w.n_layers + ' layers</span>');
 					if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
 					if (w.free_mib != null) badges.push('<span class="badge">' + (w.free_mib / 1024).toFixed(1) + ' GiB free</span>');
+					// weight provenance: served from the worker's own cache/--model-dir vs streamed
+					const cachedMib = w.weights_cached_mib || 0, streamedMib = w.weights_streamed_mib || 0;
+					if (cachedMib + streamedMib > 0) {
+						const pct = Math.round((100 * cachedMib) / (cachedMib + streamedMib));
+						badges.push('<span class="badge score" title="weights served from the worker\'s local cache / model dir">' +
+							pct + '% cached (' + (cachedMib / 1024).toFixed(1) + ' GiB)</span>');
+						if (streamedMib > 0) {
+							badges.push('<span class="badge" title="weights streamed from the coordinator">' +
+								(streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
+						}
+					}
 					const meta = w.bytes_sent != null
 						? fmtBytes(w.bytes_sent) + ' uploaded · ' + (w.calls | 0) + ' calls · rtt ' +
 						  (w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—')

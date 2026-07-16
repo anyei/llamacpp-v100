@@ -5392,6 +5392,9 @@ void server_routes::init_routes() {
                         w["bytes_sent"]      = lit->second.bytes_sent;
                         w["calls"]           = lit->second.n_calls;
                         w["ewma_latency_us"] = lit->second.ewma_latency_us;
+                        // weight provenance: worker-cache/--model-dir served vs streamed
+                        w["weights_cached_mib"]   = lit->second.weights_cached_bytes   / (1024 * 1024);
+                        w["weights_streamed_mib"] = lit->second.weights_streamed_bytes / (1024 * 1024);
                     }
                     std::string payload;
                     auto bit = beacons.find(ep);

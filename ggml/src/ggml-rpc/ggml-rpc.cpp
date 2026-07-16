@@ -611,6 +611,8 @@ struct rpc_ep_stat {
     std::atomic<uint64_t> bytes_recv{0};
     std::atomic<uint64_t> n_calls{0};
     std::atomic<uint64_t> ewma_latency_us{0};
+    std::atomic<uint64_t> weights_cached_bytes{0};
+    std::atomic<uint64_t> weights_streamed_bytes{0};
 
     void observe_latency(uint64_t us) {
         // EWMA alpha 1/8; a racing store may drop one sample - fine for a gauge
@@ -643,6 +645,8 @@ bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_
     out->bytes_recv      = st->bytes_recv.load(std::memory_order_relaxed);
     out->n_calls         = st->n_calls.load(std::memory_order_relaxed);
     out->ewma_latency_us = st->ewma_latency_us.load(std::memory_order_relaxed);
+    out->weights_cached_bytes   = st->weights_cached_bytes.load(std::memory_order_relaxed);
+    out->weights_streamed_bytes = st->weights_streamed_bytes.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -665,6 +669,8 @@ void ggml_backend_rpc_foreach_endpoint_stat(
             s.bytes_recv      = st->bytes_recv.load(std::memory_order_relaxed);
             s.n_calls         = st->n_calls.load(std::memory_order_relaxed);
             s.ewma_latency_us = st->ewma_latency_us.load(std::memory_order_relaxed);
+            s.weights_cached_bytes   = st->weights_cached_bytes.load(std::memory_order_relaxed);
+            s.weights_streamed_bytes = st->weights_streamed_bytes.load(std::memory_order_relaxed);
             snapshot.emplace_back(ep, s);
         }
     }
@@ -1174,10 +1180,22 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         }
         if (response.result) {
             // the server has the same data, no need to send it
+            if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                rpc_ep_stat * st = rpc_async_state(ctx->sock.get()).stat;
+                if (st != nullptr) {
+                    st->weights_cached_bytes.fetch_add(size, std::memory_order_relaxed);
+                }
+            }
             return;
         }
     } else {
         rpc_journal_record_set(buffer, rpc_tensor, offset, data, size, 0, false);
+    }
+    if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        rpc_ep_stat * st = rpc_async_state(ctx->sock.get()).stat;
+        if (st != nullptr) {
+            st->weights_streamed_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;

@@ -120,6 +120,11 @@ struct ggml_backend_rpc_ep_stats {
     uint64_t bytes_recv;      // blocking-command responses
     uint64_t n_calls;         // commands sent
     uint64_t ewma_latency_us; // EWMA (alpha 1/8) of blocking round-trip latency
+    // weight-upload provenance (loading view): bytes the worker already had
+    // (tensor cache / --model-dir, served via SET_TENSOR_HASH) vs bytes that
+    // had to stream over the wire
+    uint64_t weights_cached_bytes;
+    uint64_t weights_streamed_bytes;
 };
 GGML_BACKEND_API bool ggml_backend_rpc_endpoint_stats(const char * endpoint, struct ggml_backend_rpc_ep_stats * out);
 
