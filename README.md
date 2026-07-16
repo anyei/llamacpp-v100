@@ -276,8 +276,13 @@ benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
 ## Fork knobs (env gates)
 
 Everything this fork adds is **off by default** and gated by an env var (or CLI
-flag), so a stock run behaves like upstream. Full rationale, measured effects, and
-usage examples in [`docs/env-gates.md`](docs/env-gates.md); the complete list:
+flag), so a stock run behaves like upstream. The **complete, authoritative list**
+— every gate with its type, default, measured effect, and usage examples — lives
+in [`docs/env-gates.md`](docs/env-gates.md). The tables below are a curated
+highlight of the most-used knobs (the full reference also covers the meta
+expert-parallel gates, the fleet/discovery/auto-weight family, worker
+`--score`/`--allow-shutdown`, surgical re-provision, and the CUDA
+containment/fault-injection knobs):
 
 **SSD streaming — CPU tier**
 

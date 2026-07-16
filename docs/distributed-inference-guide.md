@@ -25,7 +25,10 @@ with MTP speculation is higher (~81 t/s — see the README benchmarks).
 | Need max context, model fits | offload tail layers to remote box (frees local VRAM for KV) | pipeline cost only |
 
 Rule of thumb: **tensor parallelism inside a box (NVLink), pipeline between
-boxes (Ethernet)**. Never `-sm tensor` across a network.
+boxes (Ethernet)** — with one exception: a MoE whose *experts* fit no single
+box runs cross-box as **expert-parallel** (`-sm tensor` + dedicated attention),
+because its per-layer reduce is a small vector sum, not a GEMM reduce. Side-by-
+side comparison and spin-up commands for all three modes: **§2b**.
 
 ## 0. How data moves — what crosses the network, and when
 
@@ -286,6 +289,95 @@ startup. #31 measured bandwidth-weighted splits ~2x faster than the
 free-memory default on a heterogeneous CPU fleet. An explicit `-ts`/`COORD_TS`
 always wins, and a warning fires when the model would fit the local GPUs
 alone (#31 law 1: distribution loses in that regime).
+
+## 2b. Choosing a split mode: layer vs tensor vs expert-parallel
+
+Three ways to spread one model across devices. They differ in *what* each
+device holds and *how* a token's work composes across them — which is what
+decides whether distribution helps or hurts.
+
+| | `-sm layer` (pipeline) | `-sm tensor` (tensor-parallel) | `-sm tensor` + EP (expert-parallel) |
+|---|---|---|---|
+| Each device holds | whole layers | a slice of *every* tensor | attention on ONE member, expert slices on the rest |
+| Per-token comms | activations at each stage boundary (KB) | an AllReduce **every layer** | one reduce per MoE boundary (star/fused) |
+| Composition law | **SUM** of stage times (+ hops) | max + per-layer reduce | **max over contacted workers** (#28) |
+| Scales by adding boxes | worse (more stages) single-stream; helps capacity/throughput | only inside a box | capacity + batch throughput; single-stream is latency-bound |
+| Good across a network? | **yes** (Ethernet-friendly) | **NO** — AllReduce/layer over Ethernet is ~100x too slow | yes — the reduce is a small k-vector sum, not a GEMM reduce |
+| Use when | model/KV doesn't fit one box; tail-offload for context | ≥2 NVLinked GPUs in **one** box | a MoE whose **experts** fit no single box |
+| Measured here | CPU fleet 1.2-2.0 t/s (35B); law: best-single-box wins if it fits | 2x V100 in-box: 108 t/s (35B), 47.8 (27B) — the ceiling | V4 86.7 GB RAM-resident on the fleet: 2.4-2.7 t/s single-stream |
+
+```
+ -sm layer (pipeline)          -sm tensor (in-box TP)      -sm tensor + EP (cross-box)
+ token ─▶[L0-15]▶[L16-31]▶      token ─▶┌GPU0 slice┐        attn ─▶ CUDA0 (owner)
+          box A     box B               │  reduce  │─▶       experts ─┬▶ worker .11
+ time = A + B (+ hops)                  └GPU1 slice┘         (routed) ├▶ worker .15
+ SUM of stages                    every layer, NVLink        time = MAX over the
+                                  never Ethernet             workers a token touches
+```
+
+### Spin-up — `-sm layer` (pipeline across boxes)
+
+Capacity / tail-offload. Each RPC worker computes whole layers; `-ts` weights
+the split (auto-weight fills it by measured bandwidth):
+
+```bash
+# hand-weighted: worker .11 gets 3 shares, .15 gets 2, local GPUs the rest
+llama-server -m model.gguf --rpc 10.5.5.11:50052,10.5.5.15:50052 \
+  -sm layer -ngl 99 -ts 3,2,4,4
+
+# zero-config dynamic fleet, bandwidth-weighted (workers run --score --announce):
+COORD_AUTO_WEIGHT=1 docker compose -f docker-compose.fleet-coordinator.yml up
+#   -> or the ready-made script:  ./run-fleet-deepseek-autoweight.sh
+```
+
+### Spin-up — `-sm tensor` (tensor-parallel inside one box)
+
+The single-box ceiling. All local GPUs, NVLink AllReduce, one process, no RPC:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 llama-server -m model.gguf \
+  -sm tensor -ts 0.5,0.5 -ngl 99            # + GGML_CUDA_ALLREDUCE=p2p (env-gates §3)
+```
+
+To expose a multi-GPU box as ONE tensor-parallel device *to a remote
+coordinator* (a "TP island"), run the worker with `--tensor-parallel` (§1) and
+point the coordinator's `--rpc` at it — the AllReduce stays NVLink-local on the
+island; only the island's boundary activations cross the network.
+
+### Spin-up — `-sm tensor` + expert-parallel (a MoE across the fleet)
+
+The flagship distributed mode (TASKS.md #28; design in
+`docs/expert-parallel-plan.md`). Attention/KV/router live on ONE member
+(`LLAMA_META_ATTN_OWNER`, a local V100), the routed experts are segmented
+across the members (`LLAMA_META_EP_ONLY`). This is how the 86.7 GB
+DeepSeek-V4-Flash runs RAM-resident across boxes that individually hold none of
+it:
+
+```bash
+# env selects the EP shape; --device lists the meta members in -ts order
+LLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=0 \
+llama-server -m DeepSeek-V4-Flash.gguf \
+  --rpc 10.5.5.11:50052,10.5.5.15:50054 \
+  --device CUDA0,RPC0,RPC1 -sm tensor -ts 0,3,2 \
+  -ngl 99 --no-mmap -c 4096 -ub 256 -b 256
+
+# ready-made (hand -ts):        ./run-ep-fleet-deepseek.sh
+# ready-made (auto-weighted):   EP_AUTO_WEIGHT=--rpc-auto-weight ./run-ep-fleet-deepseek.sh
+```
+
+- `-ts 0,3,2` gives the attention owner a **0** expert share (it owns attention
+  instead); `--rpc-auto-weight` sizes the rest by score, capped by memory.
+- **Single-stream is latency-bound, not compute-bound** (#28 attribution): a
+  token pays one round trip per MoE boundary, so **fewer computing members is
+  faster** single-stream (adding a fast V100 expert member *lowered* single-
+  stream 2.69 -> 2.06 t/s by adding a boundary participant). The wins are
+  **capacity** (a model no box holds) and **batch throughput** (the boundary
+  cost is paid once per step regardless of batch — `-np 4` aggregate scales
+  ~x2.85, crossing the single-box bar at B=4).
+- `-ub 256 -b 256` keeps the DSA compute reserve small (~258 MiB vs ~67 GB
+  virtual at the default ub 512). Give each member real memory headroom — V4's
+  decode compute buffer OOMs a member sized too tightly (leave margin beyond
+  `LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB`).
 
 ## 3. What to expect (measured, loopback worst case)
 

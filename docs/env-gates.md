@@ -75,6 +75,9 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 |---|---|---|---|
 | `GGML_CUDA_ALLREDUCE` | `p2p` | NCCL | `=p2p` uses a one-shot P2P NVLink AllReduce for 2 GPUs (falls back to NCCL). |
 | `GGML_CUDA_AR_P2P_MAX_BYTES` | bytes | 4 MB | Size cap above which the P2P path defers to NCCL. |
+| `GGML_CUDA_AR_COPY_THRESHOLD` | bytes | tuned | Byte threshold for the P2P AllReduce copy path (tuning knob). |
+| `GGML_CUDA_AR_COPY_CHUNK_BYTES` | bytes | 0 (off) | Chunk size for the P2P copy path; 0 keeps it unchunked. |
+| `GGML_CUDA_AR_BF16_THRESHOLD` | count | 1 | Element threshold above which the reduce runs in bf16. |
 | `GGML_CUDA_FORCE_GRAPHS` | bool | off | Force CUDA graphs on Volta (cc<8.0, where they're runtime-disabled). Opt-in; no measured gain here. |
 
 ## 5. Meta tensor-split backend (tasks 2, 8, 13, 16, 17)
@@ -88,6 +91,8 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_META_MAX_GRAPHS` | count | 8 | Compute-ring shadow-container slots (raise if many decode graph shapes are cached). |
 | `GGML_META_TIMING` | bool | off | Per-step compute vs reduce timing for the meta device. |
 | `LLAMA_META_EP_ONLY` | bool | off | Expert-parallel split shape: segment only `ffn_*_exps` across meta members, mirror everything else (attention, dense FFN, shared experts, output head). Also a fault isolator for split-policy bugs (task 28). |
+| `LLAMA_META_ATTN_OWNER` | index | -1 (off) | Dedicate attention/KV/router to meta member `<j>` (a local GPU): non-owners get zero-size attention slices, the exit projection is dot-dim split so its output derives PARTIAL, and the delayed AllReduce broadcasts the owner's activations back (x+0=x). The owner takes a **0** expert share. The core of the cross-box expert-parallel topology; composes with `LLAMA_META_EP_ONLY` (task 28 increment 3). |
+| `GGML_META_SURGICAL_MAX_STATE_MIB` | MiB | 64 | Cap on replayed non-weight state size for the meta backend's surgical re-provision path. |
 | `GGML_META_NO_DELAY` | bool | off | Reduce at every PARTIAL node instead of delaying AllReduce past the expert-merge tree. Diagnostic. |
 | `GGML_META_NO_STAR` | bool | off | Disable the star reduce (batched-read partials + host sum + async broadcast, used when a local member can root the reduce); fall back to the fold+butterfly. A/B + diagnostic. |
 | `GGML_META_NO_FUSED` | bool | off | Disable the fused boundary pipeline (proto 4.5: reduced value + CHAIN of subgraphs up to the next reduce + next-partial request in ONE message per wire member per boundary). Also auto-disabled under GGML_META_TIMING, GGML_META_NO_STAR and against pre-4.5 workers. A/B + diagnostic. |
@@ -122,7 +127,12 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_RPC_STATS` | bool | off | Client-side per-RPC-command call/byte counters, dumped to stderr at exit. Diagnostic; used to find the O(n^2) graph serialization and the per-row weight upload (task 28 increment 1). |
 | `GGML_RPC_DEBUG_FAIL_ALLOC` | `EP:SKIP:COUNT` | off | Fault injection: on endpoint `EP`, skip the first SKIP buffer allocations, fail the next COUNT, pass the rest (and log every request). Reproduces a worker rejecting a compute-buffer alloc (task 37 Run-B scenario: fail the PP compute buffer, let the no-pipeline retry pass). |
 | `GGML_RPC_DEBUG_BUF` | bool | off | Client-side buffer lifecycle log: every remote alloc (endpoint, remote_ptr, size) and free. Used to find the zero-size-chunk dummy buffer in task 37. |
-| `LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB` | MiB | 2% of model, clamped [512, 2048] | Override the per-device compute-buffer allowance `--rpc-auto-weight` subtracts from every device cap (task 37; KV is estimated from the GGUF header separately). |
+| `LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB` | MiB | 2% of model, clamped [512, 2048] | Override the per-device compute-buffer allowance `--rpc-auto-weight` subtracts from every device cap (task 37; KV is estimated from the GGUF header separately). Bump it if V4-class members OOM at decode (the default reserve can undershoot the actual compute buffer). |
+| `LLAMA_ARG_RPC_AUTO_WEIGHT` | bool | off | (= `--rpc-auto-weight`) Fill an unset `-ts` by each device's measured bandwidth score instead of by free memory, water-filled against capacity; local GPUs are benchmarked at startup. Also applies to `-sm tensor` EP splits (task 28 increment 3). Explicit `-ts` always wins. |
+| `GGML_RPC_SCORE` | bool | off | Worker-side (= `rpc-server --score`): run a ~1s matvec benchmark at startup (effective memory bandwidth, the decode-bound quantity) and publish the score in the discovery beacon + over RPC, for `--rpc-auto-weight`. Benched ONCE at startup — restart the worker when the box is idle if a busy start under-read it (TASKS.md #42). |
+| `GGML_RPC_ALLOW_SHUTDOWN` | bool | off | Worker-side (= `rpc-server --allow-shutdown`): permit the coordinator to restart this worker over RPC (`POST /fleet/worker/restart`). Off = the worker refuses shutdown commands. |
+| `LLAMA_ARG_FLEET_ADMIN` | bool | off | (= `--fleet-admin`, server) Enable `POST /fleet/worker/restart` and `POST /fleet/reload`. Requires an `--api-key` (these are remote-kill/reload primitives on an unauthenticated RPC fabric). |
+| `LLAMA_ARG_FLEET_PREFLIGHT` | path | off | (= `--fleet-preflight <gguf>`, server) Before the main load, benchmark a small model across the SAME devices/split (times single-token decodes) and publish the result in `/fleet/status`. A small dense model's compute is negligible, so the number is the fleet's per-token boundary/latency floor — an upper bound for any model on this topology, not a throughput estimate. Never runs on a resume/failure reload. |
 
 ## 8. KV cache (task 10)
 
