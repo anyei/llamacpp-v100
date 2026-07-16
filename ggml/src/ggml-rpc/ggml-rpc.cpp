@@ -4351,6 +4351,45 @@ bool ggml_backend_rpc_fetch_log(const char * endpoint, char * buf, size_t buf_si
     return true;
 }
 
+// free/total device memory over a THROWAWAY connection - never the cached compute
+// socket. The fleet-status UI poll must not share the compute socket: a synchronous
+// GET_DEVICE_MEMORY racing the decode path's in-flight async traffic desyncs the
+// framing, and get_device_memory's own failure handler would then rpc_mark_failed()
+// the endpoint - poisoning a HEALTHY worker mid-serve (TASKS.md #47). This path
+// touches neither the socket cache nor the failed-endpoint set.
+static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev); // defined below
+
+bool ggml_backend_rpc_dev_memory_ephemeral(ggml_backend_dev_t dev, int timeout_ms,
+                                           size_t * free, size_t * total) {
+    if (free)  { *free  = 0; }
+    if (total) { *total = 0; }
+    if (dev == nullptr || dev->iface.get_name != ggml_backend_rpc_device_get_name) {
+        return false;
+    }
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
+    const std::string & endpoint = ctx->endpoint;
+    const uint32_t device = ctx->device;
+    if (!ggml_backend_rpc_endpoint_reachable(endpoint.c_str(), timeout_ms)) {
+        return false; // bounded probe first: never sink the caller into a dead connect
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    rpc_msg_get_device_memory_req request;
+    request.device = device;
+    rpc_msg_get_device_memory_rsp response;
+    // send + read with the standard fixed-response framing (| size(8) | data |);
+    // this is a fresh connection with no in-flight commands, so no ping drain needed
+    if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response))) {
+        return false;
+    }
+    if (free)  { *free  = response.free_mem; }
+    if (total) { *total = response.total_mem; }
+    return true;
+}
+
 bool ggml_backend_rpc_shutdown_worker(const char * endpoint) {
     if (endpoint == nullptr) {
         return false;
@@ -4919,6 +4958,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_reachable") == 0) {
         return (void *)ggml_backend_rpc_dev_reachable;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_dev_memory_ephemeral") == 0) {
+        return (void *)ggml_backend_rpc_dev_memory_ephemeral;
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_failed") == 0) {
         return (void *)ggml_backend_rpc_dev_failed;

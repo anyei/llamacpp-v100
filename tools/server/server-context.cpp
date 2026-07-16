@@ -5024,6 +5024,7 @@ struct fleet_rpc_procs {
     bool (*shutdown_worker)(const char *)                                           = nullptr;
     bool (*get_score)(const char *, float *, float *)                               = nullptr;
     bool (*reachable)(const char *, int)                                            = nullptr;
+    bool (*dev_memory_ephemeral)(ggml_backend_dev_t, int, size_t *, size_t *)       = nullptr;
     void (*foreach_ep_stat)(void (*)(const char *, const struct ggml_backend_rpc_ep_stats *, void *), void *) = nullptr;
 };
 
@@ -5041,6 +5042,7 @@ static const fleet_rpc_procs & fleet_procs() {
             p.shutdown_worker   = (decltype(p.shutdown_worker))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_shutdown_worker");
             p.get_score         = (decltype(p.get_score))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_worker_score");
             p.reachable         = (decltype(p.reachable))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_reachable");
+            p.dev_memory_ephemeral = (decltype(p.dev_memory_ephemeral)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_memory_ephemeral");
             p.foreach_ep_stat   = (decltype(p.foreach_ep_stat))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_foreach_endpoint_stat");
         }
         return p;
@@ -5105,11 +5107,21 @@ static void fleet_dev_memory_cached(ggml_backend_dev_t dev, bool is_rpc, size_t 
             return;
         }
     }
-    ggml_backend_dev_memory(dev, free_mem, total_mem);
     if (is_rpc) {
+        // NEVER ggml_backend_dev_memory() for an RPC device here: it queries over
+        // the CACHED COMPUTE socket, and a poll racing in-flight async decode traffic
+        // desyncs the framing + poisons the endpoint, dropping a healthy worker
+        // mid-serve (TASKS.md #47). Use a throwaway connection instead.
+        if (fleet_procs().dev_memory_ephemeral != nullptr) {
+            fleet_procs().dev_memory_ephemeral(dev, 800, free_mem, total_mem);
+        } else {
+            *free_mem = 0; *total_mem = 0; // no ephemeral path: report unknown, don't touch compute
+        }
         std::lock_guard<std::mutex> lock(mutex);
         cache[dev] = { ggml_time_ms(), *free_mem, *total_mem };
+        return;
     }
+    ggml_backend_dev_memory(dev, free_mem, total_mem);
 }
 
 // worker scores: beacons carry them for free; static-listed workers get a lazy
