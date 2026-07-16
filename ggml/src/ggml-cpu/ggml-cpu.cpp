@@ -373,9 +373,24 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
     *total = pages * page_size;
-
-    // "free" system memory is ill-defined, for practical purposes assume that all of it is free:
     *free = *total;
+#ifdef __linux__
+    // report the kernel's reclaim-aware estimate instead of free == total:
+    // memory-capped placement (RPC auto-weight, fleet beacons) oversubscribes a
+    // busy box otherwise - four OOM-killed workers in one evening (TASKS.md #43f)
+    FILE * meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo != NULL) {
+        char line[128];
+        while (fgets(line, sizeof(line), meminfo)) {
+            unsigned long long kb;
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                *free = (size_t) kb * 1024;
+                break;
+            }
+        }
+        fclose(meminfo);
+    }
+#endif // __linux__
 #endif // _WIN32
 
     GGML_UNUSED(dev);

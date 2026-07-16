@@ -4596,7 +4596,11 @@ bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev) {
         return true; // not an RPC device: nothing to probe
     }
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *) dev->context;
-    return get_socket(ctx->endpoint) != nullptr;
+    // dial FRESH: the cached socket can be a dead one still held alive by old
+    // buffers - a restarted-and-healthy worker then reads as unreachable, drops
+    // its -ts share, and the split collapses onto the survivors (TASKS.md #43b).
+    // A successful fresh dial also replaces the cache entry the reload then uses.
+    return get_socket_impl(ctx->endpoint, /*fresh =*/ true) != nullptr;
 }
 
 // true when this RPC device's endpoint has failed this session
@@ -4666,15 +4670,31 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
         return false;
     }
 
+    const std::shared_ptr<socket_t> old_sock  = ctx->sock;
+    const uint64_t                  old_remote = ctx->remote_ptr;
+    void *                          old_base_p = ctx->base_ptr;
+
     *old_base = ctx->base_ptr;
     *new_base = reinterpret_cast<void *>(base_rsp.base_ptr);
     ctx->sock       = sock;
     ctx->remote_ptr = alloc_rsp.remote_ptr;
     ctx->base_ptr   = *new_base;
 
+    // a failed replay must FREE the fresh allocation and restore the old handles:
+    // leaving it sits a partially-filled share on the worker until the fallback
+    // reload's unload, doubling resident memory in the window (TASKS.md #43e)
+    auto abandon = [&]() {
+        rpc_msg_free_buffer_req freq = { ctx->remote_ptr };
+        send_rpc_cmd(sock, RPC_CMD_FREE_BUFFER, &freq, sizeof(freq), nullptr, 0);
+        ctx->sock       = old_sock;
+        ctx->remote_ptr = old_remote;
+        ctx->base_ptr   = old_base_p;
+        return false;
+    };
+
     rpc_msg_buffer_set_usage_req usage_req = { ctx->remote_ptr, (uint32_t) buffer->usage };
     if (!send_rpc_cmd(sock, RPC_CMD_BUFFER_SET_USAGE, &usage_req, sizeof(usage_req), nullptr, 0)) {
-        return false;
+        return abandon();
     }
 
     std::lock_guard<std::mutex> lock(g_rpc_journal_mutex);
@@ -4684,13 +4704,13 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
     }
     rpc_buffer_journal & j = it->second;
     if (j.disabled) {
-        return false;
+        return abandon();
     }
     const uint64_t nb = (uint64_t)(uintptr_t) *new_base;
     if (j.cleared) {
         rpc_msg_buffer_clear_req creq = { ctx->remote_ptr, j.clear_value };
         if (!send_rpc_cmd(sock, RPC_CMD_BUFFER_CLEAR, &creq, sizeof(creq), nullptr, 0)) {
-            return false;
+            return abandon();
         }
     }
     for (rpc_tensor jt : j.init_tensors) {
@@ -4699,13 +4719,24 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
         req.tensor.data  += nb;
         req.tensor.buffer = ctx->remote_ptr; // the journal recorded the DEAD allocation's id
         if (!send_rpc_cmd(sock, RPC_CMD_INIT_TENSOR, &req, sizeof(req), nullptr, 0)) {
-            return false;
+            return abandon();
         }
     }
     size_t   n_hash  = 0;
     size_t   n_small = 0;
+    uint64_t replayed_bytes = 0;
+    uint64_t next_progress  = 4ULL * 1024 * 1024 * 1024;
     for (auto & kv : j.sets) {
         const rpc_buffer_journal::set_entry & e = kv.second;
+        // a share-sized replay runs minutes (worker-disk + hash bound): make it
+        // visible - a silent surgical looked like a coordinator hang (TASKS.md #43a)
+        replayed_bytes += e.size;
+        if (replayed_bytes >= next_progress) {
+            GGML_LOG_INFO("[%s] %s: replay progress %.1f / %.1f GiB\n", __func__, endpoint.c_str(),
+                          replayed_bytes / (1024.0*1024*1024),
+                          ggml_backend_buffer_get_size(buffer) / (1024.0*1024*1024));
+            next_progress += 4ULL * 1024 * 1024 * 1024;
+        }
         rpc_tensor root = e.root;
         root.data  += nb;
         root.buffer = ctx->remote_ptr; // the journal recorded the DEAD allocation's id
@@ -4720,7 +4751,7 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
                 // full reload can restore them
                 GGML_LOG_WARN("[%s] worker cache miss for hash 0x%" PRIx64 " - falling back to reload\n",
                               __func__, e.hash);
-                return false;
+                return abandon();
             }
             n_hash++;
         } else {
@@ -4729,10 +4760,10 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
             memcpy(input.data() + sizeof(root), &e.offset, sizeof(e.offset));
             if (fseeko(j.spill, (off_t) e.spill_off, SEEK_SET) != 0 ||
                 fread(input.data() + sizeof(root) + sizeof(e.offset), 1, e.size, j.spill) != e.size) {
-                return false;
+                return abandon();
             }
             if (!send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size())) {
-                return false;
+                return abandon();
             }
             n_small++;
         }
@@ -4754,14 +4785,14 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
             greq.offset = e.offset;
             greq.size   = e.size;
             if (!send_rpc_cmd(sock, RPC_CMD_GET_TENSOR, &greq, sizeof(greq), readback.data(), e.size)) {
-                return false;
+                return abandon();
             }
             uint64_t want = e.hash;
             if (e.spill_off != UINT64_MAX) {
                 std::vector<uint8_t> spill_bytes(e.size);
                 if (fseeko(j.spill, (off_t) e.spill_off, SEEK_SET) != 0 ||
                     fread(spill_bytes.data(), 1, e.size, j.spill) != e.size) {
-                    return false;
+                    return abandon();
                 }
                 want = fnv_hash(spill_bytes.data(), e.size);
             }
@@ -4773,7 +4804,7 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
         }
         GGML_LOG_INFO("[%s] verify: %zu regions, %zu mismatches\n", __func__, j.sets.size(), n_bad);
         if (n_bad > 0) {
-            return false;
+            return abandon();
         }
     }
     // coverage is the tripwire for journal gaps: a weight buffer far below ~100%
