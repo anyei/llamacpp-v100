@@ -11,6 +11,13 @@
 #   part of --rpc-reload): the returned worker's share replays from its own cache
 #   (~2 min for a 48 GB share) with a full in-process reload as fallback.
 #
+# Batched serving (EP_PARALLEL > 1): aggregate crosses the single-box bar at -np 4
+#   (batched-bench slope x2.85 at B=8) and slots share the boundary cost for free.
+#   REQUIRES a coordinator image with the 2026-07-16 prepared-build-cache fix
+#   (TASKS.md #28 inc 4) - older images crash the attention-owner worker (or worse,
+#   corrupt silently) once multi-slot shape churn evicts a decode-graph cache entry.
+#   Scale EP_CTX with it (EP_CTX is split across slots: -np 4 at 16384 = 4096/slot).
+#
 # Requirements:
 #   - workers up via docker-compose.rpc-worker-*.yml (their -c cache volume is what
 #     makes surgical recovery and fast reloads work);

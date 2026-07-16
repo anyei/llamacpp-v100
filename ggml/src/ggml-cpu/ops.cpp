@@ -5060,6 +5060,13 @@ static void ggml_compute_forward_set_rows_f32(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                // name the node before aborting: an out-of-range row index here is
+                // the canary for stale/garbage graph inputs (caught TASKS.md #28 inc4)
+                if (!(i1 >= 0 && i1 < ne1)) {
+                    GGML_LOG_ERROR("set_rows OOB: dst='%s' src1='%s' i1=%lld ne1=%lld i10=%lld i11=%lld i12=%lld\n",
+                                   dst->name, src1->name, (long long)i1, (long long)ne1,
+                                   (long long)i10, (long long)i11, (long long)i12);
+                }
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 from_float(

@@ -368,6 +368,27 @@ Placement policy (the user-guidance dial, informed by #31):
   per-boundary latency law keeps it out of the sync ring, and V4 does not
   need its capacity.
 
+  **INCREMENT 4 CLOSED 2026-07-16 - multi-slot SERVING hardened.** The
+  batched-bench and llama-parallel gates above predate the fused-boundary +
+  prepared-build-cache stack (landed 07-14); `llama-server -np 4` over the
+  EP topology crashed the attention owner within rounds: a decode-graph
+  cache entry evicted under np4's ubatch-shape churn and rebuilt with an
+  identical logical layout produced a FALSE prepared-build hit (the content
+  hash mixed logical `t->data` but not the meta buffer identity), so member
+  subgraphs read the dead arena's freed worker allocations - garbage kv-cell
+  ids, set_rows abort, worker death. Fixed by mixing a never-recycled meta
+  buffer uid into the build key; the crashing config now survives the stress
+  matrix, decode-graph reuse is intact, and Qwen dense tensor-mode stays
+  byte-identical to the no-RPC reference. Pre-fix np>1 tensor-mode serving
+  could also corrupt SILENTLY (garbage in non-asserting inputs) - the fix is
+  a correctness prerequisite for batched EP serving, not just crash armor.
+  Async slow-link participation is CLOSED NEGATIVE outright: network expert
+  paging at 100-Mbit moves ~12.5 MB/s vs the local NVMe's 1.6-2.7 GB/s
+  (130-216x), and batch-only membership is structurally impossible without
+  duplicating expert weights. Remaining: a live-fleet -np 2/4/8 serving A/B
+  on the fixed image (needs a quiet GPU window); until then the EP compose
+  keeps -np 1 as default with the batching guidance in its header.
+
 ## 6. Open questions (tracked, not blocking increment 1)
 
 - Router on coordinator needs each token's router logits before expert calls —

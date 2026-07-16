@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -535,6 +536,12 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
+    // never-recycled buffer generation, mixed into the prepared-build content key:
+    // two same-shaped scheduler arenas (a decode-graph cache entry evicted and
+    // rebuilt) get identical logical tensor layouts, and a build cached under the
+    // old arena would be reused with its member allocations already freed
+    uint64_t uid;
+
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
@@ -557,6 +564,10 @@ struct ggml_backend_meta_buffer_context {
             const int n_simple,
             const std::vector<ggml_backend_buffer_t> & bufs)
             : stc_static(std::move(stc_static)) {
+        {
+            static std::atomic<uint64_t> next_uid{1};
+            uid = next_uid.fetch_add(1);
+        }
         {
             std::lock_guard<std::mutex> lock(registry_mutex());
             registry().insert(this);
@@ -2634,6 +2645,12 @@ static uint64_t ggml_backend_meta_outer_graph_key(const ggml_cgraph * g) {
             // build is only reusable while these exact structs are alive - key
             // them by identity, not just content
             mix(&t, sizeof(t));
+        } else {
+            // meta tensors: t->data is a logical offset, identical across two
+            // same-shaped scheduler arenas - key by the buffer generation so a
+            // build never outlives the arena whose member allocations it captured
+            const uint64_t buf_uid = ((ggml_backend_meta_buffer_context *) t->buffer->context)->uid;
+            mix(&buf_uid, sizeof(buf_uid));
         }
     };
     mix(&g->n_nodes, sizeof(g->n_nodes));
