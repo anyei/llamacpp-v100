@@ -8,6 +8,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -597,6 +598,23 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// IPv4 resolution via getaddrinfo: gethostbyname returns a pointer into a
+// shared static buffer and is MT-Unsafe - concurrent fleet-status probes on the
+// server's HTTP threads crashed inside its NSS internals (TASKS.md #40)
+static bool rpc_resolve_ipv4(const char * host, struct in_addr * out) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || res == nullptr) {
+        return false;
+    }
+    *out = ((struct sockaddr_in *) res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return true;
+}
+
 // the fd is owned by socket_t::impl only once construction succeeds; every
 // failure path before that must close it or it leaks (a worker re-dialing an
 // unreachable W2W peer leaked one fd per attempt until accept() hit EMFILE)
@@ -665,13 +683,11 @@ socket_ptr socket_t::connect(const char * host, int port) {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+    if (!rpc_resolve_ipv4(host, &addr.sin_addr)) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
         rpc_close_fd(sockfd);
         return nullptr;
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         rpc_close_fd(sockfd);
         return nullptr;
@@ -910,16 +926,22 @@ bool rpc_probe_endpoint(const char * host, int port, int timeout_ms) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+    if (!rpc_resolve_ipv4(host, &addr.sin_addr)) {
         return false;
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
     sockfd_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(fd)) {
         return false;
     }
+#ifndef _WIN32
+    // select() below cannot represent fds past FD_SETSIZE; FD_SET would write
+    // out of bounds. Report unreachable instead of smashing the stack.
+    if (fd >= FD_SETSIZE) {
+        rpc_close_fd(fd);
+        return false;
+    }
+#endif
 #ifdef _WIN32
     u_long nonblock = 1;
     ioctlsocket(fd, FIONBIO, &nonblock);
