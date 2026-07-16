@@ -131,12 +131,25 @@
 				return n + ' B';
 			}
 
+			// the SPA stores its config (incl. the API key) in localStorage; the
+			// static loading page has no settings UI, so read the same key here or
+			// /fleet/status 401s when the coordinator runs with --api-key
+			function apiKeyHeader() {
+				try {
+					const cfg = JSON.parse(localStorage.getItem('LlamaUi.config') || '{}');
+					const key = (cfg.apiKey || '').toString().trim();
+					return key ? { Authorization: 'Bearer ' + key } : {};
+				} catch (e) {
+					return {};
+				}
+			}
+
 			async function tick() {
 				if (inFlight) return;
 				inFlight = true;
 				let d;
 				try {
-					const r = await fetch('./fleet/status', { cache: 'no-store' });
+					const r = await fetch('./fleet/status', { cache: 'no-store', headers: apiKeyHeader() });
 					if (!r.ok) throw new Error(r.status);
 					d = await r.json();
 				} catch (e) {
