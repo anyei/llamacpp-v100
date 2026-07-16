@@ -597,6 +597,17 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// the fd is owned by socket_t::impl only once construction succeeds; every
+// failure path before that must close it or it leaks (a worker re-dialing an
+// unreachable W2W peer leaked one fd per attempt until accept() hit EMFILE)
+static void rpc_close_fd(sockfd_t fd) {
+#ifdef _WIN32
+    if (fd != INVALID_SOCKET) closesocket(fd);
+#else
+    if (fd >= 0) close(fd);
+#endif
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -604,6 +615,7 @@ socket_ptr socket_t::accept() {
     }
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        rpc_close_fd(client_socket_fd);
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
@@ -616,10 +628,12 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     }
     if (!set_reuse_addr(sockfd)) {
         GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     if (inet_addr(host) == INADDR_NONE) {
         GGML_LOG_ERROR("Invalid host address: %s\n", host);
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     struct sockaddr_in serv_addr;
@@ -628,9 +642,11 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     serv_addr.sin_port = htons(port);
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     if (listen(sockfd, 1) < 0) {
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
@@ -643,6 +659,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
     }
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     struct sockaddr_in addr;
@@ -651,10 +668,12 @@ socket_ptr socket_t::connect(const char * host, int port) {
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
     if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        rpc_close_fd(sockfd);
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
@@ -697,14 +716,6 @@ void rpc_transport_shutdown() {
 //
 // LAN presence beacon + discovery (UDP multicast, TASKS.md #29d)
 //
-
-static void rpc_close_fd(sockfd_t fd) {
-#ifdef _WIN32
-    if (fd != INVALID_SOCKET) closesocket(fd);
-#else
-    if (fd >= 0) close(fd);
-#endif
-}
 
 static bool rpc_parse_group(const char * group, std::string & addr, int & port) {
     if (group == nullptr || group[0] == '\0') {

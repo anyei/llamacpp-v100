@@ -487,6 +487,17 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
+// loopback endpoints (a same-box worker discovered via the loopback beacon, or a
+// static --rpc 127.0.0.1/localhost entry) are only valid from the coordinator's host
+static bool rpc_endpoint_is_loopback(const std::string & endpoint) {
+    std::string host;
+    int port;
+    if (!parse_endpoint(endpoint, host, port)) {
+        return false;
+    }
+    return host == "localhost" || host.rfind("127.", 0) == 0;
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 // tensor-parallel islands: split states uploaded by the coordinator, resolved by
@@ -1504,6 +1515,17 @@ static bool rpc_prepare_w2w_pull(ggml_backend_t backend_src, ggml_backend_t back
     if (src_ctx->endpoint == dst_ctx->endpoint) {
         return false; // same server: the buffer-level COPY_TENSOR path already handles it
     }
+    // endpoint strings are coordinator-relative: a loopback source (e.g. a worker on
+    // the coordinator box heard via the loopback beacon) is unreachable from a remote
+    // destination - it would dial ITSELF (TASKS.md #39). Bridge those copies.
+    if (rpc_endpoint_is_loopback(src_ctx->endpoint) && !rpc_endpoint_is_loopback(dst_ctx->endpoint)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("[w2w] source '%s' is loopback and unreachable from remote workers - using the bridged copy\n",
+                          src_ctx->endpoint.c_str());
+        }
+        return false;
+    }
     if (src->buffer == nullptr || dst->buffer == nullptr ||
         !ggml_backend_buffer_is_rpc(src->buffer) || !ggml_backend_buffer_is_rpc(dst->buffer)) {
         return false;
@@ -2443,25 +2465,40 @@ bool rpc_server::copy_from_remote(const std::vector<uint8_t> & input, rpc_msg_co
     // pull directly from the source worker - this process is a normal RPC client
     // there. Peer sockets are cached with strong references: the general registry
     // only holds weak_ptrs, and reconnecting (+ HELLO) per pull would add a round
-    // trip to every handoff.
+    // trip to every handoff. Unreachable peers are negative-cached: without it every
+    // pull re-dials (up to a full SYN timeout against a dead host), thousands of
+    // times per token (TASKS.md #39).
     static std::mutex peer_mutex;
     static std::unordered_map<std::string, socket_ptr> peer_socks;
+    static std::unordered_map<std::string, int64_t>    peer_dead_until_ms;
+    const auto now_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     socket_ptr sock;
     {
         std::lock_guard<std::mutex> lock(peer_mutex);
         auto it = peer_socks.find(src_endpoint);
         if (it != peer_socks.end()) {
             sock = it->second;
+        } else {
+            auto dead = peer_dead_until_ms.find(src_endpoint);
+            if (dead != peer_dead_until_ms.end() && now_ms() < dead->second) {
+                return true; // still in backoff: soft failure, no dial
+            }
         }
     }
     if (sock == nullptr) {
         sock = get_socket(src_endpoint);
         if (sock == nullptr) {
-            GGML_LOG_ERROR("[%s] cannot reach source worker '%s'\n", __func__, src_endpoint.c_str());
+            GGML_LOG_ERROR("[%s] cannot reach source worker '%s' (backing off 5s)\n", __func__, src_endpoint.c_str());
+            std::lock_guard<std::mutex> lock(peer_mutex);
+            peer_dead_until_ms[src_endpoint] = now_ms() + 5000;
             return true; // soft failure: the coordinator falls back to the bridged copy
         }
         std::lock_guard<std::mutex> lock(peer_mutex);
         peer_socks[src_endpoint] = sock;
+        peer_dead_until_ms.erase(src_endpoint);
     }
     rpc_msg_get_tensor_fenced_req req = { rsrc, src_offset, size, fence_conn, fence_seq };
     std::vector<uint8_t> data(size);
@@ -4113,12 +4150,25 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         server.build_local_index(model_dir);
     }
     uint64_t next_conn_id = 1;
+    int accept_fails = 0;
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            // transient (EMFILE under fd pressure, ECONNABORTED, ...) must not kill a
+            // worker holding a model share - retry; a listener that never recovers
+            // still exits for the supervisor restart
+            accept_fails++;
+            if (accept_fails > 300) {
+                fprintf(stderr, "accept failed %d times in a row - giving up for supervisor restart\n", accept_fails);
+                return;
+            }
+            if (accept_fails == 1 || accept_fails % 50 == 0) {
+                GGML_LOG_ERROR("Failed to accept client connection (attempt %d, retrying)\n", accept_fails);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
         }
+        accept_fails = 0;
         const uint64_t conn_id = next_conn_id++;
         // GGML_LOG so the lines reach the fleet log ring (rpc-server's log callback)
         GGML_LOG_INFO("Accepted client connection %" PRIu64 "\n", conn_id);
