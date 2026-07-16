@@ -60,6 +60,9 @@ services:
       # default). Both unset = open on the trusted LAN, restart disabled. Same
       # COORD_* names as docker-compose.fleet-coordinator.yml. Needs the 4.7 image.
       - LLAMA_ARG_FLEET_ADMIN${COORD_FLEET_ADMIN:+=1}
+      # optional preflight bench (TASKS.md #41): COORD_PREFLIGHT=/models/<small>.gguf
+      # times single-token decodes over the fleet before the main load
+      - LLAMA_ARG_FLEET_PREFLIGHT${COORD_PREFLIGHT:+=${COORD_PREFLIGHT}}
       # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
       - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server

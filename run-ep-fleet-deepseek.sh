@@ -15,7 +15,7 @@
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
 
-COORD_IMAGE=llamacpp-local-v100:55ec0bfde \
+COORD_IMAGE=llamacpp-local-v100:e0d867ec1 \
 COORD_API_KEY=anyei \
 EP_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 EP_WORKERS=10.5.5.11:50052,10.5.5.15:50052 \
