@@ -71,6 +71,15 @@ export interface ApiFleetModelInfo {
 
 export type ApiFleetServerState = 'loading' | 'reloading' | 'ready' | 'sleeping';
 
+/** Result of the opt-in --fleet-preflight benchmark (null when disabled or not yet run).
+ * The tps of a small dense model is the fleet's per-token boundary/latency floor. */
+export interface ApiFleetPreflight {
+	tps: number;
+	model: string;
+	n_tokens: number;
+	load_s: number;
+}
+
 /** Response of `GET ./fleet/status`. Fields sourced from the model params
  * (model, split_mode, n_gpu_layers) are null until the initial load finishes. */
 export interface ApiFleetStatusResponse {
@@ -83,6 +92,7 @@ export interface ApiFleetStatusResponse {
 	model?: ApiFleetModelInfo | null;
 	devices: ApiFleetDevice[];
 	discovered: ApiFleetDiscoveredWorker[];
+	preflight?: ApiFleetPreflight | null;
 }
 
 /** Response of `GET ./fleet/worker/log`. */

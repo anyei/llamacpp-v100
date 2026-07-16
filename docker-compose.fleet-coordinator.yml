@@ -54,6 +54,10 @@ services:
       # TASKS.md #35d: COORD_FLEET_ADMIN=1 + COORD_API_KEY enable restarting
       # workers from the web UI's Fleet section (POST /fleet/worker/restart)
       - LLAMA_ARG_FLEET_ADMIN${COORD_FLEET_ADMIN:+=1}
+      # optional preflight bench: COORD_PREFLIGHT=/models/<small>.gguf times
+      # single-token decodes over the fleet BEFORE the main load (the fleet's
+      # per-token latency floor, shown in the fleet UI + loading page)
+      - LLAMA_ARG_FLEET_PREFLIGHT${COORD_PREFLIGHT:+=${COORD_PREFLIGHT}}
       # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
       - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server

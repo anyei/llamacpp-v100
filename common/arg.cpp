@@ -3747,6 +3747,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FLEET_ADMIN"));
     add_opt(common_arg(
+        {"--fleet-preflight"}, "FNAME",
+        "small GGUF to benchmark the fleet with before the main load: times single-token decodes "
+        "over the same devices/split (the per-token boundary/latency floor) and shows the result "
+        "in the fleet UI (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.fleet_preflight_model = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FLEET_PREFLIGHT"));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {

@@ -662,6 +662,7 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
     bool fleet_admin      = false; // allow POST /fleet/worker/restart (also needs an --api-key)
+    std::string fleet_preflight_model = ""; // small GGUF benchmarked over the fleet before the main load
 
     // enable built-in tools
     std::vector<std::string> server_tools;

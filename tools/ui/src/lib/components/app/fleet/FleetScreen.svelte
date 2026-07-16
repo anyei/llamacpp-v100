@@ -55,6 +55,37 @@
 		return path.split('/').pop() || path;
 	});
 
+	// fleet-wide totals across the pipeline devices: worker-CPU devices contribute
+	// RAM + cpu layers, everything else (local GPUs, GPU workers) VRAM + gpu layers
+	let fleetTotals = $derived.by(() => {
+		const t = {
+			ramFree: 0,
+			ramTotal: 0,
+			vramFree: 0,
+			vramTotal: 0,
+			gpuLayers: 0,
+			cpuLayers: 0,
+			hasLayers: false
+		};
+		for (const device of devices) {
+			if (device.worker_is_cpu) {
+				t.ramFree += device.memory_free_mib;
+				t.ramTotal += device.memory_total_mib;
+				t.cpuLayers += device.n_layers ?? 0;
+			} else {
+				t.vramFree += device.memory_free_mib;
+				t.vramTotal += device.memory_total_mib;
+				t.gpuLayers += device.n_layers ?? 0;
+			}
+			if (device.n_layers != null) t.hasLayers = true;
+		}
+		return t;
+	});
+
+	function formatGib(mib: number): string {
+		return (mib / 1024).toFixed(mib >= 100 * 1024 ? 0 : 1);
+	}
+
 	// Rank the fastest/slowest scored RPC devices (needs at least two to compare)
 	let deviceRanks = $derived.by(() => {
 		const ranks: Record<string, 'fastest' | 'slowest'> = {};
@@ -266,17 +297,70 @@
 		{/if}
 
 		<section class="space-y-3">
-			<div class="flex flex-wrap items-center gap-2">
-				<h2 class="text-sm font-semibold">Pipeline devices</h2>
+			<h2 class="text-sm font-semibold">Pipeline devices</h2>
 
-				{#if status?.split_mode}
-					<Badge variant="tertiary" class="text-[10px]">split: {status.split_mode}</Badge>
-				{/if}
+			{#if status && (status.split_mode || devices.length > 0)}
+				<!-- fleet summary strip: one mini stat per column, fed by /fleet/status -->
+				<div class="grid grid-cols-2 gap-px overflow-hidden rounded-md border bg-border sm:grid-cols-3 lg:grid-cols-6">
+					{#if status.split_mode}
+						<div class="bg-card p-2">
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">split</div>
+							<div class="text-sm font-semibold">{status.split_mode}</div>
+						</div>
+					{/if}
 
-				{#if status?.n_gpu_layers != null}
-					<Badge variant="tertiary" class="text-[10px]">gpu layers: {status.n_gpu_layers}</Badge>
-				{/if}
-			</div>
+					{#if status.n_gpu_layers != null}
+						<div class="bg-card p-2" title="-ngl: layers requested onto accelerators">
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">gpu layers</div>
+							<div class="text-sm font-semibold">{status.n_gpu_layers}</div>
+						</div>
+					{/if}
+
+					{#if fleetTotals.hasLayers}
+						<div class="bg-card p-2" title="layers placed on GPU devices vs worker-CPU (RAM) devices">
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">layer placement</div>
+							<div class="text-sm font-semibold">
+								{fleetTotals.gpuLayers} gpu
+								<span class="font-normal text-muted-foreground">/</span>
+								{fleetTotals.cpuLayers} cpu
+							</div>
+						</div>
+					{/if}
+
+					{#if fleetTotals.vramTotal > 0}
+						<div class="bg-card p-2" title="free / total GPU VRAM across the pipeline devices">
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">vram</div>
+							<div class="text-sm font-semibold">
+								{formatGib(fleetTotals.vramFree)}
+								<span class="font-normal text-muted-foreground">/ {formatGib(fleetTotals.vramTotal)} GiB</span>
+							</div>
+						</div>
+					{/if}
+
+					{#if fleetTotals.ramTotal > 0}
+						<div class="bg-card p-2" title="free / total worker RAM across the pipeline devices">
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">worker ram</div>
+							<div class="text-sm font-semibold">
+								{formatGib(fleetTotals.ramFree)}
+								<span class="font-normal text-muted-foreground">/ {formatGib(fleetTotals.ramTotal)} GiB</span>
+							</div>
+						</div>
+					{/if}
+
+					{#if status.preflight}
+						<div
+							class="bg-card p-2"
+							title={`--fleet-preflight: ${status.preflight.n_tokens} timed single-token decodes of ${status.preflight.model} over this fleet (loaded in ${status.preflight.load_s.toFixed(1)} s). A small dense model's compute is negligible, so this is the fleet's per-token boundary/latency floor - an upper bound for any model on this topology, not a throughput estimate.`}
+						>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">preflight</div>
+							<div class="text-sm font-semibold">
+								{status.preflight.tps.toFixed(1)} t/s
+								<span class="font-normal text-muted-foreground">@ {status.preflight.model.replace(/\.gguf.*$/i, '')}</span>
+							</div>
+						</div>
+					{/if}
+				</div>
+			{/if}
 
 			{#if !status && !fleetStore.error}
 				<div class="rounded-md border border-dashed p-4 text-sm text-muted-foreground">

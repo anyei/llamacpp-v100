@@ -156,6 +156,7 @@
 						d.model.path +
 						(d.model.size_bytes ? ' · ' + fmtBytes(d.model.size_bytes) : '') +
 						(d.split_mode ? ' · split: ' + d.split_mode : '') +
+						(d.preflight ? ' · preflight: ' + d.preflight.tps.toFixed(1) + ' t/s (' + d.preflight.model + ')' : '') +
 						' — the UI will open automatically when ready.';
 				}
 

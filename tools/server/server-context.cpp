@@ -876,6 +876,104 @@ struct server_metrics {
 // defined with the /fleet/* helpers below
 static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params);
 
+// --fleet-preflight (TASKS.md #35f follow-up): before the main load, time
+// single-token decodes of a small model over the SAME devices/split. A small
+// dense model's compute is negligible, so the number is the fleet's per-token
+// boundary/latency floor - the term the worker bandwidth scores cannot see.
+struct fleet_preflight_result {
+    bool        valid = false;
+    double      tps   = 0.0;
+    int         n_tokens = 0;
+    double      load_s   = 0.0;
+    std::string model;
+};
+
+static std::mutex g_fleet_preflight_mutex;
+static fleet_preflight_result g_fleet_preflight;
+
+static fleet_preflight_result fleet_preflight_get() {
+    std::lock_guard<std::mutex> lock(g_fleet_preflight_mutex);
+    return g_fleet_preflight;
+}
+
+static void fleet_run_preflight(const common_params & params_main) {
+    common_params params = params_main;
+    params.model.path = params_main.fleet_preflight_model;
+    params.model.url.clear();
+    params.model.hf_repo.clear();
+    params.model.hf_file.clear();
+    params.mmproj.path.clear();
+    params.speculative = {};
+    params.lora_adapters.clear();
+    params.n_ctx        = 512;
+    params.n_batch      = 512;
+    params.n_ubatch     = 512;
+    params.n_gpu_layers = 999;
+    params.n_parallel   = 1;
+    params.warmup       = false;
+    params.load_progress_callback = nullptr; // do not feed the loading page 0.6B progress
+    params.load_progress_callback_user_data = nullptr;
+
+    SRV_INF("fleet preflight: benchmarking '%s' over the configured fleet...\n", params.model.path.c_str());
+    const int64_t t_load0 = ggml_time_us();
+    common_init_result_ptr ir = common_init_from_params(params);
+    if (ir == nullptr || ir->model() == nullptr || ir->context() == nullptr) {
+        SRV_WRN("fleet preflight: failed to load '%s' - skipping (the main load proceeds)\n", params.model.path.c_str());
+        return;
+    }
+    const double load_s = (ggml_time_us() - t_load0) / 1e6;
+
+    llama_context     * ctx   = ir->context();
+    const llama_model * model = ir->model();
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    auto argmax_tok = [&](const float * logits) {
+        llama_token best = 0;
+        for (int32_t t = 1; t < n_vocab; t++) {
+            if (logits[t] > logits[best]) {
+                best = t;
+            }
+        }
+        return best;
+    };
+
+    std::vector<llama_token> toks = common_tokenize(ctx, "The quick brown fox jumps over the lazy dog.", /*add_special =*/ true);
+    if (toks.empty() || llama_decode(ctx, llama_batch_get_one(toks.data(), (int32_t) toks.size())) != 0) {
+        SRV_WRN("%s", "fleet preflight: prompt decode failed - skipping\n");
+        return;
+    }
+
+    const int n_gen = 24, n_warm = 8;
+    llama_token cur = argmax_tok(llama_get_logits_ith(ctx, (int32_t) toks.size() - 1));
+    int64_t t0 = 0;
+    for (int i = 0; i < n_gen; i++) {
+        if (i == n_warm) {
+            t0 = ggml_time_us();
+        }
+        if (llama_decode(ctx, llama_batch_get_one(&cur, 1)) != 0) {
+            SRV_WRN("%s", "fleet preflight: decode failed mid-run - skipping\n");
+            return;
+        }
+        cur = argmax_tok(llama_get_logits_ith(ctx, 0));
+    }
+    const double dt_s = (ggml_time_us() - t0) / 1e6;
+
+    fleet_preflight_result res;
+    res.valid    = dt_s > 0.0;
+    res.n_tokens = n_gen - n_warm;
+    res.tps      = res.n_tokens / dt_s;
+    res.load_s   = load_s;
+    res.model    = params.model.path.substr(params.model.path.find_last_of('/') + 1);
+    {
+        std::lock_guard<std::mutex> lock(g_fleet_preflight_mutex);
+        g_fleet_preflight = res;
+    }
+    SRV_INF("fleet preflight: %.2f t/s single-stream (%d timed tokens, '%s', load %.1f s) - "
+            "this is the fleet's per-token latency floor, not a large-model throughput estimate\n",
+            res.tps, res.n_tokens, res.model.c_str(), res.load_s);
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1461,6 +1559,12 @@ private:
         // stream (beacons carry bw_gbps/free_mib; the listener is idempotent)
         fleet_capture_load_plan();
         fleet_start_beacon_listener();
+
+        // opt-in preflight bench: once per process, never on a resume/reload (a
+        // failure-recovery reload must not wait on a benchmark)
+        if (!is_resume && !params.fleet_preflight_model.empty() && !fleet_preflight_get().valid) {
+            fleet_run_preflight(params);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -5224,6 +5328,12 @@ void server_routes::init_routes() {
             {"devices",    std::move(devices)},
             {"discovered", std::move(discovered)},
         };
+        {
+            const fleet_preflight_result pf = fleet_preflight_get();
+            body["preflight"] = pf.valid
+                ? json({ {"tps", pf.tps}, {"model", pf.model}, {"n_tokens", pf.n_tokens}, {"load_s", pf.load_s} })
+                : json(nullptr);
+        }
         if (ready) {
             // the model's file size never changes for a given load - stat it once
             static const size_t model_bytes = [&]() -> size_t {
