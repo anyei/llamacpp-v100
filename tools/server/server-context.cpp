@@ -1028,6 +1028,7 @@ public:
             double      split_frac;    // normalized share of the split (0..1)
             int32_t     n_layers;      // predicted repeating layers; -1 = n/a (tensor mode)
             bool        worker_is_cpu; // RPC device backed by the worker's CPU/RAM
+            bool        attn_owner;    // EP: holds attention/KV/router, no expert share
         };
         std::string                load_model_name;
         size_t                     load_model_bytes = 0;
@@ -1331,6 +1332,17 @@ private:
                 : (worker_is_cpu_t) nullptr;
         }();
 
+        // EP dedicated-attention owner: LLAMA_META_ATTN_OWNER=<j> indexes the meta
+        // device's members (the tensor-mode device list), which is this same order.
+        // That member holds attention/KV/router and takes no expert share.
+        int attn_owner_idx = -1;
+        if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            const char * env = getenv("LLAMA_META_ATTN_OWNER");
+            if (env != nullptr) {
+                attn_owner_idx = atoi(env);
+            }
+        }
+
         std::lock_guard<std::mutex> lock(fleet.mutex);
         fleet.load_model_name  = std::filesystem::path(params_base.model.path).filename().string();
         fleet.load_model_bytes = model_bytes;
@@ -1345,6 +1357,7 @@ private:
                 split_sum > 0.0 ? splits[i] / split_sum : 0.0,
                 layers[i],
                 ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
+                (int) i == attn_owner_idx,
             });
         }
     }
@@ -5207,6 +5220,13 @@ void server_routes::init_routes() {
             for (size_t i = 0; i < devs.size() && i < llama_max_devices(); ++i) {
                 ts_sum += params.tensor_split[i];
             }
+            int attn_owner_idx = -1;
+            if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                const char * ao = getenv("LLAMA_META_ATTN_OWNER");
+                if (ao != nullptr) {
+                    attn_owner_idx = atoi(ao);
+                }
+            }
             for (size_t i = 0; i < devs.size(); ++i) {
                 ggml_backend_dev_t dev = devs[i];
                 const char * ep     = procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
@@ -5245,6 +5265,7 @@ void server_routes::init_routes() {
                     {"memory_free_mib",  free_mem  / (1024 * 1024)},
                     {"memory_total_mib", total_mem / (1024 * 1024)},
                     {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
+                    {"attn_owner",       (int) i == attn_owner_idx},
                     {"n_layers",         nullptr},
                     {"stats",            nullptr},
                     {"score",            nullptr},
@@ -5373,13 +5394,14 @@ void server_routes::init_routes() {
             json load_workers = json::array();
             auto push_worker = [&](const std::string & name, const std::string & ep,
                                    double split_frac, int32_t n_layers, json worker_is_cpu,
-                                   bool suppress_score) {
+                                   bool suppress_score, bool attn_owner = false) {
                 json w = {
                     {"name",       name},
                     {"endpoint",   ep.empty() ? json(nullptr) : json(ep)},
                     {"split_frac", split_frac > 0.0 ? json(split_frac) : json(nullptr)},
                     {"n_layers",   n_layers >= 0 ? json(n_layers) : json(nullptr)},
                     {"worker_is_cpu", std::move(worker_is_cpu)}, // null = unknown (unplanned endpoint)
+                    {"attn_owner", attn_owner}, // EP: holds attention, no expert share
                     {"score",      nullptr},
                     {"free_mib",   nullptr},
                     {"bytes_sent", nullptr},
@@ -5426,7 +5448,7 @@ void server_routes::init_routes() {
                         }
                     }
                 }
-                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers, p.worker_is_cpu, sibling);
+                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers, p.worker_is_cpu, sibling, p.attn_owner);
             }
             // endpoints with traffic but no plan entry (e.g. a draft model's worker)
             for (const auto & [ep, st] : live) {

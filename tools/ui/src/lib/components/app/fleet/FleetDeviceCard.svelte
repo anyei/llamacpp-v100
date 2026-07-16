@@ -170,11 +170,12 @@
 		</div>
 	</div>
 
-	{#if device.n_layers != null || splitPercent !== null}
+	{#if device.attn_owner || device.n_layers != null || splitPercent !== null}
 		<p class="text-xs text-muted-foreground">
 			{[
+				device.attn_owner ? 'attention owner' : null,
 				device.n_layers != null ? `${device.n_layers} layers` : null,
-				splitPercent !== null ? `${splitPercent}%` : null
+				!device.attn_owner && splitPercent !== null ? `${splitPercent}%` : null
 			]
 				.filter(Boolean)
 				.join(' · ')}

@@ -32,6 +32,8 @@ export interface ApiFleetDevice {
 	memory_total_mib: number;
 	/** Share of the model split assigned to this device (0..1). */
 	split_frac?: number | null;
+	/** EP dedicated-attention owner: holds attention/KV/router, takes no expert share. */
+	attn_owner?: boolean;
 	n_layers?: number | null;
 	stats?: ApiFleetDeviceStats | null;
 	score?: ApiFleetDeviceScore | null;

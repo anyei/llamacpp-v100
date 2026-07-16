@@ -212,7 +212,8 @@
 					const badges = [];
 					if (w.score) badges.push('<span class="badge score">' + w.score.bw_gbps.toFixed(1) + ' GB/s</span>');
 					if (w.n_layers != null) badges.push('<span class="badge">' + w.n_layers + ' layers</span>');
-					if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
+					if (w.attn_owner) badges.push('<span class="badge score" title="holds attention, KV and the router - takes no routed-expert share">attention owner</span>');
+					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
 					if (w.free_mib != null) badges.push('<span class="badge">' + (w.free_mib / 1024).toFixed(1) + ' GiB free</span>');
 					// weight provenance: served from the worker's own cache/--model-dir vs streamed
 					const cachedMib = w.weights_cached_mib || 0, streamedMib = w.weights_streamed_mib || 0;
