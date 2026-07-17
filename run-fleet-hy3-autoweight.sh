@@ -4,7 +4,7 @@
 # Sibling of run-fleet-glm52-autoweight.sh (GLM on :8097); this one runs on :8095.
 #
 # REQUIREMENTS
-#   - hy_v3 arch support: image >= e3b4f019c (upstream #25395 port).
+#   - hy_v3 arch support: image >= 75737b40b (upstream #25395 port incl. the jinja str.format the embedded chat template needs).
 #   - Capacity: 171 GB weights + LLAMA_FLEET_KV_RESERVE_MB (default 20 GB) needs
 #     ~191 GB pooled -> EVERY worker box online (.11, .15 both, .25, .30, .26).
 #     The new capacity gate holds the load (state: waiting-capacity) and starts
@@ -26,15 +26,9 @@ if docker ps --format '{{.Names}}' | grep -q '^llama-fleet-coordinator$'; then
   sleep 5
 fi
 
-# TEMPORARY (image e3b4f019c): hy3's embedded jinja template uses '...'.format()
-# which that image's engine lacks - the server crashes AFTER the full load
-# (post-load template parse). chatml override bypasses it; raw /v1/completions
-# is unaffected, /v1/chat wears chatml markers instead of hy3's own. The
-# .format() port is in images > e3b4f019c - drop this line after the roll.
-COORD_CHAT_TEMPLATE=chatml \
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
-COORD_IMAGE=llamacpp-local-v100:e3b4f019c \
+COORD_IMAGE=llamacpp-local-v100:75737b40b \
 COORD_MODEL=hy3-1M-MTP-Q4_K_M.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
