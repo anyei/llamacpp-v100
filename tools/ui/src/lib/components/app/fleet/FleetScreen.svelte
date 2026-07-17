@@ -177,6 +177,8 @@
 				return 'bg-green-500';
 			case 'loading':
 				return 'bg-yellow-500';
+			case 'waiting-capacity':
+				return 'bg-orange-500';
 			case 'sleeping':
 				return 'bg-gray-500';
 			default:
@@ -274,6 +276,22 @@
 							: 'Auto recovery is disabled — manual intervention may be required.'}
 					</p>
 				</div>
+			</div>
+		{/if}
+
+		{#if status?.capacity?.waiting}
+			<div class="rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-sm">
+				<p class="font-medium">
+					Insufficient fleet capacity — the model load is on hold.
+				</p>
+
+				<p class="mt-1 text-xs text-muted-foreground">
+					The model needs {(status.capacity.required_mib / 1024).toFixed(1)} GiB (weights + KV
+					reserve) but the fleet pools only {(status.capacity.available_mib / 1024).toFixed(1)} GiB
+					of device memory ({((status.capacity.required_mib - status.capacity.available_mib) / 1024).toFixed(1)}
+					GiB short). Inference becomes possible once more workers join the LAN — power on another
+					box with <code class="font-mono">--announce</code> and the load starts automatically.
+				</p>
 			</div>
 		{/if}
 
@@ -416,6 +434,7 @@
 								<Table.Head class="text-right">Devices</Table.Head>
 								<Table.Head class="text-right">Free MiB</Table.Head>
 								<Table.Head class="text-right">BW</Table.Head>
+								<Table.Head class="text-right">Cache</Table.Head>
 								<Table.Head class="text-right">Last seen</Table.Head>
 								<Table.Head>Status</Table.Head>
 							</Table.Row>
@@ -438,6 +457,13 @@
 
 									<Table.Cell class="text-right text-xs">
 										{worker.bw_gbps != null ? `${worker.bw_gbps.toFixed(1)} GB/s` : '—'}
+									</Table.Cell>
+
+									<Table.Cell
+										class="text-right text-xs"
+										title="worker tensor-cache size on disk (cache-rpc)"
+									>
+										{worker.cache_mib != null ? `${(worker.cache_mib / 1024).toFixed(1)} GiB` : '—'}
 									</Table.Cell>
 
 									<Table.Cell class="text-right text-xs text-muted-foreground">

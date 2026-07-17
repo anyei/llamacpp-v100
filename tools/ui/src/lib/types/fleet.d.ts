@@ -48,6 +48,7 @@ export interface ApiFleetDiscoveredWorker {
 	devs?: number | null;
 	proto?: number | string | null;
 	bw_gbps?: number | null;
+	cache_mib?: number | null;
 	last_seen_ms: number;
 	in_pipeline: boolean;
 }
@@ -94,6 +95,11 @@ export interface ApiFleetStatusResponse {
 	model?: ApiFleetModelInfo | null;
 	devices: ApiFleetDevice[];
 	discovered: ApiFleetDiscoveredWorker[];
+	capacity?: {
+		waiting: boolean;
+		required_mib: number;
+		available_mib: number;
+	} | null;
 	preflight?: ApiFleetPreflight | null;
 }
 

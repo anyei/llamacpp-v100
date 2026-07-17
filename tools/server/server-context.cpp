@@ -974,6 +974,49 @@ static void fleet_run_preflight(const common_params & params_main) {
             res.tps, res.n_tokens, res.model.c_str(), res.load_s);
 }
 
+// fleet helpers defined with the /fleet/* handlers below
+static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params);
+static std::optional<double>           fleet_beacon_num(const std::string & payload, const std::string & key);
+static void                            fleet_dev_memory_cached(ggml_backend_dev_t dev, bool is_rpc, size_t * free_mem, size_t * total_mem);
+static const char *                    fleet_dev_endpoint(ggml_backend_dev_t dev);
+
+static bool fleet_dev_is_rpc(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0;
+}
+
+// total weight bytes of a (possibly sharded) GGUF; 0 when the path is unreadable
+static uint64_t fleet_model_weight_bytes(const std::string & path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    uint64_t total = (uint64_t) fs::file_size(path, ec);
+    if (ec) {
+        return 0;
+    }
+    // llama_split_path naming: <prefix>-%05d-of-%05d.gguf
+    const size_t tail = path.size() >= 20 ? path.size() - 20 : 0;
+    const size_t pos  = path.find("-of-", tail);
+    if (pos == std::string::npos || path.size() - pos != 4 + 5 + 5 /* "-of-NNNNN.gguf" */
+        || path.compare(path.size() - 5, 5, ".gguf") != 0) {
+        return total;
+    }
+    const int n_split = atoi(path.c_str() + pos + 4);
+    const std::string prefix = pos >= 6 ? path.substr(0, pos - 6) : "";
+    if (n_split < 2 || prefix.empty()) {
+        return total;
+    }
+    for (int i = 2; i <= n_split; i++) {
+        char shard[1024];
+        snprintf(shard, sizeof(shard), "%s-%05d-of-%05d.gguf", prefix.c_str(), i, n_split);
+        const uint64_t sz = (uint64_t) fs::file_size(shard, ec);
+        if (ec) {
+            return 0; // missing shard: let the loader report it
+        }
+        total += sz;
+    }
+    return total;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1000,6 +1043,11 @@ public:
     struct fleet_state_t {
         std::atomic<float> load_progress{-1.0f}; // 0..1 while a load is in flight, else -1
         std::atomic<bool>  reload_active{false}; // --rpc-reload recovery in flight
+        // capacity gate (fleet-only): the load is held while the pooled device
+        // memory is below weights + KV reserve; the status handler shows why
+        std::atomic<bool>     capacity_wait{false};
+        std::atomic<uint64_t> capacity_required_mib{0};
+        std::atomic<uint64_t> capacity_available_mib{0};
         // set once the initial load_model(params) has fully returned, so the status
         // handler (exempt from the loading-503 gate) never reads main's `params`
         // while the model thread is still assigning `params = params_base`
@@ -1393,6 +1441,101 @@ private:
         });
     }
 
+    // Fleet capacity gate: a --no-mmap fleet load that exceeds the pooled device
+    // memory is a guaranteed slow failure (a worker OOMs mid-stream after minutes),
+    // so hold the load and wait for more workers instead. Fleet-only by design:
+    // single-box over-capacity (mmap paging, -ncmoe, ssd-streaming) is a supported
+    // regime and is never gated. Env: LLAMA_FLEET_KV_RESERVE_MB (headroom on top of
+    // the weights, default 20480), LLAMA_FLEET_CAPACITY_CHECK=0 disables.
+    void fleet_capacity_gate() {
+        const char * check_env = getenv("LLAMA_FLEET_CAPACITY_CHECK");
+        if (check_env != nullptr && atoi(check_env) == 0) {
+            return;
+        }
+        const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params_base);
+        bool any_rpc = false;
+        for (ggml_backend_dev_t dev : devs) {
+            any_rpc = any_rpc || fleet_dev_is_rpc(dev);
+        }
+        if (!any_rpc) {
+            return;
+        }
+        const uint64_t weight_bytes = fleet_model_weight_bytes(params_base.model.path);
+        if (weight_bytes == 0) {
+            return; // unreadable model path: the loader produces the real error
+        }
+        const char * reserve_env = getenv("LLAMA_FLEET_KV_RESERVE_MB");
+        const uint64_t reserve_mib  = reserve_env != nullptr ? (uint64_t) atoll(reserve_env) : 20480;
+        const uint64_t required_mib = weight_bytes / (1024 * 1024) + reserve_mib;
+        fleet.capacity_required_mib.store(required_mib);
+
+        int64_t t_last_log_ms = 0;
+        for (int round = 0; !fleet.stop.load(); round++) {
+            uint64_t avail_mib = 0;
+            std::set<std::string> counted_eps;
+            for (ggml_backend_dev_t dev : devs) {
+                const bool is_rpc = fleet_dev_is_rpc(dev);
+                size_t free_mem = 0, total_mem = 0;
+                fleet_dev_memory_cached(dev, is_rpc, &free_mem, &total_mem);
+                avail_mib += free_mem / (1024 * 1024);
+                if (is_rpc) {
+                    const char * ep = fleet_dev_endpoint(dev);
+                    if (ep != nullptr) {
+                        counted_eps.insert(ep);
+                    }
+                }
+            }
+            fleet.capacity_available_mib.store(avail_mib);
+            if (avail_mib >= required_mib) {
+                if (fleet.capacity_wait.load()) {
+                    SRV_INF("fleet capacity ok (%" PRIu64 " MiB available >= %" PRIu64 " MiB required) - starting the load\n",
+                            avail_mib, required_mib);
+                }
+                fleet.capacity_wait.store(false);
+                return;
+            }
+            fleet.capacity_wait.store(true);
+
+            // capacity that would join on a re-discovery: fresh beacons from
+            // workers that are not in the current pipeline
+            uint64_t potential_mib = avail_mib;
+            {
+                std::lock_guard<std::mutex> lock(fleet.mutex);
+                const int64_t t_now = ggml_time_ms();
+                for (const auto & [ep, b] : fleet.discovered) {
+                    if (counted_eps.count(ep) == 0 && t_now - b.t_last_ms < 10000) {
+                        if (auto v = fleet_beacon_num(b.payload, "free_mib")) {
+                            potential_mib += (uint64_t) *v;
+                        }
+                    }
+                }
+            }
+            // round > 0: give the first pass no restart so a just-started process
+            // that already sees the beacons registers them via its own discovery
+            if (potential_mib >= required_mib && round > 0 && params_base.rpc_discover) {
+                SRV_WRN("fleet capacity: newly discovered workers raise the pool to %" PRIu64 " MiB (>= %" PRIu64
+                        " MiB required) - exiting in 2s for a clean restart to re-discover and load\n",
+                        potential_mib, required_mib);
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                fflush(stdout);
+                fflush(stderr);
+                std::_Exit(42);
+            }
+            const int64_t t_now = ggml_time_ms();
+            if (t_now - t_last_log_ms > 30000) {
+                t_last_log_ms = t_now;
+                SRV_ERR("fleet capacity insufficient: %" PRIu64 " MiB pooled across %zu devices, need %" PRIu64
+                        " MiB (weights %.1f GiB + %" PRIu64 " MiB reserve) - waiting for more workers to join%s\n",
+                        avail_mib, devs.size(), required_mib, weight_bytes / (1024.0*1024.0*1024.0), reserve_mib,
+                        params_base.rpc_discover ? " (the load starts automatically when a new box appears)"
+                                                 : " (static --rpc config: restart with more workers)");
+            }
+            for (int i = 0; i < 12 && !fleet.stop.load(); i++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }
+    }
+
     void rpc_reload_and_resplit() {
         typedef void (*rpc_reset_failed_t)(void);
         typedef bool (*rpc_dev_reachable_t)(ggml_backend_dev_t);
@@ -1572,6 +1715,12 @@ private:
         // stream (beacons carry bw_gbps/free_mib; the listener is idempotent)
         fleet_capture_load_plan();
         fleet_start_beacon_listener();
+
+        // hold the load while the pooled fleet memory cannot fit the model; never
+        // gates on a resume (the model loaded before, capacity is proven)
+        if (!is_resume) {
+            fleet_capacity_gate();
+        }
 
         // opt-in preflight bench: once per process, never on a resume/reload (a
         // failure-recovery reload must not wait on a benchmark)
@@ -5050,6 +5199,10 @@ static const fleet_rpc_procs & fleet_procs() {
     return procs;
 }
 
+static const char * fleet_dev_endpoint(ggml_backend_dev_t dev) {
+    return fleet_procs().dev_endpoint != nullptr ? fleet_procs().dev_endpoint(dev) : nullptr;
+}
+
 // devices the model places layers on: the configured list when set, else the
 // registry's GPU devices RPC-first (mirrors llama_prepare_model_devices' default)
 static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params) {
@@ -5328,11 +5481,13 @@ void server_routes::init_routes() {
                 {"devs",         nullptr},
                 {"proto",        nullptr},
                 {"bw_gbps",      nullptr},
+                {"cache_mib",    nullptr},
             };
             if (auto v = fleet_beacon_num(b.payload, "free_mib")) { e["free_mib"] = (int64_t) *v; }
             if (auto v = fleet_beacon_num(b.payload, "devs"))     { e["devs"]     = (int64_t) *v; }
             if (auto v = fleet_beacon_num(b.payload, "proto"))    { e["proto"]    = *v;           }
             if (auto v = fleet_beacon_num(b.payload, "bw_gbps"))  { e["bw_gbps"]  = *v;           }
+            if (auto v = fleet_beacon_num(b.payload, "cache_mib")) { e["cache_mib"] = (int64_t) *v; }
             discovered.push_back(std::move(e));
         }
 
@@ -5341,6 +5496,8 @@ void server_routes::init_routes() {
         std::string state = "loading";
         if (fleet.reload_active.load()) {
             state = "reloading";
+        } else if (fleet.capacity_wait.load()) {
+            state = "waiting-capacity";
         } else if (loading) {
             state = "loading";
         } else if (!ready) {
@@ -5365,6 +5522,16 @@ void server_routes::init_routes() {
             const fleet_preflight_result pf = fleet_preflight_get();
             body["preflight"] = pf.valid
                 ? json({ {"tps", pf.tps}, {"model", pf.model}, {"n_tokens", pf.n_tokens}, {"load_s", pf.load_s} })
+                : json(nullptr);
+        }
+        {
+            const uint64_t req_mib = fleet.capacity_required_mib.load();
+            body["capacity"] = req_mib > 0
+                ? json({
+                    {"waiting",       fleet.capacity_wait.load()},
+                    {"required_mib",  req_mib},
+                    {"available_mib", fleet.capacity_available_mib.load()},
+                  })
                 : json(nullptr);
         }
         if (ready) {

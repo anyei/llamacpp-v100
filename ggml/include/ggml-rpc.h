@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    7
+#define RPC_PROTO_MINOR_VERSION    8
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
@@ -23,6 +23,15 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
+
+// source provenance for weight uploads (proto 4.8, TASKS.md #44): the caller announces
+// that the data pointer of subsequent set_tensor(_2d) calls on this thread aliases the
+// named GGUF tensor's bytes at base_offset. The RPC client forwards (name, offset, row
+// geometry) in SET_TENSOR_HASH2 offers so a --model-dir worker can serve an arbitrary
+// SLICE of a local GGUF by pread - split-boundary moves no longer cold-miss the whole
+// cache. NULL name clears the hint. Every serve is hash-verified, so a wrong or stale
+// hint degrades to streaming, never to corruption.
+GGML_BACKEND_API void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset);
 
 // model_dir (optional, TASKS.md #26): directory of local GGUF files indexed by tensor-content
 // hash at startup; SET_TENSOR_HASH cache misses are then served from local disk instead of
@@ -51,8 +60,11 @@ GGML_BACKEND_API const char * ggml_backend_rpc_dev_endpoint(ggml_backend_dev_t d
 // the beacon egress is pinned to the interface the RPC endpoint is bound to).
 // group syntax "ADDR:PORT"; NULL selects the built-in default group.
 // worker side: announce this rpc-server every ~2 s so coordinators can discover it.
+// cache_dir (optional): the tensor-cache directory; its current size is published
+// in the beacon (cache_mib=) so fleet UIs can show per-worker disk pressure.
 GGML_BACKEND_API bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
-                                                       size_t n_devices, ggml_backend_dev_t * devices);
+                                                       size_t n_devices, ggml_backend_dev_t * devices,
+                                                       const char * cache_dir);
 // coordinator side: listen for worker beacons for timeout_ms; cb fires once per unique
 // endpoint ("ip:port", with the beacon's payload line). returns the number of workers found.
 GGML_BACKEND_API int ggml_backend_rpc_discover(const char * group, int timeout_ms,

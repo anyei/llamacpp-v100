@@ -1928,6 +1928,43 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
+    // TASKS.md #44: announce the source range each member upload aliases so RPC
+    // members can offer slice provenance to --model-dir workers. Base-safe reg
+    // resolution (same constraint as the W2W procs above); cleared on every exit.
+    // Never set for PARTIAL - those bytes are transformed, not file bytes.
+    typedef void (*rpc_source_hint_t)(const char *, uint64_t);
+    static std::atomic<rpc_source_hint_t> hint_cached{nullptr};
+    rpc_source_hint_t hint_fn = hint_cached.load();
+    if (hint_fn == nullptr) {
+        for (size_t j = 0; j < n_bufs && hint_fn == nullptr; j++) {
+            ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
+            if (st == nullptr || st->buffer == nullptr) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(st->buffer));
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg != nullptr) {
+                hint_fn = (rpc_source_hint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_source_hint");
+            }
+        }
+        if (hint_fn != nullptr) {
+            hint_cached.store(hint_fn);
+        }
+    }
+    struct hint_guard_t {
+        rpc_source_hint_t fn;
+        ~hint_guard_t() {
+            if (fn != nullptr) {
+                fn(nullptr, 0);
+            }
+        }
+    } hint_guard{hint_fn};
+    auto hint = [&](size_t src_base) {
+        if (hint_fn != nullptr) {
+            hint_fn(tensor->name, src_base);
+        }
+    };
+
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -1952,6 +1989,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                         const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        hint(offset + offset_data);
                         ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
                             simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
                             row_count, simple_tensor->nb[1], tensor->nb[1]);
@@ -1977,6 +2015,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 for (size_t j = 0; j < n_bufs; j++) {
                     ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
                     const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
+                    hint(offset + offset_data);
                     ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
                         simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
                         row_count, simple_tensor->nb[2], tensor->nb[2]);
@@ -2007,12 +2046,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
+                hint(offset + offset_j);
                 ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            hint(offset);
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);

@@ -501,7 +501,7 @@ int main(int argc, char * argv[]) {
             fprintf(stderr, "Failed to obtain RPC backend announcer function, --announce disabled\n");
         } else if (start_announcer_fn(endpoint.c_str(),
                                       params.announce_group.empty() ? nullptr : params.announce_group.c_str(),
-                                      devices.size(), devices.data())) {
+                                      devices.size(), devices.data(), cache_dir)) {
             fprintf(stderr, "announcing this worker on multicast group %s (trusted networks only)\n",
                     params.announce_group.empty() ? "(default)" : params.announce_group.c_str());
         } else {
