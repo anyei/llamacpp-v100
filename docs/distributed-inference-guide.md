@@ -491,6 +491,61 @@ What these numbers teach (they generalize):
   from one worker to a 2-hop pipeline (17.9 vs 19.9) and ~4% to the network
   itself; the 35B lost ~2-4%.
 
+### 3c. Measured: Hunyuan 3 (295B MoE) served across the fleet (2026-07-17)
+
+The largest model this fleet has run: `hy3-1M-MTP-Q4_K_M.gguf` — **295B total
+/ ~21B active** (192 experts top-8 + 1 shared, 80 layers + 1 MTP NextN layer,
+GQA 64/8, 1M native context), Q4_K_M ~171 GB. Fits nowhere singly; served
+RAM/VRAM-resident across 5 boxes + 2 V100s (TASKS.md #51; arch ported from
+upstream #25395, image `llamacpp-local-v100:75737b40b`).
+
+**The fleet** (auto-weighted shares from measured bandwidth, capacity-capped):
+
+| Device | Box | Score | Share |
+|---|---|---:|---:|
+| RPC0 | 10.5.5.11 — Core Ultra 9 285H, 64 GB | 51.5 GB/s | 29.2% |
+| RPC1 | coordinator-local CPU worker (i9-10850K) | 30.1 GB/s | 19.0% |
+| RPC2 | 10.5.5.15 — i7-9750H, 64 GB | 16.3 GB/s | 11.2% |
+| RPC3 | 10.5.5.25 — i7-8550U, 32 GB (100-Mbit link) | 10.8 GB/s | 7.4% |
+| RPC4 | 10.5.5.30 — i5-3210M (2012, 2C/4T), 16 GB (100-Mbit link) | 20.8 GB/s | 4.9% |
+| CUDA0/1 | coordinator — 2x Tesla V100-SXM2-32GB (NVLink) | ~820 GB/s | 14.1% each |
+
+Coordinator box: i9-10850K (10C/20T), 46 GiB DDR4, the two V100s. Note the
+box contributes BOTH its GPUs (as pipeline stages) and its RAM (as a
+`--announce`d local CPU worker) — 33% of the model lives on the coordinator
+host in total. The weakest box on the LAN (.26, 8.6 GB/s) was deliberately
+left out: one fewer stage beats its capacity contribution.
+
+**Coordinator invocation** (`run-fleet-hy3-autoweight.sh`, compose
+`docker-compose.fleet-coordinator.yml`):
+
+```
+llama-server -m hy3-1M-MTP-Q4_K_M.gguf -ngl 99 -sm layer
+  -c 4096 -ub 256 -b 256 --no-mmap --port 8095
+env: LLAMA_ARG_RPC_DISCOVER=1  LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
+     LLAMA_ARG_RPC_AUTO_WEIGHT=1  LLAMA_ARG_FLEET_PREFLIGHT=Qwen3-0.6B
+```
+
+**Measured (temp 0.2, output read and coherent — native Hy3 chat template):**
+
+| Metric | Value |
+|---|---|
+| Load (warm worker caches, HDD source) | 42.7 min |
+| Preflight floor (0.6B over this topology) | 11.0 t/s |
+| Decode, single-stream (67-110 tok gens) | **1.90-1.93 t/s** |
+| Prompt processing (short prompts) | 3.1-3.4 t/s |
+| Decode graph reuse | engaged (186 graphs by req 3) |
+
+Context for the number: ~21B active at Q4_K_M = **~12.5 GB of weight reads
+per token**, spread over the stages' memory systems (sum-of-stages ~360 ms
++ hops) — 1.9 t/s is the expected physics, not overhead. The same session
+exercised the capacity gate twice for real (held at 177 < 194.6 GiB until
+two more boxes beaconed, then auto-restarted and loaded) and survived a
+beaconing-but-firewalled worker being dropped. Next lever: hy3's MTP head
+via the speculative stack (`p-min 0.75` mandatory — upstream measured
+acceptance collapsing at the default and 88-97% at 0.75), plus `-np`
+batching for aggregate throughput.
+
 ## 4. Session state over islands (save/restore, prompt checkpoints)
 
 Server state features work transparently across RPC and are verified
