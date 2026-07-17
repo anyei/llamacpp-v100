@@ -61,6 +61,8 @@ services:
       # persistent worker threadpool + busy-poll level (0-100); unset = disposable
       # pool per subgraph (old behavior). Spin trades idle cores for wake latency.
       - GGML_RPC_THREADPOOL_POLL=${WORKER_THREADPOOL_POLL:-}
+      # per-command latency breakdown in the worker log (TASKS.md #49): WORKER_RPC_TIMING=1
+      - GGML_RPC_TIMING=${WORKER_RPC_TIMING:-}
     # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
     # coordinator with --rpc-discover finds this worker without a static --rpc list.
     # Remove the flag to opt out; --announce-group ADDR:PORT to use a custom group.

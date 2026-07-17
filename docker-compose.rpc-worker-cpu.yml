@@ -37,6 +37,8 @@ services:
       # persistent worker threadpool + busy-poll level (0-100); unset = disposable
       # pool per subgraph (old behavior). Spin trades idle cores for wake latency.
       - GGML_RPC_THREADPOOL_POLL=${WORKER_THREADPOOL_POLL:-}
+      # per-command latency breakdown in the worker log (TASKS.md #49): WORKER_RPC_TIMING=1
+      - GGML_RPC_TIMING=${WORKER_RPC_TIMING:-}
     # WORKER_THREADS: CPU compute threads on the worker. rpc-server's default
     # (half the cores) measured FASTER than all-cores on loopback (7.7 vs 7.0
     # t/s, 35B A3B) — oversubscription hurts. On a dedicated worker box, sweep
