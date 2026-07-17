@@ -367,6 +367,11 @@ llama-server -m DeepSeek-V4-Flash.gguf \
 
 - `-ts 0,3,2` gives the attention owner a **0** expert share (it owns attention
   instead); `--rpc-auto-weight` sizes the rest by score, capped by memory.
+- **Exactly ONE local GPU** (the attention owner). A second local GPU as an
+  expert member corrupts the reduce and is rejected at load (TASKS.md #48).
+  Got two local GPUs? Use them via single-box `-sm tensor -ngl 99 -ncmoe N` —
+  that's *faster* for a model whose experts fit CPU RAM+NVMe (V4: 3.54 vs
+  ~2.5 t/s), since EP single-stream is latency-bound anyway.
 - **Single-stream is latency-bound, not compute-bound** (#28 attribution): a
   token pays one round trip per MoE boundary, so **fewer computing members is
   faster** single-stream (adding a fast V100 expert member *lowered* single-

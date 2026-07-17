@@ -134,6 +134,30 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
+            // EP dedicated attention (LLAMA_META_ATTN_OWNER) supports at most ONE local
+            // (non-RPC) member: the attention owner, which takes a zero expert share. A
+            // SECOND local GPU as an expert member corrupts the per-boundary reduce and
+            // produces degenerate output (TASKS.md #48). Reject it cleanly instead of
+            // serving garbage - put experts on RPC workers, or use both local GPUs via
+            // single-box '-sm tensor -ngl 99 -ncmoe N' (faster when the experts fit
+            // CPU RAM + NVMe: 3.54 vs ~2.5 t/s on 2x V100 for DeepSeek-V4-Flash).
+            const char * attn_owner_env = getenv("LLAMA_META_ATTN_OWNER");
+            if (attn_owner_env != nullptr && atoi(attn_owner_env) >= 0) {
+                size_t n_local = 0;
+                for (size_t i = 0; i < n_devs; ++i) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(params.devices[i]);
+                    if (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC")) {
+                        n_local++;
+                    }
+                }
+                if (n_local > 1) {
+                    LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) supports at most "
+                                    "one local GPU (the attention owner), but %zu local members were given. Put experts "
+                                    "on RPC workers, or use both local GPUs via single-box '-sm tensor -ngl 99 -ncmoe N' "
+                                    "(faster when experts fit CPU RAM+NVMe).\n", __func__, n_local);
+                    return false;
+                }
+            }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));

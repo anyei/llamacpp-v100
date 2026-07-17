@@ -17,9 +17,13 @@ cd /home/anyei/server/git-projects/llama.cpp
 COORD_IMAGE=llamacpp-local-v100:54af09616 \
 COORD_API_KEY=anyei \
 EP_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+# EP uses ONE local GPU as the dedicated attention owner (CUDA0); a SECOND local
+# GPU as an expert member corrupts the reduce (TASKS.md #48) and is rejected at
+# load. For both V100s on V4, single-box '-sm tensor -ngl 99 -ncmoe N' is faster
+# (3.54 vs ~2.5 t/s). Experts go on the RPC workers.
 EP_WORKERS=${EP_WORKERS:-10.5.5.11:50052,10.5.5.15:50054} \
-EP_DEVICES=${EP_DEVICES:-CUDA0,CUDA1,RPC0,RPC1} \
-EP_TS=${EP_TS:-0,3,3,2} \
+EP_DEVICES=${EP_DEVICES:-CUDA0,RPC0,RPC1} \
+EP_TS=${EP_TS:-0,3,2} \
 EP_CTX=${EP_CTX:-4096} \
 EP_PORT=${EP_PORT:-8098} \
 EP_PARALLEL=${EP_PARALLEL:-1} \
