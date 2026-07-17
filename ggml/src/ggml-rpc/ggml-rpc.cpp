@@ -3602,6 +3602,62 @@ rpc_server::~rpc_server() {
     }
 }
 
+// GGML_RPC_TIMING (worker-side): per-command latency breakdown so the coordinator's
+// end-to-end RTT (rpc_ep_stat ewma) can be decomposed into what the WORKER spends -
+// lock-wait (cross-connection exec-mutex contention) vs exec+send (the handler,
+// dominated by graph_compute for the EP boundary commands) - vs the residual
+// (network RTT + coordinator-side). Answers "is the ~4-5ms boundary turnaround
+// compute, contention, or wire?" (TASKS.md #28 attribution). Off by default.
+static bool rpc_timing_enabled() {
+    static const bool on = getenv("GGML_RPC_TIMING") != nullptr;
+    return on;
+}
+static std::mutex g_rpc_timing_mutex;
+struct rpc_cmd_timing { uint64_t count = 0, lock_us = 0, exec_us = 0, exec_max_us = 0; };
+static rpc_cmd_timing g_rpc_timings[RPC_CMD_COUNT];
+static uint64_t g_rpc_timing_total = 0;
+static const char * rpc_cmd_str(int cmd) {
+    switch (cmd) {
+        case RPC_CMD_GRAPH_COMPUTE:        return "GRAPH_COMPUTE";
+        case RPC_CMD_GRAPH_RECOMPUTE:      return "GRAPH_RECOMPUTE";
+        case RPC_CMD_GRAPH_COMPUTE_UID:    return "GRAPH_COMPUTE_UID";
+        case RPC_CMD_GRAPH_RECOMPUTE_UID:  return "GRAPH_RECOMPUTE_UID"; // meta per-boundary compute
+        case RPC_CMD_GRAPH_FUSED:          return "GRAPH_FUSED";         // fused EP boundary
+        case RPC_CMD_GET_TENSOR:           return "GET_TENSOR";          // star-reduce partial read
+        case RPC_CMD_SET_TENSOR:           return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:      return "SET_TENSOR_HASH";
+        case RPC_CMD_COPY_FROM_REMOTE:     return "COPY_FROM_REMOTE";    // W2W pull (butterfly)
+        case RPC_CMD_GET_TENSOR_FENCED:    return "GET_TENSOR_FENCED";
+        case RPC_CMD_PING:                 return "PING";
+        default:                           return "other";
+    }
+}
+static void rpc_timing_record(int cmd, int64_t t_recv, int64_t t_lock, int64_t t_done) {
+    if (cmd < 0 || cmd >= RPC_CMD_COUNT) {
+        return;
+    }
+    const uint64_t ex = (uint64_t) std::max<int64_t>(0, t_done - t_lock);
+    std::lock_guard<std::mutex> lock(g_rpc_timing_mutex);
+    rpc_cmd_timing & e = g_rpc_timings[cmd];
+    e.count++;
+    e.lock_us += (uint64_t) std::max<int64_t>(0, t_lock - t_recv);
+    e.exec_us += ex;
+    e.exec_max_us = std::max(e.exec_max_us, ex);
+    // periodic dump so a long-running serve loop reports without needing to exit
+    if (++g_rpc_timing_total % 20000 == 0) {
+        for (int c = 0; c < RPC_CMD_COUNT; c++) {
+            const rpc_cmd_timing & t = g_rpc_timings[c];
+            if (t.count == 0) {
+                continue;
+            }
+            GGML_LOG_INFO("[rpc-timing] %-20s n=%-7llu lock avg %.1f us  exec avg %.1f us  exec max %llu us\n",
+                          rpc_cmd_str(c), (unsigned long long) t.count,
+                          (double) t.lock_us / t.count, (double) t.exec_us / t.count,
+                          (unsigned long long) t.exec_max_us);
+        }
+    }
+}
+
 static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
@@ -3646,6 +3702,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        const int64_t t_recv = rpc_timing_enabled() ? ggml_time_us() : 0; // GGML_RPC_TIMING
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
@@ -3752,6 +3809,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
         // inside each case is safe to hold the lock over - the client sends the
         // header and payload back-to-back
         std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
+        const int64_t t_lock = rpc_timing_enabled() ? ggml_time_us() : 0; // GGML_RPC_TIMING
         server.current_conn = conn_id;
         switch (cmd) {
             case RPC_CMD_HELLO: {
@@ -4070,11 +4128,31 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
         }
         // fence progress: in lockstep with the client's sent-command counter
         server.mark_executed(conn_id);
+        if (rpc_timing_enabled()) { // GGML_RPC_TIMING: lock-wait + exec+send, per cmd
+            rpc_timing_record(cmd, t_recv, t_lock, ggml_time_us());
+        }
+    }
+}
+
+static void rpc_timing_dump() {
+    std::lock_guard<std::mutex> lock(g_rpc_timing_mutex);
+    for (int c = 0; c < RPC_CMD_COUNT; c++) {
+        const rpc_cmd_timing & t = g_rpc_timings[c];
+        if (t.count == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("[rpc-timing] %-20s n=%-7llu lock avg %.1f us  exec avg %.1f us  exec max %llu us\n",
+                      rpc_cmd_str(c), (unsigned long long) t.count,
+                      (double) t.lock_us / t.count, (double) t.exec_us / t.count,
+                      (unsigned long long) t.exec_max_us);
     }
 }
 
 static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
     rpc_serve_client_loop(server, sock, conn_id);
+    if (rpc_timing_enabled()) {
+        rpc_timing_dump(); // per-connection close: short runs report without the 20k periodic
+    }
     // runs regardless of how the loop exited (clean close or protocol error)
     server.conn_closed(conn_id); // wakes any fence waiting on this connection
     std::lock_guard<std::mutex> exec_lock(server.exec_mutex);
