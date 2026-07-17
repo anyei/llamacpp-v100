@@ -64,6 +64,9 @@ services:
       # COORD_CAPACITY_CHECK=0 disables. See docs/env-gates.md.
       - LLAMA_FLEET_KV_RESERVE_MB${COORD_KV_RESERVE_MB:+=${COORD_KV_RESERVE_MB}}
       - LLAMA_FLEET_CAPACITY_CHECK${COORD_CAPACITY_CHECK:+=${COORD_CAPACITY_CHECK}}
+      # optional chat-template override (e.g. COORD_CHAT_TEMPLATE=chatml when a
+      # model's embedded jinja uses features the engine lacks)
+      - LLAMA_ARG_CHAT_TEMPLATE${COORD_CHAT_TEMPLATE:+=${COORD_CHAT_TEMPLATE}}
       # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
       - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server

@@ -26,6 +26,12 @@ if docker ps --format '{{.Names}}' | grep -q '^llama-fleet-coordinator$'; then
   sleep 5
 fi
 
+# TEMPORARY (image e3b4f019c): hy3's embedded jinja template uses '...'.format()
+# which that image's engine lacks - the server crashes AFTER the full load
+# (post-load template parse). chatml override bypasses it; raw /v1/completions
+# is unaffected, /v1/chat wears chatml markers instead of hy3's own. The
+# .format() port is in images > e3b4f019c - drop this line after the roll.
+COORD_CHAT_TEMPLATE=chatml \
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
 COORD_IMAGE=llamacpp-local-v100:e3b4f019c \
