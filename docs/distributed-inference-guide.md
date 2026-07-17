@@ -1,7 +1,9 @@
 # Distributed Inference — Usage Guide
 
 How to run llama.cpp across multiple GPUs and machines with this fork's
-coordinator/worker support. Design rationale: `distributed-inference-plan.md`.
+coordinator/worker support. **Visual overview:** `architecture-diagrams.md`
+(placement decision map, pipeline/EP topologies, load paths, fleet lifecycle).
+Design rationale: `distributed-inference-plan.md`.
 Status/history: `TASKS.md` item 12. All numbers measured on 2x Tesla
 V100-SXM2-32GB with `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB, hybrid
 attention + DeltaNet) unless noted; small-model checks use
