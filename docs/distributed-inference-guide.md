@@ -103,6 +103,15 @@ The lifecycle of a coordinator + RPC worker, with real sizes:
    there is no version-skew failure mode, and the coordinator cannot tell the
    difference.
 
+   Since proto 4.8 (TASKS.md #44) this also covers **slices**: in EP/tensor
+   mode the coordinator's offers carry source provenance (tensor name, byte
+   offset, row geometry), so the worker assembles the exact slice from its
+   local GGUF by pread no matter where the split boundaries fall — a `-ts`
+   or auto-weight share change no longer cold-streams `--model-dir` boxes
+   (measured -71% wire bytes on a boundary-moved 9B tensor-mode load). Same
+   trust model: serve only on hash match. Kill switch: `GGML_RPC_NO_SRC_HINT=1`
+   on the coordinator.
+
 2. **Worker weight cache — the transfer happens only once.** With `-c` (and
    `LLAMA_CACHE=/cache` + a volume in a container), the worker hashes and
    persists every tensor it receives. On every later load the coordinator sends
@@ -149,6 +158,11 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
   synchronous protocol); with the cache, every later load reads local disk.
   **In a container, also set `LLAMA_CACHE=/cache`** and mount a volume there —
   without the env, the cache lands inside the container and dies with it.
+  Housekeeping (TASKS.md #45): `GGML_RPC_CACHE_LIMIT_MIB` caps the dir
+  (least-recently-USED entries evicted; serves refresh mtime), enforced on
+  every save AND once at startup — an idle worker trims stale model
+  generations before its next load. The beacon publishes the current size
+  (`cache_mib=`), shown in the fleet UI's Discovered table.
 - `-md`/`--model-dir DIR` kills even the *first*-load stream when the worker
   has its own copy of the GGUF: the worker indexes every GGUF under DIR by
   tensor-content hash at startup (reads each file once, ~seconds/10 GB on
@@ -157,8 +171,10 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
   coordinator to stream them. A stale or different local file simply
   hash-misses and streams as before — no version-skew failure mode. Only
   tensors > 10 MiB go through the hash path (same threshold as the weight
-  cache), and tensor-parallel islands still stream (they receive slices,
-  which don't hash-match whole tensors).
+  cache). Since proto 4.8, EP/tensor-mode SLICES are served from the local
+  GGUF too (the offer carries source provenance; see section 0 point 1b) —
+  before that, slices only hit the received-bytes cache and any `-ts` change
+  cold-streamed them.
 - `--tensor-parallel` requires >= 2 local GPUs; the worker prints
   `tensor-parallel island: N devices exposed as one` and advertises itself
   as `Meta[N](...)`. NCCL/P2P AllReduce runs worker-locally between its GPUs.
@@ -262,14 +278,33 @@ the RPC protocol itself. Compose reference:
 optional static list), paired with the `docker-compose.rpc-worker*.yml`
 workers, which all `--announce` by default.
 
+**Fleet capacity gate** (TASKS.md #50): when RPC devices are in the pipeline,
+the coordinator refuses to START a load whose weights + KV reserve
+(`LLAMA_FLEET_KV_RESERVE_MB`, default 20 GiB) exceed the pooled free device
+memory — a `--no-mmap` fleet load over capacity is a guaranteed
+minutes-later OOM mid-stream. Instead the server waits in a visible
+`waiting-capacity` state (orange chip + banner in the fleet UI,
+`/fleet/status.capacity` = required/available MiB) and, under
+`--rpc-discover`, watches the beacons: as soon as newly appeared workers
+raise the joinable pool past the requirement it exits 42 so the restart
+policy re-discovers the grown fleet and loads automatically — power on
+another box and walk away. Static `--rpc` configs wait with a
+restart-with-more-workers message. Single-box (no-RPC) runs are never gated
+(mmap paging, `-ncmoe`, ssd-streaming are supported over-capacity regimes);
+`LLAMA_FLEET_CAPACITY_CHECK=0` disables, and hybrid fleet+CPU-offload
+setups that deliberately place weights in coordinator RAM should disable it
+(the pool math counts devices only).
+
 **Fleet web UI + API** (TASKS.md #35): the server web UI has a **Fleet**
 section (sidebar network icon, `#/fleet`) backed by three endpoints:
 
 - `GET /fleet/status` — per-device cards: memory, split share, layers,
   transfer counters (bytes, EWMA round-trip latency), speed score, plus every
-  worker beaconing on the LAN (in the pipeline or not). Answers **during**
-  model load (reports fleet-wide load progress) and during `--rpc-reload`
-  recovery.
+  worker beaconing on the LAN (in the pipeline or not, with its beacon-carried
+  `cache_mib` tensor-cache size). Answers **during** model load (reports
+  fleet-wide load progress) and during `--rpc-reload` recovery; while the
+  capacity gate holds a load, `server_state` is `waiting-capacity` and a
+  `capacity` object carries required/available MiB.
 - `GET /fleet/worker/log?ep=host:port` — tails the worker's in-memory log
   ring over a dedicated RPC connection (proto 4.7 `GET_LOG`, served outside
   the worker's exec lock so it answers even mid-compute).

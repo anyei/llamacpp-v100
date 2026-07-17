@@ -54,9 +54,10 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=${WORKER_GPUS:-0}
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
-      # cache size cap (MiB): LRU-evict after each save; 0 = unlimited. The cap must
-      # exceed this box's biggest single-model share or the cache thrashes; boxes with
-      # small disks should override WORKER_CACHE_LIMIT_MIB lower in their .env
+      # cache size cap (MiB): LRU-evict after each save AND once at startup (stale
+      # generations trim before the next load, TASKS.md #45; beacon reports cache_mib=).
+      # 0 = unlimited. The cap must exceed this box's biggest single-model share or the
+      # cache thrashes; small disks should override WORKER_CACHE_LIMIT_MIB lower in .env
       - GGML_RPC_CACHE_LIMIT_MIB=${WORKER_CACHE_LIMIT_MIB:-65536}
       # persistent worker threadpool + busy-poll level (0-100); unset = disposable
       # pool per subgraph (old behavior). Spin trades idle cores for wake latency.

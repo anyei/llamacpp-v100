@@ -58,6 +58,12 @@ services:
       # single-token decodes over the fleet BEFORE the main load (the fleet's
       # per-token latency floor, shown in the fleet UI + loading page)
       - LLAMA_ARG_FLEET_PREFLIGHT${COORD_PREFLIGHT:+=${COORD_PREFLIGHT}}
+      # fleet capacity gate (TASKS.md #50): the load is HELD (state: waiting-capacity)
+      # while pooled device memory < weights + reserve, and auto-restarts to enlist
+      # newly beaconing workers. COORD_KV_RESERVE_MB overrides the 20480 default;
+      # COORD_CAPACITY_CHECK=0 disables. See docs/env-gates.md.
+      - LLAMA_FLEET_KV_RESERVE_MB${COORD_KV_RESERVE_MB:+=${COORD_KV_RESERVE_MB}}
+      - LLAMA_FLEET_CAPACITY_CHECK${COORD_CAPACITY_CHECK:+=${COORD_CAPACITY_CHECK}}
       # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
       - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server

@@ -29,8 +29,10 @@ services:
       - ${WORKER_MODELS_DIR:-./models-local}:/local-models:ro
     environment:
       - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
-      # cache size cap (MiB): after each save, least-recently-USED entries are
-      # evicted until the cache fits. 0 = unlimited. The cap must exceed this box's
+      # cache size cap (MiB): least-recently-USED entries evicted until the cache
+      # fits - enforced after each save AND once at startup (stale model
+      # generations trim before the next load, TASKS.md #45). The beacon reports
+      # the current size (cache_mib=, fleet UI Discovered table). 0 = unlimited. The cap must exceed this box's
       # biggest single-model share or the cache thrashes; boxes with small disks
       # should override WORKER_CACHE_LIMIT_MIB lower in their .env
       - GGML_RPC_CACHE_LIMIT_MIB=${WORKER_CACHE_LIMIT_MIB:-65536}
