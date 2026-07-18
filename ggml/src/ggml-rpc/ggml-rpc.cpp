@@ -2879,6 +2879,11 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     if (total <= limit) {
         return;
     }
+    // model-index files are tiny, never mtime-refreshed by serves, and deleting
+    // one forces a minutes-long GGUF re-hash at the next --model-dir start
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [](const rpc_cache_entry & e) {
+        return e.path.filename().string().rfind("modelidx-", 0) == 0;
+    }), entries.end());
     std::error_code ec;
     std::sort(entries.begin(), entries.end(), [](const rpc_cache_entry & a, const rpc_cache_entry & b) {
         return a.mtime < b.mtime;
@@ -3056,7 +3061,21 @@ void rpc_server::build_local_index(const char * model_dir) {
             if (ifs) {
                 std::string magic, file_line;
                 std::getline(ifs, magic);
-                // v1 files (no tensor names) are re-hashed once to upgrade
+                if (magic == "rpc-model-index v1") {
+                    // pre-4.8 index: valid hash entries, no tensor names. Keep the
+                    // fast start; slice provenance for this file just misses until
+                    // a re-index (delete the modelidx-* file to upgrade).
+                    size_t n_loaded = 0;
+                    uint64_t hash, offset, size;
+                    while (ifs >> std::hex >> hash >> std::dec >> offset >> size) {
+                        local_index[hash] = { path_str, offset, size };
+                        n_loaded++;
+                    }
+                    GGML_LOG_INFO("local index: %s (%zu tensors, v1 cached index - no slice serving until re-indexed)\n",
+                                  path_str.c_str(), n_loaded);
+                    n_files++;
+                    continue;
+                }
                 if (magic == "rpc-model-index v2") {
                     size_t n_loaded = 0;
                     uint64_t hash, offset, size;
@@ -3163,7 +3182,13 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 {
     std::vector<uint8_t> cached_file;
     if (get_cached_file(request.hash, cached_file)) {
-        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, cached_file, /*verified =*/ false, response);
+        if (!set_tensor_hash_apply(request.tensor, request.offset, request.hash, cached_file, /*verified =*/ false, response)) {
+            return false;
+        }
+        if (response.result) {
+            return true;
+        }
+        cached_file.clear(); // corrupt entry (now deleted) - try the local sources
     }
     if (get_local_tensor(request.hash, cached_file)) {
         // get_local_tensor hash-verified what it read - no second pass
@@ -3177,7 +3202,13 @@ bool rpc_server::set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, 
 {
     std::vector<uint8_t> data;
     if (get_cached_file(request.hash, data)) {
-        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, data, /*verified =*/ false, response);
+        if (!set_tensor_hash_apply(request.tensor, request.offset, request.hash, data, /*verified =*/ false, response)) {
+            return false;
+        }
+        if (response.result) {
+            return true;
+        }
+        data.clear(); // corrupt entry (now deleted) - try the local sources
     }
     // both local sources hash-verify what they read - no second pass
     if (get_local_tensor(request.hash, data) || get_local_slice(request, data)) {
@@ -3205,10 +3236,16 @@ bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, s
     if (total / row_size != n_rows || total > (1ull << 31)) {
         return false;
     }
-    const uint64_t span_end = request.src.offset + (n_rows - 1) * stride + row_size;
-    if (span_end < request.src.offset) {
+    // every term of span_end must be overflow-checked - a wrapped product would
+    // pass the ref.size bound and send the read loop far outside the tensor
+    if (request.src.offset > UINT64_MAX - row_size) {
         return false;
     }
+    const uint64_t base_end = request.src.offset + row_size;
+    if (n_rows > 1 && stride != 0 && (n_rows - 1) > (UINT64_MAX - base_end) / stride) {
+        return false;
+    }
+    const uint64_t span_end = base_end + (n_rows - 1) * stride;
     for (const local_tensor_ref & ref : it->second) {
         if (span_end > ref.size) {
             continue;

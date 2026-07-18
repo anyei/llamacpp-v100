@@ -979,6 +979,7 @@ static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & p
 static std::optional<double>           fleet_beacon_num(const std::string & payload, const std::string & key);
 static void                            fleet_dev_memory_cached(ggml_backend_dev_t dev, bool is_rpc, size_t * free_mem, size_t * total_mem);
 static const char *                    fleet_dev_endpoint(ggml_backend_dev_t dev);
+static bool                            fleet_endpoint_reachable(const std::string & ep, int timeout_ms);
 
 static bool fleet_dev_is_rpc(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1459,6 +1460,33 @@ private:
         if (weight_bytes == 0) {
             return; // unreadable model path: the loader produces the real error
         }
+        // weights that deliberately live in host RAM are invisible to the device
+        // pool - requiring the full model there would hold such configs forever
+        if (!params_base.tensor_buft_overrides.empty()) {
+            SRV_INF("%s", "fleet capacity gate skipped: tensor buft overrides (-ot/-ncmoe) place weights outside the device pool\n");
+            return;
+        }
+        if (params_base.n_gpu_layers >= 0) {
+            uint32_t n_layer = 0;
+            gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+            gguf_context * g = gguf_init_from_file(params_base.model.path.c_str(), gp);
+            if (g != nullptr) {
+                const int64_t k_arch = gguf_find_key(g, "general.architecture");
+                if (k_arch >= 0) {
+                    const std::string key = std::string(gguf_get_val_str(g, k_arch)) + ".block_count";
+                    const int64_t k = gguf_find_key(g, key.c_str());
+                    if (k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32) {
+                        n_layer = gguf_get_val_u32(g, k);
+                    }
+                }
+                gguf_free(g);
+            }
+            if (n_layer > 0 && (uint32_t) params_base.n_gpu_layers <= n_layer) {
+                SRV_INF("fleet capacity gate skipped: -ngl %d of %u layers keeps weights in host RAM\n",
+                        params_base.n_gpu_layers, n_layer);
+                return;
+            }
+        }
         const char * reserve_env = getenv("LLAMA_FLEET_KV_RESERVE_MB");
         const uint64_t reserve_mib  = reserve_env != nullptr ? (uint64_t) atoll(reserve_env) : 20480;
         const uint64_t required_mib = weight_bytes / (1024 * 1024) + reserve_mib;
@@ -1495,13 +1523,24 @@ private:
             // workers that are not in the current pipeline
             uint64_t potential_mib = avail_mib;
             {
-                std::lock_guard<std::mutex> lock(fleet.mutex);
-                const int64_t t_now = ggml_time_ms();
-                for (const auto & [ep, b] : fleet.discovered) {
-                    if (counted_eps.count(ep) == 0 && t_now - b.t_last_ms < 10000) {
-                        if (auto v = fleet_beacon_num(b.payload, "free_mib")) {
-                            potential_mib += (uint64_t) *v;
+                std::vector<std::pair<std::string, uint64_t>> joinable;
+                {
+                    std::lock_guard<std::mutex> lock(fleet.mutex);
+                    const int64_t t_now = ggml_time_ms();
+                    for (const auto & [ep, b] : fleet.discovered) {
+                        if (counted_eps.count(ep) == 0 && t_now - b.t_last_ms < 10000) {
+                            if (auto v = fleet_beacon_num(b.payload, "free_mib")) {
+                                joinable.emplace_back(ep, (uint64_t) *v);
+                            }
                         }
+                    }
+                }
+                // a beacon-fresh worker whose RPC port never accepts (e.g. firewalled)
+                // would otherwise restart-loop the coordinator: count it only if a
+                // bounded probe connects (outside the mutex - probes block)
+                for (const auto & [ep, free_mib] : joinable) {
+                    if (fleet_endpoint_reachable(ep, 800)) {
+                        potential_mib += free_mib;
                     }
                 }
             }
@@ -5223,6 +5262,10 @@ static const char * fleet_dev_endpoint(ggml_backend_dev_t dev) {
     return fleet_procs().dev_endpoint != nullptr ? fleet_procs().dev_endpoint(dev) : nullptr;
 }
 
+static bool fleet_endpoint_reachable(const std::string & ep, int timeout_ms) {
+    return fleet_procs().reachable == nullptr || fleet_procs().reachable(ep.c_str(), timeout_ms);
+}
+
 // devices the model places layers on: the configured list when set, else the
 // registry's GPU devices RPC-first (mirrors llama_prepare_model_devices' default)
 static std::vector<ggml_backend_dev_t> fleet_device_list(const common_params & params) {
@@ -5551,6 +5594,7 @@ void server_routes::init_routes() {
                     {"waiting",       fleet.capacity_wait.load()},
                     {"required_mib",  req_mib},
                     {"available_mib", fleet.capacity_available_mib.load()},
+                    {"auto_recover",  params.rpc_discover},
                   })
                 : json(nullptr);
         }

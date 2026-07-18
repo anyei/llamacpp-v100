@@ -99,6 +99,7 @@ export interface ApiFleetStatusResponse {
 		waiting: boolean;
 		required_mib: number;
 		available_mib: number;
+		auto_recover?: boolean;
 	} | null;
 	preflight?: ApiFleetPreflight | null;
 }

@@ -1933,23 +1933,28 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // resolution (same constraint as the W2W procs above); cleared on every exit.
     // Never set for PARTIAL - those bytes are transformed, not file bytes.
     typedef void (*rpc_source_hint_t)(const char *, uint64_t);
-    static std::atomic<rpc_source_hint_t> hint_cached{nullptr};
-    rpc_source_hint_t hint_fn = hint_cached.load();
-    if (hint_fn == nullptr) {
-        for (size_t j = 0; j < n_bufs && hint_fn == nullptr; j++) {
-            ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
-            if (st == nullptr || st->buffer == nullptr) {
-                continue;
-            }
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(st->buffer));
-            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (reg != nullptr) {
-                hint_fn = (rpc_source_hint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_source_hint");
-            }
+    // memoize per reg (positive AND negative) - an all-local meta buffer would
+    // otherwise rerun the full proc-address scan on every set_tensor call
+    static std::mutex hint_mutex;
+    static std::map<ggml_backend_reg_t, rpc_source_hint_t> hint_by_reg;
+    rpc_source_hint_t hint_fn = nullptr;
+    for (size_t j = 0; j < n_bufs && hint_fn == nullptr; j++) {
+        ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
+        if (st == nullptr || st->buffer == nullptr) {
+            continue;
         }
-        if (hint_fn != nullptr) {
-            hint_cached.store(hint_fn);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(st->buffer));
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
         }
+        std::lock_guard<std::mutex> lock(hint_mutex);
+        auto it = hint_by_reg.find(reg);
+        if (it == hint_by_reg.end()) {
+            it = hint_by_reg.emplace(reg,
+                (rpc_source_hint_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_source_hint")).first;
+        }
+        hint_fn = it->second;
     }
     struct hint_guard_t {
         rpc_source_hint_t fn;
