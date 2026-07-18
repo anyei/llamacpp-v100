@@ -32,6 +32,32 @@ box runs cross-box as **expert-parallel** (`-sm tensor` + dedicated attention),
 because its per-layer reduce is a small vector sum, not a GEMM reduce. Side-by-
 side comparison and spin-up commands for all three modes: **§2b**.
 
+## What this fork adds over upstream llama.cpp RPC
+
+Everything in this guide builds on upstream's `rpc-server`/`--rpc` wire
+concept, but most of what the guide describes does not exist in mainline.
+Upstream RPC is a static list of remote devices spoken to over a blocking,
+single-connection protocol: the whole model re-streams on every load, the
+async/events interface is unimplemented (so pipeline parallelism never
+engages over RPC), cross-stage copies bridge through the coordinator, and a
+worker dying mid-serve kills the run. The one-line difference: **upstream
+gives you a wire protocol; this fork built a serving fleet on top of it** —
+remote devices are treated as a *population* with measured speeds, link
+qualities, caches and lifecycles, not as GPUs that happen to be far away.
+
+| Area | Upstream mainline | This fork (proto 4.2 -> 4.8) |
+|---|---|---|
+| Topologies | layer pipeline | + in-process tensor-parallel (meta backend), **expert-parallel** (meta-over-RPC, attention owner, star reduce - §2b), TP islands (§2/§4), KV annex |
+| Wire | blocking round trips | async + events (pipeline engages), worker-to-worker fenced pulls, fused boundary command (one message per worker per MoE layer), uid-keyed graph cache (16 B/subgraph steady state) |
+| Load path | full re-stream each load; cache serves unverified entries | verified content-addressed cache (atomic write + re-hash on read), `--model-dir` local sourcing, slice provenance (§0.1b) - cold 40 min -> warm minutes, `-ts`-change-proof |
+| Fleet ops | static `--rpc` list | discovery beacons, bandwidth scoring + `--rpc-auto-weight`, capacity gate, fleet UI/API, preflight bench, worker log/restart/include (§2) |
+| Failure | run dies with the worker | CUDA-error containment (drops one connection, not the worker), journal + surgical re-provision (~2 min), `--rpc-reload` re-split over survivors (§6) |
+
+Deliberately unchanged: the trust model (unauthenticated, trusted-LAN-only,
+same as upstream) and wire-level compatibility discipline — every fork
+feature is protocol-version-gated, so a mixed fleet of old and new workers
+degrades feature-by-feature instead of breaking.
+
 ## 0. How data moves — what crosses the network, and when
 
 The lifecycle of a coordinator + RPC worker, with real sizes:
