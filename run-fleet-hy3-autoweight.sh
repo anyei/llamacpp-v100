@@ -4,7 +4,7 @@
 # Sibling of run-fleet-glm52-autoweight.sh (GLM on :8097); this one runs on :8095.
 #
 # REQUIREMENTS
-#   - hy_v3 arch support: image >= 75737b40b (upstream #25395 port incl. the jinja str.format the embedded chat template needs).
+#   - hy_v3 arch support: image >= 076d19781 (upstream #25395 port incl. the jinja str.format the embedded chat template needs).
 #   - Capacity: 171 GB weights + LLAMA_FLEET_KV_RESERVE_MB (default 20 GB) needs
 #     ~191 GB pooled -> EVERY worker box online (.11, .15 both, .25, .30, .26).
 #     The new capacity gate holds the load (state: waiting-capacity) and starts
@@ -46,7 +46,7 @@ fi
 
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
-COORD_IMAGE=llamacpp-local-v100:75737b40b \
+COORD_IMAGE=llamacpp-local-v100:076d19781 \
 COORD_MODEL=hy3-1M-MTP-Q4_K_M.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
