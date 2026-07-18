@@ -26,6 +26,19 @@ if docker ps --format '{{.Names}}' | grep -q '^llama-fleet-coordinator$'; then
   sleep 5
 fi
 
+# MTP=1 enables self-speculative decoding via hy3's trained NextN/MTP head
+# (prod recipe from docker-compose.mtp.yml; p-min 0.75 is MANDATORY for hy3 -
+# upstream measured acceptance collapsing at the default and 88-97% at 0.75).
+# The NextN layer rides the last pipeline stage (CUDA1), so drafting stays
+# coordinator-local; each verify carries the draft batch through the fleet in
+# ONE pipeline pass - on a latency-bound pipeline that multiplies tokens per
+# round trip by the accepted length.
+EXTRA_ARGS=""
+if [ "${MTP:-0}" = "1" ]; then
+  EXTRA_ARGS="--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1 --spec-draft-p-min 0.75"
+  echo "MTP speculative decoding ENABLED (n-max 3, p-min 0.75)"
+fi
+
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
 COORD_IMAGE=llamacpp-local-v100:75737b40b \
@@ -38,6 +51,7 @@ COORD_BATCH=256 \
 COORD_PORT=8095 \
 COORD_FLEET_ADMIN=1 \
 COORD_PREFLIGHT=/models/Qwen3-0.6B-BF16.gguf \
+COORD_EXTRA_ARGS="$EXTRA_ARGS" \
   docker compose -f docker-compose.fleet-coordinator.yml up
 
 # Fleet UI + chat:  http://<this-box>:8095/

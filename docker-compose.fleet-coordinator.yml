@@ -80,4 +80,5 @@ services:
       -ub ${COORD_UB:-512}
       -b ${COORD_BATCH:-2048}
       --no-mmap
+      ${COORD_EXTRA_ARGS:-}
     restart: unless-stopped
