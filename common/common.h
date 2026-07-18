@@ -477,6 +477,7 @@ struct common_params {
     std::string rpc_discover_group;    // multicast group override ("ADDR:PORT"; empty = built-in default)
 
     bool rpc_auto_weight = false;      // fill an unset -ts from worker speed scores, capped by free memory (TASKS.md #35f)
+    double rpc_auto_weight_reserve_mib = 0.0; // compute headroom the split assumed; the server verifies it post-load (TASKS.md #39)
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors

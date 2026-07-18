@@ -1323,10 +1323,15 @@ static void apply_rpc_auto_weight(common_params & params) {
         const uint32_t n_ctx = params.n_ctx > 0 ? (uint32_t) params.n_ctx : (n_ctx_train > 0 ? n_ctx_train : 4096);
         const double kv_bytes = kv_per_tok * n_ctx;
         constexpr double MiB = 1024.0 * 1024.0;
-        double compute_bytes = std::min(2048.0 * MiB, std::max(512.0 * MiB, 0.02 * w_bytes));
+        // ceiling raised 2048 -> 8192 (TASKS.md #39): the old clamp defeated the 2%
+        // rule for exactly the models whose compute buffers outgrow it (V4-class:
+        // 2% = 1.7 GiB clamped to 2 GiB while the real decode buffer ran past it,
+        // OOMing the tightest member mid-decode)
+        double compute_bytes = std::min(8192.0 * MiB, std::max(512.0 * MiB, 0.02 * w_bytes));
         if (const char * env = getenv("LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB")) {
             compute_bytes = atof(env) * MiB;
         }
+        params.rpc_auto_weight_reserve_mib = compute_bytes / MiB;
         if (tensor_mode) {
             // EP: shares are sub-layer weight slices, so no whole-layer rounding
             // margin, and the KV/state lives with the attention owner (or mirrored

@@ -2176,6 +2176,29 @@ private:
                 }
             }
         }
+
+        // TASKS.md #39: the auto-weight split assumed a flat compute reserve per
+        // device; a real compute buffer that outgrows it means a memory-capped
+        // member fit at load but can OOM at decode. Verify against reality and
+        // name the env fix - turn the silent mid-decode OOM into a load-time line.
+        if (params_base.rpc_auto_weight && params_base.rpc_auto_weight_reserve_mib > 0.0 &&
+            model_tgt != nullptr && ctx_tgt != nullptr) {
+            const double reserve_mib = params_base.rpc_auto_weight_reserve_mib;
+            const int32_t n_dev = llama_model_n_devices(model_tgt);
+            for (int32_t i = 0; i < n_dev; ++i) {
+                ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+                if (dev == nullptr) {
+                    continue;
+                }
+                const double actual_mib = llama_context_dev_compute_buffer_size(ctx_tgt, dev) / (1024.0 * 1024.0);
+                if (actual_mib > reserve_mib) {
+                    SRV_WRN("fleet reserve undershoot: %s compute buffer is %.0f MiB but the auto-weight "
+                            "split reserved %.0f MiB - a memory-capped member can OOM at decode; "
+                            "set LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB=%.0f and reload\n",
+                            ggml_backend_dev_name(dev), actual_mib, reserve_mib, actual_mib * 1.25);
+                }
+            }
+        }
         fleet.load_progress.store(-1.0f);
         fleet_start_beacon_listener();
 

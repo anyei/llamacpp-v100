@@ -3353,6 +3353,29 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+size_t llama_context::dev_compute_buffer_size(ggml_backend_dev_t dev) const {
+    if (sched == nullptr) {
+        return 0;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_t backend = backends[i].get();
+        if (ggml_backend_get_device(backend) != dev) {
+            continue;
+        }
+        if (model.hparams.no_alloc && i < backend_buf_exp_size.size()) {
+            total += backend_buf_exp_size[i];
+        } else {
+            total += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        }
+    }
+    return total;
+}
+
+size_t llama_context_dev_compute_buffer_size(const struct llama_context * ctx, ggml_backend_dev_t dev) {
+    return ctx != nullptr ? ctx->dev_compute_buffer_size(dev) : 0;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
