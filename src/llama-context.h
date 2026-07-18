@@ -189,10 +189,6 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
-    // scheduler compute-buffer bytes on a device (0 = no backend for it here);
-    // fleet auto-weight reserve verification (TASKS.md #39)
-    size_t dev_compute_buffer_size(ggml_backend_dev_t dev) const;
-
     //
     // training
     //

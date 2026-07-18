@@ -265,18 +265,23 @@ struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
 };
 
-// proto 4.8 (TASKS.md #44): the offered bytes are src_n_rows reads of src_row_size
-// at src_offset + i*src_row_stride within the named GGUF tensor's data. A worker
-// with --model-dir assembles the slice by pread and hash-verifies before applying;
-// n_rows == 1 is the contiguous case.
+// proto 4.8 (TASKS.md #44): slice geometry within a source GGUF tensor - n_rows
+// reads of row_size at offset + i*row_stride; n_rows == 1 is the contiguous
+// case. One struct shared by the wire message, the journal and the client.
+struct rpc_src_geom {
+    uint64_t offset;
+    uint64_t row_size;
+    uint64_t n_rows;
+    uint64_t row_stride;
+};
+
+// the offered bytes are the named GGUF tensor's slice per src/src_name; a
+// worker with --model-dir assembles it by pread and hash-verifies before applying
 struct rpc_msg_set_tensor_hash2_req {
     rpc_tensor tensor;
     uint64_t offset;
     uint64_t hash;
-    uint64_t src_offset;
-    uint64_t src_row_size;
-    uint64_t src_n_rows;
-    uint64_t src_row_stride;
+    rpc_src_geom src;
     char     src_name[GGML_MAX_NAME];
 };
 
@@ -411,11 +416,8 @@ struct rpc_buffer_journal {
         // source provenance (proto 4.8, TASKS.md #44): non-empty src_name replays
         // via SET_TENSOR_HASH2 so a --model-dir worker rebuilds slices that never
         // touched its disk cache
-        char       src_name[GGML_MAX_NAME] = {0};
-        uint64_t   src_offset     = 0;
-        uint64_t   src_row_size   = 0;
-        uint64_t   src_n_rows     = 0;
-        uint64_t   src_row_stride = 0;
+        char         src_name[GGML_MAX_NAME] = {0};
+        rpc_src_geom src = {};
     };
     // keyed by BUFFER-relative start (root offset from base + write offset): the
     // key must be unique per buffer region - keying by the tensor-relative offset
@@ -1139,15 +1141,8 @@ static const ggml_tensor * rpc_resolve_view(const ggml_tensor * tensor, size_t &
 // source provenance for weight uploads (proto 4.8, TASKS.md #44): the caller (the
 // meta backend's weight splitter, via the registry proc) announces which GGUF
 // tensor the data pointer of subsequent set_tensor(_2d) calls aliases. Row
-// geometry is derived per call; a wrong hint hash-misses on the worker and
-// degrades to streaming. Thread-local: weight loads are synchronous.
-struct rpc_src_ref {
-    uint64_t src_offset;
-    uint64_t row_size;
-    uint64_t n_rows;
-    uint64_t row_stride;
-};
-
+// geometry (rpc_src_geom) is derived per call; a wrong hint hash-misses on the
+// worker and degrades to streaming. Thread-local: weight loads are synchronous.
 static thread_local struct {
     char     name[GGML_MAX_NAME];
     uint64_t base;
@@ -1170,7 +1165,7 @@ void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset) {
 // the worker's local cache, small writes replay literally, bounded)
 static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tensor & root, uint64_t offset,
                                    const void * data, size_t size, uint64_t hash, bool have_hash,
-                                   const rpc_src_ref * src = nullptr) {
+                                   const rpc_src_geom * src = nullptr) {
     if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         return;
     }
@@ -1192,10 +1187,7 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
     e.spill_off = UINT64_MAX;
     if (src != nullptr && have_hash && g_rpc_src_hint.valid) {
         snprintf(e.src_name, sizeof(e.src_name), "%s", g_rpc_src_hint.name);
-        e.src_offset     = src->src_offset;
-        e.src_row_size   = src->row_size;
-        e.src_n_rows     = src->n_rows;
-        e.src_row_stride = src->row_stride;
+        e.src = *src;
     }
     if (!have_hash) {
         if (j.spill == nullptr) {
@@ -1226,7 +1218,7 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
 }
 
 static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
-                                       size_t offset, size_t size, const rpc_src_ref * src) {
+                                       size_t offset, size_t size, const rpc_src_geom * src) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     const ggml_tensor * root = rpc_resolve_view(tensor, offset);
     rpc_tensor rpc_tensor = serialize_tensor(root);
@@ -1243,10 +1235,7 @@ static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor
             request.tensor         = rpc_tensor;
             request.offset         = offset;
             request.hash           = hash;
-            request.src_offset     = src->src_offset;
-            request.src_row_size   = src->row_size;
-            request.src_n_rows     = src->n_rows;
-            request.src_row_stride = src->row_stride;
+            request.src = *src;
             snprintf(request.src_name, sizeof(request.src_name), "%s", g_rpc_src_hint.name);
             status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH2, &request, sizeof(request), &response, sizeof(response));
         } else {
@@ -1292,12 +1281,8 @@ static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    if (g_rpc_src_hint.valid) {
-        const rpc_src_ref src = { g_rpc_src_hint.base, (uint64_t) size, 1, 0 };
-        rpc_buffer_set_tensor_impl(buffer, tensor, data, offset, size, &src);
-    } else {
-        rpc_buffer_set_tensor_impl(buffer, tensor, data, offset, size, nullptr);
-    }
+    const rpc_src_geom src = { g_rpc_src_hint.base, (uint64_t) size, 1, 0 };
+    rpc_buffer_set_tensor_impl(buffer, tensor, data, offset, size, g_rpc_src_hint.valid ? &src : nullptr);
 }
 
 // strided host rows into a contiguous device range: gather client-side and upload in
@@ -1309,7 +1294,7 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     if (stride_tensor != size) {
         // destination rows are not contiguous - no batching possible
         for (size_t i = 0; i < n_copies; i++) {
-            const rpc_src_ref src = { g_rpc_src_hint.base + i*stride_data, (uint64_t) size, 1, 0 };
+            const rpc_src_geom src = { g_rpc_src_hint.base + i*stride_data, (uint64_t) size, 1, 0 };
             rpc_buffer_set_tensor_impl(buffer, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size,
                                        hinted ? &src : nullptr);
         }
@@ -1323,7 +1308,7 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         for (size_t k = 0; k < n; k++) {
             memcpy(tmp.data() + k*size, (const char *) data + (i0 + k)*stride_data, size);
         }
-        const rpc_src_ref src = { g_rpc_src_hint.base + i0*stride_data, (uint64_t) size, n, stride_data };
+        const rpc_src_geom src = { g_rpc_src_hint.base + i0*stride_data, (uint64_t) size, n, stride_data };
         rpc_buffer_set_tensor_impl(buffer, tensor, tmp.data(), offset + i0*stride_tensor, n*size,
                                    hinted ? &src : nullptr);
     }
@@ -2480,7 +2465,7 @@ private:
         uint64_t    size;
     };
     bool get_local_tensor(uint64_t hash, std::vector<uint8_t> & data);
-    bool set_tensor_hash_apply(const rpc_msg_set_tensor_hash_req & request, std::vector<uint8_t> & cached_file, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_hash_apply(const rpc_tensor & tensor, uint64_t offset, uint64_t hash, std::vector<uint8_t> & cached_file, bool verified, rpc_msg_set_tensor_hash_rsp & response);
     // hash -> location in a local GGUF; built once at startup, read-only afterwards
     std::unordered_map<uint64_t, local_tensor_ref> local_index;
 
@@ -2853,6 +2838,33 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 // opt-in cache size cap (GGML_RPC_CACHE_LIMIT_MIB): after a save, evict entries
 // oldest-mtime-first until the dir fits. Served entries refresh their mtime, so a
 // hot working set survives while superseded model generations age out.
+struct rpc_cache_entry {
+    fs::path           path;
+    uint64_t           size;
+    fs::file_time_type mtime;
+};
+
+// walk the cache dir once; returns total bytes, optionally collecting entries
+static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache_entry> * entries) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        rpc_cache_entry e { it->path(), it->file_size(ec), it->last_write_time(ec) };
+        if (ec) {
+            continue;
+        }
+        total += e.size;
+        if (entries != nullptr) {
+            entries->push_back(std::move(e));
+        }
+    }
+    return total;
+}
+
 static void rpc_cache_enforce_limit(const char * cache_dir) {
     static const long long limit_mib = []() {
         const char * env = getenv("GGML_RPC_CACHE_LIMIT_MIB");
@@ -2862,35 +2874,18 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
         return;
     }
     const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
-    struct cache_entry {
-        fs::path           path;
-        uint64_t           size;
-        fs::file_time_type mtime;
-    };
-    std::vector<cache_entry> entries;
-    uint64_t total = 0;
-    std::error_code ec;
-    for (auto it = fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::directory_iterator(); it.increment(ec)) {
-        if (!it->is_regular_file(ec)) {
-            continue;
-        }
-        cache_entry e { it->path(), it->file_size(ec), it->last_write_time(ec) };
-        if (ec) {
-            continue;
-        }
-        total += e.size;
-        entries.push_back(std::move(e));
-    }
+    std::vector<rpc_cache_entry> entries;
+    uint64_t total = rpc_cache_dir_scan(cache_dir, &entries);
     if (total <= limit) {
         return;
     }
-    std::sort(entries.begin(), entries.end(), [](const cache_entry & a, const cache_entry & b) {
+    std::error_code ec;
+    std::sort(entries.begin(), entries.end(), [](const rpc_cache_entry & a, const rpc_cache_entry & b) {
         return a.mtime < b.mtime;
     });
     size_t   n_evicted = 0;
     uint64_t freed     = 0;
-    for (const cache_entry & e : entries) {
+    for (const rpc_cache_entry & e : entries) {
         if (total <= limit) {
             break;
         }
@@ -3167,25 +3162,29 @@ bool rpc_server::get_local_tensor(uint64_t hash, std::vector<uint8_t> & data) {
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file) && !get_local_tensor(request.hash, cached_file)) {
-        response.result = 0;
-        return true;
+    if (get_cached_file(request.hash, cached_file)) {
+        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, cached_file, /*verified =*/ false, response);
     }
-    return set_tensor_hash_apply(request, cached_file, response);
+    if (get_local_tensor(request.hash, cached_file)) {
+        // get_local_tensor hash-verified what it read - no second pass
+        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, cached_file, /*verified =*/ true, response);
+    }
+    response.result = 0;
+    return true;
 }
 
 bool rpc_server::set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     std::vector<uint8_t> data;
-    if (!get_cached_file(request.hash, data) && !get_local_tensor(request.hash, data) && !get_local_slice(request, data)) {
-        response.result = 0;
-        return true;
+    if (get_cached_file(request.hash, data)) {
+        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, data, /*verified =*/ false, response);
     }
-    rpc_msg_set_tensor_hash_req base;
-    base.tensor = request.tensor;
-    base.offset = request.offset;
-    base.hash   = request.hash;
-    return set_tensor_hash_apply(base, data, response);
+    // both local sources hash-verify what they read - no second pass
+    if (get_local_tensor(request.hash, data) || get_local_slice(request, data)) {
+        return set_tensor_hash_apply(request.tensor, request.offset, request.hash, data, /*verified =*/ true, response);
+    }
+    response.result = 0;
+    return true;
 }
 
 bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, std::vector<uint8_t> & data) {
@@ -3196,9 +3195,9 @@ bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, s
     if (it == local_name_index.end()) {
         return false;
     }
-    const uint64_t n_rows   = request.src_n_rows;
-    const uint64_t row_size = request.src_row_size;
-    const uint64_t stride   = request.src_row_stride;
+    const uint64_t n_rows   = request.src.n_rows;
+    const uint64_t row_size = request.src.row_size;
+    const uint64_t stride   = request.src.row_stride;
     if (n_rows == 0 || row_size == 0) {
         return false;
     }
@@ -3206,8 +3205,8 @@ bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, s
     if (total / row_size != n_rows || total > (1ull << 31)) {
         return false;
     }
-    const uint64_t span_end = request.src_offset + (n_rows - 1) * stride + row_size;
-    if (span_end < request.src_offset) {
+    const uint64_t span_end = request.src.offset + (n_rows - 1) * stride + row_size;
+    if (span_end < request.src.offset) {
         return false;
     }
     for (const local_tensor_ref & ref : it->second) {
@@ -3221,7 +3220,7 @@ bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, s
         data.resize(total);
         bool ok = true;
         for (uint64_t i = 0; i < n_rows && ok; i++) {
-            f.seekg((std::streamoff) (ref.offset + request.src_offset + i*stride));
+            f.seekg((std::streamoff) (ref.offset + request.src.offset + i*stride));
             ok = (bool) f.read((char *) data.data() + i*row_size, row_size);
         }
         // same-named tensors across files (or a changed file) disambiguate here
@@ -3234,17 +3233,19 @@ bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, s
     return false;
 }
 
-bool rpc_server::set_tensor_hash_apply(const rpc_msg_set_tensor_hash_req & request, std::vector<uint8_t> & cached_file, rpc_msg_set_tensor_hash_rsp & response)
+bool rpc_server::set_tensor_hash_apply(const rpc_tensor & req_tensor, uint64_t offset, uint64_t hash, std::vector<uint8_t> & cached_file, bool verified, rpc_msg_set_tensor_hash_rsp & response)
 {
     // verify before serving: a truncated or stale entry (interrupted cache write,
     // changed local file) must fall back to streaming, not corrupt the tensor.
     // A bad cache file is deleted so the fallback SET_TENSOR rewrites it.
-    if (fnv_hash(cached_file.data(), cached_file.size()) != request.hash) {
+    // Self-verifying sources (local index / slice) pass verified=true - their
+    // read already hash-checked these exact bytes, no second pass.
+    if (!verified && fnv_hash(cached_file.data(), cached_file.size()) != hash) {
         GGML_LOG_ERROR("[%s] cached data for hash 0x%" PRIx64 " fails verification (%zu bytes) - falling back to streaming\n",
-                       __func__, request.hash, cached_file.size());
+                       __func__, hash, cached_file.size());
         if (cache_dir) {
             char hash_str[17];
-            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, request.hash);
+            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
             std::error_code ec;
             fs::remove(fs::path(cache_dir) / hash_str, ec);
         }
@@ -3260,13 +3261,13 @@ bool rpc_server::set_tensor_hash_apply(const rpc_msg_set_tensor_hash_req & reque
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    ggml_tensor * tensor = deserialize_tensor(ctx, &req_tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
-            __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
+            __func__, (void*)tensor->buffer, tensor->data, offset, size, hash);
 
     // sanitize tensor->data (skip for tensor-parallel meta buffers: their data field is a
     // logical address in split-tensor space and the meta layer bounds physical placement)
@@ -3274,15 +3275,15 @@ bool rpc_server::set_tensor_hash_apply(const rpc_msg_set_tensor_hash_req & reque
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
-        if (request.tensor.data + request.offset < p0
-         || request.tensor.data + request.offset >= p1
-         || size > (p1 - request.tensor.data - request.offset)) {
+        if (req_tensor.data + offset < p0
+         || req_tensor.data + offset >= p1
+         || size > (p1 - req_tensor.data - offset)) {
             GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, request.tensor.data, request.offset, size, request.hash, p0, p1);
+                           __func__, req_tensor.data, offset, size, hash, p0, p1);
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    ggml_backend_tensor_set(tensor, cached_file.data(), offset, size);
     response.result = 1;
     return true;
 }
@@ -4515,23 +4516,16 @@ bool ggml_backend_rpc_start_announcer(const char * endpoint, const char * group,
         // tensor-cache size (TASKS.md #45): the dir walk is cheap but not free, so
         // refresh at most every 30 s (beacons fire every ~2 s)
         if (!cache_dir_str.empty() && len > 0 && (size_t) len < sizeof(buf)) {
-            static std::atomic<uint64_t> cached_mib{0};
-            static std::atomic<int64_t>  cached_at_ms{-1};
+            // single announcer thread - plain statics suffice
+            static uint64_t cached_mib   = 0;
+            static int64_t  cached_at_ms = -1;
             const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (cached_at_ms.load() < 0 || now_ms - cached_at_ms.load() > 30000) {
-                uint64_t total = 0;
-                std::error_code ec;
-                for (auto it = fs::directory_iterator(cache_dir_str, fs::directory_options::skip_permission_denied, ec);
-                     !ec && it != fs::directory_iterator(); it.increment(ec)) {
-                    if (it->is_regular_file(ec)) {
-                        total += it->file_size(ec);
-                    }
-                }
-                cached_mib.store(total / (1024 * 1024));
-                cached_at_ms.store(now_ms);
+            if (cached_at_ms < 0 || now_ms - cached_at_ms > 30000) {
+                cached_mib   = rpc_cache_dir_scan(cache_dir_str.c_str(), nullptr) / (1024 * 1024);
+                cached_at_ms = now_ms;
             }
-            snprintf(buf + len, sizeof(buf) - len, " cache_mib=%" PRIu64, cached_mib.load());
+            snprintf(buf + len, sizeof(buf) - len, " cache_mib=%" PRIu64, cached_mib);
         }
         return std::string(buf);
     };
@@ -5103,10 +5097,7 @@ bool ggml_backend_rpc_buffer_reprovision(ggml_backend_buffer_t buffer, void ** o
                 req.tensor         = root;
                 req.offset         = e.offset;
                 req.hash           = e.hash;
-                req.src_offset     = e.src_offset;
-                req.src_row_size   = e.src_row_size;
-                req.src_n_rows     = e.src_n_rows;
-                req.src_row_stride = e.src_row_stride;
+                req.src = e.src;
                 memcpy(req.src_name, e.src_name, sizeof(req.src_name));
                 ok = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_HASH2, &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.result;
             } else {

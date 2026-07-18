@@ -993,21 +993,20 @@ static uint64_t fleet_model_weight_bytes(const std::string & path) {
     if (ec) {
         return 0;
     }
-    // llama_split_path naming: <prefix>-%05d-of-%05d.gguf
-    const size_t tail = path.size() >= 20 ? path.size() - 20 : 0;
-    const size_t pos  = path.find("-of-", tail);
-    if (pos == std::string::npos || path.size() - pos != 4 + 5 + 5 /* "-of-NNNNN.gguf" */
-        || path.compare(path.size() - 5, 5, ".gguf") != 0) {
+    // sharded model: the split count is the only part llama_split_prefix cannot
+    // recover on its own, so parse it, then let the canonical helpers do the rest
+    const size_t pos = path.rfind("-of-");
+    if (pos == std::string::npos || path.size() - pos != 4 + 5 + 5 /* "-of-NNNNN.gguf" */) {
         return total;
     }
     const int n_split = atoi(path.c_str() + pos + 4);
-    const std::string prefix = pos >= 6 ? path.substr(0, pos - 6) : "";
-    if (n_split < 2 || prefix.empty()) {
+    char prefix[1024];
+    if (n_split < 2 || llama_split_prefix(prefix, sizeof(prefix), path.c_str(), 1, n_split) <= 0) {
         return total;
     }
     for (int i = 2; i <= n_split; i++) {
         char shard[1024];
-        snprintf(shard, sizeof(shard), "%s-%05d-of-%05d.gguf", prefix.c_str(), i, n_split);
+        llama_split_path(shard, sizeof(shard), prefix, i, n_split);
         const uint64_t sz = (uint64_t) fs::file_size(shard, ec);
         if (ec) {
             return 0; // missing shard: let the loader report it
@@ -1453,11 +1452,7 @@ private:
             return;
         }
         const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params_base);
-        bool any_rpc = false;
-        for (ggml_backend_dev_t dev : devs) {
-            any_rpc = any_rpc || fleet_dev_is_rpc(dev);
-        }
-        if (!any_rpc) {
+        if (std::none_of(devs.begin(), devs.end(), fleet_dev_is_rpc)) {
             return;
         }
         const uint64_t weight_bytes = fleet_model_weight_bytes(params_base.model.path);
@@ -2184,13 +2179,15 @@ private:
         if (params_base.rpc_auto_weight && params_base.rpc_auto_weight_reserve_mib > 0.0 &&
             model_tgt != nullptr && ctx_tgt != nullptr) {
             const double reserve_mib = params_base.rpc_auto_weight_reserve_mib;
-            const int32_t n_dev = llama_model_n_devices(model_tgt);
-            for (int32_t i = 0; i < n_dev; ++i) {
-                ggml_backend_dev_t dev = llama_model_get_device(model_tgt, i);
+            std::map<ggml_backend_dev_t, size_t> compute_by_dev;
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+                compute_by_dev[ggml_backend_buft_get_device(buft)] += mb.compute;
+            }
+            for (const auto & [dev, compute] : compute_by_dev) {
                 if (dev == nullptr) {
                     continue;
                 }
-                const double actual_mib = llama_context_dev_compute_buffer_size(ctx_tgt, dev) / (1024.0 * 1024.0);
+                const double actual_mib = compute / (1024.0 * 1024.0);
                 if (actual_mib > reserve_mib) {
                     SRV_WRN("fleet reserve undershoot: %s compute buffer is %.0f MiB but the auto-weight "
                             "split reserved %.0f MiB - a memory-capped member can OOM at decode; "

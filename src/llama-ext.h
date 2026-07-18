@@ -84,11 +84,6 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
-// actual compute-buffer bytes the context's scheduler allocated on a device
-// (fleet auto-weight reserve verification, TASKS.md #39); 0 if the device has
-// no backend in this context
-LLAMA_API size_t llama_context_dev_compute_buffer_size(const struct llama_context * ctx, ggml_backend_dev_t dev);
-
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

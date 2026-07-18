@@ -286,9 +286,9 @@
 				</p>
 
 				<p class="mt-1 text-xs text-muted-foreground">
-					The model needs {(status.capacity.required_mib / 1024).toFixed(1)} GiB (weights + KV
-					reserve) but the fleet pools only {(status.capacity.available_mib / 1024).toFixed(1)} GiB
-					of device memory ({((status.capacity.required_mib - status.capacity.available_mib) / 1024).toFixed(1)}
+					The model needs {formatGib(status.capacity.required_mib)} GiB (weights + KV
+					reserve) but the fleet pools only {formatGib(status.capacity.available_mib)} GiB
+					of device memory ({formatGib(status.capacity.required_mib - status.capacity.available_mib)}
 					GiB short). Inference becomes possible once more workers join the LAN — power on another
 					box with <code class="font-mono">--announce</code> and the load starts automatically.
 				</p>
@@ -463,7 +463,7 @@
 										class="text-right text-xs"
 										title="worker tensor-cache size on disk (cache-rpc)"
 									>
-										{worker.cache_mib != null ? `${(worker.cache_mib / 1024).toFixed(1)} GiB` : '—'}
+										{worker.cache_mib != null ? `${formatGib(worker.cache_mib)} GiB` : '—'}
 									</Table.Cell>
 
 									<Table.Cell class="text-right text-xs text-muted-foreground">
