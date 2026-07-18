@@ -36,7 +36,12 @@ fi
 EXTRA_ARGS=""
 if [ "${MTP:-0}" = "1" ]; then
   EXTRA_ARGS="--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1 --spec-draft-p-min 0.75"
-  echo "MTP speculative decoding ENABLED (n-max 3, p-min 0.75)"
+  # TASKS.md #52: with draft padding ON, p-min is ignored and hy3's single-depth
+  # head force-proposes junk at chain depths 2-3 (measured 32% acceptance,
+  # 1.43 t/s < 1.9 plain). NO_PAD makes p-min real; TIMING attributes phases.
+  export COORD_SPEC_NO_PAD=1
+  export COORD_SPEC_TIMING=1
+  echo "MTP speculative decoding ENABLED (n-max 3, p-min 0.75, no-pad, timing)"
 fi
 
 MODELS_DIR=/mnt/files \

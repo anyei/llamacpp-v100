@@ -64,6 +64,13 @@ services:
       # COORD_CAPACITY_CHECK=0 disables. See docs/env-gates.md.
       - LLAMA_FLEET_KV_RESERVE_MB${COORD_KV_RESERVE_MB:+=${COORD_KV_RESERVE_MB}}
       - LLAMA_FLEET_CAPACITY_CHECK${COORD_CAPACITY_CHECK:+=${COORD_CAPACITY_CHECK}}
+      # speculative knobs (TASKS.md #52): COORD_SPEC_NO_PAD=1 disables draft
+      # padding so --spec-draft-p-min actually gates the draft chain (with
+      # padding on, p_min is ignored by design - fine for well-trained chained
+      # heads, junk-amplifying for single-depth ones like hy3's);
+      # COORD_SPEC_TIMING=1 logs per-phase draft/verify timings
+      - LLAMA_SPEC_DRAFT_NO_PAD${COORD_SPEC_NO_PAD:+=1}
+      - LLAMA_SPEC_TIMING${COORD_SPEC_TIMING:+=1}
       # optional chat-template override (e.g. COORD_CHAT_TEMPLATE=chatml when a
       # model's embedded jinja uses features the engine lacks)
       - LLAMA_ARG_CHAT_TEMPLATE${COORD_CHAT_TEMPLATE:+=${COORD_CHAT_TEMPLATE}}
