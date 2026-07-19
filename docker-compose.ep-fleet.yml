@@ -68,6 +68,8 @@ services:
       # configs placing experts in coordinator RAM). See docs/env-gates.md.
       - LLAMA_FLEET_KV_RESERVE_MB${COORD_KV_RESERVE_MB:+=${COORD_KV_RESERVE_MB}}
       - LLAMA_FLEET_CAPACITY_CHECK${COORD_CAPACITY_CHECK:+=${COORD_CAPACITY_CHECK}}
+      # EP compute reserve override (TASKS.md #39): the 2% default undershoots V4-EP
+      - LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB${EP_RESERVE_MB:+=${EP_RESERVE_MB}}
       # note: --api-key's env is LLAMA_API_KEY (no _ARG_), unlike most server flags
       - LLAMA_API_KEY${COORD_API_KEY:+=${COORD_API_KEY}}
     entrypoint: /app/llama-server
