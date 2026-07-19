@@ -28,6 +28,8 @@ export interface ApiFleetDevice {
 	worker_is_cpu: boolean;
 	reachable: boolean;
 	failed: boolean;
+	health?: 'healthy' | 'degraded' | 'recovering';
+	failure_count?: number | null;
 	memory_free_mib: number;
 	memory_total_mib: number;
 	/** Share of the model split assigned to this device (0..1). */
@@ -94,6 +96,7 @@ export interface ApiFleetStatusResponse {
 	n_gpu_layers?: number | null;
 	model?: ApiFleetModelInfo | null;
 	devices: ApiFleetDevice[];
+	recent_failures?: number;
 	discovered: ApiFleetDiscoveredWorker[];
 	capacity?: {
 		waiting: boolean;

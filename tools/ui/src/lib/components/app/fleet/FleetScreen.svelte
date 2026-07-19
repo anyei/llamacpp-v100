@@ -279,6 +279,15 @@
 			</div>
 		{/if}
 
+		{#if status?.recent_failures}
+			<div class="rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-sm">
+				<p class="font-medium">
+					{status.recent_failures} worker{status.recent_failures > 1 ? 's' : ''} failed in the last 5
+					minutes — the pipeline may be crash-looping even if devices show reachable now.
+				</p>
+			</div>
+		{/if}
+
 		{#if status?.capacity?.waiting}
 			<div class="rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-sm">
 				<p class="font-medium">

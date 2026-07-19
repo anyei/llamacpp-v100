@@ -217,6 +217,18 @@
 		</div>
 	{/if}
 
+	{#if device.health === 'degraded' || device.health === 'recovering'}
+		<div
+			class="mb-2 rounded px-2 py-1 text-xs {device.health === 'degraded'
+				? 'bg-destructive/15 text-destructive'
+				: 'bg-orange-500/15 text-orange-600'}"
+			title="failure history persists 5 min after recovery - a crash-looping worker no longer shows green between crashes"
+		>
+			{device.health === 'degraded' ? 'FAILING' : 'recovering'}
+			{#if device.failure_count}&nbsp;· {device.failure_count} failure{device.failure_count > 1 ? 's' : ''}{/if}
+		</div>
+	{/if}
+
 	{#if device.is_rpc && device.endpoint}
 		<div class="mt-auto flex justify-end gap-2">
 			<Button variant="outline" size="sm" onclick={handleShowLogs}>

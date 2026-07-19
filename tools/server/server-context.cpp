@@ -1066,6 +1066,16 @@ public:
         };
         std::map<std::string, beacon_t> discovered; // endpoint -> last beacon heard
 
+        // TASKS.md #46: failure HISTORY per endpoint - live booleans clear on
+        // recovery, so a crash-looping worker looked healthy between crashes
+        struct fail_rec {
+            int64_t last_failure_ms = 0;
+            int32_t failures        = 0;
+            int32_t recoveries      = 0;
+            bool    was_failed      = false;
+        };
+        mutable std::map<std::string, fail_rec> fail_history;
+
         // load plan (TASKS.md #35a loading page): captured on the model thread at
         // the START of load_model - what is being loaded and how it will be split -
         // so the loading page can show it while weights stream. The end-of-load
@@ -5484,6 +5494,26 @@ void server_routes::init_routes() {
                     fleet_dev_memory_cached(dev, is_rpc, &free_mem, &total_mem);
                 }
 
+                std::string health = "healthy";
+                int32_t fail_count = 0;
+                if (is_rpc) {
+                    std::lock_guard<std::mutex> lock(fleet.mutex);
+                    auto & fr = fleet.fail_history[ep];
+                    if (failed && !fr.was_failed) {
+                        fr.failures++;
+                        fr.last_failure_ms = ggml_time_ms();
+                    }
+                    if (!failed && fr.was_failed) {
+                        fr.recoveries++;
+                    }
+                    fr.was_failed = failed;
+                    fail_count = fr.failures;
+                    if (failed) {
+                        health = "degraded";
+                    } else if (fr.failures > 0 && ggml_time_ms() - fr.last_failure_ms < 300000) {
+                        health = "recovering";
+                    }
+                }
                 json d = {
                     {"name",             ggml_backend_dev_name(dev)},
                     {"description",      ggml_backend_dev_description(dev)},
@@ -5492,6 +5522,8 @@ void server_routes::init_routes() {
                     {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)},
                     {"reachable",        reachable},
                     {"failed",           failed},
+                    {"health",           health},
+                    {"failure_count",    is_rpc ? json(fail_count) : json(nullptr)},
                     {"memory_free_mib",  free_mem  / (1024 * 1024)},
                     {"memory_total_mib", total_mem / (1024 * 1024)},
                     {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
@@ -5588,6 +5620,17 @@ void server_routes::init_routes() {
             body["preflight"] = pf.valid
                 ? json({ {"tps", pf.tps}, {"model", pf.model}, {"n_tokens", pf.n_tokens}, {"load_s", pf.load_s} })
                 : json(nullptr);
+        }
+        {
+            int recent = 0;
+            std::lock_guard<std::mutex> lock(fleet.mutex);
+            const int64_t t_now2 = ggml_time_ms();
+            for (const auto & [fep, fr] : fleet.fail_history) {
+                if (fr.failures > 0 && t_now2 - fr.last_failure_ms < 300000) {
+                    recent++;
+                }
+            }
+            body["recent_failures"] = recent;
         }
         {
             const uint64_t req_mib = fleet.capacity_required_mib.load();
