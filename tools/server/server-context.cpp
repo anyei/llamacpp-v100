@@ -1087,6 +1087,7 @@ public:
             int32_t     n_layers;      // predicted repeating layers; -1 = n/a (tensor mode)
             bool        worker_is_cpu; // RPC device backed by the worker's CPU/RAM
             bool        attn_owner;    // EP: holds attention/KV/router, no expert share
+            int64_t     free_start_mib; // device free memory at load start (#56 VRAM-delta progress)
         };
         std::string                load_model_name;
         size_t                     load_model_bytes = 0;
@@ -1409,6 +1410,8 @@ private:
         fleet.load_plan.clear();
         for (size_t i = 0; i < n; ++i) {
             const char * ep = dev_endpoint_fn != nullptr ? dev_endpoint_fn(devs[i]) : nullptr;
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(devs[i], &free_mem, &total_mem);
             fleet.load_plan.push_back({
                 ggml_backend_dev_name(devs[i]),
                 ep != nullptr ? ep : "",
@@ -1416,6 +1419,7 @@ private:
                 layers[i],
                 ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
                 (int) i == attn_owner_idx,
+                (int64_t) (free_mem / (1024 * 1024)),
             });
         }
     }
@@ -5682,10 +5686,12 @@ void server_routes::init_routes() {
             json load_workers = json::array();
             auto push_worker = [&](const std::string & name, const std::string & ep,
                                    double split_frac, int32_t n_layers, json worker_is_cpu,
-                                   bool suppress_score, bool attn_owner = false) {
+                                   bool suppress_score, bool attn_owner = false,
+                                   int64_t free_start_mib = -1) {
                 json w = {
                     {"name",       name},
                     {"endpoint",   ep.empty() ? json(nullptr) : json(ep)},
+                    {"free_start_mib", free_start_mib >= 0 ? json(free_start_mib) : json(nullptr)},
                     {"split_frac", split_frac > 0.0 ? json(split_frac) : json(nullptr)},
                     {"n_layers",   n_layers >= 0 ? json(n_layers) : json(nullptr)},
                     {"worker_is_cpu", std::move(worker_is_cpu)}, // null = unknown (unplanned endpoint)
@@ -5696,6 +5702,17 @@ void server_routes::init_routes() {
                     {"calls",      nullptr},
                     {"ewma_latency_us", nullptr},
                 };
+                if (ep.empty()) {
+                    // local device: live free memory for the #56 VRAM-delta bar
+                    for (ggml_backend_dev_t dev : fleet_device_list(params)) {
+                        if (name == ggml_backend_dev_name(dev)) {
+                            size_t free_mem = 0, total_mem = 0;
+                            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                            w["free_mib"] = (int64_t) (free_mem / (1024 * 1024));
+                            break;
+                        }
+                    }
+                }
                 if (!ep.empty()) {
                     auto lit = live.find(ep);
                     if (lit != live.end()) {
@@ -5736,7 +5753,7 @@ void server_routes::init_routes() {
                         }
                     }
                 }
-                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers, p.worker_is_cpu, sibling, p.attn_owner);
+                push_worker(p.name, p.endpoint, p.split_frac, p.n_layers, p.worker_is_cpu, sibling, p.attn_owner, p.free_start_mib);
             }
             // endpoints with traffic but no plan entry (e.g. a draft model's worker)
             for (const auto & [ep, st] : live) {

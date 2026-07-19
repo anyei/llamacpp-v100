@@ -77,7 +77,17 @@
 				border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
 			}
 			.badge.score { color: var(--fg); font-weight: 600; }
-		</style>
+		
+			.pbar { height: 6px; border-radius: 3px; background: #2223; overflow: hidden; display: flex; margin: 4px 0 2px; }
+			.pfill-c { background: #4ade80; height: 100%; }
+			.pfill-s { background: #60a5fa; height: 100%; }
+			.chip { font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 6px; }
+			.chip.ready { background: #16a34a33; color: #16a34a; }
+			.chip.cache { background: #4ade8033; color: #4ade80; }
+			.chip.stream { background: #60a5fa33; color: #60a5fa; }
+			.chip.wait { background: #8883; }
+			details.meta > summary { cursor: pointer; font-size: 11px; opacity: 0.6; }
+</style>
 	</head>
 	<body>
 		<main>
@@ -198,44 +208,64 @@
 				}
 				host.innerHTML = workers.map((w) => {
 					const key = w.endpoint || w.name;
-					const label = w.endpoint ? w.name + ' · ' + w.endpoint : w.name + ' · local';
-					let rate = '';
-					if (w.bytes_sent != null) {
-						const p = prev[key];
-						rate = '…';
-						if (p && now > p.t) {
-							const bps = ((w.bytes_sent - p.bytes) / (now - p.t)) * 1000; // bytes/s
-							rate = bps > 0 ? (bps / MiB).toFixed(1) + ' MB/s' : 'idle';
-						}
-						prev[key] = { bytes: w.bytes_sent, t: now };
-					}
-					const badges = [];
-					if (w.score) badges.push('<span class="badge score">' + w.score.bw_gbps.toFixed(1) + ' GB/s</span>');
-					if (w.n_layers != null) badges.push('<span class="badge">' + w.n_layers + ' layers</span>');
-					if (w.attn_owner) badges.push('<span class="badge score" title="holds attention, KV and the router - takes no routed-expert share">attention owner</span>');
-					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
-					if (w.free_mib != null) badges.push('<span class="badge">' + (w.free_mib / 1024).toFixed(1) + ' GiB free</span>');
-					// weight provenance: served from the worker's own cache/--model-dir vs streamed
+					const label = w.endpoint ? w.name + ' \u00b7 ' + w.endpoint : w.name + ' \u00b7 local';
+					const p = prev[key] || {};
 					const cachedMib = w.weights_cached_mib || 0, streamedMib = w.weights_streamed_mib || 0;
-					if (cachedMib + streamedMib > 0) {
-						const pct = Math.round((100 * cachedMib) / (cachedMib + streamedMib));
-						badges.push('<span class="badge score" title="weights served from the worker\'s local cache / model dir">' +
-							pct + '% cached (' + (cachedMib / 1024).toFixed(1) + ' GiB)</span>');
-						if (streamedMib > 0) {
-							badges.push('<span class="badge" title="weights streamed from the coordinator">' +
-								(streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
-						}
+					// #56: progress vs expected share. RPC = cached+streamed bytes;
+					// local devices = VRAM delta from the load-start snapshot.
+					const modelMib = d.model && d.model.size_bytes ? d.model.size_bytes / MiB : 0;
+					const expected = w.attn_owner || !w.split_frac ? 0 : w.split_frac * modelMib;
+					let doneMib = cachedMib + streamedMib;
+					if (!w.endpoint && w.free_start_mib != null && w.free_mib != null) {
+						doneMib = Math.max(doneMib, w.free_start_mib - w.free_mib);
 					}
-					const meta = w.bytes_sent != null
-						? fmtBytes(w.bytes_sent) + ' uploaded · ' + (w.calls | 0) + ' calls · rtt ' +
-						  (w.ewma_latency_us ? (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : '—')
-						: (w.endpoint ? 'waiting for first transfer…' : 'local device');
+					const pct = expected > 0 ? Math.min(100, (100 * doneMib) / expected) : 0;
+					const ready = expected > 0 && pct >= 97;
+					// state chip from counter motion between polls
+					let chip = '<span class="chip wait">waiting</span>';
+					if (ready) chip = '<span class="chip ready">READY</span>';
+					else if (streamedMib > (p.streamed ?? 0)) chip = '<span class="chip stream">streaming</span>';
+					else if (cachedMib > (p.cached ?? 0)) chip = '<span class="chip cache">loading from cache</span>';
+					else if (doneMib > (p.done ?? 0)) chip = '<span class="chip cache">loading</span>';
+					// headline: MB/s while active, share when done
+					let rate = '';
+					if (w.bytes_sent != null && p.t && now > p.t) {
+						const bps = ((w.bytes_sent - (p.bytes || 0)) / (now - p.t)) * 1000;
+						rate = ready ? Math.round(pct) + '%' : bps > 0 ? (bps / MiB).toFixed(1) + ' MB/s' : '\u2026';
+					}
+					prev[key] = { bytes: w.bytes_sent || 0, t: now, cached: cachedMib, streamed: streamedMib, done: doneMib };
+					// two-tone bar: cached (green) + streamed (blue) of expected
+					const cw = expected > 0 ? Math.min(100, (100 * cachedMib) / expected) : 0;
+					const sw = expected > 0 ? Math.min(100 - cw, (100 * streamedMib) / expected) : 0;
+					const lw = !w.endpoint && expected > 0 ? Math.min(100, (100 * doneMib) / expected) : 0;
+					const bar = expected > 0
+						? '<div class="pbar" title="' + Math.round(pct) + '% of ~' + (expected / 1024).toFixed(1) + ' GiB share">' +
+						  (w.endpoint
+							? '<div class="pfill-c" style="width:' + cw + '%"></div><div class="pfill-s" style="width:' + sw + '%"></div>'
+							: '<div class="pfill-c" style="width:' + lw + '%"></div>') + '</div>'
+						: '';
+					// #57: one primary badge line; everything else behind <details>
+					const badges = [];
+					if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
+					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
+					if (cachedMib > 0) badges.push('<span class="badge score">' + (cachedMib / 1024).toFixed(1) + ' GiB cached</span>');
+					if (streamedMib > 0) badges.push('<span class="badge">' + (streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
+					const detail = [
+						w.score ? w.score.bw_gbps.toFixed(1) + ' GB/s' : null,
+						w.n_layers != null ? w.n_layers + ' layers' : null,
+						w.free_mib != null ? (w.free_mib / 1024).toFixed(1) + ' GiB free' : null,
+						w.bytes_sent != null ? fmtBytes(w.bytes_sent) + ' uploaded' : null,
+						w.calls != null ? (w.calls | 0) + ' calls' : null,
+						w.ewma_latency_us ? 'rtt ' + (w.ewma_latency_us / 1000).toFixed(1) + ' ms' : null,
+					].filter(Boolean).join(' \u00b7 ');
 					return (
 						'<div class="worker"><div class="wrow">' +
-						'<span class="ep">' + kindIcon(w) + esc(label) + '</span>' +
+						'<span class="ep">' + kindIcon(w) + esc(label) + chip + '</span>' +
 						'<span class="rate">' + rate + '</span></div>' +
+						bar +
 						'<div class="badges">' + badges.join('') + '</div>' +
-						'<div class="meta">' + meta + '</div></div>'
+						(detail ? '<details class="meta"><summary>details</summary>' + detail + '</details>' : '') +
+						'</div>'
 					);
 				}).join('');
 			}
