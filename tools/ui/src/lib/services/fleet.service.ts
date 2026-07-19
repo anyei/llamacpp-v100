@@ -56,6 +56,16 @@ export class FleetService {
 	}
 
 	/**
+	 * Re-runs the ~0.5s bandwidth benchmark on a worker (proto 4.9). A busy or
+	 * older worker reports success=false. Shares apply at the next (re)load.
+	 */
+	static async rescoreWorker(
+		endpoint: string
+	): Promise<{ success: boolean; bw_gbps?: number; mm_gflops?: number; reason?: string }> {
+		return apiPost(API_FLEET.WORKER_RESCORE, { endpoint });
+	}
+
+	/**
 	 * Reloads the coordinator to enlist newly discovered workers. The server
 	 * exits and its restart policy brings it back with rediscovery, so all
 	 * in-flight requests are dropped and the model reloads across the grown

@@ -32,6 +32,7 @@ export const API_FLEET = {
 	STATUS: './fleet/status',
 	WORKER_LOG: './fleet/worker/log',
 	WORKER_RESTART: './fleet/worker/restart',
+	WORKER_RESCORE: './fleet/worker/rescore',
 	RELOAD: './fleet/reload'
 };
 

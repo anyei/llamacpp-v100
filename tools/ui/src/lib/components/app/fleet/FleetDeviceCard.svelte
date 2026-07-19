@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Cpu, Gpu, RotateCcw, ScrollText } from '@lucide/svelte';
+	import { Cpu, Gpu, RotateCcw, ScrollText, Gauge } from '@lucide/svelte';
 	import { toast } from 'svelte-sonner';
 	import * as Card from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
@@ -37,6 +37,24 @@
 	let kindLabel = $derived(device.worker_is_cpu ? 'CPU (worker RAM)' : 'GPU');
 
 	let showRestartDialog = $state(false);
+	let isRescoring = $state(false);
+
+	async function handleRescore() {
+		if (!device.endpoint) return;
+		isRescoring = true;
+		try {
+			const r = await FleetService.rescoreWorker(device.endpoint);
+			if (r.success) {
+				toast.success(`${device.endpoint}: ${r.bw_gbps?.toFixed(1)} GB/s — shares apply at the next reload`);
+			} else {
+				toast.error(r.reason ?? 'rescore failed');
+			}
+		} catch (e: unknown) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			isRescoring = false;
+		}
+	}
 	let isRestarting = $state(false);
 
 	let memoryUsedMib = $derived(Math.max(0, device.memory_total_mib - device.memory_free_mib));
@@ -205,6 +223,17 @@
 				<ScrollText class="h-3.5 w-3.5" />
 				Logs
 			</Button>
+
+			<span
+				title={fleetAdmin
+					? 'Re-run the bandwidth benchmark now (shares apply at the next reload)'
+					: 'start server with --fleet-admin and an API key'}
+			>
+				<Button variant="outline" size="sm" disabled={!fleetAdmin || isRescoring} onclick={handleRescore}>
+					<Gauge class="h-3.5 w-3.5 {isRescoring ? 'animate-pulse' : ''}" />
+					Re-score
+				</Button>
+			</span>
 
 			<span title={fleetAdmin ? undefined : 'start server with --fleet-admin and an API key'}>
 				<Button

@@ -1090,11 +1090,13 @@ static void apply_rpc_auto_weight(common_params & params) {
     typedef bool (*benchmark_t)(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops);
     typedef bool (*worker_is_cpu_t)(ggml_backend_dev_t dev);
     get_score_t     get_score_fn     = nullptr;
+    get_score_t     rescore_fn       = nullptr;
     dev_endpoint_t  dev_endpoint_fn  = nullptr;
     benchmark_t     benchmark_fn     = nullptr;
     worker_is_cpu_t worker_is_cpu_fn = nullptr;
     if (rpc_reg != nullptr) {
         get_score_fn     = (get_score_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_get_worker_score");
+        rescore_fn       = (get_score_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_rescore_worker");
         dev_endpoint_fn  = (dev_endpoint_t)  ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_endpoint");
         benchmark_fn     = (benchmark_t)     ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_benchmark_device");
         worker_is_cpu_fn = (worker_is_cpu_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_dev_worker_is_cpu");
@@ -1229,7 +1231,12 @@ static void apply_rpc_auto_weight(common_params & params) {
                 score[i] = 0.0;
                 continue;
             }
-            if (ep == nullptr || !get_score_fn(ep, &bw, &fl)) {
+            // TASKS.md #42: a startup score taken on a busy box under-reads up to
+            // 10x and starves the member - re-bench at split time when possible
+            // (4.9 workers; a busy/older worker falls back to the startup score)
+            if (ep != nullptr && rescore_fn != nullptr && rescore_fn(ep, &bw, &fl)) {
+                LOG_INF("--rpc-auto-weight: %s (%s): re-benched at split time\n", ggml_backend_dev_name(devs[i]), ep);
+            } else if (ep == nullptr || !get_score_fn(ep, &bw, &fl)) {
                 LOG_WRN("--rpc-auto-weight: worker %s has no score (run rpc-server with --score); "
                         "falling back to the default memory-proportional split\n", ep ? ep : "?");
                 return;

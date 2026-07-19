@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    8
+#define RPC_PROTO_MINOR_VERSION    9
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
@@ -123,6 +123,10 @@ GGML_BACKEND_API bool ggml_backend_rpc_endpoint_reachable(const char * endpoint,
 GGML_BACKEND_API bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, float * mm_gflops);
 // worker side: publish this worker's score (beacon field + RPC_CMD_GET_SCORE)
 GGML_BACKEND_API void ggml_backend_rpc_set_worker_score(float bw_gbps, float mm_gflops);
+// coordinator side: ask a worker to RE-benchmark now (proto 4.9). The worker
+// refuses (returns false) while a compute is in flight - a bench racing a decode
+// under-reads both. On success the worker's beacon carries the fresh score.
+GGML_BACKEND_API bool ggml_backend_rpc_rescore_worker(const char * endpoint, float * bw_gbps, float * mm_gflops);
 // coordinator side: query a worker's score; false if unscored or proto < 4.7
 GGML_BACKEND_API bool ggml_backend_rpc_get_worker_score(const char * endpoint, float * bw_gbps, float * mm_gflops);
 

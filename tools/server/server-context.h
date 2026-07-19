@@ -131,6 +131,7 @@ struct server_routes {
     server_http_context::handler_t get_fleet_status;
     server_http_context::handler_t get_fleet_worker_log;
     server_http_context::handler_t post_fleet_worker_restart;
+    server_http_context::handler_t post_fleet_worker_rescore;
     server_http_context::handler_t post_fleet_reload;
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;

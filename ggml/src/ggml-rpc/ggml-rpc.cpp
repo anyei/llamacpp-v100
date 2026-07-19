@@ -150,6 +150,8 @@ enum rpc_cmd {
     // proto 4.8 (TASKS.md #44): SET_TENSOR_HASH carrying source provenance so a
     // --model-dir worker can serve an arbitrary slice of a local GGUF tensor
     RPC_CMD_SET_TENSOR_HASH2,
+    // proto 4.9 (TASKS.md #42): on-demand re-benchmark; refused mid-compute
+    RPC_CMD_RESCORE,
     RPC_CMD_COUNT,
 };
 
@@ -2409,6 +2411,7 @@ public:
     void free_owned(uint64_t conn_id);
 
     void hello(rpc_msg_hello_rsp & response);
+    void rescore(rpc_msg_get_score_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
     bool get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_get_max_size_rsp & response);
@@ -2654,6 +2657,25 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+}
+
+// TASKS.md #42: re-run the ~0.5 s bandwidth bench on demand. try_lock: a bench
+// racing an in-flight compute under-reads both, so a busy worker refuses.
+void rpc_server::rescore(rpc_msg_get_score_rsp & response) {
+    response = {};
+    std::unique_lock<std::mutex> lock(exec_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || backends.empty()) {
+        return; // valid stays 0 = busy/unavailable
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[0]);
+    float bw = 0.0f, fl = 0.0f;
+    if (dev == nullptr || !ggml_backend_rpc_benchmark_device(dev, &bw, &fl)) {
+        return;
+    }
+    ggml_backend_rpc_set_worker_score(bw, fl);
+    response.valid     = 1;
+    response.bw_gbps   = bw;
+    response.mm_gflops = fl;
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -3838,6 +3860,7 @@ static const char * rpc_cmd_str(int cmd) {
         case RPC_CMD_SET_TENSOR:           return "SET_TENSOR";
         case RPC_CMD_SET_TENSOR_HASH:      return "SET_TENSOR_HASH";
         case RPC_CMD_SET_TENSOR_HASH2:     return "SET_TENSOR_HASH2";
+        case RPC_CMD_RESCORE:              return "RESCORE";
         case RPC_CMD_COPY_FROM_REMOTE:     return "COPY_FROM_REMOTE";    // W2W pull (butterfly)
         case RPC_CMD_GET_TENSOR_FENCED:    return "GET_TENSOR_FENCED";
         case RPC_CMD_PING:                 return "PING";
@@ -3986,6 +4009,18 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             response.valid     = g_worker_score_valid.load() ? 1 : 0;
             response.bw_gbps   = g_worker_score_bw.load();
             response.mm_gflops = g_worker_score_fl.load();
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
+        if (cmd == RPC_CMD_RESCORE) {
+            if (!recv_msg(sock, nullptr, 0)) {
+                break;
+            }
+            rpc_msg_get_score_rsp response = {};
+            server.rescore(response);
             if (!send_msg(sock, &response, sizeof(response))) {
                 break;
             }
@@ -4762,6 +4797,30 @@ bool ggml_backend_rpc_get_worker_score(const char * endpoint, float * bw_gbps, f
     return true;
 }
 
+bool ggml_backend_rpc_rescore_worker(const char * endpoint, float * bw_gbps, float * mm_gflops) {
+    if (endpoint == nullptr || bw_gbps == nullptr || mm_gflops == nullptr) {
+        return false;
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return false;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    if (rpc_async_state(sock.get()).server_minor < 9) {
+        return false;
+    }
+    rpc_msg_get_score_rsp response = {};
+    if (!send_rpc_cmd(sock, RPC_CMD_RESCORE, nullptr, 0, &response, sizeof(response))) {
+        return false;
+    }
+    if (!response.valid) {
+        return false;
+    }
+    *bw_gbps   = response.bw_gbps;
+    *mm_gflops = response.mm_gflops;
+    return true;
+}
+
 // device speed benchmark (TASKS.md #31/#35f): a chain of large f32 matvecs. A
 // matvec streams the whole matrix once per multiply, so tokens/s here IS the
 // device's effective memory bandwidth - the same quantity that bounds decode -
@@ -5287,6 +5346,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_source_hint") == 0) {
         return (void *)ggml_backend_rpc_source_hint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_rescore_worker") == 0) {
+        return (void *)ggml_backend_rpc_rescore_worker;
     }
     if (std::strcmp(name, "ggml_backend_rpc_discover") == 0) {
         return (void *)ggml_backend_rpc_discover;

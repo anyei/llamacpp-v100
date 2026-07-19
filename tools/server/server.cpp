@@ -208,6 +208,7 @@ int llama_server(int argc, char ** argv) {
     ctx_http.get ("/fleet/status",             ex_wrapper(routes.get_fleet_status)); // answers during load (see middleware_server_state)
     ctx_http.get ("/fleet/worker/log",         ex_wrapper(routes.get_fleet_worker_log));
     ctx_http.post("/fleet/worker/restart",     ex_wrapper(routes.post_fleet_worker_restart));
+    ctx_http.post("/fleet/worker/rescore",     ex_wrapper(routes.post_fleet_worker_rescore));
     ctx_http.post("/fleet/reload",             ex_wrapper(routes.post_fleet_reload));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));

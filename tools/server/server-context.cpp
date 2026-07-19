@@ -5231,6 +5231,7 @@ struct fleet_rpc_procs {
     bool (*fetch_log)(const char *, char *, size_t, size_t *)                       = nullptr;
     bool (*shutdown_worker)(const char *)                                           = nullptr;
     bool (*get_score)(const char *, float *, float *)                               = nullptr;
+    bool (*rescore)(const char *, float *, float *)                                 = nullptr;
     bool (*reachable)(const char *, int)                                            = nullptr;
     bool (*dev_memory_ephemeral)(ggml_backend_dev_t, int, size_t *, size_t *)       = nullptr;
     void (*foreach_ep_stat)(void (*)(const char *, const struct ggml_backend_rpc_ep_stats *, void *), void *) = nullptr;
@@ -5249,6 +5250,7 @@ static const fleet_rpc_procs & fleet_procs() {
             p.fetch_log         = (decltype(p.fetch_log))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_fetch_log");
             p.shutdown_worker   = (decltype(p.shutdown_worker))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_shutdown_worker");
             p.get_score         = (decltype(p.get_score))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_get_worker_score");
+            p.rescore           = (decltype(p.rescore))           ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_rescore_worker");
             p.reachable         = (decltype(p.reachable))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_endpoint_reachable");
             p.dev_memory_ephemeral = (decltype(p.dev_memory_ephemeral)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_dev_memory_ephemeral");
             p.foreach_ep_stat   = (decltype(p.foreach_ep_stat))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_foreach_endpoint_stat");
@@ -5751,6 +5753,31 @@ void server_routes::init_routes() {
 
     // restart a worker (TASKS.md #35d): worker exits 0, its supervisor restarts it,
     // --rpc-reload's surgical path re-provisions it. Admin-gated: remote kill.
+    this->post_fleet_worker_rescore = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const auto & procs = fleet_procs();
+        if (!params.fleet_admin || params.api_keys.empty()) {
+            res->error(format_error_response("worker rescore requires --fleet-admin AND an --api-key", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        const std::string ep = body.value("endpoint", "");
+        if (ep.empty() || procs.rescore == nullptr) {
+            res->error(format_error_response("missing 'endpoint' or rescore unavailable", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        float bw = 0.0f, fl = 0.0f;
+        if (!procs.rescore(ep.c_str(), &bw, &fl)) {
+            // busy worker or pre-4.9 image - not an HTTP error, report it
+            res->ok({ {"success", false}, {"reason", "worker busy or does not support rescore (needs proto 4.9)"} });
+            return res;
+        }
+        SRV_INF("fleet-admin: re-scored %s: %.2f GB/s, %.1f GFLOPS\n", ep.c_str(), bw, fl);
+        res->ok({ {"success", true}, {"bw_gbps", bw}, {"mm_gflops", fl},
+                  {"note", "shares apply at the next (re)load - use fleet reload to re-split"} });
+        return res;
+    };
+
     this->post_fleet_worker_restart = [this](const server_http_req & req) {
         auto res = create_response(true);
         const auto & procs = fleet_procs();
