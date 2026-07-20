@@ -46,7 +46,7 @@ fi
 
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
-COORD_IMAGE=llamacpp-local-v100:076d19781 \
+COORD_IMAGE=llamacpp-local-v100:3eff1cd6a \
 COORD_MODEL=hy3-1M-MTP-Q4_K_M.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
