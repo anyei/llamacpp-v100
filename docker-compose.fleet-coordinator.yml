@@ -36,7 +36,8 @@ services:
       # which local GPUs join the pipeline alongside the discovered workers;
       # empty = pure orchestration, every layer goes to the fleet
       - CUDA_VISIBLE_DEVICES=${COORD_GPUS:-0,1}
-      - LLAMA_ARG_RPC_DISCOVER=1
+      # COORD_DISCOVER=0 pins the fleet to COORD_RPC only (no LAN discovery)
+      - LLAMA_ARG_RPC_DISCOVER=${COORD_DISCOVER:-1}
       - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
       # optional static workers in addition to discovery (comma-separated host:port)
       - LLAMA_ARG_RPC=${COORD_RPC:-}
