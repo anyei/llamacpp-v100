@@ -45,7 +45,7 @@ gives you a wire protocol; this fork built a serving fleet on top of it** —
 remote devices are treated as a *population* with measured speeds, link
 qualities, caches and lifecycles, not as GPUs that happen to be far away.
 
-| Area | Upstream mainline | This fork (proto 4.2 -> 4.8) |
+| Area | Upstream mainline | This fork (proto 4.2 -> 4.9) |
 |---|---|---|
 | Topologies | layer pipeline | + in-process tensor-parallel (meta backend), **expert-parallel** (meta-over-RPC, attention owner, star reduce - §2b), TP islands (§2/§4), KV annex |
 | Wire | blocking round trips | async + events (pipeline engages), worker-to-worker fenced pulls, fused boundary command (one message per worker per MoE layer), uid-keyed graph cache (16 B/subgraph steady state) |
@@ -336,6 +336,17 @@ section (sidebar network icon, `#/fleet`) backed by three endpoints:
 - `GET /fleet/worker/log?ep=host:port` — tails the worker's in-memory log
   ring over a dedicated RPC connection (proto 4.7 `GET_LOG`, served outside
   the worker's exec lock so it answers even mid-compute).
+- `POST /fleet/worker/rescore {"endpoint": ...}` — re-runs the worker's ~0.5 s
+  bandwidth benchmark on demand (proto 4.9; a busy worker refuses rather than
+  under-read). `--rpc-auto-weight` also re-benches every 4.9 worker at split
+  time automatically, so stale startup scores no longer starve members. UI:
+  per-worker Re-score button; shares apply at the next (re)load.
+- Device cards carry a persistent health badge (healthy / recovering /
+  degraded, with failure counts kept 5 min past recovery) and the fleet page
+  banners recent failures — a crash-looping worker no longer shows green
+  between crashes. The loading page shows per-worker readiness: two-tone
+  progress bars (cached vs streamed, VRAM-delta for local GPUs) with
+  waiting / streaming / loading-from-cache / READY chips.
 - `POST /fleet/worker/restart {"endpoint": ...}` — asks the worker to
   `exit(0)` so its restart policy brings it back and `--rpc-reload`
   re-provisions it. Requires `--fleet-admin` AND an `--api-key` (it is a
