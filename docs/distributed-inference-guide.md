@@ -304,7 +304,10 @@ multicast group. Trusted networks only — beacons are unauthenticated, like
 the RPC protocol itself. Compose reference:
 `docker-compose.fleet-coordinator.yml` (discovery + skip-unavailable + an
 optional static list), paired with the `docker-compose.rpc-worker*.yml`
-workers, which all `--announce` by default.
+workers, which all `--announce` by default. `COORD_DISCOVER=0` turns
+discovery off so the pipeline is pinned to `COORD_RPC` exactly — e.g.
+`COORD_DISCOVER=0 COORD_RPC=127.0.0.1:50053` serves on the local GPUs plus
+only the box's own CPU worker, ignoring whatever else announces on the LAN.
 
 **Fleet capacity gate** (TASKS.md #50): when RPC devices are in the pipeline,
 the coordinator refuses to START a load whose weights + KV reserve
@@ -332,7 +335,19 @@ section (sidebar network icon, `#/fleet`) backed by three endpoints:
   `cache_mib` tensor-cache size). Answers **during** model load (reports
   fleet-wide load progress) and during `--rpc-reload` recovery; while the
   capacity gate holds a load, `server_state` is `waiting-capacity` and a
-  `capacity` object carries required/available MiB.
+  `capacity` object carries required/available MiB. Also carries (#58):
+  `perf` — token-weighted rolling average decode t/s over the last 32
+  completed generations (any serve, fleet or single-box), shown as an
+  "avg t/s" tile in the fleet summary strip; and per-RPC-device `timing` —
+  the worker-side handler time of the busiest graph command (`exec avg`,
+  `exec max`, `lock avg`, call count), parsed from the newest `[rpc-timing]`
+  dump in the worker's log ring over the same ephemeral `GET_LOG` the logs
+  view uses (10 s cache per endpoint). The UI renders it as an `exec N ms`
+  badge on the worker card — only when the worker runs `GGML_RPC_TIMING` —
+  and highlights the slowest-above-median worker: the pipeline's long pole
+  (single-stream decode is the sum of the stages). exec-avg is compute +
+  response send ON the worker; the wire RTT next to the transfer rates is
+  the end-to-end number, so the gap between them is network + coordinator.
 - `GET /fleet/worker/log?ep=host:port` — tails the worker's in-memory log
   ring over a dedicated RPC connection (proto 4.7 `GET_LOG`, served outside
   the worker's exec lock so it answers even mid-compute).
