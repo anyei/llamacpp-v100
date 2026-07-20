@@ -152,6 +152,12 @@ enum rpc_cmd {
     RPC_CMD_SET_TENSOR_HASH2,
     // proto 4.9 (TASKS.md #42): on-demand re-benchmark; refused mid-compute
     RPC_CMD_RESCORE,
+    // proto 4.10 (TASKS.md #62): manifest handshake - the client learns every
+    // hash the worker can serve locally in ONE round trip, then places known
+    // tensors in batches and streams unknown ones without an offer round trip
+    RPC_CMD_GET_MANIFEST,
+    RPC_CMD_SET_TENSOR_HASH_BATCH,
+    RPC_CMD_SET_TENSOR_HASH_DATA,
     RPC_CMD_COUNT,
 };
 
@@ -265,6 +271,19 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+// proto 4.10 (TASKS.md #62): one batched placement of manifest-known tensors.
+// Request: | count (8 bytes) | count x rpc_msg_set_tensor_hash_batch_entry |
+struct rpc_msg_set_tensor_hash_batch_entry {
+    rpc_tensor tensor;
+    uint64_t   offset;
+    uint64_t   hash;
+};
+
+struct rpc_msg_set_tensor_hash_batch_rsp {
+    uint64_t n_miss;          // 0 = every entry placed from local sources
+    uint64_t first_miss_hash; // diagnostic for the (stale-manifest) failure log
 };
 
 // proto 4.8 (TASKS.md #44): slice geometry within a source GGUF tensor - n_rows
@@ -584,6 +603,12 @@ struct ggml_backend_rpc_async_state {
     uint64_t conn_id = 0;      // this socket's connection id on the server (0 = not fetched)
     std::string endpoint;      // for failure attribution (set by get_socket)
     struct rpc_ep_stat * stat = nullptr; // per-endpoint counters (set with endpoint)
+    // proto 4.10 manifest handshake (TASKS.md #62): every hash the worker can
+    // serve locally, fetched once per connection; known weight placements queue
+    // here and flush as ONE batched command instead of one offer RTT per tensor
+    bool manifest_fetched = false;
+    std::unordered_set<uint64_t> manifest;
+    std::vector<rpc_msg_set_tensor_hash_batch_entry> pending_batch;
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -759,7 +784,16 @@ void ggml_backend_rpc_set_shutdown_enabled(bool enabled) {
     g_worker_shutdown_enabled.store(enabled);
 }
 
+static bool rpc_batch_flush_locked(socket_ptr sock, ggml_backend_rpc_async_state & st);
+
 static bool send_rpc_cmd_raw(socket_ptr sock, ggml_backend_rpc_async_state & st, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    // queued batch placements must land before ANY other command: a later write
+    // or read of the same region would otherwise be reordered against them
+    if (cmd != RPC_CMD_SET_TENSOR_HASH_BATCH && !st.pending_batch.empty()) {
+        if (!rpc_batch_flush_locked(sock, st)) {
+            return false;
+        }
+    }
     if (rpc_client_stats * s = rpc_stats()) {
         s->count[cmd]++;
         s->bytes[cmd] += input_size;
@@ -792,6 +826,43 @@ static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state
             return false; // stream out of sync - a PING response is always empty
         }
         st.pings_done++;
+    }
+    return true;
+}
+
+// caller must hold st.mutex. Sends the queued manifest-known placements as one
+// SET_TENSOR_HASH_BATCH and waits for its response. A miss here means the
+// manifest went stale (the worker evicted an entry mid-load) - fail the send so
+// the caller's failure path (mark_failed -> reload/surgical) re-provisions.
+static bool rpc_batch_flush_locked(socket_ptr sock, ggml_backend_rpc_async_state & st) {
+    if (st.pending_batch.empty()) {
+        return true;
+    }
+    std::vector<rpc_msg_set_tensor_hash_batch_entry> batch;
+    batch.swap(st.pending_batch); // before the send: send_rpc_cmd_raw re-enters the flush check
+    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+        return false;
+    }
+    const uint64_t count = batch.size();
+    std::vector<uint8_t> input(sizeof(count) + count * sizeof(batch[0]));
+    memcpy(input.data(), &count, sizeof(count));
+    memcpy(input.data() + sizeof(count), batch.data(), count * sizeof(batch[0]));
+    if (!send_rpc_cmd_raw(sock, st, RPC_CMD_SET_TENSOR_HASH_BATCH, input.data(), input.size())) {
+        return false;
+    }
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    rpc_msg_set_tensor_hash_batch_rsp response;
+    if (out_size != sizeof(response) || !sock->recv_data(&response, sizeof(response))) {
+        return false;
+    }
+    if (response.n_miss != 0) {
+        GGML_LOG_ERROR("[rpc] batched placement: %" PRIu64 "/%" PRIu64 " entries missed on %s "
+                       "(first hash 0x%" PRIx64 ") - manifest went stale, failing the endpoint\n",
+                       response.n_miss, count, st.endpoint.c_str(), response.first_miss_hash);
+        return false;
     }
     return true;
 }
@@ -1219,11 +1290,94 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
     j.sets[key] = std::move(e);
 }
 
+// proto 4.10 (TASKS.md #62): fetch the worker's manifest - every content hash it
+// can serve locally (cache entries + --model-dir index) - once per connection.
+// One round trip replaces the per-tensor offer/response the warm path used to pay.
+static void rpc_manifest_ensure(socket_ptr sock) {
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (st.manifest_fetched || st.server_minor < 10) {
+        return;
+    }
+    st.manifest_fetched = true; // one attempt; on failure the load just streams
+    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+        return;
+    }
+    if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GET_MANIFEST, nullptr, 0)) {
+        return;
+    }
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return;
+    }
+    uint64_t count;
+    if (out_size < sizeof(count) || !sock->recv_data(&count, sizeof(count))) {
+        return;
+    }
+    if (count != (out_size - sizeof(count)) / sizeof(uint64_t)) {
+        return; // malformed - do not trust the stream any further than this read
+    }
+    std::vector<uint64_t> hashes(count);
+    if (count > 0 && !sock->recv_data(hashes.data(), count * sizeof(uint64_t))) {
+        return;
+    }
+    st.manifest.insert(hashes.begin(), hashes.end());
+    GGML_LOG_INFO("[rpc] manifest from %s: %zu locally served tensors\n", st.endpoint.c_str(), st.manifest.size());
+}
+
 static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
                                        size_t offset, size_t size, const rpc_src_geom * src) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     const ggml_tensor * root = rpc_resolve_view(tensor, offset);
     rpc_tensor rpc_tensor = serialize_tensor(root);
+    ggml_backend_rpc_async_state & ast = rpc_async_state(ctx->sock.get());
+    // proto 4.10 manifest path (TASKS.md #62), weight buffers only (activations
+    // must never enter the cache): manifest-known hashes queue as batched
+    // placements - no per-tensor round trip; unknown ones stream WITH their hash
+    // so the worker caches them at ANY size and the next load batch-places them
+    if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ast.server_minor >= 10) {
+        rpc_manifest_ensure(ctx->sock);
+        const uint64_t hash = fnv_hash((const uint8_t *) data, size);
+        const bool use_src  = src != nullptr && g_rpc_src_hint.valid;
+        rpc_journal_record_set(buffer, rpc_tensor, offset, data, size, hash, true, use_src ? src : nullptr);
+        bool known     = false;
+        bool flush_now = false;
+        {
+            std::lock_guard<std::mutex> lock(ast.mutex);
+            known = ast.manifest.count(hash) > 0;
+            if (known) {
+                ast.pending_batch.push_back({ rpc_tensor, offset, hash });
+                flush_now = ast.pending_batch.size() >= 512;
+            } else {
+                ast.manifest.insert(hash); // the stream below makes the worker cache it
+            }
+        }
+        if (ast.stat != nullptr) {
+            (known ? ast.stat->weights_cached_bytes : ast.stat->weights_streamed_bytes)
+                .fetch_add(size, std::memory_order_relaxed);
+        }
+        if (known) {
+            if (flush_now) {
+                std::lock_guard<std::mutex> lock(ast.mutex);
+                if (!rpc_batch_flush_locked(ctx->sock, ast)) {
+                    rpc_mark_failed(ast.endpoint, __func__);
+                }
+            }
+            return;
+        }
+        // | rpc_tensor | offset (8 bytes) | hash (8 bytes) | data | - no response, like SET_TENSOR
+        size_t input_size = sizeof(rpc_tensor) + 2 * sizeof(uint64_t) + size;
+        std::vector<uint8_t> input(input_size, 0);
+        uint64_t offset64 = offset;
+        memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+        memcpy(input.data() + sizeof(rpc_tensor), &offset64, sizeof(offset64));
+        memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset64), &hash, sizeof(hash));
+        memcpy(input.data() + sizeof(rpc_tensor) + 2 * sizeof(uint64_t), data, size);
+        if (!send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH_DATA, input.data(), input.size())) {
+            rpc_mark_failed(ast.endpoint, __func__);
+        }
+        return;
+    }
     if (size > HASH_THRESHOLD) {
         const uint64_t hash = fnv_hash((const uint8_t*)data, size);
         const bool use_src  = src != nullptr && g_rpc_src_hint.valid
@@ -2420,6 +2574,10 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    // proto 4.10 (TASKS.md #62)
+    bool set_tensor_hash_batch(const std::vector<uint8_t> & input, rpc_msg_set_tensor_hash_batch_rsp & response);
+    bool set_tensor_hash_data(const std::vector<uint8_t> & input);
+    void manifest(std::vector<uint64_t> & hashes);
     bool set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -2453,6 +2611,7 @@ public:
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+    void cache_store(uint64_t hash, const void * data, size_t size);
 
     // run a graph compute with error containment (TASKS.md #29e): a backend failure —
     // including a CUDA error thrown under GGML_CUDA_ERROR_CONTAIN — fails THIS
@@ -2968,49 +3127,55 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
 
     const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
     if (cache_dir && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
-        char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-        // save to cache_dir/hash_str via a temp file: a partial write (killed worker,
-        // full disk) must never land under the final name - an unverified truncated
-        // entry used to poison every later load of the tensor
-        fs::path cache_file = fs::path(cache_dir) / hash_str;
-        fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
-        std::ofstream ofs(tmp_file, std::ios::binary);
-        if (!ofs.is_open()) {
-            // the cache dir can disappear at runtime (manual cleanup) - without this
-            // every later save fails silently and loads re-stream forever
-            std::error_code ec_mk;
-            fs::create_directories(fs::path(cache_dir), ec_mk);
-            ofs.open(tmp_file, std::ios::binary);
-        }
-        ofs.write((const char *)data, size);
-        ofs.close();
-        std::error_code ec;
-        if (ofs.good()) {
-            fs::rename(tmp_file, cache_file, ec);
-        }
-        if (!ofs.good() || ec) {
-            GGML_LOG_ERROR("[%s] failed to save '%s'\n", __func__, cache_file.string().c_str());
-            fs::remove(tmp_file, ec);
-        } else {
-#ifndef _WIN32
-            // flush + drop the pages now: a model-sized load otherwise accumulates
-            // model-sized DIRTY page cache on top of the weights themselves, enough
-            // to OOM a worker whose RAM share is sized near its capacity
-            int fd = open(cache_file.string().c_str(), O_RDONLY);
-            if (fd >= 0) {
-                fsync(fd);
-                posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-                close(fd);
-            }
-#endif
-            GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
-            rpc_cache_enforce_limit(cache_dir);
-        }
+        cache_store(fnv_hash((const uint8_t*)data, size), data, size);
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
     return true;
+}
+
+void rpc_server::cache_store(uint64_t hash, const void * data, size_t size) {
+    if (cache_dir == nullptr) {
+        return;
+    }
+    char hash_str[17];
+    snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+    // save to cache_dir/hash_str via a temp file: a partial write (killed worker,
+    // full disk) must never land under the final name - an unverified truncated
+    // entry used to poison every later load of the tensor
+    fs::path cache_file = fs::path(cache_dir) / hash_str;
+    fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
+    std::ofstream ofs(tmp_file, std::ios::binary);
+    if (!ofs.is_open()) {
+        // the cache dir can disappear at runtime (manual cleanup) - without this
+        // every later save fails silently and loads re-stream forever
+        std::error_code ec_mk;
+        fs::create_directories(fs::path(cache_dir), ec_mk);
+        ofs.open(tmp_file, std::ios::binary);
+    }
+    ofs.write((const char *)data, size);
+    ofs.close();
+    std::error_code ec;
+    if (ofs.good()) {
+        fs::rename(tmp_file, cache_file, ec);
+    }
+    if (!ofs.good() || ec) {
+        GGML_LOG_ERROR("[%s] failed to save '%s'\n", __func__, cache_file.string().c_str());
+        fs::remove(tmp_file, ec);
+    } else {
+#ifndef _WIN32
+        // flush + drop the pages now: a model-sized load otherwise accumulates
+        // model-sized DIRTY page cache on top of the weights themselves, enough
+        // to OOM a worker whose RAM share is sized near its capacity
+        int fd = open(cache_file.string().c_str(), O_RDONLY);
+        if (fd >= 0) {
+            fsync(fd);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            close(fd);
+        }
+#endif
+        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        rpc_cache_enforce_limit(cache_dir);
+    }
 }
 
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
@@ -3133,9 +3298,8 @@ void rpc_server::build_local_index(const char * model_dir) {
         std::vector<std::tuple<uint64_t, uint64_t, uint64_t, std::string>> entries; // hash, offset, size, name
         for (int64_t i = 0; i < gguf_get_n_tensors(gctx); i++) {
             const size_t size = gguf_get_tensor_size(gctx, i);
-            if (size <= HASH_THRESHOLD) {
-                continue; // the coordinator only hashes tensors above the threshold
-            }
+            // index every size: since proto 4.10 the manifest handshake places
+            // sub-threshold weights from local sources too (TASKS.md #62)
             const uint64_t offset = data_offset + gguf_get_tensor_offset(gctx, i);
             buf.resize(size);
             f.seekg(offset);
@@ -3238,6 +3402,109 @@ bool rpc_server::set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, 
     }
     response.result = 0;
     return true;
+}
+
+// proto 4.10 (TASKS.md #62): place a batch of manifest-known tensors in one round
+// trip. Every entry SHOULD hit (the client only queues hashes from the manifest);
+// a miss means the entry was evicted since - reported so the client can fail over
+bool rpc_server::set_tensor_hash_batch(const std::vector<uint8_t> & input, rpc_msg_set_tensor_hash_batch_rsp & response) {
+    response.n_miss          = 0;
+    response.first_miss_hash = 0;
+    uint64_t count;
+    if (input.size() < sizeof(count)) {
+        return false;
+    }
+    memcpy(&count, input.data(), sizeof(count));
+    if (count > (input.size() - sizeof(count)) / sizeof(rpc_msg_set_tensor_hash_batch_entry) ||
+        input.size() != sizeof(count) + count * sizeof(rpc_msg_set_tensor_hash_batch_entry)) {
+        return false;
+    }
+    const auto * entries = (const rpc_msg_set_tensor_hash_batch_entry *) (input.data() + sizeof(count));
+    for (uint64_t i = 0; i < count; i++) {
+        rpc_msg_set_tensor_hash_req req = { entries[i].tensor, entries[i].offset, entries[i].hash };
+        rpc_msg_set_tensor_hash_rsp rsp = {};
+        if (!set_tensor_hash(req, rsp)) {
+            return false;
+        }
+        if (rsp.result == 0) {
+            if (response.n_miss == 0) {
+                response.first_miss_hash = entries[i].hash;
+            }
+            response.n_miss++;
+        }
+    }
+    return true;
+}
+
+// proto 4.10 (TASKS.md #62): SET_TENSOR carrying the client-computed hash, weight
+// buffers only. Cached at ANY size (sub-threshold weights were re-streamed every
+// load before); the hash is verified before the cache write so a corrupt frame
+// cannot poison the entry under a name later loads would trust
+bool rpc_server::set_tensor_hash_data(const std::vector<uint8_t> & input) {
+    if (input.size() < sizeof(rpc_tensor) + 2 * sizeof(uint64_t)) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *) input.data();
+    uint64_t offset, hash;
+    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
+    memcpy(&hash,   input.data() + sizeof(rpc_tensor) + sizeof(offset), sizeof(hash));
+    const size_t size = input.size() - sizeof(rpc_tensor) - 2 * sizeof(uint64_t);
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, in_tensor->data, offset, size, p0, p1);
+            return false;
+        }
+    }
+    const void * data = input.data() + sizeof(rpc_tensor) + 2 * sizeof(uint64_t);
+    if (fnv_hash((const uint8_t *) data, size) == hash) {
+        cache_store(hash, data, size);
+    } else {
+        GGML_LOG_ERROR("[%s] hash mismatch on %zu bytes - tensor applied, entry NOT cached\n", __func__, size);
+    }
+    ggml_backend_tensor_set(tensor, data, offset, size);
+    return true;
+}
+
+// proto 4.10 (TASKS.md #62): every hash this worker can serve locally - cache
+// entries (16-hex-char filenames) + the --model-dir index. local_index is built
+// before serving starts and read-only afterwards, so no exec lock is needed
+void rpc_server::manifest(std::vector<uint64_t> & hashes) {
+    if (cache_dir != nullptr) {
+        std::error_code ec;
+        fs::directory_iterator end;
+        for (fs::directory_iterator it(cache_dir, ec); !ec && it != end; it.increment(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name.size() != 16 || !it->is_regular_file(ec)) {
+                continue; // modelidx-*, *.tmp, foreign files
+            }
+            char * endp = nullptr;
+            const uint64_t hash = strtoull(name.c_str(), &endp, 16);
+            if (endp == name.c_str() + 16) {
+                hashes.push_back(hash);
+            }
+        }
+    }
+    for (const auto & [hash, ref] : local_index) {
+        hashes.push_back(hash);
+        (void) ref;
+    }
 }
 
 bool rpc_server::get_local_slice(const rpc_msg_set_tensor_hash2_req & request, std::vector<uint8_t> & data) {
@@ -3860,6 +4127,9 @@ static const char * rpc_cmd_str(int cmd) {
         case RPC_CMD_SET_TENSOR:           return "SET_TENSOR";
         case RPC_CMD_SET_TENSOR_HASH:      return "SET_TENSOR_HASH";
         case RPC_CMD_SET_TENSOR_HASH2:     return "SET_TENSOR_HASH2";
+        case RPC_CMD_SET_TENSOR_HASH_BATCH: return "SET_TENSOR_HASH_BATCH";
+        case RPC_CMD_SET_TENSOR_HASH_DATA: return "SET_TENSOR_HASH_DATA";
+        case RPC_CMD_GET_MANIFEST:         return "GET_MANIFEST";
         case RPC_CMD_RESCORE:              return "RESCORE";
         case RPC_CMD_COPY_FROM_REMOTE:     return "COPY_FROM_REMOTE";    // W2W pull (butterfly)
         case RPC_CMD_GET_TENSOR_FENCED:    return "GET_TENSOR_FENCED";
@@ -3996,6 +4266,26 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             }
             std::string tail = rpc_log_tail(std::min<uint64_t>(request.max_bytes, RPC_LOG_RING_CAP));
             if (!send_msg(sock, tail.data(), tail.size())) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
+        if (cmd == RPC_CMD_GET_MANIFEST) {
+            // read-only over the cache dir + startup-built index: no exec lock,
+            // so the load-time handshake answers even mid-compute
+            if (!recv_msg(sock, nullptr, 0)) {
+                break;
+            }
+            std::vector<uint64_t> hashes;
+            server.manifest(hashes);
+            const uint64_t count = hashes.size();
+            std::vector<uint8_t> response(sizeof(count) + count * sizeof(uint64_t));
+            memcpy(response.data(), &count, sizeof(count));
+            if (count > 0) {
+                memcpy(response.data() + sizeof(count), hashes.data(), count * sizeof(uint64_t));
+            }
+            if (!send_msg(sock, response.data(), response.size())) {
                 break;
             }
             server.mark_executed(conn_id);
@@ -4204,6 +4494,31 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH_BATCH: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_set_tensor_hash_batch_rsp response;
+                if (!server.set_tensor_hash_batch(input, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH_DATA: {
+                // no response, like SET_TENSOR
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_hash_data(input)) {
                     return;
                 }
                 break;

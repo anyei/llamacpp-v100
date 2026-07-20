@@ -144,7 +144,17 @@ The lifecycle of a coordinator + RPC worker, with real sizes:
    `LLAMA_CACHE=/cache` + a volume in a container), the worker hashes and
    persists every tensor it receives. On every later load the coordinator sends
    just the hash (`SET_TENSOR_HASH`), the worker answers "have it," and loads
-   from local disk — restart-safe, re-stream-free.
+   from local disk — restart-safe, re-stream-free. **Proto 4.10 (TASKS.md #62)
+   removes the two residual costs**: (a) the coordinator fetches the worker's
+   MANIFEST (every hash it can serve locally) once at load start and places all
+   known tensors in batched commands — the warm path collapses from one offer
+   round trip per tensor (~1800 for a V4-class model) to ~2 round trips total;
+   (b) weights of ANY size are cached — before, sub-10-MiB tensors
+   (norms/biases/small projections, hundreds of MB per model) re-streamed on
+   every load. Unknown tensors stream WITH their hash (`SET_TENSOR_HASH_DATA`,
+   no offer round trip) and enter the cache for the next load. Weight buffers
+   only — activations never touch the cache. Older workers keep the per-offer
+   protocol unchanged.
 
 3. **Inference — only activations (and logits) cross, per step.** Per token
    the coordinator sends the worker's boundary input activations and receives
@@ -197,9 +207,10 @@ ggml-rpc-server -H 0.0.0.0 -p 50052 -c --tensor-parallel
   NVMe; the index persists in the cache dir so later starts are instant) and
   serves hash-matched tensors from local disk instead of asking the
   coordinator to stream them. A stale or different local file simply
-  hash-misses and streams as before — no version-skew failure mode. Only
-  tensors > 10 MiB go through the hash path (same threshold as the weight
-  cache). Since proto 4.8, EP/tensor-mode SLICES are served from the local
+  hash-misses and streams as before — no version-skew failure mode. Since
+  proto 4.10 the index covers tensors of every size (older cached `modelidx-*`
+  files lack the small entries until re-indexed — delete them to upgrade).
+  Since proto 4.8, EP/tensor-mode SLICES are served from the local
   GGUF too (the offer carries source provenance; see section 0 point 1b) —
   before that, slices only hit the received-bytes cache and any `-ts` change
   cold-streamed them.
