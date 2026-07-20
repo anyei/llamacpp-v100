@@ -1484,8 +1484,14 @@ private:
             return; // unreadable model path: the loader produces the real error
         }
         // weights that deliberately live in host RAM are invisible to the device
-        // pool - requiring the full model there would hold such configs forever
-        if (!params_base.tensor_buft_overrides.empty()) {
+        // pool - requiring the full model there would hold such configs forever.
+        // The vector is always padded with {nullptr,nullptr} sentinels for
+        // llama_params_fit (arg.cpp), so emptiness cannot distinguish a real
+        // -ot/-ncmoe - look for an actual pattern instead
+        const bool has_buft_override = std::any_of(
+            params_base.tensor_buft_overrides.begin(), params_base.tensor_buft_overrides.end(),
+            [](const llama_model_tensor_buft_override & o) { return o.pattern != nullptr; });
+        if (has_buft_override) {
             SRV_INF("%s", "fleet capacity gate skipped: tensor buft overrides (-ot/-ncmoe) place weights outside the device pool\n");
             return;
         }
