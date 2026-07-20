@@ -17,6 +17,17 @@ export interface ApiFleetDeviceScore {
 	mm_gflops: number;
 }
 
+/** Worker-side handler timing of the busiest graph command, parsed from the
+ * worker's [rpc-timing] log dumps. Present only when the worker runs with
+ * GGML_RPC_TIMING. */
+export interface ApiFleetDeviceTiming {
+	cmd: string;
+	n: number;
+	lock_avg_us: number;
+	exec_avg_us: number;
+	exec_max_us: number;
+}
+
 /** A device participating in the inference pipeline (local or RPC worker). */
 export interface ApiFleetDevice {
 	name: string;
@@ -39,6 +50,7 @@ export interface ApiFleetDevice {
 	n_layers?: number | null;
 	stats?: ApiFleetDeviceStats | null;
 	score?: ApiFleetDeviceScore | null;
+	timing?: ApiFleetDeviceTiming | null;
 }
 
 /** A worker announced on the LAN via discovery (may or may not be in the pipeline). */
@@ -85,6 +97,13 @@ export interface ApiFleetPreflight {
 	load_s: number;
 }
 
+/** Rolling token-weighted average decode speed over the last `window_n`
+ * completed generations (null until a request finishes). */
+export interface ApiFleetPerf {
+	tg_avg_tps: number;
+	window_n: number;
+}
+
 /** Response of `GET ./fleet/status`. Fields sourced from the model params
  * (model, split_mode, n_gpu_layers) are null until the initial load finishes. */
 export interface ApiFleetStatusResponse {
@@ -105,6 +124,7 @@ export interface ApiFleetStatusResponse {
 		auto_recover?: boolean;
 	} | null;
 	preflight?: ApiFleetPreflight | null;
+	perf?: ApiFleetPerf | null;
 }
 
 /** Response of `GET ./fleet/worker/log`. */

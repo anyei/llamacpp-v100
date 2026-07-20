@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <deque>
 #include <optional>
 #include <exception>
 #include <memory>
@@ -1065,6 +1066,14 @@ public:
             int64_t     t_last_ms;
         };
         std::map<std::string, beacon_t> discovered; // endpoint -> last beacon heard
+
+        // TASKS.md #58: recent completed generations, newest at back - feeds the
+        // fleet-wide rolling avg decode t/s in /fleet/status
+        struct perf_rec {
+            int32_t n_decoded;
+            double  t_gen_ms;
+        };
+        std::deque<perf_rec> perf_history;
 
         // TASKS.md #46: failure HISTORY per endpoint - live booleans clear on
         // recovery, so a crash-looping worker looked healthy between crashes
@@ -2969,6 +2978,14 @@ private:
         }
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+
+        if (slot.n_decoded > 0 && slot.t_token_generation > 0.0) {
+            std::lock_guard<std::mutex> lock(fleet.mutex);
+            fleet.perf_history.push_back({ slot.n_decoded, slot.t_token_generation });
+            if (fleet.perf_history.size() > 32) {
+                fleet.perf_history.pop_front();
+            }
+        }
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
@@ -5394,6 +5411,68 @@ static std::optional<std::pair<float,float>> fleet_worker_score(const std::strin
     return std::make_pair(bw, fl);
 }
 
+// TASKS.md #58: worker-side per-boundary handler time. The [rpc-timing] dumps
+// (GGML_RPC_TIMING) land in the worker's log ring; tail it over the same
+// ephemeral GET_LOG the logs view uses and keep the newest line of the busiest
+// graph command. Absent when the worker doesn't run with the flag.
+struct fleet_worker_timing_rec {
+    std::string cmd;
+    uint64_t    n           = 0;
+    double      lock_avg_us = 0.0;
+    double      exec_avg_us = 0.0;
+    uint64_t    exec_max_us = 0;
+};
+static std::optional<fleet_worker_timing_rec> fleet_worker_timing(const std::string & endpoint) {
+    if (fleet_procs().fetch_log == nullptr) {
+        return std::nullopt;
+    }
+    struct entry { int64_t t_ms; std::optional<fleet_worker_timing_rec> rec; };
+    static std::mutex mutex;
+    static std::map<std::string, entry> cache;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(endpoint);
+        if (it != cache.end() && ggml_time_ms() - it->second.t_ms < 10000) {
+            return it->second.rec;
+        }
+    }
+    std::optional<fleet_worker_timing_rec> rec;
+    std::vector<char> buf(65536);
+    size_t out_len = 0;
+    if (fleet_procs().fetch_log(endpoint.c_str(), buf.data(), buf.size(), &out_len)) {
+        // counters are cumulative, so the last dump per command wins
+        std::map<std::string, fleet_worker_timing_rec> latest;
+        const std::string log(buf.data(), out_len);
+        const std::string tag = "[rpc-timing] ";
+        size_t pos = 0;
+        while ((pos = log.find(tag, pos)) != std::string::npos) {
+            pos += tag.size();
+            const size_t eol = log.find('\n', pos);
+            const std::string line = log.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+            char cmd[32];
+            unsigned long long n = 0, exec_max = 0;
+            double lock_avg = 0.0, exec_avg = 0.0;
+            if (sscanf(line.c_str(), "%31s n=%llu lock avg %lf us exec avg %lf us exec max %llu us",
+                       cmd, &n, &lock_avg, &exec_avg, &exec_max) == 5) {
+                latest[cmd] = { cmd, n, lock_avg, exec_avg, exec_max };
+            }
+        }
+        for (const auto & [cmd, r] : latest) {
+            if (cmd.rfind("GRAPH_", 0) != 0) {
+                continue; // only compute commands can be the boundary long pole
+            }
+            if (!rec.has_value() || r.n > rec->n) {
+                rec = r;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cache[endpoint] = { ggml_time_ms(), rec };
+    }
+    return rec;
+}
+
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
@@ -5438,6 +5517,9 @@ void server_routes::init_routes() {
         size_t      load_model_bytes = 0;
         std::string load_split_mode;
         std::vector<server_context_impl::fleet_state_t::planned_dev_t> load_plan;
+        size_t  perf_window_n = 0;
+        int64_t perf_n_tokens = 0;
+        double  perf_t_gen_ms = 0.0;
         {
             std::lock_guard<std::mutex> lock(fleet.mutex);
             for (const auto & d : fleet.layer_map) {
@@ -5449,6 +5531,11 @@ void server_routes::init_routes() {
             load_model_bytes = fleet.load_model_bytes;
             load_split_mode  = fleet.load_split_mode;
             load_plan        = fleet.load_plan;
+            perf_window_n    = fleet.perf_history.size();
+            for (const auto & p : fleet.perf_history) {
+                perf_n_tokens += p.n_decoded;
+                perf_t_gen_ms += p.t_gen_ms;
+            }
         }
 
         // read main's `params` only once the initial load has fully returned; until
@@ -5535,6 +5622,7 @@ void server_routes::init_routes() {
                     {"n_layers",         nullptr},
                     {"stats",            nullptr},
                     {"score",            nullptr},
+                    {"timing",           nullptr},
                 };
                 auto lit = layer_map.find(ggml_backend_dev_name(dev));
                 if (lit != layer_map.end()) {
@@ -5563,6 +5651,17 @@ void server_routes::init_routes() {
                     if (!cpu_sibling) {
                         if (auto score = fleet_worker_score(ep, payload, !reachable)) {
                             d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                        }
+                        if (reachable && !failed) {
+                            if (auto timing = fleet_worker_timing(ep)) {
+                                d["timing"] = {
+                                    {"cmd",         timing->cmd},
+                                    {"n",           timing->n},
+                                    {"lock_avg_us", timing->lock_avg_us},
+                                    {"exec_avg_us", timing->exec_avg_us},
+                                    {"exec_max_us", timing->exec_max_us},
+                                };
+                            }
                         }
                     }
                 }
@@ -5625,6 +5724,10 @@ void server_routes::init_routes() {
                 ? json({ {"tps", pf.tps}, {"model", pf.model}, {"n_tokens", pf.n_tokens}, {"load_s", pf.load_s} })
                 : json(nullptr);
         }
+        // token-weighted rolling avg over the recent completed generations (#58)
+        body["perf"] = perf_t_gen_ms > 0.0
+            ? json({ {"tg_avg_tps", 1e3 * perf_n_tokens / perf_t_gen_ms}, {"window_n", perf_window_n} })
+            : json(nullptr);
         {
             int recent = 0;
             std::lock_guard<std::mutex> lock(fleet.mutex);

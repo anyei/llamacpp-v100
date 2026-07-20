@@ -15,6 +15,8 @@
 		fleetAdmin: boolean;
 		rates?: FleetEndpointRates;
 		rank?: 'fastest' | 'slowest' | null;
+		/** True when this worker has the highest exec-avg in the fleet (long pole). */
+		execSlowest?: boolean;
 		/** 1-based position among devices sharing this endpoint, when > 1 total. */
 		siblingIndex?: number | null;
 		/** How many devices this worker (endpoint) exposes. */
@@ -27,6 +29,7 @@
 		fleetAdmin,
 		rates,
 		rank = null,
+		execSlowest = false,
 		siblingIndex = null,
 		siblingCount = null,
 		onShowLogs
@@ -45,7 +48,9 @@
 		try {
 			const r = await FleetService.rescoreWorker(device.endpoint);
 			if (r.success) {
-				toast.success(`${device.endpoint}: ${r.bw_gbps?.toFixed(1)} GB/s — shares apply at the next reload`);
+				toast.success(
+					`${device.endpoint}: ${r.bw_gbps?.toFixed(1)} GB/s — shares apply at the next reload`
+				);
 			} else {
 				toast.error(r.reason ?? 'rescore failed');
 			}
@@ -163,6 +168,16 @@
 				</Badge>
 			{/if}
 
+			{#if device.timing}
+				<Badge
+					variant={execSlowest ? 'tertiary' : 'outline'}
+					class="text-[10px]"
+					title={`worker-side handler time (GGML_RPC_TIMING): ${device.timing.cmd} exec avg over ${device.timing.n.toLocaleString()} calls — compute + result send ON the worker; excludes network RTT and coordinator time (the wire RTT is the ms next to the transfer rates). exec max ${(device.timing.exec_max_us / 1000).toFixed(1)} ms · lock wait avg ${(device.timing.lock_avg_us / 1000).toFixed(2)} ms${execSlowest ? ' · slowest in the fleet — the pipeline long pole' : ''}`}
+				>
+					exec {(device.timing.exec_avg_us / 1000).toFixed(1)} ms
+				</Badge>
+			{/if}
+
 			{#if rank === 'fastest'}
 				<Badge class="text-[10px]">fastest</Badge>
 			{:else if rank === 'slowest'}
@@ -225,7 +240,9 @@
 			title="failure history persists 5 min after recovery - a crash-looping worker no longer shows green between crashes"
 		>
 			{device.health === 'degraded' ? 'FAILING' : 'recovering'}
-			{#if device.failure_count}&nbsp;· {device.failure_count} failure{device.failure_count > 1 ? 's' : ''}{/if}
+			{#if device.failure_count}&nbsp;· {device.failure_count} failure{device.failure_count > 1
+					? 's'
+					: ''}{/if}
 		</div>
 	{/if}
 
@@ -241,7 +258,12 @@
 					? 'Re-run the bandwidth benchmark now (shares apply at the next reload)'
 					: 'start server with --fleet-admin and an API key'}
 			>
-				<Button variant="outline" size="sm" disabled={!fleetAdmin || isRescoring} onclick={handleRescore}>
+				<Button
+					variant="outline"
+					size="sm"
+					disabled={!fleetAdmin || isRescoring}
+					onclick={handleRescore}
+				>
 					<Gauge class="h-3.5 w-3.5 {isRescoring ? 'animate-pulse' : ''}" />
 					Re-score
 				</Button>

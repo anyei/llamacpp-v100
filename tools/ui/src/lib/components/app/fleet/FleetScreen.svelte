@@ -113,6 +113,19 @@
 		return ranks;
 	});
 
+	// The slowest exec-avg worker above the fleet median is the pipeline's long
+	// pole (single-stream decode is the sum of the boundary stages)
+	let timingSlowest = $derived.by(() => {
+		const timed = rpcDevices.filter((device) => typeof device.timing?.exec_avg_us === 'number');
+		if (timed.length < 2) return null;
+
+		const sorted = [...timed].sort((a, b) => a.timing!.exec_avg_us - b.timing!.exec_avg_us);
+		const median = sorted[Math.floor(sorted.length / 2)].timing!.exec_avg_us;
+		const slowest = sorted[sorted.length - 1];
+
+		return slowest.timing!.exec_avg_us > median ? slowest.name : null;
+	});
+
 	let logsOpen = $state(false);
 	let logsEndpoint = $state<string | null>(null);
 
@@ -290,16 +303,15 @@
 
 		{#if status?.capacity?.waiting}
 			<div class="rounded-md border border-orange-500/40 bg-orange-500/10 p-3 text-sm">
-				<p class="font-medium">
-					Insufficient fleet capacity — the model load is on hold.
-				</p>
+				<p class="font-medium">Insufficient fleet capacity — the model load is on hold.</p>
 
 				<p class="mt-1 text-xs text-muted-foreground">
-					The model needs {formatGib(status.capacity.required_mib)} GiB (weights + KV
-					reserve) but the fleet pools only {formatGib(status.capacity.available_mib)} GiB
-					of device memory ({formatGib(status.capacity.required_mib - status.capacity.available_mib)}
-					GiB short). Inference becomes possible once more workers join the LAN — power on another
-					box with <code class="font-mono">--announce</code>{status.capacity.auto_recover
+					The model needs {formatGib(status.capacity.required_mib)} GiB (weights + KV reserve) but the
+					fleet pools only {formatGib(status.capacity.available_mib)} GiB of device memory ({formatGib(
+						status.capacity.required_mib - status.capacity.available_mib
+					)}
+					GiB short). Inference becomes possible once more workers join the LAN — power on another box
+					with <code class="font-mono">--announce</code>{status.capacity.auto_recover
 						? ' and the load starts automatically'
 						: ', then restart the coordinator with the grown --rpc list'}.
 				</p>
@@ -330,7 +342,9 @@
 
 			{#if status && (status.split_mode || devices.length > 0)}
 				<!-- fleet summary strip: one mini stat per column, fed by /fleet/status -->
-				<div class="grid grid-cols-2 gap-px overflow-hidden rounded-md border bg-border sm:grid-cols-3 lg:grid-cols-6">
+				<div
+					class="grid grid-cols-2 gap-px overflow-hidden rounded-md border bg-border sm:grid-cols-3 lg:grid-cols-6"
+				>
 					{#if status.split_mode}
 						<div class="bg-card p-2">
 							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">split</div>
@@ -340,14 +354,21 @@
 
 					{#if status.n_gpu_layers != null}
 						<div class="bg-card p-2" title="-ngl: layers requested onto accelerators">
-							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">gpu layers</div>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">
+								gpu layers
+							</div>
 							<div class="text-sm font-semibold">{status.n_gpu_layers}</div>
 						</div>
 					{/if}
 
 					{#if fleetTotals.hasLayers}
-						<div class="bg-card p-2" title="layers placed on GPU devices vs worker-CPU (RAM) devices">
-							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">layer placement</div>
+						<div
+							class="bg-card p-2"
+							title="layers placed on GPU devices vs worker-CPU (RAM) devices"
+						>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">
+								layer placement
+							</div>
 							<div class="text-sm font-semibold">
 								{fleetTotals.gpuLayers} gpu
 								<span class="font-normal text-muted-foreground">/</span>
@@ -361,17 +382,36 @@
 							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">vram</div>
 							<div class="text-sm font-semibold">
 								{formatGib(fleetTotals.vramFree)}
-								<span class="font-normal text-muted-foreground">/ {formatGib(fleetTotals.vramTotal)} GiB</span>
+								<span class="font-normal text-muted-foreground"
+									>/ {formatGib(fleetTotals.vramTotal)} GiB</span
+								>
 							</div>
 						</div>
 					{/if}
 
 					{#if fleetTotals.ramTotal > 0}
 						<div class="bg-card p-2" title="free / total worker RAM across the pipeline devices">
-							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">worker ram</div>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">
+								worker ram
+							</div>
 							<div class="text-sm font-semibold">
 								{formatGib(fleetTotals.ramFree)}
-								<span class="font-normal text-muted-foreground">/ {formatGib(fleetTotals.ramTotal)} GiB</span>
+								<span class="font-normal text-muted-foreground"
+									>/ {formatGib(fleetTotals.ramTotal)} GiB</span
+								>
+							</div>
+						</div>
+					{/if}
+
+					{#if status.perf}
+						<div
+							class="bg-card p-2"
+							title={`rolling token-weighted average decode speed over the last ${status.perf.window_n} completed request${status.perf.window_n > 1 ? 's' : ''}`}
+						>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">avg t/s</div>
+							<div class="text-sm font-semibold">
+								{status.perf.tg_avg_tps.toFixed(2)}
+								<span class="font-normal text-muted-foreground">/ {status.perf.window_n} req</span>
 							</div>
 						</div>
 					{/if}
@@ -384,7 +424,9 @@
 							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">preflight</div>
 							<div class="text-sm font-semibold">
 								{status.preflight.tps.toFixed(1)} t/s
-								<span class="font-normal text-muted-foreground">@ {status.preflight.model.replace(/\.gguf.*$/i, '')}</span>
+								<span class="font-normal text-muted-foreground"
+									>@ {status.preflight.model.replace(/\.gguf.*$/i, '')}</span
+								>
 							</div>
 						</div>
 					{/if}
@@ -410,6 +452,7 @@
 							fleetAdmin={status?.fleet_admin ?? false}
 							rates={fleetStore.getRates(device.endpoint)}
 							rank={deviceRanks[device.name] ?? null}
+							execSlowest={timingSlowest === device.name}
 							siblingIndex={endpointSiblings.index[device.name] ?? null}
 							siblingCount={device.endpoint
 								? (endpointSiblings.counts[device.endpoint] ?? null)
