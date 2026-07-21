@@ -1003,10 +1003,14 @@ static uint64_t fleet_model_weight_bytes(const std::string & path) {
     }
     const int n_split = atoi(path.c_str() + pos + 4);
     char prefix[1024];
-    if (n_split < 2 || llama_split_prefix(prefix, sizeof(prefix), path.c_str(), 1, n_split) <= 0) {
+    // llama_split_prefix/llama_split_path take a 0-BASED split_no (they format
+    // split_no+1); passing 1-based here made the prefix never match, so this
+    // helper silently returned shard 1's size alone and the capacity gate ran
+    // 5x under-counted on every sharded model (found via GLM-5.2, 2026-07-21)
+    if (n_split < 2 || llama_split_prefix(prefix, sizeof(prefix), path.c_str(), 0, n_split) <= 0) {
         return total;
     }
-    for (int i = 2; i <= n_split; i++) {
+    for (int i = 1; i < n_split; i++) {
         char shard[1024];
         llama_split_path(shard, sizeof(shard), prefix, i, n_split);
         const uint64_t sz = (uint64_t) fs::file_size(shard, ec);
@@ -1477,11 +1481,15 @@ private:
         }
         const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params_base);
         if (std::none_of(devs.begin(), devs.end(), fleet_dev_is_rpc)) {
-            return;
+            return; // single-box (no-RPC) runs are never gated, silently
         }
         const uint64_t weight_bytes = fleet_model_weight_bytes(params_base.model.path);
         if (weight_bytes == 0) {
-            return; // unreadable model path: the loader produces the real error
+            // a sharded model with ANY unreadable sibling also lands here - say so,
+            // because a fleet load then proceeds UNGATED (GLM-5.2 EP, 2026-07-21)
+            SRV_WRN("fleet capacity gate skipped: could not size '%s' (unreadable file or missing shard)\n",
+                    params_base.model.path.c_str());
+            return;
         }
         // weights that deliberately live in host RAM are invisible to the device
         // pool - requiring the full model there would hold such configs forever.

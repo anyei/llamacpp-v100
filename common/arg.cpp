@@ -1258,10 +1258,34 @@ static void apply_rpc_auto_weight(common_params & params) {
     // exist NOW - for -hf/--model-url the download runs later, so w_bytes would be
     // 0 and every memory cap silently disabled (a fast-but-small worker could then
     // be handed more than fits -> OOM). Bail to the capacity-safe default instead.
+    // SHARDED models must sum every -NNNNN-of-NNNNN sibling: sizing by shard 1
+    // alone made a 227 GiB GLM split look like 38 GiB, un-capping every share
+    // (first hit by the GLM-5.2 EP load, 2026-07-21).
     double w_bytes = 0.0;
-    std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
-    if (f.good()) {
-        w_bytes = (double) f.tellg();
+    {
+        std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
+        if (f.good()) {
+            w_bytes = (double) f.tellg();
+        }
+    }
+    const size_t of_pos = params.model.path.rfind("-of-");
+    if (w_bytes > 0.0 && of_pos != std::string::npos &&
+        params.model.path.size() - of_pos == 4 + 5 + 5 /* "-of-NNNNN.gguf" */) {
+        const int n_split = atoi(params.model.path.c_str() + of_pos + 4);
+        char prefix[1024];
+        // 0-based split_no (the helpers format split_no+1)
+        if (n_split >= 2 && llama_split_prefix(prefix, sizeof(prefix), params.model.path.c_str(), 0, n_split) > 0) {
+            for (int i = 1; i < n_split; i++) {
+                char shard[1024];
+                if (llama_split_path(shard, sizeof(shard), prefix, i, n_split) <= 0) {
+                    continue;
+                }
+                std::ifstream fs_(shard, std::ios::binary | std::ios::ate);
+                if (fs_.good()) {
+                    w_bytes += (double) fs_.tellg();
+                }
+            }
+        }
     }
     if (w_bytes <= 0.0) {
         LOG_WRN("--rpc-auto-weight: model file '%s' not readable yet (remote model?); "
