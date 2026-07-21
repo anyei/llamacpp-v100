@@ -43,12 +43,17 @@ services:
       - LLAMA_SSD_STREAM_GPU=1                                  # tier 1: VRAM slot cache (GPU landing)
       - LLAMA_SSD_STREAM_VRAM_BUDGET=${SSD_VRAM_MIB:-16384}     # VRAM cache, MiB
       - LLAMA_SSD_STREAM_BUDGET=${SSD_RAM_MIB:-32768}           # RAM cache, MiB
-      - LLAMA_SSD_STREAM_READ_THREADS=${SSD_READ_THREADS:-4}    # parallel O_DIRECT miss reads
+      - LLAMA_SSD_STREAM_READ_THREADS=${SSD_READ_THREADS:-4}    # parallel O_DIRECT miss reads (#55: also batches the CPU tier, +17% decode there)
+      # (#55) EXPERIMENTAL router-lookahead prefetch: predicts the next N tensors'
+      # experts from the previous token's routing. Measured NO-WIN for DeepSeek-V4
+      # (redundant with the LRU at practical budgets) - default off; the debug dump
+      # reports its prediction accuracy if you experiment (e.g. SSD_PREFETCH=6).
+      - LLAMA_SSD_STREAM_PREFETCH=${SSD_PREFETCH:-0}
       # SLRU scan-resistance (default on) + O_DIRECT (default on) + input_cpy reclaim
       # (default on) are already the best values — left at defaults intentionally.
       - GGML_SSD_STREAM_DEBUG=1                                 # log hit rates + miss-path timing
     command: >
-      -m /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf
+      -m /models/${SSD_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
       --host 0.0.0.0
       --port 8080
       -ngl 99
