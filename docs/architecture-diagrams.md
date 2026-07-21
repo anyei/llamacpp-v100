@@ -75,8 +75,44 @@ flowchart TD
   Batching is the scaling axis: B=8 measured x2.85 aggregate.
 - Constraint: exactly ONE local GPU may be a member (the owner); a second
   local GPU as expert member corrupts the reduce (#48, rejected at load).
+  REMOTE GPUs (a worker box's GPU) are legal members — they are just RPC
+  devices — but a small-VRAM card contributes little expert *capacity* while
+  adding a serialized hop, so worker RAM is usually the better member.
 - Slow-LINK boxes must stay out of the ring entirely: the cost is per
   boundary, not per byte (100-Mbit member = 0.42 vs 1.82 t/s, #28).
+
+### 3b. The capacity law: whose memory counts (layer vs EP)
+
+EP pools only what can hold *experts* — the owner takes no expert share and
+the second local GPU is excluded (#48) — while `-sm layer` pools every
+device. Worked example, GLM-5.2 Q2_K_XL (226.9 GiB + 8 GiB reserve =
+**240.5 GiB required**) on this fleet, 2026-07-21:
+
+```mermaid
+flowchart TB
+    subgraph EP["EP pool = worker RAM + owner only -> 178.6 GiB : HOLDS (62 GiB short)"]
+        direction LR
+        O1["CUDA0 owner<br/>~30 GiB"]:::gpu ---
+        E1["local worker<br/>~38 GiB"] --- E2[".11<br/>~58 GiB"] ---
+        E3[".25<br/>~28 GiB"] --- E4[".30<br/>~13 GiB"]
+        X1["CUDA1 32 GiB<br/>EXCLUDED (#48)"]:::dead
+        X2["1660 Ti 6 GiB<br/>legal, ~nil capacity"]:::dead
+    end
+    subgraph LAYER["-sm layer pool = every device -> 231.5 GiB : 9 GiB short, auto-starts when a box joins"]
+        direction LR
+        L0["CUDA0<br/>~30 GiB"]:::gpu --- L1["CUDA1<br/>~29 GiB"]:::gpu ---
+        L2["1660 Ti<br/>~5 GiB"]:::gpu --- L3["5 CPU workers<br/>~167 GiB"]
+    end
+    classDef gpu fill:#8ecae6,color:#000
+    classDef dead fill:#e5e5e5,color:#888,stroke-dasharray: 5 5
+```
+
+- The capacity gate prints exactly this math and, under `--rpc-discover`,
+  holds the load and starts it automatically when a new box beacons.
+- Sharded GGUFs are sized as the SUM of all `-NNNNN-of-NNNNN` siblings
+  (fixed 2026-07-21: 0-based `llama_split_prefix` — before that every
+  sharded model was silently sized as shard 1 alone, and auto-weight could
+  hand a worker more than its RAM).
 
 ## 4. Weight distribution on load (proto 4.8)
 
