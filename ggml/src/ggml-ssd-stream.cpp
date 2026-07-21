@@ -3,13 +3,16 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <list>
 #include <map>
@@ -62,6 +65,8 @@ struct slice_node {
     // fill-pass epoch: slices touched in the CURRENT pass are pinned against
     // eviction (their pages are queued for copy/H2D within this pass).
     uint64_t  pass = 0;
+    // inserted by the lookahead prefetcher and not yet demanded (accuracy stat)
+    bool      prefetched = false;
 };
 
 // index entry: which segment the slice lives in, and its node iterator.
@@ -125,6 +130,32 @@ struct ssd_stream_state {
     // (3.3 profiling, GGML_SSD_STREAM_DEBUG) miss-path time split: wall-clock ns
     // blocked in ssd_touch (RAM lookup / SSD pread) vs issuing the H2D copy.
     uint64_t gpu_read_ns = 0, gpu_h2d_ns = 0;
+
+    // ---- router-lookahead prefetch (TASKS.md #55) ---------------------------
+    // Predict the NEXT streamed tensors' expert sets from the PREVIOUS token
+    // pass (MoE routing has strong temporal locality across consecutive tokens)
+    // and pread them into the arena from a background thread while the current
+    // node computes - the demand path then RAM-hits instead of blocking on the
+    // SSD. All fields below are guarded by `mutex` except the queue (qmx).
+    int  pf_depth = 0;           // successor tensors to prefetch (0 = off)
+    bool pf_started = false;
+    // slices a prefetch read is filling RIGHT NOW: not yet in the index, and the
+    // demand path must wait on fill_cv instead of double-reading the same range
+    std::set<slice_key>     filling;
+    std::condition_variable fill_cv;
+    // per-tensor expert set of the previous pass + the stable bind order
+    std::unordered_map<const ggml_tensor *, std::vector<int32_t>> pf_last_ids;
+    std::vector<const ggml_tensor *>                  pf_order;
+    std::unordered_map<const ggml_tensor *, size_t>   pf_pos;
+    // per-(tensor,expert) demand counts: routing-skew histogram (debug dump)
+    std::unordered_map<const ggml_tensor *, std::vector<uint32_t>> use_counts;
+    uint64_t pf_issued = 0, pf_filled = 0, pf_used = 0, pf_dropped = 0;
+
+    std::thread             pf_worker;
+    std::mutex              pf_qmx;   // guards pf_queue + pf_stop only
+    std::condition_variable pf_qcv;
+    std::deque<slice_key>   pf_queue;
+    bool                    pf_stop = false;
 };
 
 ssd_stream_state g_state;
@@ -248,18 +279,27 @@ void ssd_demote_protected(void) {
 }
 
 // ensure expert slice (t,e) at [addr,addr+len) backed by file bytes at file_off
-// is resident; caller holds g_state.mutex. With defer_read=true the SLRU
+// is resident; caller holds g_state.mutex via lk. With defer_read=true the SLRU
 // bookkeeping/eviction/insertion happen now (serial) but the pread is SKIPPED and
 // the function returns true - the caller must then read [file_off,+len) into addr
 // itself (used to batch+parallelize the miss reads). Returns false when no read is
 // needed (RAM hit, or defer_read=false where the read was done inline).
-bool ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, size_t file_off,
-        bool defer_read = false) {
+bool ssd_touch(std::unique_lock<std::mutex> & lk, const ggml_tensor * t, int e, void * addr, size_t len,
+        int fd, size_t file_off, bool defer_read = false) {
     auto &  st  = g_state;
     slice_key key{ t, e };
+    // a lookahead prefetch may be mid-pread into this exact range: wait for it
+    // to land (it inserts into the index) instead of racing a second read
+    while (st.filling.count(key)) {
+        st.fill_cv.wait(lk);
+    }
     auto it = st.index.find(key);
     if (it != st.index.end()) {
         slice_ref & ref = it->second;
+        if (ref.it->prefetched) {
+            ref.it->prefetched = false;
+            st.pf_used++; // the prediction paid: demand hit on a prefetched slice
+        }
         if (ref.prot) {
             st.protectd.splice(st.protectd.begin(), st.protectd, ref.it); // -> protected MRU
         } else if (st.slru) {
@@ -318,6 +358,201 @@ bool ssd_touch(const ggml_tensor * t, int e, void * addr, size_t len, int fd, si
     st.resident_bytes += len;
     st.n_miss++;
     return defer_read; // caller reads the bytes when deferred
+}
+
+// read a batch of deferred miss reads with up to n_threads parallel workers,
+// each with its own O_DIRECT bounce from `bufs`/`caps` (resized as needed).
+// Parallelism is the lever: expert slices are MB-scale reads at random offsets,
+// so a single QD-1 stream leaves most of the NVMe's bandwidth on the table.
+struct ssd_read_task { int fd; char * dst; size_t len; size_t off; };
+
+bool ssd_read_batch(const std::vector<ssd_read_task> & reads, int n_threads,
+        std::vector<void *> & bufs, std::vector<size_t> & caps) {
+    if (reads.empty()) {
+        return true;
+    }
+    const int nt = std::max(1, std::min<int>(n_threads, (int) reads.size()));
+    if ((int) bufs.size() < nt) {
+        bufs.resize(nt, nullptr);
+        caps.resize(nt, 0);
+    }
+    std::atomic<bool> failed{false};
+    auto worker = [&](int wi) {
+        for (size_t j = (size_t) wi; j < reads.size(); j += (size_t) nt) {
+            const ssd_read_task & t = reads[j];
+            const bool ok = g_state.odirect
+                ? ssd_pread_odirect(t.fd, t.dst, t.len, t.off, &bufs[wi], &caps[wi], g_state.page_size)
+                : ssd_pread_buffered(t.fd, t.dst, t.len, t.off);
+            if (!ok) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) (nt - 1));
+    for (int wi = 1; wi < nt; ++wi) pool.emplace_back(worker, wi);
+    worker(0);
+    for (auto & th : pool) th.join();
+    return !failed.load();
+}
+
+// ---- router-lookahead prefetch (TASKS.md #55) ------------------------------
+//
+// The background worker drains predicted (tensor, expert) keys, preads the
+// missing ones into the arena and inserts them as probation-MRU entries. Reads
+// run WITHOUT g_state.mutex (own O_DIRECT bounce), so they overlap both the
+// consuming node's compute and the demand path's own reads (deeper NVMe queue).
+// Prefetch never overshoots the budget: if fitting a slice would require
+// evicting a current-pass-pinned entry, the prediction is dropped instead.
+
+void ssd_prefetch_worker() {
+    auto & st = g_state;
+    struct pf_read { slice_key key; void * addr; size_t len; int fd; size_t off; };
+    for (;;) {
+        std::vector<slice_key> batch;
+        {
+            std::unique_lock<std::mutex> qlk(st.pf_qmx);
+            st.pf_qcv.wait(qlk, [&] { return st.pf_stop || !st.pf_queue.empty(); });
+            if (st.pf_stop) {
+                return;
+            }
+            const size_t n = std::min<size_t>(st.pf_queue.size(), 16);
+            batch.assign(st.pf_queue.begin(), st.pf_queue.begin() + n);
+            st.pf_queue.erase(st.pf_queue.begin(), st.pf_queue.begin() + n);
+        }
+        std::vector<pf_read> reads;
+        {
+            std::unique_lock<std::mutex> lk(st.mutex);
+            for (const slice_key & key : batch) {
+                if (st.index.count(key) || st.filling.count(key)) {
+                    continue; // already resident or already being filled
+                }
+                auto reg = st.registry.find(key.t);
+                if (reg == st.registry.end()) {
+                    continue;
+                }
+                const size_t len = key.t->nb[2];
+                // evict to fit, but never a current-pass-pinned entry - drop instead
+                bool fits = true;
+                while (st.resident_bytes + len > st.budget_bytes) {
+                    std::list<slice_node> * seg = nullptr;
+                    if (!st.probation.empty() && st.probation.back().pass != st.cur_pass) {
+                        seg = &st.probation;
+                    } else if (!st.protectd.empty() && st.protectd.back().pass != st.cur_pass) {
+                        seg = &st.protectd;
+                    }
+                    if (seg == nullptr) {
+                        fits = false;
+                        break;
+                    }
+                    auto tail = std::prev(seg->end());
+                    ssd_evict(*tail);
+                    st.resident_bytes -= tail->len;
+                    if (seg == &st.protectd) {
+                        st.protected_bytes -= tail->len;
+                    }
+                    st.index.erase(tail->key);
+                    seg->pop_back();
+                }
+                if (!fits) {
+                    st.pf_dropped++;
+                    continue;
+                }
+                st.filling.insert(key);
+                st.resident_bytes += len; // reserved now so parallel fits stay honest
+                reads.push_back(pf_read{ key,
+                        (char *) key.t->data + (size_t) key.e * len, len,
+                        reg->second.fd, reg->second.offs + (size_t) key.e * len });
+            }
+        }
+        // parallel reads with worker-local bounces: the prefetcher's whole value
+        // on an IO-bound decode is DEEPENING the NVMe queue, not just overlap
+        static std::vector<void *> pf_bufs;
+        static std::vector<size_t> pf_caps;
+        std::vector<ssd_read_task> tasks;
+        tasks.reserve(reads.size());
+        for (const pf_read & r : reads) {
+            tasks.push_back(ssd_read_task{ r.fd, (char *) r.addr, r.len, r.off });
+        }
+        const bool ok = ssd_read_batch(tasks, st.read_threads, pf_bufs, pf_caps);
+        {
+            std::unique_lock<std::mutex> lk(st.mutex);
+            for (const pf_read & r : reads) {
+                st.filling.erase(r.key);
+                if (ok) {
+                    st.probation.push_front(slice_node{ r.key, r.addr, r.len, /*pass =*/ 0, /*prefetched =*/ true });
+                    st.index[r.key] = slice_ref{ false, st.probation.begin() };
+                    st.bytes_read += r.len;
+                    st.pf_filled++;
+                } else {
+                    // NOT fatal (unlike the demand path): nothing consumed these
+                    // pages and the entries never enter the index, so a later
+                    // demand simply re-reads them
+                    st.resident_bytes -= r.len;
+                    st.pf_dropped++;
+                }
+            }
+            st.fill_cv.notify_all();
+        }
+    }
+}
+
+// record this pass's expert set for tensor t and enqueue the PREDICTED sets of
+// the next pf_depth streamed tensors (previous-pass ids). Caller holds st.mutex.
+// The bind order wraps, so the tail of a token prefetches the next token's head.
+void ssd_prefetch_observe(const ggml_tensor * t, std::vector<int32_t> && ids) {
+    auto & st = g_state;
+    if (st.pf_depth <= 0 || ids.empty()) {
+        return;
+    }
+    if (!st.pf_started) {
+        st.pf_started = true;
+        st.pf_worker  = std::thread(ssd_prefetch_worker);
+    }
+    for (const int32_t e : ids) {
+        auto & counts = st.use_counts[t];
+        if (counts.size() < (size_t) t->ne[2]) {
+            counts.resize((size_t) t->ne[2], 0);
+        }
+        counts[e]++;
+    }
+    auto pit = st.pf_pos.find(t);
+    if (pit == st.pf_pos.end()) {
+        pit = st.pf_pos.emplace(t, st.pf_order.size()).first;
+        st.pf_order.push_back(t);
+    }
+    st.pf_last_ids[t] = std::move(ids);
+    const size_t n_order = st.pf_order.size();
+    if (n_order < 2) {
+        return;
+    }
+    size_t enq = 0;
+    {
+        std::lock_guard<std::mutex> qlk(st.pf_qmx);
+        for (int k = 1; k <= st.pf_depth && (size_t) k < n_order; k++) {
+            const ggml_tensor * s = st.pf_order[(pit->second + (size_t) k) % n_order];
+            auto lit = st.pf_last_ids.find(s);
+            if (lit == st.pf_last_ids.end()) {
+                continue;
+            }
+            for (const int32_t e : lit->second) {
+                const slice_key key{ s, (int) e };
+                if (st.index.count(key) || st.filling.count(key)) {
+                    continue;
+                }
+                if (st.pf_queue.size() >= 1024) {
+                    st.pf_queue.pop_front(); // best-effort: newest predictions win
+                    st.pf_dropped++;
+                }
+                st.pf_queue.push_back(key);
+                enq++;
+            }
+        }
+    }
+    if (enq > 0) {
+        st.pf_issued += enq;
+        st.pf_qcv.notify_one();
+    }
 }
 
 // ---- GPU expert-slot cache policy (increment 3.2a) -------------------------
@@ -468,7 +703,26 @@ const char * ssd_buft_get_name(ggml_backend_buffer_type_t) {
 // clears the registry + SLRU + counters. Caller must NOT hold g_state.mutex.
 static void ssd_stream_reset() {
     auto & st = g_state;
+    // stop the prefetch worker BEFORE taking st.mutex: it may be blocked on that
+    // mutex mid-fill, and joining while holding it would deadlock. After the join
+    // no other thread touches the streaming state.
+    if (st.pf_started) {
+        {
+            std::lock_guard<std::mutex> qlk(st.pf_qmx);
+            st.pf_stop = true;
+        }
+        st.pf_qcv.notify_all();
+        st.pf_worker.join();
+        st.pf_started = false;
+        st.pf_stop    = false;
+        st.pf_queue.clear();
+    }
     std::lock_guard<std::mutex> lock(st.mutex);
+    st.filling.clear();
+    st.pf_last_ids.clear();
+    st.pf_order.clear();
+    st.pf_pos.clear();
+    st.use_counts.clear();
     for (auto & kv : g_gpu_pools) {
         if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
         if (kv.second.ctx) ggml_free(kv.second.ctx);
@@ -627,14 +881,20 @@ bool ggml_ssd_stream_enabled(void) {
         st.read_threads = rt ? atoi(rt) : 1;
         if (st.read_threads < 1)  st.read_threads = 1;
         if (st.read_threads > 16) st.read_threads = 16;
+        // (#55) router-lookahead prefetch: how many SUCCESSOR streamed tensors to
+        // prefetch from the previous token's routing (3 tensors ~= 1 MoE layer)
+        const char * pf = getenv("LLAMA_SSD_STREAM_PREFETCH");
+        st.pf_depth = pf ? atoi(pf) : 0;
+        if (st.pf_depth < 0)  st.pf_depth = 0;
+        if (st.pf_depth > 64) st.pf_depth = 64;
         st.enabled_checked = true;
         if (st.enabled) {
             st.debug = getenv("GGML_SSD_STREAM_DEBUG") != nullptr;
-            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s%s, read-threads %d\n",
+            GGML_LOG_INFO("ggml_ssd_stream: enabled, expert-cache budget %zu MiB, policy %s%s, read-threads %d, prefetch %d\n",
                     st.budget_bytes / (1024 * 1024),
                     st.slru ? "SLRU" : "LRU",
                     st.gpu ? " [GPU slot cache ON]" : "",
-                    st.read_threads);
+                    st.read_threads, st.pf_depth);
         }
     }
     return st.enabled;
@@ -794,7 +1054,7 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
         input_cpy == nullptr || backend == nullptr || ids == nullptr || n_ids <= 0 || n_expert <= 0) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_state.mutex);
+    std::unique_lock<std::mutex> lock(g_state.mutex);
     g_state.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     const gpu_pool_key key{ input->ne[0], input->ne[1], (int) input->type, (const void *) backend };
     auto pit = g_gpu_pools.find(key);
@@ -828,11 +1088,11 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
     const bool par  = g_state.read_threads > 1;
     auto reg = g_state.registry.find(input);
     const bool have_reg = reg != g_state.registry.end();
-    struct read_task { int fd; char * dst; size_t len; size_t off; };
     std::vector<std::pair<int32_t,int>> misses; // (expert, slot) needing an H2D
-    std::vector<read_task>              reads;  // VRAM misses that also missed RAM
+    std::vector<ssd_read_task>          reads;  // VRAM misses that also missed RAM
 
     std::vector<int32_t> expert_to_slot((size_t) n_expert, -1);
+    std::vector<int32_t> used; // deduped selection: routing histogram + lookahead prediction
     auto tp0 = std::chrono::steady_clock::now();
     for (int64_t i1 = 0; i1 < ne1; i1++) {
         for (int64_t i0 = 0; i0 < ne0; i0++) {
@@ -840,6 +1100,7 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
             if (e < 0 || e >= n_expert || expert_to_slot[e] != -1) {
                 continue;
             }
+            used.push_back(e);
             bool miss = false;
             const int slot = pe.pool.touch(slice_key{ input, (int) e }, &miss);
             if (slot < 0) {
@@ -854,48 +1115,26 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
                     // slice - inline when serial, or deferred to the parallel phase.
                     char * dst = (char *) input->data + (size_t) e * slice;
                     const size_t foff = reg->second.offs + (size_t) e * slice;
-                    if (ssd_touch(input, (int) e, dst, slice, reg->second.fd, foff, /*defer_read=*/par)) {
-                        reads.push_back(read_task{ reg->second.fd, dst, slice, foff });
+                    if (ssd_touch(lock, input, (int) e, dst, slice, reg->second.fd, foff, /*defer_read=*/par)) {
+                        reads.push_back(ssd_read_task{ reg->second.fd, dst, slice, foff });
                     }
                 }
             }
         }
     }
+    ssd_prefetch_observe(input, std::move(used));
     auto tp1 = std::chrono::steady_clock::now();
 
     // (2) read the RAM-missed slices. Parallel across read_threads workers, each with
     // its own O_DIRECT bounce buffer (distinct dst + bounce -> no shared state).
     if (par && !reads.empty()) {
-        const int nt = std::min<int>(g_state.read_threads, (int) reads.size());
-        if ((int) g_state.rbufs.size() < nt) {
-            g_state.rbufs.resize(nt, nullptr);
-            g_state.rbuf_caps.resize(nt, 0);
-        }
-        std::atomic<bool> read_failed{false};
-        auto worker = [&](int wi) {
-            for (size_t j = (size_t) wi; j < reads.size(); j += (size_t) nt) {
-                const read_task & t = reads[j];
-                const bool ok = g_state.odirect
-                    ? ssd_pread_odirect(t.fd, t.dst, t.len, t.off,
-                            &g_state.rbufs[wi], &g_state.rbuf_caps[wi], g_state.page_size)
-                    : ssd_pread_buffered(t.fd, t.dst, t.len, t.off);
-                if (!ok) {
-                    read_failed.store(true, std::memory_order_relaxed);
-                }
-            }
-        };
-        std::vector<std::thread> pool;
-        pool.reserve((size_t) (nt - 1));
-        for (int wi = 1; wi < nt; ++wi) pool.emplace_back(worker, wi);
-        worker(0);
-        for (auto & th : pool) th.join();
-        if (read_failed.load()) {
+        if (!ssd_read_batch(reads, g_state.read_threads, g_state.rbufs, g_state.rbuf_caps)) {
             // same rationale as ssd_pread_full: the slices are already marked
             // resident and phase 3 would H2D unfilled pages - fail loudly.
             GGML_ABORT("ggml_ssd_stream: disk read failed in a parallel miss-read worker - "
                        "cannot continue safely with unfilled expert weights");
         }
-        for (const read_task & t : reads) g_state.bytes_read += t.len;
+        for (const ssd_read_task & t : reads) g_state.bytes_read += t.len;
     }
     auto tp2 = std::chrono::steady_clock::now();
 
@@ -967,6 +1206,25 @@ bool ggml_ssd_stream_gpu_bind(ggml_tensor * node, const ggml_tensor * input, ggm
                     (unsigned long long) g_state.n_hit, (unsigned long long) g_state.n_miss,
                     ram_tot ? 100.0 * g_state.n_hit / ram_tot : 0.0,
                     g_state.gpu_read_ns / 1e9, g_state.gpu_h2d_ns / 1e9);
+            if (g_state.pf_depth > 0) {
+                // routing skew: what share of demand goes to the top-decile experts
+                // (the "learned pinning" question - high share => pinning could pay)
+                uint64_t skew_tot = 0, skew_top = 0;
+                for (const auto & kv : g_state.use_counts) {
+                    std::vector<uint32_t> c = kv.second;
+                    std::sort(c.begin(), c.end(), std::greater<uint32_t>());
+                    const size_t top = std::max<size_t>(1, c.size() / 10);
+                    for (size_t i = 0; i < c.size(); i++) {
+                        skew_tot += c[i];
+                        if (i < top) skew_top += c[i];
+                    }
+                }
+                GGML_LOG_INFO("ggml_ssd_stream: prefetch issued=%llu filled=%llu used=%llu dropped=%llu (accuracy %.1f%%) | top-10%% expert share %.1f%%\n",
+                        (unsigned long long) g_state.pf_issued, (unsigned long long) g_state.pf_filled,
+                        (unsigned long long) g_state.pf_used, (unsigned long long) g_state.pf_dropped,
+                        g_state.pf_filled ? 100.0 * g_state.pf_used / g_state.pf_filled : 0.0,
+                        skew_tot ? 100.0 * skew_top / skew_tot : 0.0);
+            }
         }
     }
     return true;
@@ -1047,7 +1305,7 @@ void ggml_ssd_stream_prefill_experts(const ggml_tensor * w, const uint32_t * use
         return;
     }
     auto & st = g_state;
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
     st.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     auto reg = st.registry.find(w);
     if (reg == st.registry.end()) {
@@ -1061,7 +1319,7 @@ void ggml_ssd_stream_prefill_experts(const ggml_tensor * w, const uint32_t * use
         if (used_ids && !ggml_bitset_get(used_ids, e)) {
             continue;
         }
-        ssd_touch(w, (int) e, base + (size_t) e * slice, slice, fd, offs + (size_t) e * slice);
+        ssd_touch(lock, w, (int) e, base + (size_t) e * slice, slice, fd, offs + (size_t) e * slice);
     }
 #else
     GGML_UNUSED(w); GGML_UNUSED(used_ids); GGML_UNUSED(n_expert);
@@ -1092,7 +1350,7 @@ bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     }
 
     auto & st = g_state;
-    std::lock_guard<std::mutex> lock(st.mutex);
+    std::unique_lock<std::mutex> lock(st.mutex);
     st.cur_pass++; // new fill pass: slices touched below are pinned until it ends
     auto reg = st.registry.find(w);
     if (reg == st.registry.end()) {
@@ -1107,13 +1365,37 @@ bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
 
     const int64_t   n_ids   = ggml_nelements(ids);
     const int32_t * id_data = (const int32_t *) ids->data;
+    std::vector<int32_t> used;
+    std::vector<bool>    seen((size_t) n_expert, false);
+    // defer the miss reads and issue them as one parallel batch: MB-scale slices
+    // at random offsets are latency-bound at QD1, and a node misses several at once
+    const bool par = st.read_threads > 1;
+    std::vector<ssd_read_task> deferred;
     for (int64_t k = 0; k < n_ids; k++) {
         const int32_t e = id_data[k];
-        if (e < 0 || e >= n_expert) {
+        if (e < 0 || e >= n_expert || seen[e]) {
             continue;
         }
-        ssd_touch(w, (int) e, base + (size_t) e * slice, slice, fd, offs + (size_t) e * slice);
+        seen[e] = true;
+        used.push_back(e);
+        char *       dst  = base + (size_t) e * slice;
+        const size_t foff = offs + (size_t) e * slice;
+        if (ssd_touch(lock, w, (int) e, dst, slice, fd, foff, /*defer_read=*/par)) {
+            deferred.push_back(ssd_read_task{ fd, dst, slice, foff });
+        }
     }
+    if (!deferred.empty()) {
+        if (!ssd_read_batch(deferred, st.read_threads, st.rbufs, st.rbuf_caps)) {
+            // same rationale as ssd_pread_full: the slices are already marked
+            // resident - continuing would serve unfilled expert weights
+            GGML_ABORT("ggml_ssd_stream: disk read failed in a parallel miss-read worker - "
+                       "cannot continue safely with unfilled expert weights");
+        }
+        for (const ssd_read_task & t : deferred) {
+            st.bytes_read += t.len;
+        }
+    }
+    ssd_prefetch_observe(w, std::move(used));
     if (st.debug && (st.n_hit + st.n_miss) % 4000 < (uint64_t) n_ids) {
         const uint64_t total = st.n_hit + st.n_miss;
         GGML_LOG_INFO("ggml_ssd_stream: hits=%llu miss=%llu (hit %.1f%%) promote=%llu evict=%llu resident=%zuMiB (prot %zuMiB) read=%.2fGB\n",
@@ -1122,6 +1404,12 @@ bool ggml_ssd_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
                 (unsigned long long) st.n_promote, (unsigned long long) st.n_evict,
                 st.resident_bytes / (1024*1024), st.protected_bytes / (1024*1024),
                 st.bytes_read / 1e9);
+        if (st.pf_depth > 0) {
+            GGML_LOG_INFO("ggml_ssd_stream: prefetch issued=%llu filled=%llu used=%llu dropped=%llu (accuracy %.1f%%)\n",
+                    (unsigned long long) st.pf_issued, (unsigned long long) st.pf_filled,
+                    (unsigned long long) st.pf_used, (unsigned long long) st.pf_dropped,
+                    st.pf_filled ? 100.0 * st.pf_used / st.pf_filled : 0.0);
+        }
     }
     return true; // node-at-a-time: guarantees ids and all deps are computed before the fill
 }
