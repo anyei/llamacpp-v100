@@ -1107,6 +1107,20 @@ public:
         std::string                load_split_mode;
         std::vector<planned_dev_t> load_plan;
 
+        // initialization timing (TASKS.md #63): fleet-wide load duration plus
+        // per-worker share-ready milestones, sampled on the model thread (progress
+        // callback) and by the status handler (hence mutable, like fail_history).
+        // load_ms stays until the next load so the fleet screen can keep showing
+        // it after the loading page is gone.
+        int64_t t_load_start_ms = 0; // stamped when the load plan is captured
+        int64_t load_ms         = 0; // last completed load duration; 0 = none yet
+        struct init_track {
+            int64_t t_ready_ms       = 0;    // hit the planned-share threshold (live)
+            int64_t t_last_growth_ms = 0;    // last time this device's bytes grew
+            double  last_done_mib    = -1.0;
+        };
+        mutable std::map<std::string, init_track> init_times; // endpoint, or local device name
+
         std::thread       listener;
         std::atomic<bool> stop{false};
 
@@ -1117,6 +1131,68 @@ public:
             }
         }
     } fleet;
+
+    // per-worker init milestones (TASKS.md #63): a worker is "placed" when its
+    // observed weight bytes reach its planned share (same 97% rule as the loading
+    // page). Sampled from the model thread's progress callback - so headless loads
+    // get timed too - and from the status handler (const, hence mutable state).
+    void fleet_sample_init_times() const {
+        typedef void (*foreach_stat_t)(void (*)(const char *, const ggml_backend_rpc_ep_stats *, void *), void *);
+        static const foreach_stat_t foreach_stat_fn = []() {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg != nullptr
+                ? (foreach_stat_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_foreach_endpoint_stat")
+                : (foreach_stat_t) nullptr;
+        }();
+        std::map<std::string, ggml_backend_rpc_ep_stats> live;
+        if (foreach_stat_fn != nullptr) {
+            foreach_stat_fn([](const char * ep, const ggml_backend_rpc_ep_stats * st, void * ud) {
+                (*(std::map<std::string, ggml_backend_rpc_ep_stats> *) ud)[ep] = *st;
+            }, &live);
+        }
+        const int64_t t_now = ggml_time_ms();
+        std::lock_guard<std::mutex> lock(fleet.mutex);
+        if (fleet.t_load_start_ms == 0 || fleet.load_ms != 0) {
+            return; // no load in flight
+        }
+        for (const auto & p : fleet.load_plan) {
+            const std::string key = !p.endpoint.empty() ? p.endpoint : p.name;
+            auto & rec = fleet.init_times[key];
+            if (rec.t_ready_ms != 0) {
+                continue;
+            }
+            double done_mib = 0.0;
+            if (!p.endpoint.empty()) {
+                auto it = live.find(p.endpoint);
+                if (it != live.end()) {
+                    done_mib = (double) (it->second.weights_cached_bytes + it->second.weights_streamed_bytes) / (1024.0 * 1024.0);
+                }
+            } else if (p.free_start_mib >= 0) {
+                // local device: VRAM delta from the load-start snapshot
+                ggml_backend_dev_t dev = ggml_backend_dev_by_name(p.name.c_str());
+                if (dev != nullptr) {
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                    done_mib = (double) p.free_start_mib - (double) (free_mem / (1024 * 1024));
+                }
+            }
+            // fallback signal for the end-of-load stamp: when the counters last
+            // grew (0.5 MiB floor filters local free-mem jitter)
+            if (done_mib > rec.last_done_mib + 0.5) {
+                rec.t_last_growth_ms = t_now;
+                rec.last_done_mib    = done_mib;
+            }
+            // same expected-share rule as the loading page: attention owners and
+            // shareless devices have no measurable target. 97% is optimistic for
+            // whole-model shares (CPU-kept tensors like token_embd never arrive) -
+            // those are settled at load end from t_last_growth_ms instead.
+            const double expected_mib = p.attn_owner || p.split_frac <= 0.0 ? 0.0
+                : p.split_frac * (double) fleet.load_model_bytes / (1024.0 * 1024.0);
+            if (expected_mib > 0.0 && done_mib >= 0.97 * expected_mib) {
+                rec.t_ready_ms = t_now;
+            }
+        }
+    }
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
@@ -1416,6 +1492,9 @@ private:
         }
 
         std::lock_guard<std::mutex> lock(fleet.mutex);
+        fleet.t_load_start_ms = ggml_time_ms();
+        fleet.load_ms         = 0;
+        fleet.init_times.clear();
         fleet.load_model_name  = std::filesystem::path(params_base.model.path).filename().string();
         fleet.load_model_bytes = model_bytes;
         fleet.load_split_mode  = params_base.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer"
@@ -1758,6 +1837,7 @@ private:
             std::lock_guard<std::mutex> lock(d->ctx->fleet.mutex);
             d->ctx->fleet.load_stage = d->stage;
         }
+        d->ctx->fleet_sample_init_times();
         if (d->ctx->callback_state) {
             d->ctx->callback_state(SERVER_STATE_LOADING, {
                 {"stages", d->stages},
@@ -2269,6 +2349,25 @@ private:
                             "split reserved %.0f MiB - a memory-capped member can OOM at decode; "
                             "set LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB=%.0f and reload\n",
                             ggml_backend_dev_name(dev), actual_mib, reserve_mib, actual_mib * 1.25);
+                }
+            }
+        }
+        // close out the init clocks (TASKS.md #63): the model is ready, so every
+        // planned share is placed - devices the share threshold never caught are
+        // settled from when their counters last grew (their stream actually
+        // finished), or the full duration as the upper bound
+        fleet_sample_init_times();
+        {
+            std::lock_guard<std::mutex> lock(fleet.mutex);
+            const int64_t t_now = ggml_time_ms();
+            if (fleet.t_load_start_ms > 0) {
+                fleet.load_ms = t_now - fleet.t_load_start_ms;
+            }
+            for (const auto & p : fleet.load_plan) {
+                const std::string key = !p.endpoint.empty() ? p.endpoint : p.name;
+                auto & rec = fleet.init_times[key];
+                if (rec.t_ready_ms == 0) {
+                    rec.t_ready_ms = rec.t_last_growth_ms > 0 ? rec.t_last_growth_ms : t_now;
                 }
             }
         }
@@ -5523,6 +5622,9 @@ void server_routes::init_routes() {
         const auto & procs = fleet_procs();
         const auto & fleet = ctx_server.fleet;
 
+        // record init milestones this poll may be first to observe (#63)
+        ctx_server.fleet_sample_init_times();
+
         // copy the mutex-guarded state up front
         std::map<std::string, int32_t> layer_map;
         std::map<std::string, server_context_impl::fleet_state_t::beacon_t> beacons;
@@ -5531,6 +5633,9 @@ void server_routes::init_routes() {
         size_t      load_model_bytes = 0;
         std::string load_split_mode;
         std::vector<server_context_impl::fleet_state_t::planned_dev_t> load_plan;
+        int64_t t_load_start_ms = 0;
+        int64_t load_ms         = 0;
+        std::map<std::string, server_context_impl::fleet_state_t::init_track> init_times;
         size_t  perf_window_n = 0;
         int64_t perf_n_tokens = 0;
         double  perf_t_gen_ms = 0.0;
@@ -5545,6 +5650,9 @@ void server_routes::init_routes() {
             load_model_bytes = fleet.load_model_bytes;
             load_split_mode  = fleet.load_split_mode;
             load_plan        = fleet.load_plan;
+            t_load_start_ms  = fleet.t_load_start_ms;
+            load_ms          = fleet.load_ms;
+            init_times       = fleet.init_times;
             perf_window_n    = fleet.perf_history.size();
             for (const auto & p : fleet.perf_history) {
                 perf_n_tokens += p.n_decoded;
@@ -5556,6 +5664,13 @@ void server_routes::init_routes() {
         // then the model thread may still be assigning it (the status endpoint is
         // exempt from the loading-503 gate, so this handler can run concurrently)
         const bool ready = fleet.ready.load();
+
+        // init time relative to load start (#63); null until the share is placed
+        auto init_ms_of = [&](const std::string & key) -> json {
+            const auto it = init_times.find(key);
+            return t_load_start_ms > 0 && it != init_times.end() && it->second.t_ready_ms != 0
+                ? json(it->second.t_ready_ms - t_load_start_ms) : json(nullptr);
+        };
 
         std::set<std::string> pipeline_eps;
         json devices = json::array();
@@ -5637,6 +5752,7 @@ void server_routes::init_routes() {
                     {"stats",            nullptr},
                     {"score",            nullptr},
                     {"timing",           nullptr},
+                    {"init_ms",          init_ms_of(is_rpc ? ep : ggml_backend_dev_name(dev))},
                 };
                 auto lit = layer_map.find(ggml_backend_dev_name(dev));
                 if (lit != layer_map.end()) {
@@ -5786,7 +5902,12 @@ void server_routes::init_routes() {
         }
         if (loading) {
             body["load_progress"] = { {"value", progress}, {"stage", load_stage} };
+            if (t_load_start_ms > 0) {
+                body["load_progress"]["elapsed_ms"] = ggml_time_ms() - t_load_start_ms;
+            }
         }
+        // last completed load duration (#63); survives until the next load starts
+        body["load_ms"] = load_ms > 0 ? json(load_ms) : json(nullptr);
         // per-worker load view (TASKS.md #35a): while the model is loading the
         // params-gated devices[] is empty, so merge the load PLAN (planned split
         // share + predicted layers, captured on the model thread at load start)
@@ -5813,6 +5934,7 @@ void server_routes::init_routes() {
                     {"n_layers",   n_layers >= 0 ? json(n_layers) : json(nullptr)},
                     {"worker_is_cpu", std::move(worker_is_cpu)}, // null = unknown (unplanned endpoint)
                     {"attn_owner", attn_owner}, // EP: holds attention, no expert share
+                    {"init_ms",    init_ms_of(!ep.empty() ? ep : name)},
                     {"score",      nullptr},
                     {"free_mib",   nullptr},
                     {"bytes_sent", nullptr},

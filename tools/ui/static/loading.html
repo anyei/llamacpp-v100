@@ -141,6 +141,12 @@
 				return n + ' B';
 			}
 
+			function fmtDur(ms) {
+				if (ms < 1000) return ms + ' ms';
+				if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + ' s';
+				return Math.floor(ms / 60000) + 'm ' + Math.round((ms % 60000) / 1000) + 's';
+			}
+
 			// the SPA stores its config (incl. the API key) in localStorage; the
 			// static loading page has no settings UI, so read the same key here or
 			// /fleet/status 401s when the coordinator runs with --api-key
@@ -186,7 +192,8 @@
 				const lp = d.load_progress || {};
 				document.getElementById('stage').textContent =
 					'Stage: ' + (lp.stage || '…') +
-					(typeof lp.value === 'number' ? '  ·  ' + Math.round(lp.value * 100) + '%' : '');
+					(typeof lp.value === 'number' ? '  ·  ' + Math.round(lp.value * 100) + '%' : '') +
+					(typeof lp.elapsed_ms === 'number' ? '  ·  ' + fmtDur(lp.elapsed_ms) + ' elapsed' : '');
 				document.getElementById('bar').style.width =
 					(typeof lp.value === 'number' ? Math.max(2, lp.value * 100) : 2) + '%';
 
@@ -206,6 +213,11 @@
 					host.innerHTML = '<div class="empty">Connecting to workers…</div>';
 					return;
 				}
+				// #64: the rows are rebuilt wholesale every tick, which would replace a
+				// freshly-opened <details> with a closed one - carry the open set over
+				const openKeys = new Set(
+					Array.from(host.querySelectorAll('details.meta[open]')).map((el) => el.dataset.key)
+				);
 				host.innerHTML = workers.map((w) => {
 					const key = w.endpoint || w.name;
 					const label = w.endpoint ? w.name + ' \u00b7 ' + w.endpoint : w.name + ' \u00b7 local';
@@ -250,6 +262,8 @@
 					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
 					if (cachedMib > 0) badges.push('<span class="badge score">' + (cachedMib / 1024).toFixed(1) + ' GiB cached</span>');
 					if (streamedMib > 0) badges.push('<span class="badge">' + (streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
+					// #63: coordinator-measured init time (load start -> share placed)
+					if (w.init_ms != null) badges.push('<span class="badge score">init ' + fmtDur(w.init_ms) + '</span>');
 					const detail = [
 						w.score ? w.score.bw_gbps.toFixed(1) + ' GB/s' : null,
 						w.n_layers != null ? w.n_layers + ' layers' : null,
@@ -264,7 +278,10 @@
 						'<span class="rate">' + rate + '</span></div>' +
 						bar +
 						'<div class="badges">' + badges.join('') + '</div>' +
-						(detail ? '<details class="meta"><summary>details</summary>' + detail + '</details>' : '') +
+						(detail
+							? '<details class="meta" data-key="' + esc(key) + '"' + (openKeys.has(key) ? ' open' : '') + '>' +
+							  '<summary>details</summary>' + detail + '</details>'
+							: '') +
 						'</div>'
 					);
 				}).join('');

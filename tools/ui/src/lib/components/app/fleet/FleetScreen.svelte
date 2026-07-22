@@ -86,6 +86,13 @@
 		return (mib / 1024).toFixed(mib >= 100 * 1024 ? 0 : 1);
 	}
 
+	function formatDuration(ms: number): string {
+		if (ms < 1000) return `${ms} ms`;
+		if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+
+		return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+	}
+
 	// Rank the fastest/slowest scored RPC devices (needs at least two to compare)
 	let deviceRanks = $derived.by(() => {
 		const ranks: Record<string, 'fastest' | 'slowest'> = {};
@@ -323,7 +330,12 @@
 				<div class="flex justify-between text-xs text-muted-foreground">
 					<span>Loading model — {status.load_progress.stage}</span>
 
-					<span>{Math.round(status.load_progress.value * 100)}%</span>
+					<span>
+						{Math.round(status.load_progress.value * 100)}%
+						{#if status.load_progress.elapsed_ms != null}
+							· {formatDuration(status.load_progress.elapsed_ms)}
+						{/if}
+					</span>
 				</div>
 
 				<div class="h-2 w-full overflow-hidden rounded-full bg-muted">
@@ -413,6 +425,16 @@
 								{status.perf.tg_avg_tps.toFixed(2)}
 								<span class="font-normal text-muted-foreground">/ {status.perf.window_n} req</span>
 							</div>
+						</div>
+					{/if}
+
+					{#if status.load_ms != null}
+						<div
+							class="bg-card p-2"
+							title="fleet initialization time of the last load: load start -> model ready (per-worker times are on the device cards)"
+						>
+							<div class="text-[10px] uppercase tracking-wide text-muted-foreground">init</div>
+							<div class="text-sm font-semibold">{formatDuration(status.load_ms)}</div>
 						</div>
 					{/if}
 

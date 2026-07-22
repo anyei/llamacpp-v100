@@ -73,6 +73,13 @@
 
 	let latencyMs = $derived(device.stats ? (device.stats.ewma_latency_us / 1000).toFixed(1) : null);
 
+	function formatDuration(ms: number): string {
+		if (ms < 1000) return `${ms} ms`;
+		if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+
+		return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+	}
+
 	function statusColor(): string {
 		if (device.failed) return 'bg-red-500';
 		if (!device.reachable) return 'bg-gray-500';
@@ -165,6 +172,16 @@
 			{#if device.score}
 				<Badge variant="outline" class="text-[10px]">
 					{device.score.bw_gbps.toFixed(1)} GB/s
+				</Badge>
+			{/if}
+
+			{#if device.init_ms != null}
+				<Badge
+					variant="outline"
+					class="text-[10px]"
+					title="initialization time of the last load: load start -> this device's share fully placed"
+				>
+					init {formatDuration(device.init_ms)}
 				</Badge>
 			{/if}
 

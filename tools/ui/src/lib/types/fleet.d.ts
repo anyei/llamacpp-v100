@@ -51,6 +51,9 @@ export interface ApiFleetDevice {
 	stats?: ApiFleetDeviceStats | null;
 	score?: ApiFleetDeviceScore | null;
 	timing?: ApiFleetDeviceTiming | null;
+	/** Initialization time of the last load: load start -> this device's share
+	 * fully placed, ms. Null when unmeasured. */
+	init_ms?: number | null;
 }
 
 /** A worker announced on the LAN via discovery (may or may not be in the pipeline). */
@@ -72,6 +75,8 @@ export interface ApiFleetLoadProgress {
 	/** Progress 0..1 */
 	value: number;
 	stage: string;
+	/** Time since the load started, ms. */
+	elapsed_ms?: number | null;
 }
 
 /** Pipeline reload / recovery state. */
@@ -125,6 +130,8 @@ export interface ApiFleetStatusResponse {
 	} | null;
 	preflight?: ApiFleetPreflight | null;
 	perf?: ApiFleetPerf | null;
+	/** Duration of the last completed model load, ms (null until one finishes). */
+	load_ms?: number | null;
 }
 
 /** Response of `GET ./fleet/worker/log`. */
