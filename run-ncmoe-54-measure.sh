@@ -59,7 +59,14 @@ docker run -d --name llama-ncmoe-54 --gpus all \
     --host 0.0.0.0 --port 8080 -np 1 -fit off
 
 echo "--- waiting for the model (first tokens are cold; cache warms as it decodes)"
-until curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do sleep 5; done
+until curl -sf --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; do
+    if [[ "$(docker inspect -f '{{.State.Running}}' llama-ncmoe-54 2>/dev/null)" != "true" ]]; then
+        echo "--- FAILED: container died during load; last log lines:"
+        docker logs --tail 12 llama-ncmoe-54 2>&1
+        exit 1
+    fi
+    sleep 5
+done
 
 read_sectors() { awk '{print $3}' /sys/block/nvme0n1/stat; }
 
