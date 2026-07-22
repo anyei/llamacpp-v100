@@ -988,10 +988,11 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_FALCON_H1:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
-        case LLM_ARCH_DEEPSEEK2:
-        case LLM_ARCH_DEEPSEEK32:
-        case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_GLM_DSA:
+        // NOT listed: DEEPSEEK2/DEEPSEEK32/DEEPSEEK4/GLM_DSA - this tree supports
+        // them in tensor mode via the mirrored-attention path (single shared
+        // latent head; validated in TASKS.md #13/#28/#39). The pre-merge gate
+        // checked model->devices (empty at create time) and never fired; the
+        // merged params-based gate does, so listing them here blocks EP.
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
         case LLM_ARCH_NEMOTRON_H:

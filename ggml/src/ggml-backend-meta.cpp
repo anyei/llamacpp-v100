@@ -1126,11 +1126,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
+            // the split axis can carry through unchanged (same position, stride and
+            // full extent) while the view elides OTHER dims - e.g. the post-merge
+            // MoE weighted-sum views one expert's rows out of [hidden, expert, token],
+            // which breaks the stride-of-next-dim match below
+            if (tensor->nb[axis] == tensor->src[0]->nb[axis] && tensor->ne[axis] == tensor->src[0]->ne[axis]) {
+                return {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+            }
             for (int dim = 0; dim < GGML_MAX_DIMS-1; dim++) {
                 if (tensor->nb[dim+1] == tensor->src[0]->nb[axis+1]) {
                     return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                 }
             }
+            GGML_LOG_ERROR("%s: unmapped view '%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
+                           "of '%s' (op %s, split axis %d) ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu]\n",
+                           __func__, tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                           tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                           tensor->src[0]->name, ggml_op_name(tensor->src[0]->op), axis,
+                           tensor->src[0]->ne[0], tensor->src[0]->ne[1], tensor->src[0]->ne[2], tensor->src[0]->ne[3],
+                           tensor->src[0]->nb[0], tensor->src[0]->nb[1], tensor->src[0]->nb[2], tensor->src[0]->nb[3]);
             GGML_ABORT("fatal error");
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -1290,6 +1304,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
+        }
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            (src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_2 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_1 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0)) {
+            for (int s = 0; s < 6; s++) {
+                GGML_LOG_ERROR("%s: '%s' src[%d] '%s' (op %s) split axis %d\n", __func__, tensor->name,
+                               s, tensor->src[s] ? tensor->src[s]->name : "?",
+                               tensor->src[s] ? ggml_op_name(tensor->src[s]->op) : "?", src_ss[s].axis);
+            }
         }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
