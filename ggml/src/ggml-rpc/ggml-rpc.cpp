@@ -948,6 +948,13 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
                        response.major, response.minor, response.patch, RPC_PROTO_MAJOR_VERSION);
         return false;
     }
+    // patch is the ggml op-enum fingerprint (see ggml-rpc.h) - on a mismatch
+    // serialized graphs decode to DIFFERENT ops on the worker; reject loudly
+    if (response.patch != RPC_PROTO_PATCH_VERSION) {
+        GGML_LOG_ERROR("RPC server op-set mismatch: %d.%d.%d (need patch %d) - rebuild the worker from this tree\n",
+                       response.major, response.minor, response.patch, RPC_PROTO_PATCH_VERSION);
+        return false;
+    }
     // forward-tolerant: a server with a HIGHER minor is fine - it is a strict
     // superset, and we only ever use commands up to OUR minor. Clamping here (vs
     // the old `minor > ours -> reject`) keeps mixed-minor fleets working so a

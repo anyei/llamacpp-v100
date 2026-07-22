@@ -6,9 +6,13 @@
 extern "C" {
 #endif
 
+// minor 11: upstream 6d5a910 merge added 4 ggml ops (lightning indexer,
+// fused hyper-connections) - the op enum shifted on the wire, so pre-merge
+// workers must be rejected. patch tracks upstream's op-enum fingerprint and
+// is enforced at HELLO (a mismatch decodes graphs to the wrong ops).
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    10
-#define RPC_PROTO_PATCH_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    11
+#define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");

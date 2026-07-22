@@ -284,6 +284,7 @@ bool server_http_context::init(const common_params & params) {
                     return false;
                 }
             }
+#endif
             // no endpoints are allowed to be accessed when the server is not ready
             // this is to prevent any data races or inconsistent states
             res.status = 503;
