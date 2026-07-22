@@ -1,0 +1,64 @@
+# SYCL RPC worker — distributed-inference worker for a box with an Intel GPU
+# (Arc dGPU or Core Ultra iGPU, e.g. the 10.5.5.11 Arc 140T box).
+# Companion to docker-compose.rpc-worker{-cpu,-cuda,-vulkan}.yml.
+#
+# Preferred: PULL the image from the fleet registry on the V100 box (the
+# worker boxes are slow builders; one-time: add 10.5.5.1:5000 to
+# insecure-registries):
+#   docker pull 10.5.5.1:5000/llamacpp-intel:full-<tag>
+#   WORKER_IMAGE=10.5.5.1:5000/llamacpp-intel:full-<tag> \
+#     docker compose -f docker-compose.rpc-worker-sycl.yml up -d
+#
+# Fallback — build on the worker box from this tree:
+#   docker build -f .devops/intel.Dockerfile --target full -t llamacpp-intel:full .
+#
+# Device selection: -d SYCL0 exposes the Intel GPU (TASKS.md #59: on the .11
+# Arc 140T this beat the CPU path by ~4% decode and 2.3x prefill standalone).
+# Use -d SYCL0,CPU to expose the box's CPU as a second pipeline stage, or
+# -d CPU to run this image as a plain CPU worker.
+#
+# The container needs the host's DRM render nodes (/dev/dri). If the compute
+# runtime complains about permissions, add the host's render group id:
+#   group_add: ["992"]   # getent group render | cut -d: -f3
+#
+# The model file is NOT needed on the worker; weights stream from the
+# coordinator and are hash-cached under /cache.
+#
+# SECURITY: the RPC protocol has no auth or TLS. Bind only to a private or
+# WireGuard/overlay network, never a public interface.
+
+services:
+  llama-rpc-worker-sycl:
+    container_name: llama-rpc-worker-sycl
+    image: ${WORKER_IMAGE:-llamacpp-intel:full}
+    entrypoint: /app/ggml-rpc-server
+    network_mode: host              # direct sockets; see security note
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./cache-rpc:/cache
+      # optional worker-local GGUF dir for --model-dir (skips first-load streaming;
+      # point WORKER_MODELS_DIR at the dir holding your .gguf copies)
+      - ${WORKER_MODELS_DIR:-./models-local}:/local-models:ro
+    environment:
+      - LLAMA_CACHE=/cache          # required for -c to land in the mounted volume
+      # cache size cap (MiB): LRU-evict after each save AND once at startup (stale
+      # generations trim before the next load, TASKS.md #45; beacon reports cache_mib=).
+      # 0 = unlimited. The cap must exceed this box's biggest single-model share or the
+      # cache thrashes; small disks should override WORKER_CACHE_LIMIT_MIB lower in .env
+      - GGML_RPC_CACHE_LIMIT_MIB=${WORKER_CACHE_LIMIT_MIB:-65536}
+      # per-command latency breakdown in the worker log (TASKS.md #49): WORKER_RPC_TIMING=1
+      - GGML_RPC_TIMING=${WORKER_RPC_TIMING:-}
+    # --announce: LAN presence beacon (UDP multicast, same interface as -H) so a
+    # coordinator with --rpc-discover finds this worker without a static --rpc list.
+    command: >
+      -H ${WORKER_BIND:-0.0.0.0}
+      -p ${WORKER_PORT:-50052}
+      -t ${WORKER_THREADS:-8}
+      -d ${WORKER_DEVICES:-SYCL0}
+      -c
+      --announce
+      --score
+      --allow-shutdown
+      --model-dir /local-models
+    restart: always
