@@ -1542,11 +1542,19 @@ static void ggml_backend_rpc_buffer_set_usage(ggml_backend_buffer_t buffer, enum
     }
 }
 
+static void ggml_backend_rpc_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    // no dedicated RPC command: stream a filled buffer through set_tensor. The
+    // memsets that reach here are infrequent cache clears (e.g. the dsv4
+    // compressed-KV per-stream wipes), not hot-path traffic.
+    std::vector<uint8_t> data(size, value);
+    ggml_backend_rpc_buffer_set_tensor(buffer, tensor, data.data(), offset, size);
+}
+
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_rpc_buffer_init_tensor,
-    /* .memset_tensor   = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_rpc_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_rpc_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_rpc_buffer_get_tensor,
     /* .set_tensor_2d   = */ ggml_backend_rpc_buffer_set_tensor_2d,

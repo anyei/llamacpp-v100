@@ -1050,6 +1050,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         // note: do not print src names here - over RPC the src pointers of a lone
         // deserialized struct can dangle and turn this abort into a silent segfault
+        for (int s = 0; s < 2; s++) {
+            std::string segs;
+            for (int k = 0; k < 8; k++) {
+                segs += " " + std::to_string(src_ss[s].ne[k]);
+            }
+            GGML_LOG_ERROR("mul_mat src%d axis=%s n_segments=%u nr0=%u ne[0..7]=[%s] owner=%d\n",
+                    s, ggml_backend_meta_split_axis_name(src_ss[s].axis), src_ss[s].n_segments,
+                    src_ss[s].nr[0], segs.c_str(), split_state_owner(src_ss[s]));
+        }
         GGML_ABORT("unsupported mul_mat split combination: %s = src0[%s] x src1[%s]",
                 tensor->name,
                 ggml_backend_meta_split_axis_name(src_ss[0].axis),
@@ -1356,7 +1365,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
             if (buf_ctx->debug > 1) {
-                GGML_LOG_DEBUG("SRC_RESOLVE: %s[%s] src%zu %s[%s] -> %s\n",
+                GGML_LOG_ERROR("SRC_RESOLVE: %s[%s] src%zu %s[%s] -> %s\n",
                         tensor->name, ggml_op_name(tensor->op), i, tensor->src[i]->name,
                         ggml_op_name(tensor->src[i]->op), ggml_backend_meta_split_axis_name(src_ss[i].axis));
             }
@@ -1538,6 +1547,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_LIGHTNING_INDEXER: {
+                // dsv4 sparse-attention indexer: attention-side, so in the
+                // supported configs every src is mirrored or owner-degenerate
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -1645,7 +1659,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
                 ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
             }
-            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
+            GGML_LOG_ERROR("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
                 ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
         }
     }
@@ -1944,6 +1958,43 @@ static void ggml_backend_meta_buffer_reject_unknown_alias(const struct ggml_tens
     if ((const char *) tensor->data < (const char *) it->first + entry_nbytes) {
         GGML_ABORT("%s: tensor '%s' aliases registered island tensor '%s' but cannot be resolved - "
                    "views must be translated to their root tensor before crossing RPC", op, tensor->name, fp.name);
+    }
+}
+
+static void ggml_backend_meta_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    // needed since the upstream merge: the dsv4 compressed-KV cache clears
+    // per-stream slices via ggml_backend_tensor_memset (llama-kv-cache-dsv4.cpp)
+    if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
+        ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
+        if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) == 0) {
+            continue; // zero-size shard (degenerate/dedicated non-owner)
+        }
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            ggml_backend_tensor_memset(st, value, offset, size);
+            continue;
+        }
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            ggml_backend_tensor_memset(st, value, 0, ggml_nbytes(st));
+            continue;
+        }
+        // per-stream clear (a whole dim-2 slice) of a tensor split on axis 0/1:
+        // each member shard keeps the stream structure with a shrunken stride
+        if ((split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) &&
+                tensor->ne[3] == 1 && tensor->nb[2] != 0 &&
+                offset % tensor->nb[2] == 0 && size == (size_t) tensor->nb[2]) {
+            const size_t stream         = offset / tensor->nb[2];
+            const size_t st_stream_size = ggml_nbytes(st) / tensor->ne[2];
+            ggml_backend_tensor_memset(st, value, stream*st_stream_size, st_stream_size);
+            continue;
+        }
+        GGML_ABORT("meta memset_tensor: unsupported range for split tensor %s (axis %d, offset %zu, size %zu)",
+                   tensor->name, (int) split_state.axis, offset, size);
     }
 }
 
@@ -2264,7 +2315,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
