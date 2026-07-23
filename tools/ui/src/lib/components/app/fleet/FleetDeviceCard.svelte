@@ -128,7 +128,7 @@
 		: 'bg-muted/30'} {device.failed ? 'border-destructive/50' : ''}"
 >
 	<div class="flex items-start justify-between gap-2">
-		<div class="min-w-0">
+		<div class="min-w-0 flex-1">
 			<div class="flex items-center gap-2">
 				<KindIcon class="h-4 w-4 shrink-0 text-muted-foreground" aria-label={kindLabel} />
 
@@ -143,14 +143,14 @@
 				</div>
 			</div>
 
-			<p class="truncate text-xs text-muted-foreground">{device.description}</p>
+			<p class="text-xs text-muted-foreground" title={device.description}>{device.description}</p>
 
 			{#if device.endpoint}
 				<p class="truncate font-mono text-[10px] text-muted-foreground">{device.endpoint}</p>
 			{/if}
 		</div>
 
-		<div class="flex shrink-0 flex-wrap justify-end gap-1">
+		<div class="flex shrink-0 gap-1">
 			<Badge variant={device.is_rpc ? 'secondary' : 'outline'} class="text-[10px]">
 				{device.is_rpc ? 'RPC' : 'Local'}
 			</Badge>
@@ -158,7 +158,12 @@
 			{#if device.worker_is_cpu}
 				<Badge variant="tertiary" class="text-[10px]">CPU (RAM)</Badge>
 			{/if}
+		</div>
+	</div>
 
+	<!-- secondary facts on their own row so the name/description stay readable -->
+	{#if siblingCount != null || device.score || device.init_ms != null || device.timing || rank}
+		<div class="flex flex-wrap gap-1">
 			{#if siblingCount != null && siblingCount > 1 && siblingIndex != null}
 				<Badge
 					variant="outline"
@@ -170,7 +175,7 @@
 			{/if}
 
 			{#if device.score}
-				<Badge variant="outline" class="text-[10px]">
+				<Badge variant="outline" class="text-[10px]" title="measured memory bandwidth (worker --score)">
 					{device.score.bw_gbps.toFixed(1)} GB/s
 				</Badge>
 			{/if}
@@ -201,7 +206,7 @@
 				<Badge variant="tertiary" class="text-[10px]">slowest</Badge>
 			{/if}
 		</div>
-	</div>
+	{/if}
 
 	<div class="space-y-1">
 		<div class="flex justify-between text-[10px] text-muted-foreground">
