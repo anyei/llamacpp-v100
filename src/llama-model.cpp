@@ -432,6 +432,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
+        } else if (tensor_name.substr(0, 5) == "dsv4_" && tensor_name.rfind("_l") != std::string::npos) {
+            // dsv4 sparse-attention caches ("dsv4_*_l<N>"): the layer index must
+            // resolve or an interleaved owner group puts the cache on a different
+            // member than its layer's compute (TASKS #70)
+            il = std::stoull(tensor_name.substr(tensor_name.rfind("_l") + 2));
+            prefix = "blk." + std::to_string(il) + ".";
+            rotation = get_il_eff(il) % ud->n_devices;
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -748,12 +755,40 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (tc.dedicated && split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-        // degenerate split: the owner takes every segment whole - no granularity
-        // rounding, no rotation - and every other member gets a zero-size slice
-        const int attn_owner = atoi(getenv("LLAMA_META_ATTN_OWNER")); // set, or tc.dedicated could not be
+        // dedicated split: the owner set takes every segment - every other member
+        // gets a zero-size slice. A single owner takes segments whole (degenerate,
+        // no granularity rounding, no rotation). An owner GROUP (TASKS #70, e.g.
+        // "0,1" = both local GPUs over NVLink) head-splits each segment equally
+        // across its members so mirrors larger than one device fit - this is the
+        // regular tensor-mode attention split restricted to the owner subset.
+        static const std::vector<int> attn_owners = [] {
+            std::vector<int> ret;
+            const char * env = getenv("LLAMA_META_ATTN_OWNER"); // set, or tc.dedicated could not be
+            for (const char * p = env; p != nullptr && *p != '\0';) {
+                char * end;
+                const long v = strtol(p, &end, 10);
+                if (end == p) {
+                    break;
+                }
+                if (v >= 0) {
+                    ret.push_back((int) v);
+                }
+                p = *end == ',' ? end + 1 : end;
+            }
+            return ret;
+        }();
+        GGML_ASSERT(!attn_owners.empty());
+        // owner GROUP (TASKS #70): interleave LAYERS across the owners - each
+        // layer's attention lives whole on one owner, so every single-owner
+        // invariant (per-row norms over full vectors, one latent cache home,
+        // zero-slice compute skip) holds unchanged, while the memory footprint
+        // divides across the group. Feature-dim splitting between owners is NOT
+        // viable here: MLA's shared-latent norms/caches would need a
+        // replicated-on-subset state the split formalism does not have.
+        const int owner = attn_owners[tc.il % attn_owners.size()];
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         for (size_t is = 0; is < segments.size(); is++) {
-            split_state.ne[is*ud->n_devices + attn_owner] = segments[is].first;
+            split_state.ne[is*ud->n_devices + owner] = segments[is].first;
             split_state.nr[is] = segments[is].second;
         }
         split_state.n_segments = segments.size();

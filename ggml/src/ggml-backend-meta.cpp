@@ -946,6 +946,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         // a feature-dim split breaks row integrity - except degenerate, where the
         // owner's rows are complete
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && split_state_owner(src_ss[0]) < 0) {
+            GGML_LOG_ERROR("%s: per-row op '%s' (%s) on AXIS_0 src '%s' (%s) without single owner: ne=[%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "]\n",
+                           __func__, tensor->name, ggml_op_name(tensor->op),
+                           tensor->src[0] ? tensor->src[0]->name : "?",
+                           tensor->src[0] ? ggml_op_name(tensor->src[0]->op) : "?",
+                           src_ss[0].ne[0], src_ss[0].ne[1], src_ss[0].ne[2], src_ss[0].ne[3]);
+        }
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0 || split_state_owner(src_ss[0]) >= 0);
         return src_ss[0];
     };
