@@ -150,7 +150,18 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                         n_local++;
                     }
                 }
-                if (n_local > 1) {
+                // LLAMA_META_ALLOW_MULTI_LOCAL=1: re-test gate for the #48 corruption
+                // after major merges - outputs MUST pass the coherence gate before
+                // trusting a multi-local EP config
+                static const bool allow_multi_local = [] {
+                    const char * env = getenv("LLAMA_META_ALLOW_MULTI_LOCAL");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (n_local > 1 && allow_multi_local) {
+                    LLAMA_LOG_WARN("%s: LLAMA_META_ALLOW_MULTI_LOCAL: running %zu local members with dedicated "
+                                   "attention - this config corrupted output pre-merge (TASKS.md #48), verify coherence\n",
+                                   __func__, n_local);
+                } else if (n_local > 1) {
                     LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) supports at most "
                                     "one local GPU (the attention owner), but %zu local members were given. Put experts "
                                     "on RPC workers, or use both local GPUs via single-box '-sm tensor -ngl 99 -ncmoe N' "
