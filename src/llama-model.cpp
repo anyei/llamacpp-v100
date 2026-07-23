@@ -495,6 +495,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const char * env = getenv("LLAMA_META_EP_ONLY");
             return env != nullptr && atoi(env) != 0;
         }();
+        // TASKS #70: standard-arch EP with a dedicated owner (set) - the attention
+        // block (q/k/v/o weights, biases, KV cache) rides the dedicated
+        // owner-interleaved path instead of the EP full mirror, so the non-expert
+        // stack no longer replicates onto every member (hy3's 34.7 GB mirror
+        // exceeds a 32 GB V100; interleaved across owners it fits). Norms, sinks
+        // and the router stay mirrored below - the owner has them locally. Same
+        // axis choices as the proven DSA treatment above.
+        if (ep_only && !dsa_arch && attn_owner >= 0 && (size_t) attn_owner < ud->n_devices) {
+            if (std::regex_match(tensor_name, pattern_q_weight) ||
+                std::regex_match(tensor_name, pattern_kv_weight) ||
+                std::regex_match(tensor_name, pattern_qkv_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "", "", /*dedicated =*/ true);
+            }
+            if (std::regex_match(tensor_name, pattern_q_bias) ||
+                std::regex_match(tensor_name, pattern_kv_bias) ||
+                std::regex_match(tensor_name, pattern_qkv_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+            }
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+            }
+        }
         if (ep_only && tensor_name.find("_exps") == std::string::npos) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }

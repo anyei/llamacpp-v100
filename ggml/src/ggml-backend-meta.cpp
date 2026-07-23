@@ -1031,12 +1031,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // same-owner degenerate operands: PARTIAL is only wanted at the
                 // designated island EXIT (the dedicated attention out projection,
                 // dot-dim split by the policy - names must stay in sync with
-                // pattern_dsa_attn_exit in llama-model.cpp). Everything else
-                // (indexer scores, cache reads) stays on the owner - a broadcast
-                // there is pure boundary overhead.
+                // pattern_dsa_attn_exit / pattern_attn_out_weight in
+                // llama-model.cpp: "attn_output_b" is the DSA exit, "attn_output."
+                // the standard-arch exit under TASKS #70 dedicated attention).
+                // Everything else (indexer scores, cache reads) stays on the
+                // owner - a broadcast there is pure boundary overhead.
                 const int owner0 = split_state_owner(src_ss[0]);
-                if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) &&
-                        !(tensor->src[0]->op == GGML_OP_NONE && strstr(tensor->src[0]->name, "attn_output_b") != nullptr)) {
+                const bool island_exit = tensor->src[0]->op == GGML_OP_NONE &&
+                    (strstr(tensor->src[0]->name, "attn_output_b") != nullptr ||
+                     strstr(tensor->src[0]->name, "attn_output.") != nullptr);
+                if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) && !island_exit) {
                     return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner0, tensor->ne[0]);
                 }
             }
