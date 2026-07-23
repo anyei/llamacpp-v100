@@ -392,6 +392,16 @@ private:
 
     ggml_backend_sched_t active_sched() const { return sched_active != nullptr ? sched_active : sched.get(); }
 
+    // TASKS #71 stage 1 (LLAMA_META_LOCAL_DRAFT=1): the MTP draft context runs on
+    // the meta device's IN-PROCESS members only - its scheduler has no meta backend
+    // and graph_localize() remaps meta-hosted weight srcs to a local member's full
+    // shadow, so drafting stops paying fleet boundaries.
+    bool                mtp_local = false;
+    ggml_backend_dev_t  mtp_meta_dev = nullptr;
+    std::vector<size_t> mtp_local_members; // member indices of in-process (non-RPC) devices
+
+    bool graph_localize(ggml_cgraph * gf);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

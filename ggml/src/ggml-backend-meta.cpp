@@ -839,6 +839,88 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return nullptr;
 }
 
+size_t ggml_backend_meta_dev_n_members(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    return ((const ggml_backend_meta_device_context *) dev->context)->simple_devs.size();
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_member(ggml_backend_dev_t dev, size_t j) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    GGML_ASSERT(j < dev_ctx->simple_devs.size());
+    return dev_ctx->simple_devs[j];
+}
+
+bool ggml_backend_meta_tensor_is_meta_hosted(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
+struct ggml_tensor * ggml_backend_meta_tensor_full_shadow(const struct ggml_tensor * tensor, size_t j) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return nullptr;
+    }
+    if (j >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) {
+        return nullptr;
+    }
+    ggml_tensor * shadow = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+    if (shadow == nullptr || ggml_nelements(shadow) == 0 || ggml_nelements(shadow) != ggml_nelements(tensor)) {
+        return nullptr; // member j holds a slice (or nothing), not the full tensor
+    }
+    return shadow;
+}
+
+bool ggml_backend_meta_graph_localize(struct ggml_cgraph * gf, const size_t * members, size_t n_members) {
+    auto localize = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (!ggml_backend_meta_tensor_is_meta_hosted(t)) {
+            return t;
+        }
+        for (size_t k = 0; k < n_members; k++) {
+            ggml_tensor * shadow = ggml_backend_meta_tensor_full_shadow(t, members[k]);
+            if (shadow != nullptr) {
+                return shadow;
+            }
+        }
+        GGML_LOG_ERROR("%s: no listed member holds a full copy of '%s' (split across members?) - "
+                "the graph cannot run locally\n", __func__, t->name);
+        return nullptr;
+    };
+
+    for (int i = 0; i < gf->n_nodes; i++) {
+        ggml_tensor * node = gf->nodes[i];
+
+        if (node->view_src != nullptr && ggml_backend_meta_tensor_is_meta_hosted(node->view_src)) {
+            ggml_tensor * vs = localize(node->view_src);
+            if (vs == nullptr) {
+                return false;
+            }
+            node->view_src = vs;
+            node->buffer   = vs->buffer;
+            node->data     = (char *) vs->data + node->view_offs;
+        }
+
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s] == nullptr) {
+                continue;
+            }
+            ggml_tensor * src = localize(node->src[s]);
+            if (src == nullptr) {
+                return false;
+            }
+            node->src[s] = src;
+        }
+    }
+
+    for (int i = 0; i < gf->n_leafs; i++) {
+        ggml_tensor * leaf = localize(gf->leafs[i]);
+        if (leaf == nullptr) {
+            return false;
+        }
+        gf->leafs[i] = leaf;
+    }
+
+    return true;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(

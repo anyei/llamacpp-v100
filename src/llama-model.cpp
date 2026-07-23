@@ -520,6 +520,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
             }
         }
+        // TASKS #71 stage 1 (LLAMA_META_LOCAL_DRAFT=1): NEXTN/MTP layers are used
+        // ONLY by the draft graph (the main decode stops at n_layer), so their
+        // routed experts ride the dedicated owner path instead of the expert split.
+        // With them dedicated, EVERY draft-graph weight has a full local copy on an
+        // owner and the MTP draft context can run coordinator-local - drafting
+        // stops paying fleet boundaries (measured 3.39 t/s WITH fleet-scheduled
+        // draft vs 4.61 without any draft on the hy3 dual-role EP serve).
+        static const bool local_draft = [] {
+            const char * env = getenv("LLAMA_META_LOCAL_DRAFT");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (ep_only && local_draft && attn_owner >= 0 && (size_t) attn_owner < ud->n_devices &&
+                tensor_name.find("_exps") != std::string::npos &&
+                tensor_name.compare(0, 4, "blk.") == 0) {
+            const uint32_t il_exps = std::stoul(tensor_name.substr(4));
+            if (il_exps >= hparams.n_layer()) { // a nextn layer
+                if (std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", /*dedicated =*/ true);
+                }
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "", "", /*dedicated =*/ true);
+            }
+        }
         if (ep_only && tensor_name.find("_exps") == std::string::npos) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
@@ -2310,6 +2333,30 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // TASKS #71 stage 1 (LLAMA_META_LOCAL_DRAFT=1): the coordinator-local MTP
+    // draft context must keep its cache OUT of meta buffers (its scheduler has
+    // no meta backend), so its offload is disabled and the (tiny, nextn-layer-
+    // only) cache lands on CPU.
+    const bool mtp_local_cache = [&] {
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            return false;
+        }
+        static const bool env_on = [] {
+            const char * env = getenv("LLAMA_META_LOCAL_DRAFT");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (!env_on) {
+            return false;
+        }
+        for (const auto & d : devices) {
+            if (d.is_meta) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    const bool offload_kqv_eff = cparams.offload_kqv && !mtp_local_cache;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2337,7 +2384,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         params.type_k,
                         params.type_v,
                         !cparams.flash_attn,
-                        cparams.offload_kqv,
+                        offload_kqv_eff,
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
                         cparams.n_seq_max,
@@ -2362,7 +2409,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             *this,
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
-                            cparams.offload_kqv,
+                            offload_kqv_eff,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
@@ -2407,7 +2454,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
+                            /* offload           */ offload_kqv_eff,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
@@ -2426,7 +2473,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
+                            /* offload           */ offload_kqv_eff,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
@@ -2468,7 +2515,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 params.type_k,
                                 params.type_v,
                                 !cparams.flash_attn,
-                                cparams.offload_kqv,
+                                offload_kqv_eff,
                                 params.swa_full,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
@@ -2498,7 +2545,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
-                                    cparams.offload_kqv,
+                                    offload_kqv_eff,
                                     params.swa_full,
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
@@ -2515,7 +2562,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
-                                    cparams.offload_kqv,
+                                    offload_kqv_eff,
                                     params.swa_full,
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
@@ -2536,7 +2583,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 params.type_k,
                                 params.type_v,
                                 !cparams.flash_attn,
-                                cparams.offload_kqv,
+                                offload_kqv_eff,
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,

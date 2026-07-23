@@ -426,6 +426,23 @@ extern "C" {
     // Returns false when anything cannot be restored (caller should fully reload).
     GGML_API bool ggml_backend_meta_reprovision_endpoint(const char * endpoint);
 
+    // local-draft support (TASKS #71): enumerate a meta device's member devices,
+    // and fetch member j's shadow of a meta-hosted tensor when that member holds a
+    // FULL copy (mirrored, or dedicated-on-j). Returns NULL when the tensor is not
+    // meta-hosted, the member has no shadow, or the member's slice is not the whole
+    // tensor. The returned tensor lives in the member's plain backend buffer and can
+    // be used as a graph src by a scheduler that does not contain the meta backend.
+    GGML_API size_t               ggml_backend_meta_dev_n_members(ggml_backend_dev_t dev);
+    GGML_API ggml_backend_dev_t   ggml_backend_meta_dev_member   (ggml_backend_dev_t dev, size_t j);
+    GGML_API bool                 ggml_backend_meta_tensor_is_meta_hosted(const struct ggml_tensor * tensor);
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_full_shadow(const struct ggml_tensor * tensor, size_t j);
+
+    // remap every meta-hosted tensor referenced by the graph (node srcs, view
+    // sources AND leaf entries) to the first listed member's full local shadow.
+    // Returns false - after logging the offending tensor - if any referenced
+    // meta tensor has no full copy on any of the given members.
+    GGML_API bool ggml_backend_meta_graph_localize(struct ggml_cgraph * gf, const size_t * members, size_t n_members);
+
     //
     // Utils
     //

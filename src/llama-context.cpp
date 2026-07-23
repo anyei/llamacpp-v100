@@ -335,9 +335,63 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // TASKS #71 stage 1: coordinator-local MTP draft. The draft context gets a
+    // scheduler WITHOUT the meta backend - only the meta device's in-process
+    // members - and graph_localize() remaps meta-hosted weights to their local
+    // full shadows. Requires every draft-graph weight to have a full local copy
+    // (EP_ONLY mirrors + dedicated attention + LLAMA_META_LOCAL_DRAFT's
+    // nextn-expert dedication provide exactly that).
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const char * env = getenv("LLAMA_META_LOCAL_DRAFT");
+        if (env != nullptr && atoi(env) != 0) {
+            for (const auto & dev : model.devices) {
+                if (dev.is_meta) {
+                    mtp_meta_dev = dev.dev;
+                    break;
+                }
+            }
+            if (mtp_meta_dev != nullptr) {
+                const size_t n_members = ggml_backend_meta_dev_n_members(mtp_meta_dev);
+                for (size_t j = 0; j < n_members; j++) {
+                    ggml_backend_dev_t member = ggml_backend_meta_dev_member(mtp_meta_dev, j);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(member);
+                    if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+                        continue; // remote member - defeats the purpose
+                    }
+                    mtp_local_members.push_back(j);
+                }
+                if (!mtp_local_members.empty()) {
+                    mtp_local = true;
+                    LLAMA_LOG_INFO("%s: LLAMA_META_LOCAL_DRAFT: MTP draft context runs on %zu in-process member(s) of %s\n",
+                            __func__, mtp_local_members.size(), ggml_backend_dev_name(mtp_meta_dev));
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_META_LOCAL_DRAFT requested but the meta device has no in-process members - draft stays fleet-scheduled\n",
+                            __func__);
+                }
+            }
+        }
+    }
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
+            if (mtp_local && dev.is_meta) {
+                // local-draft mode: init the meta device's in-process members
+                // instead of the meta backend itself (CPU members are covered by
+                // the CPU backend added below)
+                for (size_t j : mtp_local_members) {
+                    ggml_backend_dev_t member = ggml_backend_meta_dev_member(mtp_meta_dev, j);
+                    if (ggml_backend_dev_type(member) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    ggml_backend_t backend = ggml_backend_dev_init(member, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(member)));
+                    }
+                    backends.emplace_back(backend);
+                }
+                continue;
+            }
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -1493,6 +1547,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (mtp_local && !graph_localize(gf)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
         const auto t_alloc_0 = ggml_time_us();
 
         if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
@@ -2541,6 +2600,12 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (mtp_local && !graph_localize(gf)) {
+        this->n_outputs = save_n_outputs;
+        LLAMA_LOG_ERROR("%s: LLAMA_META_LOCAL_DRAFT: failed to localize the reserve graph\n", __func__);
+        return nullptr;
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -2557,6 +2622,18 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     return gf;
+}
+
+// TASKS #71 stage 1: remap every meta-hosted weight src in the freshly built
+// draft graph to a local member's FULL shadow tensor, so the local-only
+// scheduler never touches the meta backend. Returns false (and logs once) if
+// any weight lacks a full local copy - the compute would then fail loudly
+// rather than silently mixing backends.
+bool llama_context::graph_localize(ggml_cgraph * gf) {
+    if (!mtp_local) {
+        return true;
+    }
+    return ggml_backend_meta_graph_localize(gf, mtp_local_members.data(), mtp_local_members.size());
 }
 
 llm_graph_params llama_context::graph_params(

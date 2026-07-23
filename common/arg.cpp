@@ -1049,9 +1049,14 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         devices.push_back(nullptr);
     } else {
         ggml_backend_load_all();
+        // TASKS #71 (LLAMA_META_LOCAL_DRAFT): the coordinator-local draft needs an
+        // in-process member in the meta device; on CPU-only fleets that member is
+        // the host CPU itself, so allow it in the list when the feature is on.
+        const char * local_draft = getenv("LLAMA_META_LOCAL_DRAFT");
+        const bool   allow_cpu   = local_draft != nullptr; // presence gates the topology; =0 keeps the feature off
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && !allow_cpu)) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }
             devices.push_back(dev);
