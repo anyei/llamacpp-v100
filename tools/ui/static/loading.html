@@ -226,7 +226,7 @@
 					// #56: progress vs expected share. RPC = cached+streamed bytes;
 					// local devices = VRAM delta from the load-start snapshot.
 					const modelMib = d.model && d.model.size_bytes ? d.model.size_bytes / MiB : 0;
-					const expected = w.attn_owner || !w.split_frac ? 0 : w.split_frac * modelMib;
+					const expected = !w.split_frac ? 0 : w.split_frac * modelMib; // mixed-role owners track their expert share
 					let doneMib = cachedMib + streamedMib;
 					if (!w.endpoint && w.free_start_mib != null && w.free_mib != null) {
 						doneMib = Math.max(doneMib, w.free_start_mib - w.free_mib);
@@ -258,13 +258,17 @@
 						: '';
 					// #57: one primary badge line; everything else behind <details>
 					const badges = [];
-					if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
+					if (w.attn_owner && w.split_frac) badges.push('<span class="badge score">attention owner + ' + Math.round(w.split_frac * 100) + '% experts</span>');
+					else if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
 					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
 					if (cachedMib > 0) badges.push('<span class="badge score">' + (cachedMib / 1024).toFixed(1) + ' GiB cached</span>');
 					if (streamedMib > 0) badges.push('<span class="badge">' + (streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
 					// #63: coordinator-measured init time (load start -> share placed)
 					if (w.init_ms != null) badges.push('<span class="badge score">init ' + fmtDur(w.init_ms) + '</span>');
 					const detail = [
+						// local devices: memory summary (delta from the load-start snapshot)
+						!w.endpoint && w.free_start_mib != null && w.free_mib != null
+							? ((w.free_start_mib - w.free_mib) / 1024).toFixed(1) + ' GiB used since load start' : null,
 						w.score ? w.score.bw_gbps.toFixed(1) + ' GB/s' : null,
 						w.n_layers != null ? w.n_layers + ' layers' : null,
 						w.free_mib != null ? (w.free_mib / 1024).toFixed(1) + ' GiB free' : null,

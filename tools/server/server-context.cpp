@@ -1016,6 +1016,24 @@ static uint64_t fleet_model_weight_bytes(const std::string & path) {
     return total;
 }
 
+// parse LLAMA_META_ATTN_OWNER - a single index or a comma list (owner GROUP,
+// TASKS #70); returns the member indices that hold the dedicated attention
+static std::vector<int> fleet_attn_owner_list(const char * env) {
+    std::vector<int> ret;
+    for (const char * p = env; p != nullptr && *p != '\0';) {
+        char * end;
+        const long v = strtol(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        if (v >= 0) {
+            ret.push_back((int) v);
+        }
+        p = *end == ',' ? end + 1 : end;
+    }
+    return ret;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1176,11 +1194,13 @@ public:
                 rec.t_last_growth_ms = t_now;
                 rec.last_done_mib    = done_mib;
             }
-            // same expected-share rule as the loading page: attention owners and
-            // shareless devices have no measurable target. 97% is optimistic for
-            // whole-model shares (CPU-kept tensors like token_embd never arrive) -
-            // those are settled at load end from t_last_growth_ms instead.
-            const double expected_mib = p.attn_owner || p.split_frac <= 0.0 ? 0.0
+            // same expected-share rule as the loading page: shareless devices have
+            // no measurable target (a PURE attention owner has split_frac 0; a
+            // MIXED-role owner with an expert share is tracked like any member).
+            // 97% is optimistic for whole-model shares (CPU-kept tensors like
+            // token_embd never arrive) - those are settled at load end from
+            // t_last_growth_ms instead.
+            const double expected_mib = p.split_frac <= 0.0 ? 0.0
                 : p.split_frac * (double) fleet.load_model_bytes / (1024.0 * 1024.0);
             if (expected_mib > 0.0 && done_mib >= 0.97 * expected_mib) {
                 rec.t_ready_ms = t_now;
@@ -1481,12 +1501,9 @@ private:
         // EP dedicated-attention owner: LLAMA_META_ATTN_OWNER=<j> indexes the meta
         // device's members (the tensor-mode device list), which is this same order.
         // That member holds attention/KV/router and takes no expert share.
-        int attn_owner_idx = -1;
+        std::vector<int> attn_owners;
         if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            const char * env = getenv("LLAMA_META_ATTN_OWNER");
-            if (env != nullptr) {
-                attn_owner_idx = atoi(env);
-            }
+            attn_owners = fleet_attn_owner_list(getenv("LLAMA_META_ATTN_OWNER"));
         }
 
         std::lock_guard<std::mutex> lock(fleet.mutex);
@@ -1508,7 +1525,7 @@ private:
                 split_sum > 0.0 ? splits[i] / split_sum : 0.0,
                 layers[i],
                 ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
-                (int) i == attn_owner_idx,
+                std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end(),
                 (int64_t) (free_mem / (1024 * 1024)),
             });
         }
@@ -5631,12 +5648,9 @@ void server_routes::init_routes() {
             for (size_t i = 0; i < devs.size() && i < llama_max_devices(); ++i) {
                 ts_sum += params.tensor_split[i];
             }
-            int attn_owner_idx = -1;
+            std::vector<int> attn_owners;
             if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-                const char * ao = getenv("LLAMA_META_ATTN_OWNER");
-                if (ao != nullptr) {
-                    attn_owner_idx = atoi(ao);
-                }
+                attn_owners = fleet_attn_owner_list(getenv("LLAMA_META_ATTN_OWNER"));
             }
             for (size_t i = 0; i < devs.size(); ++i) {
                 ggml_backend_dev_t dev = devs[i];
@@ -5698,7 +5712,7 @@ void server_routes::init_routes() {
                     {"memory_free_mib",  free_mem  / (1024 * 1024)},
                     {"memory_total_mib", total_mem / (1024 * 1024)},
                     {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
-                    {"attn_owner",       (int) i == attn_owner_idx},
+                    {"attn_owner",       std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end()},
                     {"n_layers",         nullptr},
                     {"stats",            nullptr},
                     {"score",            nullptr},
