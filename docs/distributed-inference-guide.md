@@ -21,7 +21,8 @@ with MTP speculation is higher (~81 t/s — see the README benchmarks).
 |---|---|---|
 | All GPUs in one machine | single process, `-sm tensor` + NCCL — do NOT use RPC | 47.8 t/s (27B, nospec) — the ceiling reference |
 | Model fits one machine, second box idle | leave it idle, or serve another model on it | — |
-| Model does NOT fit one machine | pipeline between boxes: `-sm layer --rpc worker:port` | 32.3 vs 33.2 t/s in-process (27B, 1 local + 1 RPC GPU) → ~3%/token + network RTT |
+| Model does NOT fit one machine (dense) | pipeline between boxes: `-sm layer --rpc worker:port` | 32.3 vs 33.2 t/s in-process (27B, 1 local + 1 RPC GPU) → ~3%/token + network RTT |
+| MoE does NOT fit one machine | expert-parallel, owner group + dual-role (§2b, #70): `./run-ep-fleet-hy3.sh` | hy3 182.5 GB: **4.61-4.80 t/s** EP vs 2.74 layer; V4 86.7 GB: 5.14-5.33 EP vs 4.79 layer |
 | Second box has multiple NVLinked GPUs | TP island: worker runs `--tensor-parallel`, coordinator pipelines to it | 33.3 t/s (27B entirely on a remote 2-GPU island — pessimal case) |
 | Second box has no GPU (CPU + RAM only) | CPU worker: `cpu.Dockerfile --target rpc-worker` (§1b) | 35B-A3B MoE: 7.4-10.4 t/s by CPU; 0.6B: ~20 t/s; ~2-4% network tax (§3b) |
 | Need max context, model fits | offload tail layers to remote box (frees local VRAM for KV) | pipeline cost only |
@@ -398,13 +399,13 @@ decides whether distribution helps or hurts.
 
 | | `-sm layer` (pipeline) | `-sm tensor` (tensor-parallel) | `-sm tensor` + EP (expert-parallel) |
 |---|---|---|---|
-| Each device holds | whole layers | a slice of *every* tensor | attention on ONE member, expert slices on the rest |
+| Each device holds | whole layers | a slice of *every* tensor | attention on the OWNER GROUP (local GPUs, layer-interleaved; may also hold expert shares = dual-role, #70), expert slices on the rest |
 | Per-token comms | activations at each stage boundary (KB) | an AllReduce **every layer** | one reduce per MoE boundary (star/fused) |
 | Composition law | **SUM** of stage times (+ hops) | max + per-layer reduce | **max over contacted workers** (#28) |
 | Scales by adding boxes | worse (more stages) single-stream; helps capacity/throughput | only inside a box | capacity + batch throughput; single-stream is latency-bound |
 | Good across a network? | **yes** (Ethernet-friendly) | **NO** — AllReduce/layer over Ethernet is ~100x too slow | yes — the reduce is a small k-vector sum, not a GEMM reduce |
 | Use when | model/KV doesn't fit one box; tail-offload for context | ≥2 NVLinked GPUs in **one** box | a MoE whose **experts** fit no single box |
-| Measured here | CPU fleet 1.2-2.0 t/s (35B); law: best-single-box wins if it fits | 2x V100 in-box: 108 t/s (35B), 47.8 (27B) — the ceiling | V4 86.7 GB RAM-resident on the fleet: 2.4-2.7 t/s single-stream |
+| Measured here | CPU fleet 1.2-2.0 t/s (35B); hy3 182.5 GB lean fleet 2.74; law: best-single-box wins if it fits | 2x V100 in-box: 108 t/s (35B), 47.8 (27B) — the ceiling | V4 86.7 GB lean-3 roster: **5.14-5.33 t/s** (2026-07-22 record); hy3 182.5 GB dual-role owner group: **4.61-4.80 t/s** vs its 2.74 layer baseline (2026-07-23) |
 
 ```
  -sm layer (pipeline)          -sm tensor (in-box TP)      -sm tensor + EP (cross-box)
