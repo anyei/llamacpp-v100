@@ -4,7 +4,13 @@
 # Sibling of run-fleet-glm52-autoweight.sh (GLM on :8097); this one runs on :8095.
 #
 # REQUIREMENTS
-#   - hy_v3 arch support: image >= 076d19781 (upstream #25395 port incl. the jinja str.format the embedded chat template needs).
+#   - Post-merge fleet: image >= 2cb391528 on the COORDINATOR AND EVERY WORKER
+#     (proto 4.11.3 rejects pre-merge workers - the op enum shifted; #65/#66).
+#     hy_v3 arch is now the MERGED fork+upstream implementation (single arch
+#     registration since 6d5a910) - this run doubles as its first serve.
+#   - .11 exposes SYCL0,CPU since 2026-07-22: for LAYER mode SYCL0 is the right
+#     device (#59: +4% decode, 2.3x prefill) and its many small per-layer buffers
+#     fit the iGPU - unlike EP's giant expert buffers (#68 crash).
 #   - Capacity: 171 GB weights + LLAMA_FLEET_KV_RESERVE_MB (default 20 GB) needs
 #     ~191 GB pooled -> EVERY worker box online (.11, .15 both, .25, .30, .26).
 #     The new capacity gate holds the load (state: waiting-capacity) and starts
@@ -46,7 +52,7 @@ fi
 
 MODELS_DIR=/mnt/files \
 COORD_API_KEY=anyei \
-COORD_IMAGE=llamacpp-local-v100:3eff1cd6a \
+COORD_IMAGE=${COORD_IMAGE:-llamacpp-local-v100:2cb391528} \
 COORD_MODEL=hy3-1M-MTP-Q4_K_M.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
@@ -57,7 +63,7 @@ COORD_PORT=8095 \
 COORD_FLEET_ADMIN=1 \
 COORD_PREFLIGHT=/models/Qwen3-0.6B-BF16.gguf \
 COORD_EXTRA_ARGS="$EXTRA_ARGS" \
-  docker compose -f docker-compose.fleet-coordinator.yml up
+  docker compose -f docker-compose.fleet-coordinator.yml up -d
 
 # Fleet UI + chat:  http://<this-box>:8095/
 # Chosen split:     docker logs llama-fleet-coordinator | grep -i auto-weight
