@@ -447,31 +447,41 @@ island; only the island's boundary activations cross the network.
 ### Spin-up — `-sm tensor` + expert-parallel (a MoE across the fleet)
 
 The flagship distributed mode (TASKS.md #28; design in
-`docs/expert-parallel-plan.md`). Attention/KV/router live on ONE member
-(`LLAMA_META_ATTN_OWNER`, a local V100), the routed experts are segmented
-across the members (`LLAMA_META_EP_ONLY`). This is how the 86.7 GB
-DeepSeek-V4-Flash runs RAM-resident across boxes that individually hold none of
-it:
+`docs/expert-parallel-plan.md`; owner GROUP + dual-role: #70). Attention/KV/
+router live on the OWNER GROUP (`LLAMA_META_ATTN_OWNER=0,1` — comma list of
+local GPUs, layers interleaved `il % n_owners`, attention syncs stay on
+NVLink), the routed experts are segmented across the members
+(`LLAMA_META_EP_ONLY`). Owners may ALSO carry expert shares in leftover VRAM
+(dual-role). This is how 86.7 GB DeepSeek-V4-Flash and 182.5 GB hy3 run
+RAM-resident across boxes that individually hold none of them:
 
 ```bash
 # env selects the EP shape; --device lists the meta members in -ts order
-LLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=0 \
-llama-server -m DeepSeek-V4-Flash.gguf \
-  --rpc 10.5.5.11:50052,10.5.5.15:50054 \
-  --device CUDA0,RPC0,RPC1 -sm tensor -ts 0,3,2 \
-  -ngl 99 --no-mmap -c 4096 -ub 256 -b 256
+LLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=0,1 LLAMA_META_ALLOW_MULTI_LOCAL=1 \
+llama-server -m hy3-1M-MTP-Q4_K_M.gguf \
+  --rpc 127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055 \
+  --device CUDA0,CUDA1,RPC0,RPC2,RPC3 -sm tensor -ts 18,18,52,50,27 \
+  -ngl 99 --no-mmap --rpc-reload -c 4096 -ub 256 -b 256
 
-# ready-made (hand -ts):        ./run-ep-fleet-deepseek.sh
-# ready-made (auto-weighted):   EP_AUTO_WEIGHT=--rpc-auto-weight ./run-ep-fleet-deepseek.sh
+# ready-made (V4, single owner):   ./run-ep-fleet-deepseek.sh
+# ready-made (hy3, dual-role):     ./run-ep-fleet-hy3.sh   (MTP=1 for spec decode)
 ```
 
-- `-ts 0,3,2` gives the attention owner a **0** expert share (it owns attention
-  instead); `--rpc-auto-weight` sizes the rest by score, capped by memory.
-- **Exactly ONE local GPU** (the attention owner). A second local GPU as an
-  expert member corrupts the reduce and is rejected at load (TASKS.md #48).
-  Got two local GPUs? Use them via single-box `-sm tensor -ngl 99 -ncmoe N` —
-  that's *faster* for a model whose experts fit CPU RAM+NVMe (V4: 3.54 vs
-  ~2.5 t/s), since EP single-stream is latency-bound anyway.
+- `-ts` shares are EXPERT BYTES (GiB works). `18,18,...` = dual-role owners
+  (18 GiB of experts each at VRAM bandwidth — measured hy3 3.5-3.8 -> 4.6-4.8
+  t/s vs CPU-only experts); `0,0,...` = attention-only owners. CAPACITY-FIT
+  every share: member footprint = slice + residual mirror (hy3 1.9 / GLM 3.4
+  GiB) + ~1.5 GiB compute; an oversized share aborts the worker (#68b).
+  Auto-weight is NOT yet owner-group aware (#70) — pin -ts by hand and run
+  with `LLAMA_FLEET_CAPACITY_CHECK=0` (the gate predates dedicated sizing).
+- **Always pass `--rpc-reload` on EP loads** (#72): a batched-placement
+  manifest miss fails the endpoint by design; only the reload/surgical
+  machinery re-provisions it — without the flag the load wedges silently at
+  100% or the first decode fails with compute status -3.
+- The old one-local-GPU limit (#48) is RETIRED: the owner-group A/B is
+  byte-identical to single-owner (#70). For a model whose experts fit local
+  RAM+NVMe, single-box `-sm tensor -ngl 99 -ncmoe N` is still faster (V4:
+  9.8 vs ~5 t/s) — EP is for models that exceed the box.
 - **Single-stream is latency-bound, not compute-bound** (#28 attribution): a
   token pays one round trip per MoE boundary, so **fewer computing members is
   faster** single-stream (adding a fast V100 expert member *lowered* single-

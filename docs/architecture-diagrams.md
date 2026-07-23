@@ -52,17 +52,21 @@ flowchart LR
 
 ## 3. Expert-parallel (`-sm tensor` + `LLAMA_META_ATTN_OWNER`)
 
-For MoE models: only the routed experts are split; one local GPU owns
-attention/KV/router; workers hold expert shards. The composition law flips
-from SUM-over-stages to MAX-over-contacted-workers.
+For MoE models: only the routed experts are split; an owner GROUP of local
+GPUs holds attention/KV/router (layers interleaved `il % n_owners`, all
+attention syncs on NVLink); workers hold expert shards. Owners may ALSO hold
+expert shards in leftover VRAM (dual-role, #70 — validated live 2026-07-23).
+The composition law flips from SUM-over-stages to MAX-over-contacted-workers.
 
 ```mermaid
 flowchart TD
     subgraph coordinator box
-        A["CUDA0 = attention owner<br/>attention + KV + router + dense<br/>(0% expert share)"]
+        A["CUDA0 owner (even layers)<br/>attention + KV + router<br/>+ dual-role expert shard"]
+        B["CUDA1 owner (odd layers)<br/>attention + KV + router<br/>+ dual-role expert shard"]
+        A <-->|NVLink| B
     end
-    A -->|"activations (KB)"| W1["worker .11<br/>expert shard ~60%"]
-    A -->|"activations (KB)"| W2["worker .15<br/>expert shard ~40%"]
+    A -->|"activations (KB)"| W1["worker .11<br/>expert shard"]
+    A -->|"activations (KB)"| W2["worker .15<br/>expert shard"]
     W1 -->|"partial expert sums"| A
     W2 -->|"partial expert sums"| A
     A -->|"star reduce: host sum,<br/>broadcast identical bytes"| A
@@ -73,29 +77,43 @@ flowchart TD
   + returns the boundary partial in the same response).
 - Single-stream is RTT-serialized (~43 boundaries x RTT; workers idle >90%).
   Batching is the scaling axis: B=8 measured x2.85 aggregate.
-- Constraint: exactly ONE local GPU may be a member (the owner); a second
-  local GPU as expert member corrupts the reduce (#48, rejected at load).
-  REMOTE GPUs (a worker box's GPU) are legal members — they are just RPC
-  devices — but a small-VRAM card contributes little expert *capacity* while
-  adding a serialized hop, so worker RAM is usually the better member.
+- `LLAMA_META_ATTN_OWNER=0,1` = owner group (comma list). Requires
+  `LLAMA_META_ALLOW_MULTI_LOCAL=1`; the old one-local-GPU limit (#48) is
+  retired — the owner-group A/B is byte-identical to single-owner (#70).
+- Dual-role: give owners nonzero `-ts` shares and they hold experts at
+  VRAM bandwidth (~800 GB/s vs 25-57 on CPU boxes). Measured hy3:
+  CPU-only experts 3.5-3.8 t/s -> dual-role 4.6-4.8 t/s (+68-75% vs the
+  2.74 layer baseline).
+- Dedicated attention applies to STANDARD MoE archs too (#70), not just
+  DSA: the per-member mirror is only embd/shexp/norms/output — measured
+  1.9 GiB (hy3) / 3.4 GiB (GLM-5.2), NOT the whole non-expert stack.
+- Shares are BYTES, so capacity-fit them per box (parse the GGUF: experts
+  vs attention vs mirror) — auto-weight is not yet owner-group aware and
+  a 76 GiB share on a 59 GiB box kills the worker (#68b, #72).
+- ALWAYS pass `--rpc-reload` on EP loads: a batched-placement manifest miss
+  fails the endpoint by design and only the reload/surgical machinery
+  re-provisions it; without it the load wedges silently (#72).
 - Slow-LINK boxes must stay out of the ring entirely: the cost is per
   boundary, not per byte (100-Mbit member = 0.42 vs 1.82 t/s, #28).
 
 ### 3b. The capacity law: whose memory counts (layer vs EP)
 
-EP pools only what can hold *experts* — the owner takes no expert share and
-the second local GPU is excluded (#48) — while `-sm layer` pools every
-device. Worked example, GLM-5.2 Q2_K_XL (226.9 GiB + 8 GiB reserve =
-**240.5 GiB required**) on this fleet, 2026-07-21:
+Post-#70 the EP pool is: EVERY member's expert budget = (free memory −
+per-member mirror − compute reserve), including BOTH owners' leftover VRAM
+(dual-role). What must fit is only the EXPERT bytes — parse the GGUF for
+the real split; the old "whole non-expert stack mirrors per member" law is
+dead (dedicated attention lives on the owner group; residual mirror is
+1.9-3.4 GiB). Worked example, GLM-5.2 Q2_K_XL — GGUF-parsed 2026-07-23:
+**experts 216.2 GiB** + attention 7.3 (owners) + mirror 3.4/member:
 
 ```mermaid
 flowchart TB
-    subgraph EP["EP pool = worker RAM + owner only -> 178.6 GiB : HOLDS (62 GiB short)"]
+    subgraph EP["EP expert pool (#70 owner group + dual-role) -> ~218-225 GiB vs 216.2 needed : BORDERLINE-FEASIBLE (was '62 short, closed' pre-#70)"]
         direction LR
-        O1["CUDA0 owner<br/>~30 GiB"]:::gpu ---
-        E1["local worker<br/>~38 GiB"] --- E2[".11<br/>~58 GiB"] ---
-        E3[".25<br/>~28 GiB"] --- E4[".30<br/>~13 GiB"]
-        X1["CUDA1 32 GiB<br/>EXCLUDED (#48)"]:::dead
+        O1["CUDA0 owner<br/>~20-23 GiB experts<br/>(32 - attn/KV/compute)"]:::gpu ---
+        O2["CUDA1 owner<br/>~20-23 GiB experts"]:::gpu ---
+        E1["local worker<br/>~60 GiB"] --- E2[".11<br/>~51 GiB"] ---
+        E3[".15<br/>~41 GiB"] --- E4[".25<br/>~24 GiB (100-Mbit!)"]:::slow
         X2["1660 Ti 6 GiB<br/>legal, ~nil capacity"]:::dead
     end
     subgraph LAYER["-sm layer pool = every device -> 231.5 GiB : 9 GiB short, auto-starts when a box joins"]
@@ -105,10 +123,19 @@ flowchart TB
     end
     classDef gpu fill:#8ecae6,color:#000
     classDef dead fill:#e5e5e5,color:#888,stroke-dasharray: 5 5
+    classDef slow fill:#ffb703,color:#000
 ```
 
-- The capacity gate prints exactly this math and, under `--rpc-discover`,
-  holds the load and starts it automatically when a new box beacons.
+- GLM EP now closes only if .25 joins (100-Mbit straggler — expect the
+  per-boundary tax, #28) or owner shares are pushed to ~23 GiB each; it
+  is no longer physics-closed. Proof point of the law: hy3 (experts
+  164.9 GiB) went from "EP infeasible, 34.7 GiB mirror" to the FASTEST
+  hy3 serve (4.6-4.8 t/s dual-role EP) under exactly this math.
+- The capacity gate does NOT yet know dedicated-split sizing — EP loads
+  currently need `LLAMA_FLEET_CAPACITY_CHECK=0` and hand-fitted `-ts`
+  (open in #70); the gate still prints the correct math for layer mode
+  and, under `--rpc-discover`, holds the load and starts it automatically
+  when a new box beacons.
 - Sharded GGUFs are sized as the SUM of all `-NNNNN-of-NNNNN` siblings
   (fixed 2026-07-21: 0-based `llama_split_prefix` — before that every
   sharded model was silently sized as shard 1 alone, and auto-weight could
