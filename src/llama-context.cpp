@@ -2688,8 +2688,9 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.n_outputs     =*/ n_outputs,
+        /*.expert_tables =*/ model.expert_placement != nullptr ? model.expert_tables.get() : nullptr,
+        /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
 }

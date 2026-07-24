@@ -78,6 +78,11 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool use_direct_io = false;
     bool check_tensors;
+
+    // TASKS #75: when set, routed-expert weights of placed layers are read with
+    // their dim-2 expert chunks PERMUTED (hottest-first) so the meta buffer
+    // receives an already-permuted logical tensor (docs/expert-placement-plan.md §2b)
+    const struct llama_expert_placement * expert_placement = nullptr;
     bool no_alloc;
 
     llama_files files;

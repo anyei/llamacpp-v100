@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-expert-placement.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -399,6 +400,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->load_stats(ml);
         model->print_info();
 
+        // TASKS #75: hot-expert placement - load + validate the artifact before
+        // tensors so the split policy can consult it. Meta (tensor-split) configs
+        // only; loud error on any shape mismatch (docs/expert-placement-plan.md §3).
+        if (const char * pl_path = getenv("LLAMA_META_EXPERT_PLACEMENT"); pl_path != nullptr && pl_path[0] != '\0') {
+            const bool has_meta = std::any_of(model->devices.begin(), model->devices.end(),
+                                              [](const llama_device & d) { return d.is_meta; });
+            if (!has_meta) {
+                LLAMA_LOG_WARN("%s: LLAMA_META_EXPERT_PLACEMENT is set but there is no meta (tensor-split) device - ignored\n", __func__);
+            } else if (model->hparams.n_expert == 0) {
+                throw std::runtime_error("LLAMA_META_EXPERT_PLACEMENT set but the model has no experts");
+            } else {
+                model->expert_placement = llama_expert_placement_load(
+                    pl_path, model->hparams.n_layer(), model->hparams.n_expert, model->get_split_state_ud.n_devices);
+                ml.expert_placement = model->expert_placement.get();
+            }
+        }
+
+
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
@@ -406,6 +425,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        // TASKS #75: build + upload the per-member ownership tables (remap/mask)
+        // once the meta device exists and weights are placed
+        if (model->expert_placement != nullptr && !params.no_alloc) {
+            ggml_backend_dev_t meta_dev = nullptr;
+            for (const auto & d : model->devices) {
+                if (d.is_meta) {
+                    meta_dev = d.dev;
+                    break;
+                }
+            }
+            GGML_ASSERT(meta_dev != nullptr); // placement load already required a meta device
+            model->expert_tables = llama_expert_placement_create_tables(
+                *model->expert_placement, ggml_backend_dev_buffer_type(meta_dev),
+                model->get_split_state_ud.n_devices);
+            LLAMA_LOG_INFO("%s: expert placement: ownership tables uploaded (%u layers)\n",
+                           __func__, model->expert_placement->n_layer);
         }
 
         return {0, model_ptr.release()};

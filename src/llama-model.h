@@ -17,6 +17,8 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_placement;
+struct llama_expert_placement_tables;
 
 // available models
 enum llm_type {
@@ -636,6 +638,11 @@ struct llama_model {
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+
+    // TASKS #75: hot-expert placement (LLAMA_META_EXPERT_PLACEMENT=<json>, tensor-split
+    // meta configs only); null = uniform contiguous split (today's behavior)
+    std::shared_ptr<llama_expert_placement> expert_placement;
+    std::shared_ptr<llama_expert_placement_tables> expert_tables;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;

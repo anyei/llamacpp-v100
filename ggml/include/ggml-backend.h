@@ -426,6 +426,14 @@ extern "C" {
     // Returns false when anything cannot be restored (caller should fully reload).
     GGML_API bool ggml_backend_meta_reprovision_endpoint(const char * endpoint);
 
+    // TASKS #75 (hot-expert placement): write one MEMBER's shadow of a meta-buffer
+    // tensor directly. Needed for tensors whose per-member CONTENTS differ (the
+    // expert ownership mask / id-remap tables): a plain meta set_tensor writes all
+    // members identically (MIRRORED) or divides the values (PARTIAL), neither of
+    // which can express per-member data.
+    GGML_API void ggml_backend_meta_tensor_set_member(
+        struct ggml_tensor * tensor, size_t member, const void * data, size_t offset, size_t size);
+
     //
     // Utils
     //

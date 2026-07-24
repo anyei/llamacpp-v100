@@ -959,6 +959,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // TASKS #75 hot-expert placement: the masked expert product - each member
+        // holds full-shape values where only its OWNED (token, k) lanes are
+        // nonzero (the mirrored-state mask contents differ per member), so the
+        // member sum is the logical value: honestly PARTIAL, reconciled at the
+        // expert-sum AllReduce. Tagged by name from build_moe_ffn (the derivation
+        // is structural and cannot see contents; same pattern as the island-exit
+        // name checks in handle_mul_mat).
+        if (tensor->op == GGML_OP_MUL && strstr(tensor->name, "ffn_moe_weighted_placed") != nullptr) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -1014,6 +1024,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        // TASKS #75 hot-expert placement: MUL_MAT_ID against expert-axis-split
+        // weights. Each member computes every (token, k) pair against its LOCAL
+        // expert set (ids remapped member-locally in the graph); non-owned lanes
+        // are finite garbage neutralized by the PARTIAL ownership mask on the
+        // gating weights. The per-member output is full-shape -> MIRRORED.
+        if (tensor->op == GGML_OP_MUL_MAT_ID && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -1972,6 +1991,19 @@ static void ggml_backend_meta_buffer_reject_unknown_alias(const struct ggml_tens
     }
 }
 
+// TASKS #75: member-targeted write for tensors whose per-member contents differ
+// (expert ownership mask / id-remap tables). Bypasses the split-state fan-out
+// and writes exactly one member's shadow.
+void ggml_backend_meta_tensor_set_member(ggml_tensor * tensor, size_t member, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer));
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    GGML_ASSERT(member < n_bufs);
+    ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, member);
+    GGML_ASSERT(st != nullptr && st->buffer != nullptr);
+    GGML_ASSERT(ggml_nbytes(st) == ggml_nbytes(tensor)); // full-shape shadows only (MIRRORED/PARTIAL states)
+    ggml_backend_tensor_set(st, data, offset, size);
+}
+
 static void ggml_backend_meta_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     // needed since the upstream merge: the dsv4 compressed-KV cache clears
     // per-stream slices via ggml_backend_tensor_memset (llama-kv-cache-dsv4.cpp)
@@ -2179,8 +2211,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // first so no lookup or derivation ever walks their src pointers
     if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
         ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
-    }
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    }    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 

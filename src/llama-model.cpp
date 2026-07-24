@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-expert-placement.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -349,6 +350,48 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+
+    // TASKS #75: hot-expert placement - routed expert weights split along the
+    // EXPERT axis (dim 2) with per-member counts from the placement artifact
+    // (whole-expert ownership), instead of the uniform feature-dim split. The
+    // ownership mask is honestly PARTIAL (member masks sum to the all-ones
+    // vector); the remap table is declared MIRRORED with per-member contents
+    // (benign: masked lanes only). See docs/expert-placement-plan.md section 2.
+    if (const llama_expert_placement * pl = ud->model->expert_placement.get()) {
+        static const std::regex pattern_exps_weight("blk\\.(\\d+)\\.ffn_(gate|up|gate_up|down)_exps\\.weight");
+        static const std::regex pattern_exp_mask   ("blk\\.(\\d+)\\.exp_mask");
+        static const std::regex pattern_exp_remap  ("blk\\.(\\d+)\\.exp_remap");
+        std::smatch m;
+        auto simple_state = [](ggml_backend_meta_split_axis axis) {
+            ggml_backend_meta_split_state ss = {};
+            ss.axis = axis;
+            ss.nr[0] = 1;
+            ss.n_segments = 1;
+            return ss;
+        };
+        if (std::regex_match(tensor_name, m, pattern_exps_weight)) {
+            const uint32_t il = (uint32_t) std::stoul(m[1]);
+            if (pl->layer_placed(il)) {
+                GGML_ASSERT(tensor->ne[2] == (int64_t) pl->n_expert);
+                ggml_backend_meta_split_state ss = simple_state(GGML_BACKEND_SPLIT_AXIS_2);
+                const std::vector<int32_t> & cnt = pl->counts[il];
+                GGML_ASSERT(cnt.size() == ud->n_devices);
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    ss.ne[j] = cnt[j];
+                }
+                return ss;
+            }
+            // unplaced layer: fall through to the regular policy below
+        } else if (std::regex_match(tensor_name, m, pattern_exp_mask)) {
+            // MIRRORED with per-member CONTENTS (a benign state lie - the masked
+            // lanes differ per member, and the graph names the masked expert
+            // product 'ffn_moe_weighted_placed' whose PARTIAL rule reconciles
+            // members at the existing expert-sum AllReduce boundary)
+            return simple_state(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        } else if (std::regex_match(tensor_name, m, pattern_exp_remap)) {
+            return simple_state(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+    }
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
