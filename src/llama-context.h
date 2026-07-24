@@ -333,6 +333,9 @@ private:
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
+    // TASKS #74: per-layer expert-selection histogram (LLAMA_EXPERT_PROFILE=<path>)
+    std::unique_ptr<struct llama_expert_profile> expert_profile;
+
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers

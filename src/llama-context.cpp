@@ -15,10 +15,96 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+
+// TASKS #74: per-layer expert-selection histogram. Env LLAMA_EXPERT_PROFILE=<path>
+// installs a sched eval callback that reads every "ffn_moe_topk-<il>" tensor
+// (the router's selected expert ids, [n_expert_used, n_tokens] I32 - works on the
+// meta backend too, tensor_get gathers from the owning member) and accumulates
+// counts[layer][expert]. The histogram is what #75 hot-expert placement consumes.
+struct llama_expert_profile {
+    std::string path;
+    std::string model_name;
+    uint32_t n_layer       = 0;
+    uint32_t n_expert      = 0;
+    uint32_t n_expert_used = 0;
+
+    std::vector<std::vector<uint64_t>> counts;   // [n_layer][n_expert]
+    std::vector<uint64_t> rows;                  // [n_layer] tokens routed per layer
+    int      ref_layer      = -1;                // first MoE layer seen - paces the dumps
+    uint64_t last_dump_rows = 0;
+    std::mutex mtx;
+
+    void accumulate(int il, const int32_t * ids, int64_t n_ids, int64_t n_tokens) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (il < 0 || (uint32_t) il >= n_layer) {
+            return;
+        }
+        auto & c = counts[il];
+        for (int64_t i = 0; i < n_ids; i++) {
+            if (ids[i] >= 0 && (uint32_t) ids[i] < n_expert) {
+                c[ids[i]]++;
+            }
+        }
+        rows[il] += n_tokens;
+        if (ref_layer < 0) {
+            ref_layer = il;
+        }
+        if (il == ref_layer && rows[il] - last_dump_rows >= 500) {
+            last_dump_rows = rows[il];
+            dump();
+        }
+    }
+
+    void dump() { // caller holds mtx (or is the single-threaded dtor)
+        const std::string tmp = path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("expert-profile: cannot write '%s'\n", tmp.c_str());
+            return;
+        }
+        const uint64_t tokens = ref_layer >= 0 ? rows[ref_layer] : 0;
+        fprintf(f, "{\n  \"model\": \"%s\",\n  \"n_layer\": %u,\n  \"n_expert\": %u,\n  \"n_expert_used\": %u,\n  \"tokens_profiled\": %" PRIu64 ",\n  \"rows_per_layer\": [",
+                model_name.c_str(), n_layer, n_expert, n_expert_used, tokens);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            fprintf(f, "%s%" PRIu64, il ? ", " : "", rows[il]);
+        }
+        fprintf(f, "],\n  \"counts\": [\n");
+        for (uint32_t il = 0; il < n_layer; il++) {
+            fprintf(f, "    [");
+            for (uint32_t e = 0; e < n_expert; e++) {
+                fprintf(f, "%s%" PRIu64, e ? "," : "", counts[il][e]);
+            }
+            fprintf(f, "]%s\n", il + 1 < n_layer ? "," : "");
+        }
+        fprintf(f, "  ]\n}\n");
+        fclose(f);
+        rename(tmp.c_str(), path.c_str());
+    }
+};
+
+static bool llama_expert_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    constexpr const char * prefix = "ffn_moe_topk-";
+    constexpr size_t prefix_len = 13;
+    if (ask) {
+        return strncmp(t->name, prefix, prefix_len) == 0;
+    }
+    if (strncmp(t->name, prefix, prefix_len) != 0 || t->type != GGML_TYPE_I32) {
+        return true;
+    }
+    auto * prof = (llama_expert_profile *) user_data;
+    const int il = atoi(t->name + prefix_len);
+    const int64_t n_ids = ggml_nelements(t);
+    std::vector<int32_t> ids(n_ids);
+    ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
+    prof->accumulate(il, ids.data(), n_ids, t->ne[1]);
+    return true;
+}
 
 //
 // llama_context
@@ -137,6 +223,27 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // TASKS #74: expert-selection profiling - only on the primary decode context
+    // (an MTP draft context would clobber the same output file), only when no
+    // other eval callback claims the single sched slot
+    if (cparams.cb_eval == nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && hparams.n_expert > 0) {
+        const char * prof_path = getenv("LLAMA_EXPERT_PROFILE");
+        if (prof_path != nullptr && prof_path[0] != '\0') {
+            expert_profile = std::make_unique<llama_expert_profile>();
+            expert_profile->path          = prof_path;
+            expert_profile->model_name    = model.name;
+            expert_profile->n_layer       = hparams.n_layer();
+            expert_profile->n_expert      = hparams.n_expert;
+            expert_profile->n_expert_used = hparams.n_expert_used;
+            expert_profile->counts.assign(expert_profile->n_layer, std::vector<uint64_t>(expert_profile->n_expert, 0));
+            expert_profile->rows.assign(expert_profile->n_layer, 0);
+            cparams.cb_eval           = llama_expert_profile_cb;
+            cparams.cb_eval_user_data = expert_profile.get();
+            LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE: recording per-layer expert selections to '%s'\n",
+                           __func__, prof_path);
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -503,6 +610,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (expert_profile) {
+        std::lock_guard<std::mutex> lock(expert_profile->mtx);
+        expert_profile->dump();
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
