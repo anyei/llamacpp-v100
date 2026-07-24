@@ -105,3 +105,34 @@ rig today. WATCH (esp. PR #24423 + llama-server support), don't build.
 
 Upstream merge cadence: WEEKLY (17 days of drift cost 31% on V4, #65). Each
 merge cycle re-runs the watch list above (#67a).
+
+## Addendum 2026-07-24: research/true-parallel-inference folder review (#71)
+
+Reviewed the remaining unread items in `research/true-parallel-inference/`:
+
+- **Median Selection Subset Aggregation** (`9b81f...-Paper.pdf`, NeurIPS 2014,
+  Wang/Peng/Dunson): parallel *statistical* inference - Lasso/GIC feature
+  selection fitted per data subset, combined by median inclusion + coefficient
+  averaging. "Inference" = parameter estimation; terminology collision, no
+  applicability to generative decoding. OFF-TOPIC.
+- **Parallel Inference for Real-Time ML Applications** (Al Bayyat et al. 2024):
+  sklearn `RandomizedSearchCV(n_jobs=-1)` Random-Forest hyperparameter tuning
+  benchmark. OFF-TOPIC.
+- **`5-288`**: dead page capture (tracking scripts only, no article body).
+- **Defeating Nondeterminism in LLM Inference** (`index.html`, Thinking
+  Machines Lab): RELEVANT - batch-invariance. Explains the temp-0 output drift
+  we measure across split configs and between spec-verify batches and plain
+  decode (reduction order changes with batch shape -> logit drift -> token
+  divergence). Consequences adopted:
+  1. Byte-identity gates are SHAPE-LOCAL: only compare runs with identical
+     split + batch shape; cross-shape drift at temp-0 is expected physics, not
+     corruption (nearly mis-diagnosed twice on 2026-07-23).
+  2. Batch-invariant kernels are a #71 stage-2+ enabler: bitwise-equal
+     verify-batch vs single-token logits would make speculation provably
+     identity-preserving, restoring the byte-identity gate for all spec work.
+     Re-derivation cost for sm70 unknown; watch for upstream/community
+     batch-invariant kernel work before building.
+
+Collection note: filter future paper hauls on "parallel/speculative DECODING"
+or "token generation" - "parallel inference" collides with statistics and
+classic-ML serving literature.
