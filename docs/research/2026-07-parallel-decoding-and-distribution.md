@@ -199,3 +199,22 @@ stability. An afternoon of counter code, zero placement changes.
    list replacing the contiguous owner slice (+20-30% decode expected).
 3. **#71 stage 2 = draft-on-VRAM-experts self-speculation** (needs #75).
 4. Absorb DSpark when merged; track #25818 + #24675 at each weekly merge.
+
+## Addendum 2026-07-24b: Brakel et al., "Model Parallelism on Distributed
+## Infrastructure" (arXiv 2403.03699) — folder review
+
+Survey of model parallelism (intra-op vs inter-op taxonomy, auto-parallelisation
+search: Alpa/FlexFlow-SOAP/PipeDream/FTPipe/Metis; training-era case studies).
+No new runnable technique, two takeaways adopted:
+1. Independent confirmation of the fleet laws the guide already states
+   (intra-op needs NVLink-class links; inter-op pipelines tolerate Ethernet;
+   micro-batching amortizes bubbles).
+2. **Auto-parallelisation-as-search is the right frame for #70-tail
+   auto-weight v2 ("auto-place")**: today's auto-weight is a greedy
+   bandwidth-proportional splitter, blind to owner groups/dual-role/expert
+   scatter. Formulate placement (per-device role + byte share + hot-expert
+   list) as a search over our MEASURED cost model (worker scores, capacities,
+   link RTTs, #74 coverage curves) — Alpa-style two-level, but our fleet is
+   small enough for near-exhaustive search. FTPipe's non-adjacent-layer
+   assignment also generalizes our layer-mode contiguous slabs, though #61
+   showed layer mode is near-physics, so low priority.
