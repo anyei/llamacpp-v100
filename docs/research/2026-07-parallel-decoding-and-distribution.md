@@ -136,3 +136,66 @@ Reviewed the remaining unread items in `research/true-parallel-inference/`:
 Collection note: filter future paper hauls on "parallel/speculative DECODING"
 or "token generation" - "parallel inference" collides with statistics and
 classic-ML serving literature.
+
+## Iteration 2 — 2026-07-24 (post-#70/#71-stage-1 refocus)
+
+### (a) Upstream watch (merge base ~Jul 5 -> Jul 24)
+- **RPC core stagnant** (nothing merged since May). Issue #25890 (15-min serialized
+  535 GB loads) is third-party validation of our caching/manifest moat. WATCH:
+  **#24675** (RPC async/events -> pipeline parallelism over RPC - the one PR that
+  narrows the gap), **#25818** ("remote speculative decoding via ethernet",
+  draft on a separate llama-server - the FIRST upstream distributed-spec
+  feature; absorb or differentiate at merge time).
+- **Meta backend**: #19378 merged Apr (LOCAL TP only); July hardening (TP+ncmoe
+  MoE fix #25028, DSV4 fused ops #25585). No sign of meta+RPC composition.
+  Merge-friction risk concentrates in ggml-backend-meta.cpp + spec sidecar
+  auto-config churn in common/ (#25811/#25955/#25989).
+- **Upstream circles hot-experts single-box**: #25932 (--pin-hotexperts, usage
+  tracking + mlock top-N) and #26003 (--lazy-experts, page-cache prefetch of
+  routed experts). Read both before building ours; nothing cross-node.
+- Spec framework: DSpark drafter PR #25173 (DFlash + semi-AR Markov head,
+  60-85% over MTP-1 in DSV4 production; DFlash itself already merged).
+
+### (b) Hot-expert placement — GO, gated on a 1-day profiling counter
+Field consensus: balancing losses equalize GLOBAL expert load, not per-layer/
+per-domain load ("globally balanced, locally imbalanced"). Measured coverage at
+a 25% budget on balanced-trained MoEs: **37-53%** (MoE-Sieve: OLMoE 53%, Qwen-MoE
+37.4%, DeepSeek-MoE 42.6%; CRAFT: per-layer peak-to-mean 2.5x-27x on R1/Kimi-K2).
+Frequency beats recency (LFU +84% over LRU, CMU 2511.05814); static profiled
+placement is the working floor (Fiddler, ktransformers, SlimCaching, Prism).
+FOR US: uniform owner slice = 25.5% VRAM hit fraction by construction; frequency
+placement projects **37-43% conservative** (+12-18 pp) -> CPU expert bytes/token
+drop ~20-25% -> up to ~1.2-1.3x decode on the record config (5.06-5.22 -> ~6-6.7
+ceiling). Per-layer top-k frequency ranking suffices for static placement
+(submodular-greedy optimal, Prism); uniform per-layer budget first, entropy-
+weighted budgets as v2. Risks to verify on-workload: hy3's shared experts may
+have absorbed the skew; mixed traffic flattens hot sets. DECISIVE MEASUREMENT
+(filed as #74): per-layer router-selection counters, few thousand decode tokens
+of representative traffic, compute top-25.5% coverage per layer + cross-domain
+stability. An afternoon of counter code, zero placement changes.
+
+### (c) Watch list resolutions
+- **MoE x speculation expert-read explosion is now a NAMED problem**: MoE-Spec
+  (2602.16052, +10-30% via expert budgeting), EcoSpec (2607.12696, expert-reuse-
+  aware draft selection, 1.62x), Utility-Driven SD (2506.20675). Our #71 stage-1
+  parity-minus verdict independently reproduced by the field; their mitigations
+  are the stage-2 toolbox.
+- **Self-Speculative MoE (WWW 2026, 3.72x claimed): draft with a reduced expert
+  subset of the SAME model — zero extra weight reads.** Fused with dual-role:
+  draft by routing ONLY to VRAM-resident experts (no RAM traffic), verify full.
+  Marries hot-expert placement and speculation into one mechanism — adopted as
+  the #71 STAGE-2 CANDIDATE (after #74/#75 land, which also make the reduced
+  set accurate).
+- Batch-invariance: vLLM mode is sm80+ (no V100); llama.cpp PR #16016 (covers
+  mul_mat_id) is a maintainer-rejected draft -> fork-carry option if/when we
+  want provable spec identity.
+- DiffusionGemma: GGUFs exist (unsloth 26B-A4B), llama.cpp still cli-only draft
+  (#24423/#24427, "diffusion server" at design stage). TiDAR: still paper-only.
+  LLaDA2.X: open diffusion MoEs (16B/100B) with cli-path support.
+
+### Iteration-2 prioritized candidates
+1. **#74 expert-frequency profiling** (1 day): router counters + coverage report
+   -> gates #75. 2. **#75 hot-expert placement**: per-layer expert-ID scatter
+   list replacing the contiguous owner slice (+20-30% decode expected).
+3. **#71 stage 2 = draft-on-VRAM-experts self-speculation** (needs #75).
+4. Absorb DSpark when merged; track #25818 + #24675 at each weekly merge.
