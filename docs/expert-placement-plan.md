@@ -181,3 +181,48 @@ are valid here (NOT on the GPU fleet - gotcha #4).
 - `-ts` for non-expert tensors is unchanged; EXPERT shares come from the
   placement JSON when set (the JSON's member_shares should match the serve's
   expert -ts; the consistency check warns on mismatch).
+
+## 6. Regenerating the artifact for a serve roster (fleet A/B prerequisite)
+
+The placement artifact is ROSTER-SPECIFIC, not just model-specific: its
+`counts_per_layer` rows have one entry per META MEMBER, in meta device order,
+and the runtime consistency check hard-errors when that count differs from the
+serve's member count. Any change to the roster or to the expert `-ts`
+invalidates the artifact - regenerate it, do not reuse.
+
+Rules:
+
+1. **Member order = meta device order = the order of `--device`/EP_DEVICES**
+   (e.g. the hy3 record serve CUDA0,CUDA1,RPC0,RPC1,RPC2 = local V100 owners
+   first, then local cpu worker, .11, .15). `--ts` for the generator must be
+   given in that same order.
+2. **Shares = the serve's EXPERT `-ts`, not layer shares.** For the record
+   dual-role config that is `--ts 21,21,46,50,27` (owners hold 21 GB of
+   experts each). Zero-share members are not representable in v1 (every
+   member must own >= 1 expert per placed layer - the table-builder guard);
+   a pure attention owner with 0% experts would need the v1 guard relaxed
+   (give it a minimal share instead).
+3. **Hot-first ordering does the placement**: the generator ranks experts
+   hottest-first per layer, and members receive contiguous runs in `--ts`
+   order - so the members listed FIRST get the hottest experts. Owners
+   (VRAM) must therefore come first in the roster, which they already do in
+   the dual-role EP configs.
+4. **Interaction with LLAMA_META_EP_ONLY / ATTN_OWNER**: placement only
+   overrides the `_exps` weights of placed layers; the dedicated-attention
+   and mirror rules are untouched. The placement JSON's shares must be
+   regenerated whenever the EP `-ts` is retuned (e.g. the 18->21 GB owner
+   bump was a different artifact-shares config than the earlier record).
+
+Example (hy3 record roster, both-domain profile merge):
+
+```bash
+scripts/expert-placement.py profiles/hy3-full.json \
+    --profile-b profiles/hy3-bucketA.json \
+    --ts 21,21,46,50,27 -o placements/hy3-record-21-21-46-50-27.json
+```
+
+Name the artifact after model+shares (as above) so a stale artifact is
+visible at a glance; keep them under `placements/` next to `profiles/`.
+The generator's coverage report prints the owners' expected hit fraction -
+record it with the serve (hy3-full at this split: members 0+1 = 25.5% of
+experts covering 91.3% of routed selections).
