@@ -82,7 +82,7 @@ flowchart TD
   retired — the owner-group A/B is byte-identical to single-owner (#70).
 - Dual-role: give owners nonzero `-ts` shares and they hold experts at
   VRAM bandwidth (~800 GB/s vs 25-57 on CPU boxes). Measured hy3:
-  CPU-only experts 3.5-3.8 t/s -> dual-role 4.6-4.8 t/s (+68-75% vs the
+  CPU-only experts 3.5-3.8 t/s -> dual-role 5.06-5.22 t/s (+85-90% vs the
   2.74 layer baseline).
 - Dedicated attention applies to STANDARD MoE archs too (#70), not just
   DSA: the per-member mirror is only embd/shexp/norms/output — measured
