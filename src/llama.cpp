@@ -150,6 +150,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                         n_local++;
                     }
                 }
+                // an owner GROUP (TASKS #70, comma list e.g. "0,1") legitimately
+                // spans that many local members - attention head-splits among them
+                size_t n_owners = 1;
+                for (const char * p = attn_owner_env; *p != '\0'; p++) {
+                    n_owners += *p == ',';
+                }
+                if (n_local <= n_owners) {
+                    n_local = 1; // within the owner group - pass the guard below
+                }
                 // LLAMA_META_ALLOW_MULTI_LOCAL=1: re-test gate for the #48 corruption
                 // after major merges - outputs MUST pass the coherence gate before
                 // trusting a multi-local EP config
