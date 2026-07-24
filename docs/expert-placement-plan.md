@@ -160,6 +160,13 @@ are valid here (NOT on the GPU fleet - gotcha #4).
 3. **Skew gate**: real hottest-first placement == placement-off,
    byte-identical (permutation must not change math - each expert's arithmetic
    is identical, the weighted sum is per-pair and order-independent).
+   **MEASURED 2026-07-24: exact under GGML_META_NO_DELAY=1 (all five variants
+   byte-identical to OFF); the delayed-reduce path diverges for strongly
+   skewed counts (32/160, 160/32) by fp summation GROUPING only -
+   deterministic, boundaries identical (GGML_META_DEBUG_REDUCE diff empty).
+   PPL gate settles it: trunc-hy3 8-chunk wikitext - OFF 119683.40 +/- 3655,
+   identity 119673.89, skew-160/32 119694.74 - spread 0.009%, ~300000x inside
+   the error bar. Quality-neutral rounding class (dev-workflow §5).**
 4. **Ownership audit**: GGML_META_DEBUG counters - per member, mul_mat_id rows
    computed vs owned; a member computing a non-owned pair (beyond the masked
    slot-0 dummies) is a bug even if output matches.
