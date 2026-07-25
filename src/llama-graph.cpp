@@ -1943,15 +1943,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // member-local ids for the expert GEMMs (get_rows on an I32 src stays I32).
         // NOT applied to selected_experts yet - the gating-weight gather below must
         // read probs by ORIGINAL expert id.
-        ggml_tensor * ids_local = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, remap, 1, n_expert), ids_flat);
-        ids_local = ggml_reshape_2d(ctx0, ids_local, selected_experts->ne[0], selected_experts->ne[1]);
+        ggml_tensor * ids_rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, remap, 1, n_expert), ids_flat);
+        ggml_tensor * msk_rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mask, 1, n_expert), ids_flat);
+        // TASKS #75 gate 4: under GGML_META_DEBUG, pin the flat ownership gathers as
+        // graph outputs so the meta backend's audit readback at graph end sees this
+        // graph's values (unpinned cells are recycled by the allocator once consumed)
+        static const bool expert_audit = getenv("GGML_META_DEBUG") != nullptr;
+        if (expert_audit) {
+            ggml_set_output(ids_rows);
+            ggml_set_output(msk_rows);
+        }
+        ggml_tensor * ids_local = ggml_reshape_2d(ctx0, ids_rows, selected_experts->ne[0], selected_experts->ne[1]);
         cb(ids_local, "ffn_moe_ids_local", il);
 
         // ownership mask rows [1, n_expert_used, n_tokens]; the mask table is
         // PARTIAL (member masks sum to ones), so this product chain derives
         // PARTIAL and reaches the existing AllReduce boundary
-        exp_mask_rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mask, 1, n_expert), ids_flat);
-        exp_mask_rows = ggml_reshape_3d(ctx0, exp_mask_rows, 1, selected_experts->ne[0], selected_experts->ne[1]);
+        exp_mask_rows = ggml_reshape_3d(ctx0, msk_rows, 1, selected_experts->ne[0], selected_experts->ne[1]);
         cb(exp_mask_rows, "ffn_moe_exp_mask", il);
 
         exp_ids_local = ids_local;

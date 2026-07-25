@@ -2632,9 +2632,171 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     return backend_ctx->name.c_str();
 }
 
+// TASKS #75 gate 4 (ownership audit, docs/expert-placement-plan.md section 4):
+// with expert placement active every member computes every selected (token, k)
+// pair against its LOCAL expert slots; owned pairs carry mask 1.0, non-owned
+// pairs ride the dummy local slot 0 and are masked out. Recount the pairs from
+// the member shadows after compute: a non-owned pair computed against a slot
+// other than 0 is a bug even when the (masked) output still matches.
+// GGML_META_DEBUG>0 only - zero cost when unset.
+struct ggml_meta_expert_audit_totals {
+    uint64_t computed   = 0; // (slot, row) pairs computed across the layer's expert GEMMs
+    uint64_t owned      = 0; // pairs the member owns (mask 1.0)
+    uint64_t dummy      = 0; // non-owned pairs computed against the dummy slot 0
+    uint64_t violations = 0; // non-owned pairs off the dummy slot / slots out of range
+};
+
+static std::vector<ggml_meta_expert_audit_totals> ggml_meta_expert_audit_totals_by_member;
+
+static void ggml_meta_expert_audit_pairs(
+        ggml_meta_expert_audit_totals & tot,
+        const int32_t * ids, const float * mask, int64_t n_ids, int64_t k, int64_t n_local, int n_gemm,
+        size_t member, int il, const char * tag) {
+    for (int64_t p = 0; p < n_ids; p++) {
+        const int32_t slot = ids[p];
+        const bool   owned = mask[p] > 0.5f;
+        tot.computed += n_gemm;
+        if (owned) {
+            tot.owned += n_gemm;
+        } else if (slot == 0) {
+            tot.dummy += n_gemm;
+        }
+        const char * why = nullptr;
+        if (slot < 0 || slot >= n_local) {
+            why = "slot out of range";
+        } else if (!owned && slot != 0) {
+            why = "non-owned pair off the dummy slot";
+        }
+        if (why != nullptr) {
+            tot.violations += n_gemm;
+            GGML_LOG_ERROR("EXPERT_AUDIT: WARN%s member %zu layer %d pair (tok %" PRId64 ", k %" PRId64 "): %s "
+                           "(slot %d, member owns %" PRId64 " experts, ids shared by %d expert gemms) - violation #%" PRIu64 "\n",
+                           tag, member, il, p/k, p%k, why, slot, n_local, n_gemm, tot.violations);
+        }
+    }
+}
+
+static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cgraph * cgraph) {
+    static const int debug = []() {
+        const char * d = getenv("GGML_META_DEBUG");
+        return d != nullptr ? atoi(d) : 0;
+    }();
+    if (debug <= 0) {
+        return;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_backends = backend_ctx->backend_configs.size();
+
+    // placed expert GEMMs: MUL_MAT_ID against an expert-axis (dim-2) split weight -
+    // only the placement split policy (llama-model.cpp) splits _exps that way
+    std::map<const ggml_tensor *, int> ids_users; // member-local ids tensor -> #expert GEMMs using it
+    std::map<const ggml_tensor *, int> ids_gemm;  // ... -> node index of one such GEMM
+    std::map<const ggml_tensor *, int> ids_layer; // ... -> layer id from the weight name
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[2] == nullptr ||
+                node->src[0]->buffer == nullptr || !ggml_backend_buffer_is_meta(node->src[0]->buffer)) {
+            continue;
+        }
+        if (ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            continue;
+        }
+        int il = -1;
+        sscanf(node->src[0]->name, "blk.%d.", &il);
+        if (ids_users[node->src[2]]++ == 0) {
+            ids_gemm [node->src[2]] = i;
+            ids_layer[node->src[2]] = il;
+        }
+    }
+    if (ids_users.empty()) {
+        return;
+    }
+
+    // GGML_META_DEBUG>1 negative control: the pair counter must warn on a
+    // synthetic non-owned pair mapped off the dummy slot (run once)
+    if (debug > 1) {
+        static bool selftest_done = false;
+        if (!selftest_done) {
+            selftest_done = true;
+            const int32_t ids_bad [] = {1, 0, 3, 0}; // pair 2: mask 0 but slot 3
+            const float   mask_bad[] = {1, 0, 0, 1};
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST injecting 1 non-owned non-dummy pair (expect 1 WARN + 1 violation)\n");
+            ggml_meta_expert_audit_totals tot;
+            ggml_meta_expert_audit_pairs(tot, ids_bad, mask_bad, 4, 2, 4, 1, 0, -1, " SELFTEST");
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST counted computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
+                    " violations=%" PRIu64 " (want 4/2/1/1)\n",
+                    tot.computed, tot.owned, tot.dummy, tot.violations);
+        }
+    }
+
+    auto & totals = ggml_meta_expert_audit_totals_by_member;
+    if (totals.size() != n_backends) {
+        totals.assign(n_backends, {});
+    }
+    const std::vector<ggml_meta_expert_audit_totals> before = totals;
+    static uint64_t n_graphs = 0;
+    n_graphs++;
+
+    for (const auto & it : ids_users) {
+        const ggml_tensor * ids    = it.first;
+        const int           n_gemm = it.second;
+        const int           il     = ids_layer[ids];
+        const int           i_gemm = ids_gemm [ids];
+        const int64_t n_ids = ggml_nelements(ids);
+        const int64_t k     = ids->ne[0];
+
+        // the layer's ownership mask rows (build_moe_ffn names them ffn_moe_exp_mask-<il>)
+        char mask_name[GGML_MAX_NAME];
+        snprintf(mask_name, sizeof(mask_name), "ffn_moe_exp_mask-%d", il);
+        int i_mask = -1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (strcmp(cgraph->nodes[i]->name, mask_name) == 0) {
+                i_mask = i;
+                break;
+            }
+        }
+        if (i_mask < 0) {
+            GGML_LOG_ERROR("EXPERT_AUDIT: layer %d: '%s' not in this graph piece - layer skipped\n", il, mask_name);
+            continue;
+        }
+
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_tensor * st_ids  = bcj.nodes[i_gemm]->src[2];
+            const ggml_tensor * st_mask = bcj.nodes[i_mask];
+            const int64_t n_local = bcj.nodes[i_gemm]->src[0]->ne[2]; // member's local expert count
+            GGML_ASSERT(ggml_nelements(st_ids) == n_ids && ggml_nelements(st_mask) == n_ids);
+            GGML_ASSERT(st_ids->type == GGML_TYPE_I32 && st_mask->type == GGML_TYPE_F32);
+            std::vector<int32_t> ids_buf (n_ids);
+            std::vector<float>   mask_buf(n_ids);
+            ggml_backend_tensor_get(st_ids,  ids_buf.data(),  0, n_ids*sizeof(int32_t));
+            ggml_backend_tensor_get(st_mask, mask_buf.data(), 0, n_ids*sizeof(float));
+            ggml_meta_expert_audit_pairs(totals[j], ids_buf.data(), mask_buf.data(), n_ids, k, n_local, n_gemm, j, il, "");
+        }
+    }
+
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_meta_expert_audit_totals & b = before[j];
+        const ggml_meta_expert_audit_totals & t = totals[j];
+        fprintf(stderr, "EXPERT_AUDIT: member %zu graph #%" PRIu64 ": computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
+                " violations=%" PRIu64 " | total computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64 " violations=%" PRIu64 "\n",
+                j, n_graphs,
+                t.computed - b.computed, t.owned - b.owned, t.dummy - b.dummy, t.violations - b.violations,
+                t.computed, t.owned, t.dummy, t.violations);
+    }
+}
+
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    // TASKS #75 gate 4: final ownership-audit totals (only if the audit ran)
+    for (size_t j = 0; j < ggml_meta_expert_audit_totals_by_member.size(); j++) {
+        const ggml_meta_expert_audit_totals & t = ggml_meta_expert_audit_totals_by_member[j];
+        fprintf(stderr, "EXPERT_AUDIT: FINAL member %zu: computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
+                " violations=%" PRIu64 "%s\n",
+                j, t.computed, t.owned, t.dummy, t.violations, t.violations == 0 ? "" : " - BUGS DETECTED");
+    }
+    ggml_meta_expert_audit_totals_by_member.clear();
     delete backend_ctx;
     delete backend;
 }
@@ -3804,6 +3966,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->tm_build_hits   = 0;
         backend_ctx->tm_build_misses = 0;
     }
+    // TASKS #75 gate 4: expert ownership audit (no-op unless GGML_META_DEBUG>0)
+    ggml_backend_meta_expert_audit(backend, cgraph);
     return GGML_STATUS_SUCCESS;
 }
 

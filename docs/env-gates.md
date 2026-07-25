@@ -87,7 +87,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 
 | Gate | Type | Default | What it does |
 |---|---|---|---|
-| `GGML_META_DEBUG` | 1 / 2 | off | Split-state diagnostics; `=2` also prints per-source resolution (`SRC_RESOLVE`). |
+| `GGML_META_DEBUG` | 1 / 2 | off | Split-state diagnostics; `=2` also prints per-source resolution (`SRC_RESOLVE`). With expert placement active (TASKS #75), `>=1` also runs the gate-4 ownership audit: per member, mul_mat_id (slot, row) pairs computed vs owned vs masked dummy-slot, `EXPERT_AUDIT:` lines per graph + finals at free, loud WARN per non-owned pair computed off the dummy slot (pins the flat id/mask gathers as graph outputs so the readback is valid); `=2` additionally runs the audit selftests (injected bad table / bad pair must be caught). |
 | `GGML_META_DEBUG_REDUCE` | bool | off | Print AllReduce boundary placement (`partial N -> boundary M`). |
 | `GGML_META_MAX_GRAPHS` | count | 8 | Compute-ring shadow-container slots (raise if many decode graph shapes are cached). |
 | `GGML_META_TIMING` | bool | off | Per-step compute vs reduce timing for the meta device. |

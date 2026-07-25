@@ -12,6 +12,7 @@
 #include <fstream>
 #include <regex>
 #include <stdexcept>
+#include <cstdlib>
 
 using json = nlohmann::ordered_json;
 
@@ -160,6 +161,43 @@ const std::vector<int32_t> * llama_expert_placement_perm_for(
     return &pl->perm[il];
 }
 
+// gate 4 static audit (docs/expert-placement-plan.md section 4 item 4): verify
+// member j's built ownership tables are a true partition - every expert owned
+// by exactly one member, owned slots inside the artifact counts, non-owned
+// experts remapped to the dummy slot 0. Loud load-time error naming the field,
+// same style as the section 3 consistency check.
+static void llama_expert_placement_audit_tables(
+        uint32_t il, size_t j, const std::vector<int32_t> & member_of, int32_t cnt_j,
+        const std::vector<int32_t> & remap_j, const std::vector<float> & mask_j) {
+    const uint32_t n_expert = (uint32_t) member_of.size();
+    int64_t n_owned = 0;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        if (member_of[e] < 0) {
+            throw std::runtime_error(format("expert placement: layer %u: expert %d has no owning member "
+                                            "(ownership is not a partition)", il, e));
+        }
+        const bool owned = member_of[e] == (int32_t) j;
+        n_owned += owned;
+        if (!owned && remap_j[e] != 0) {
+            throw std::runtime_error(format("expert placement: layer %u member %zu: remap maps non-owned expert %d "
+                                            "to local slot %d, want dummy slot 0", il, j, e, remap_j[e]));
+        }
+        if (owned && (remap_j[e] < 0 || remap_j[e] >= cnt_j)) {
+            throw std::runtime_error(format("expert placement: layer %u member %zu: owned expert %d local slot %d "
+                                            "outside [0,%d)", il, j, e, remap_j[e], cnt_j));
+        }
+        if (mask_j[e] != (owned ? 1.0f : 0.0f)) {
+            throw std::runtime_error(format("expert placement: layer %u member %zu: mask for expert %d is %f, want %s",
+                                            il, j, e, (double) mask_j[e], owned ? "1.0" : "0.0"));
+        }
+    }
+    if (n_owned != cnt_j) {
+        throw std::runtime_error(format("expert placement: layer %u: member %zu owns %lld experts, "
+                                        "counts_per_layer says %d (ownership is not a partition)",
+                                        il, j, (long long) n_owned, cnt_j));
+    }
+}
+
 std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tables(
         const llama_expert_placement & pl, ggml_backend_buffer_type_t meta_buft, size_t n_members) {
     const uint32_t n_layer  = pl.n_layer;
@@ -203,6 +241,11 @@ std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tab
     // per-member contents: member j's remap maps its owned experts to local slots
     // [0, cnt_j) (positions relative to its permuted range start); non-owned ids
     // map to local slot 0 (a valid slot - the mask zeroes their contribution).
+    static const int meta_debug = []() {
+        const char * d = getenv("GGML_META_DEBUG");
+        return d != nullptr ? atoi(d) : 0;
+    }();
+    static bool selftest_done = false;
     std::vector<int32_t> remap_j(n_expert);
     std::vector<float>   mask_j(n_expert);
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -225,7 +268,25 @@ std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tab
                 const bool owned = member_of[e] == (int32_t) j;
                 remap_j[e] = owned ? perm_pos[e] - first_pos : 0;
                 mask_j [e] = owned ? 1.0f : 0.0f;
-                GGML_ASSERT(!owned || (remap_j[e] >= 0 && remap_j[e] < cnt[j]));
+            }
+            llama_expert_placement_audit_tables(il, j, member_of, cnt[j], remap_j, mask_j);
+            // GGML_META_DEBUG>1 negative control: the audit must catch a
+            // hand-corrupted table (a non-owned expert mapped off the dummy slot)
+            if (meta_debug > 1 && !selftest_done) {
+                selftest_done = true;
+                std::vector<int32_t> bad = remap_j;
+                for (uint32_t e = 0; e < n_expert; e++) {
+                    if (member_of[e] != (int32_t) j) {
+                        bad[e] = 1;
+                        break;
+                    }
+                }
+                try {
+                    llama_expert_placement_audit_tables(il, j, member_of, cnt[j], bad, mask_j);
+                    LLAMA_LOG_ERROR("%s: SELFTEST: static audit FAILED to catch an injected table error\n", __func__);
+                } catch (const std::runtime_error & e) {
+                    LLAMA_LOG_INFO("%s: SELFTEST: static audit caught injected table error: %s\n", __func__, e.what());
+                }
             }
             ggml_backend_meta_tensor_set_member(tables->remap[il], j, remap_j.data(), 0, n_expert*sizeof(int32_t));
             ggml_backend_meta_tensor_set_member(tables->mask [il], j, mask_j.data(),  0, n_expert*sizeof(float));

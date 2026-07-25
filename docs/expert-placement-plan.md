@@ -170,6 +170,23 @@ are valid here (NOT on the GPU fleet - gotcha #4).
 4. **Ownership audit**: GGML_META_DEBUG counters - per member, mul_mat_id rows
    computed vs owned; a member computing a non-owned pair (beyond the masked
    slot-0 dummies) is a bug even if output matches.
+   **MEASURED 2026-07-24: PASS. Implemented as (a) a load-time static audit of
+   the built tables (true partition, owned slots within counts, non-owned -> 0;
+   loud named-field error, section 3 style) and (b) runtime counters in the meta
+   backend reading back the member shadows of the member-local ids and mask rows
+   after each graph (GGML_META_DEBUG>=1; `EXPERT_AUDIT:` per-graph + FINAL
+   lines). Gotcha that cost a day: an end-of-graph readback of the flat gathers
+   is STALE by default - the ggml allocator recycles their cell once consumed
+   (both gathers even alias one address), so the audit saw a recycled mirrored
+   F32 tensor identical on all members. Fix: under the debug env, build_moe_ffn
+   pins the two flat gathers with ggml_set_output (never freed / never
+   overwritten); value-neutral (text sha identical pinned vs not). CPU loopback,
+   2 members, trunc-hy3, 24 tok temp-0: uniform [96,96] - member 0 owned 2751 /
+   dummy 633, member 1 owned 633 / dummy 2751, computed 3384 each, owned sums to
+   computed, violations 0; skew [32,160] - 1506/1878, violations 0; placement
+   off - zero audit output. Negative control: GGML_META_DEBUG=2 selftests fire
+   (injected bad table caught at load; injected non-owned non-dummy pair warns),
+   and a hand-corrupted artifact hard-errors at load naming the field.**
 5. **Fleet A/B** (only after 1-4): record hy3 EP config, uniform vs placement,
    same image, coherence-read + t/s; optionally PPL spot-check. Expectation:
    owner VRAM hit fraction ~91% vs 25.5%, decode toward 8-10 t/s.
