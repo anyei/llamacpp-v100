@@ -14,7 +14,6 @@
 #include "ggml-cpp.h"
 
 struct llama_expert_placement {
-    std::string path;
     std::string model_name; // informational, from the artifact
 
     uint32_t n_layer  = 0;
@@ -30,11 +29,6 @@ struct llama_expert_placement {
     // unplaced layers. counts[il].size() == n_members for placed layers.
     std::vector<std::vector<int32_t> > counts;
 
-    // derived, per layer: original expert id -> owning member (-1 = unplaced layer)
-    std::vector<std::vector<int32_t> > member_of;
-    // derived, per layer: original expert id -> permuted position
-    std::vector<std::vector<int32_t> > perm_pos;
-
     bool layer_placed(uint32_t il) const {
         return il < perm.size() && !perm[il].empty();
     }
@@ -46,6 +40,13 @@ struct llama_expert_placement {
 std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
         const std::string & path, uint32_t n_layer, uint32_t n_expert, size_t n_members);
 
+// the placed layer index for a routed-expert weight tensor name
+// (`blk.<il>.ffn_{gate,up,gate_up,down}_exps.weight`), or -1 when the name is
+// not one / the layer is unplaced. Shared by the model loader (permuted
+// upload) and the meta split policy (llama-model.cpp).
+int llama_expert_placement_layer_for(
+        const llama_expert_placement * pl, const char * tensor_name);
+
 // the dim-2 load permutation for a routed-expert weight tensor, or nullptr when
 // the name is not a placed `blk.<il>.ffn_{gate,up,gate_up,down}_exps.weight`.
 // Used by the model loader to read expert chunks in permuted (hottest-first)
@@ -54,10 +55,14 @@ const std::vector<int32_t> * llama_expert_placement_perm_for(
         const llama_expert_placement * pl, const char * tensor_name);
 
 // TASKS #75: per-layer ownership tables consumed by build_moe_ffn (plan §2c).
-// remap[il]: I32 [n_expert], global expert id -> member-LOCAL slot (per-member
-//            contents; MIRRORED split state - a benign lie, masked lanes only).
-// mask[il]:  F32 [n_expert], 1.0 owned / 0.0 not (per-member contents; PARTIAL
-//            split state - honest: member masks sum to the all-ones vector).
+// Both are registered MIRRORED with per-member CONTENTS (uploaded through
+// ggml_backend_meta_tensor_set_member):
+// remap[il]: I32 [n_expert], global expert id -> member-LOCAL slot (a benign
+//            state lie - non-owned lanes are zeroed by the mask below).
+// mask[il]:  F32 [n_expert], 1.0 owned / 0.0 not. Member masks sum to the
+//            all-ones vector; PARTIAL enters the split derivation one step
+//            later, via the name-tagged handle_bin_bcast rule on the masked
+//            expert product ('ffn_moe_weighted_placed') - not via the table.
 struct llama_expert_placement_tables {
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf;

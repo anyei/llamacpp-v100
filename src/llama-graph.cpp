@@ -1929,10 +1929,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * exp_ids_local = nullptr;
     if (expert_tables != nullptr && il >= 0 && (size_t) il < expert_tables->remap.size() &&
             expert_tables->remap[il] != nullptr) {
-        GGML_ASSERT(!weight_before_ffn && "expert placement does not support weight_before_ffn arches (v1)");
-        GGML_ASSERT(up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
-                    gate_up_exps_b == nullptr && "expert placement does not support routed-expert biases (v1)");
-        GGML_ASSERT(arch != LLM_ARCH_GROVEMOE && "expert placement does not support GroveMoE id rescaling (v1)");
         ggml_tensor * remap = expert_tables->remap[il]; // I32 [n_expert]
         ggml_tensor * mask  = expert_tables->mask [il]; // F32 [n_expert]
         GGML_ASSERT(remap->ne[0] == n_expert && mask->ne[0] == n_expert);

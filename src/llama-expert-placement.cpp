@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <regex>
 #include <stdexcept>
@@ -31,7 +32,6 @@ std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
     }
 
     auto placement = std::make_unique<llama_expert_placement>();
-    placement->path = path;
 
     try {
         placement->model_name = j.value("model", "");
@@ -54,8 +54,6 @@ std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
 
         placement->perm.resize(n_layer);
         placement->counts.resize(n_layer);
-        placement->member_of.resize(n_layer);
-        placement->perm_pos.resize(n_layer);
 
         uint32_t n_placed = 0;
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -88,39 +86,23 @@ std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
                                                 "(artifact generated for a different member count?)", il, cnt.size(), n_members));
             }
             int64_t sum = 0;
-            for (int32_t c : cnt) {
-                if (c < 0) {
-                    throw std::runtime_error(format("layer %u: negative member count %d", il, c));
+            for (size_t j = 0; j < cnt.size(); j++) {
+                if (cnt[j] < 0) {
+                    throw std::runtime_error(format("layer %u: negative member count %d", il, cnt[j]));
                 }
-                sum += c;
+                if (cnt[j] == 0) {
+                    throw std::runtime_error(format("layer %u: member %zu owns 0 experts - "
+                                                    "every member needs >= 1 expert per placed layer (v1 guard)", il, j));
+                }
+                sum += cnt[j];
             }
             if (sum != (int64_t) n_expert) {
                 throw std::runtime_error(format("layer %u: member counts sum to %lld, want n_expert=%u",
                                                 il, (long long) sum, n_expert));
             }
 
-            // derived: original id -> owning member / permuted position
-            std::vector<int32_t> member_of(n_expert, -1);
-            std::vector<int32_t> perm_pos(n_expert, -1);
-            {
-                size_t  member  = 0;
-                int32_t in_member = 0;
-                for (uint32_t k = 0; k < n_expert; k++) {
-                    while (member < n_members && in_member >= cnt[member]) {
-                        member++;
-                        in_member = 0;
-                    }
-                    GGML_ASSERT(member < n_members); // counts sum == n_expert, so this cannot run out
-                    member_of[perm[k]] = (int32_t) member;
-                    perm_pos [perm[k]] = (int32_t) k;
-                    in_member++;
-                }
-            }
-
-            placement->perm     [il].swap(perm);
-            placement->counts   [il].swap(cnt);
-            placement->member_of[il].swap(member_of);
-            placement->perm_pos [il].swap(perm_pos);
+            placement->perm  [il].swap(perm);
+            placement->counts[il].swap(cnt);
         }
 
         if (n_placed == 0) {
@@ -144,21 +126,27 @@ std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
     return placement;
 }
 
-const std::vector<int32_t> * llama_expert_placement_perm_for(
+int llama_expert_placement_layer_for(
         const llama_expert_placement * pl, const char * tensor_name) {
     if (pl == nullptr || tensor_name == nullptr) {
-        return nullptr;
+        return -1;
     }
     static const std::regex pattern_exps_weight("blk\\.(\\d+)\\.ffn_(gate|up|gate_up|down)_exps\\.weight");
     std::cmatch m;
     if (!std::regex_match(tensor_name, m, pattern_exps_weight)) {
-        return nullptr;
+        return -1;
     }
     const uint32_t il = (uint32_t) std::stoul(m[1]);
     if (!pl->layer_placed(il)) {
-        return nullptr;
+        return -1;
     }
-    return &pl->perm[il];
+    return (int) il;
+}
+
+const std::vector<int32_t> * llama_expert_placement_perm_for(
+        const llama_expert_placement * pl, const char * tensor_name) {
+    const int il = llama_expert_placement_layer_for(pl, tensor_name);
+    return il >= 0 ? &pl->perm[il] : nullptr;
 }
 
 // gate 4 static audit (docs/expert-placement-plan.md section 4 item 4): verify
@@ -167,9 +155,22 @@ const std::vector<int32_t> * llama_expert_placement_perm_for(
 // experts remapped to the dummy slot 0. Loud load-time error naming the field,
 // same style as the section 3 consistency check.
 static void llama_expert_placement_audit_tables(
-        uint32_t il, size_t j, const std::vector<int32_t> & member_of, int32_t cnt_j,
+        uint32_t il, size_t j, const std::vector<int32_t> & perm, const std::vector<int32_t> & cnt,
         const std::vector<int32_t> & remap_j, const std::vector<float> & mask_j) {
-    const uint32_t n_expert = (uint32_t) member_of.size();
+    const uint32_t n_expert = (uint32_t) perm.size();
+    const int32_t  cnt_j    = cnt[j];
+    // original expert id -> owning member, from the perm+counts the tables were
+    // built from (perm is a validated bijection, counts sum to n_expert)
+    std::vector<int32_t> member_of(n_expert, -1);
+    {
+        int32_t pos = 0;
+        for (size_t m = 0; m < cnt.size(); m++) {
+            for (int32_t k = 0; k < cnt[m]; k++) {
+                member_of[perm[pos + k]] = (int32_t) m;
+            }
+            pos += cnt[m];
+        }
+    }
     int64_t n_owned = 0;
     for (uint32_t e = 0; e < n_expert; e++) {
         if (member_of[e] < 0) {
@@ -252,37 +253,33 @@ std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tab
         if (!pl.layer_placed(il)) {
             continue;
         }
-        const std::vector<int32_t> & member_of = pl.member_of[il];
-        const std::vector<int32_t> & perm_pos  = pl.perm_pos[il];
-        const std::vector<int32_t> & cnt       = pl.counts[il];
+        const std::vector<int32_t> & perm = pl.perm  [il];
+        const std::vector<int32_t> & cnt  = pl.counts[il];
         for (size_t j = 0; j < n_members; j++) {
-            if (cnt[j] == 0) {
-                throw std::runtime_error(format("expert placement: layer %u member %zu owns 0 experts - "
-                                                "every member needs >= 1 expert per placed layer (v1 guard)", il, j));
-            }
             int32_t first_pos = 0;
             for (size_t k = 0; k < j; k++) {
                 first_pos += cnt[k];
             }
-            for (uint32_t e = 0; e < n_expert; e++) {
-                const bool owned = member_of[e] == (int32_t) j;
-                remap_j[e] = owned ? perm_pos[e] - first_pos : 0;
-                mask_j [e] = owned ? 1.0f : 0.0f;
+            std::fill(remap_j.begin(), remap_j.end(), 0);
+            std::fill(mask_j.begin(),  mask_j.end(),  0.0f);
+            for (int32_t k = first_pos; k < first_pos + cnt[j]; k++) {
+                remap_j[perm[k]] = k - first_pos;
+                mask_j [perm[k]] = 1.0f;
             }
-            llama_expert_placement_audit_tables(il, j, member_of, cnt[j], remap_j, mask_j);
+            llama_expert_placement_audit_tables(il, j, perm, cnt, remap_j, mask_j);
             // GGML_META_DEBUG>1 negative control: the audit must catch a
             // hand-corrupted table (a non-owned expert mapped off the dummy slot)
             if (meta_debug > 1 && !selftest_done) {
                 selftest_done = true;
                 std::vector<int32_t> bad = remap_j;
-                for (uint32_t e = 0; e < n_expert; e++) {
-                    if (member_of[e] != (int32_t) j) {
-                        bad[e] = 1;
+                for (uint32_t k = 0; k < n_expert; k++) {
+                    if ((int32_t) k < first_pos || (int32_t) k >= first_pos + cnt[j]) {
+                        bad[perm[k]] = 1;
                         break;
                     }
                 }
                 try {
-                    llama_expert_placement_audit_tables(il, j, member_of, cnt[j], bad, mask_j);
+                    llama_expert_placement_audit_tables(il, j, perm, cnt, bad, mask_j);
                     LLAMA_LOG_ERROR("%s: SELFTEST: static audit FAILED to catch an injected table error\n", __func__);
                 } catch (const std::runtime_error & e) {
                     LLAMA_LOG_INFO("%s: SELFTEST: static audit caught injected table error: %s\n", __func__, e.what());

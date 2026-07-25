@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -403,20 +404,48 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // TASKS #75: hot-expert placement - load + validate the artifact before
         // tensors so the split policy can consult it. Meta (tensor-split) configs
         // only; loud error on any shape mismatch (docs/expert-placement-plan.md §3).
+        ggml_backend_dev_t meta_dev = nullptr;
         if (const char * pl_path = getenv("LLAMA_META_EXPERT_PLACEMENT"); pl_path != nullptr && pl_path[0] != '\0') {
-            const bool has_meta = std::any_of(model->devices.begin(), model->devices.end(),
+            const auto it_meta = std::find_if(model->devices.begin(), model->devices.end(),
                                               [](const llama_device & d) { return d.is_meta; });
-            if (!has_meta) {
+            if (it_meta == model->devices.end()) {
                 LLAMA_LOG_WARN("%s: LLAMA_META_EXPERT_PLACEMENT is set but there is no meta (tensor-split) device - ignored\n", __func__);
             } else if (model->hparams.n_expert == 0) {
                 throw std::runtime_error("LLAMA_META_EXPERT_PLACEMENT set but the model has no experts");
             } else {
+                // v1 arch gates: fail at load instead of aborting at first decode
+                if (model->arch == LLM_ARCH_GROVEMOE) {
+                    throw std::runtime_error("expert placement does not support GroveMoE id rescaling (v1)");
+                }
+                if (model->arch == LLM_ARCH_LLAMA4) {
+                    throw std::runtime_error("expert placement does not support weight_before_ffn arches (v1)");
+                }
+                meta_dev = it_meta->dev;
                 model->expert_placement = llama_expert_placement_load(
                     pl_path, model->hparams.n_layer(), model->hparams.n_expert, model->get_split_state_ud.n_devices);
                 ml.expert_placement = model->expert_placement.get();
+
+                // v1 gate: an -ot override on a placed expert tensor displaces it
+                // from the meta buffer (the loader would then upload with no
+                // buffer set - ggml-backend.cpp tensor_set assert) - reject at load
+                for (const llama_model_tensor_buft_override * ov = params.tensor_buft_overrides;
+                        ov != nullptr && ov->pattern != nullptr; ov++) {
+                    const std::regex ov_pattern(ov->pattern);
+                    for (uint32_t il = 0; il < model->expert_placement->n_layer; il++) {
+                        if (!model->expert_placement->layer_placed(il)) {
+                            continue;
+                        }
+                        for (const char * kind : {"gate", "up", "gate_up", "down"}) {
+                            const std::string tname = "blk." + std::to_string(il) + ".ffn_" + kind + "_exps.weight";
+                            if (std::regex_match(tname, ov_pattern)) {
+                                throw std::runtime_error(format("expert placement: -ot override '%s' targets routed expert tensor '%s' - "
+                                                                "placement requires routed experts on the meta device (v1)", ov->pattern, tname.c_str()));
+                            }
+                        }
+                    }
+                }
             }
         }
-
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
@@ -430,14 +459,44 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // TASKS #75: build + upload the per-member ownership tables (remap/mask)
         // once the meta device exists and weights are placed
         if (model->expert_placement != nullptr && !params.no_alloc) {
-            ggml_backend_dev_t meta_dev = nullptr;
-            for (const auto & d : model->devices) {
-                if (d.is_meta) {
-                    meta_dev = d.dev;
-                    break;
+            GGML_ASSERT(meta_dev != nullptr); // placement load already required a meta device
+
+            // v1 gate: routed-expert biases are incompatible with ownership
+            // masking (plan section 2d) - fail at load, not at first decode
+            for (size_t il = 0; il < model->layers.size(); il++) {
+                const llama_layer & layer = model->layers[il];
+                if (layer.ffn_gate_exps_b != nullptr || layer.ffn_up_exps_b != nullptr ||
+                    layer.ffn_down_exps_b != nullptr || layer.ffn_gate_up_exps_b != nullptr) {
+                    throw std::runtime_error(format("expert placement does not support routed-expert biases (v1): "
+                                                    "layer %zu has ffn_*_exps.bias", il));
                 }
             }
-            GGML_ASSERT(meta_dev != nullptr); // placement load already required a meta device
+
+            // the loader permutes placed expert weights by NAME and build_moe_ffn
+            // remaps expert ids - both blind to where the weights landed, so a
+            // placed layer whose routed experts are off the meta buffer would
+            // silently pair remapped ids with unpermuted weights
+            for (uint32_t il = 0; il < model->layers.size(); il++) {
+                if (!model->expert_placement->layer_placed(il)) {
+                    continue;
+                }
+                const llama_layer & layer = model->layers[il];
+                const std::pair<const ggml_tensor *, const char *> exps[] = {
+                    { layer.ffn_gate_exps,    "ffn_gate_exps.weight"    },
+                    { layer.ffn_up_exps,      "ffn_up_exps.weight"      },
+                    { layer.ffn_down_exps,    "ffn_down_exps.weight"    },
+                    { layer.ffn_gate_up_exps, "ffn_gate_up_exps.weight" },
+                };
+                for (const auto & e : exps) {
+                    if (e.first != nullptr && !ggml_backend_buffer_is_meta(e.first->buffer)) {
+                        throw std::runtime_error(format("expert placement: layer %u tensor '%s' is not on the meta "
+                                                        "device buffer (likely causes: -ot override, partial -ngl, "
+                                                        "ssd-streaming) - placement requires routed experts on the "
+                                                        "meta device", il, e.second));
+                    }
+                }
+            }
+
             model->expert_tables = llama_expert_placement_create_tables(
                 *model->expert_placement, ggml_backend_dev_buffer_type(meta_dev),
                 model->get_split_state_ud.n_devices);

@@ -2211,7 +2211,8 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // first so no lookup or derivation ever walks their src pointers
     if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
         ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
-    }    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 

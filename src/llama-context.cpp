@@ -2689,7 +2689,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs     =*/ n_outputs,
-        /*.expert_tables =*/ model.expert_placement != nullptr ? model.expert_tables.get() : nullptr,
+        /*.expert_tables =*/ model.expert_tables.get(),
         /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

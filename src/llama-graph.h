@@ -937,7 +937,6 @@ struct llm_graph_context {
 
     const llm_graph_cb & cb_func;
 
-    // TASKS #75: hot-expert placement ownership tables (null = placement off)
     const llama_expert_placement_tables * expert_tables = nullptr;
 
     llm_graph_result * res;

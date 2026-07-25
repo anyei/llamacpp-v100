@@ -76,9 +76,9 @@ constant per-layer lookup tables turn ownership into data:
   a benign state lie: the remap only chooses which garbage lane non-owned
   pairs compute, and those lanes are zeroed by the mask below.
 - `exp_mask[il]`: F32 `[n_expert]` per member - 1.0 owned, 0.0 non-owned.
-  Split state **PARTIAL - and honestly so**: each expert is owned by exactly
-  one member, so the member masks SUM to the all-ones vector, which is
-  precisely PARTIAL's contract (shadows sum to the logical value).
+  Registered MIRRORED with per-member CONTENTS (same member-targeted upload as
+  the remap); the member masks SUM to the all-ones vector, which is what makes
+  the name-tagged PARTIAL step below exact.
 
 Graph (env-gated branch in build_moe_ffn):
 
@@ -92,14 +92,17 @@ Graph (env-gated branch in build_moe_ffn):
 **Derivation chain (the part the first draft of this plan got wrong):** with
 only masking, every intermediate would derive MIRRORED and no reduce boundary
 would ever fire - members' differing values would never reconcile. The PARTIAL
-mask fixes the derivation:
+tag on the masked expert product fixes the derivation:
 
 ```text
-exp_mask                          PARTIAL   (honest: masks sum to ones)
-get_rows(exp_mask, ids)        -> PARTIAL   (gather of summands; new rule in handle_get_rows)
-mul(weights MIR, mask PARTIAL) -> PARTIAL   (mul by a mirrored factor distributes
-                                             over the member sum; new rule in handle_bin_bcast)
-mul(experts MIR, w_masked)     -> PARTIAL   (same rule)
+exp_mask                          MIRRORED  (per-member contents; masks sum to ones)
+get_rows(exp_mask, ids)        -> MIRRORED  (state; the contents differ per member)
+mul(weights MIR, mask rows)    -> MIRRORED  (state; only owned lanes stay nonzero)
+mul(experts, w_masked)         -> PARTIAL   (name-tagged 'ffn_moe_weighted_placed'
+                                             rule in handle_bin_bcast - each member's
+                                             nonzero lanes are exactly its owned
+                                             pairs, so the member sum is the logical
+                                             value)
 expert-sum ADD chain           -> PARTIAL   (existing rule - today's expert-sum pattern)
 ```
 

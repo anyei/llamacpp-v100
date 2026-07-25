@@ -420,6 +420,8 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
     // surgical re-provision of a RESTARTED RPC worker at the same endpoint: re-create
     // its member buffers, replay their weight journal (worker-cache hash replay) and
     // rebase the shadow registrations - the model keeps serving without a reload.

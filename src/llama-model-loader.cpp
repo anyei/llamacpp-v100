@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "ggml-ssd-stream.h"
 #include "gguf.h"
@@ -1583,7 +1584,11 @@ bool llama_model_loader::load_all_data(
         // already-permuted logical tensor, so its unchanged AXIS_2 contiguous
         // chunk splice gives member j exactly its placement experts. Bypasses
         // the mmap-alias and chunked-async fast paths (needs a mutable copy).
-        if (const std::vector<int32_t> * perm = llama_expert_placement_perm_for(expert_placement, ggml_get_name(cur))) {
+        // Only fire for tensors that actually landed on the meta buffer - a
+        // displaced tensor (-ot, partial -ngl) falls through to the normal path
+        // and the load-time guard in llama.cpp rejects the config gracefully.
+        if (const std::vector<int32_t> * perm = llama_expert_placement_perm_for(expert_placement, ggml_get_name(cur));
+                perm != nullptr && cur->buffer != nullptr && ggml_backend_buffer_is_meta(cur->buffer)) {
             GGML_ASSERT(ggml_is_contiguous(cur) && cur->ne[3] == 1);
             GGML_ASSERT((int64_t) perm->size() == cur->ne[2]);
             const size_t chunk_size = cur->nb[2]; // one expert
