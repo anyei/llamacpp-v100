@@ -20,8 +20,8 @@
 #     mismatch is the thing worth observing in this experiment.
 set -euo pipefail
 cd /home/anyei/server/git-projects/llama.cpp
-
-COORD_IMAGE=llamacpp-local-v100:bc12761c5 \
+COORD_API_KEY=anyei \
+COORD_IMAGE=llamacpp-local-v100:b80ba3114 \
 COORD_MODEL=DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \

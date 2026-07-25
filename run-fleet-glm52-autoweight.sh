@@ -37,7 +37,7 @@ fi
 
 MODELS_DIR=/mnt/full-models \
 COORD_API_KEY=anyei \
-COORD_IMAGE=llamacpp-local-v100:076d19781 \
+COORD_IMAGE=llamacpp-local-v100:731d807b7 \
 COORD_MODEL=GLM-5.2-Q2_K_XL-00001-of-00006.gguf \
 COORD_AUTO_WEIGHT=1 \
 COORD_GPUS=0,1 \
