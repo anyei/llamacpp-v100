@@ -35,6 +35,12 @@ Reference hardware: Tesla V100-SXM2 (Volta, sm70, NVLink NV2 pairs), scaling fro
 
 ### 1.3 Hard limitations for distributed use (verified in source)
 
+> Historical baseline (2026-07-08, design time). Several rows have since
+> shipped fixes: worker-to-worker copies (proto 4.2, fenced pulls), async RPC
+> (markers + events), fault tolerance (#29: surgical re-provision +
+> `--rpc-reload`), capability negotiation (op-fingerprint HELLO, proto 4.11).
+> Current state: `docs/distributed-inference-guide.md`.
+
 | Limitation | Where |
 |---|---|
 | NCCL init is single-process only (`ncclCommInitAll`) | `ggml-cuda.cu:1393-1414` |

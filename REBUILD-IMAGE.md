@@ -28,7 +28,7 @@ Current flags already baked into `.devops/cuda.Dockerfile` (nothing to add manua
 | `CMAKE_CUDA_ARCHITECTURES=70` | V100 (compute capability 7.0) — the default, no build-arg needed |
 | `GGML_CUDA_NCCL=ON` | NCCL AllReduce over NVLink for tensor-parallel |
 | `GGML_CUDA_FA_ALL_QUANTS=ON` | mixed K/V cache quant types (e.g. `-ctk q8_0 -ctv q4_0`) |
-| `GGML_CUDA_GRAPHS=ON` | harmless on V100 (CUDA graphs are disabled at runtime for cc < 8.0) |
+| `GGML_CUDA_GRAPHS=ON` | since 601ad05a9 upstream enables CUDA graphs on Volta by default (part of the V4 decode gain); disable per-config with `GGML_CUDA_DISABLE_GRAPHS=1` where shape churn makes re-capture a loss (MTP spec decode, see docker-compose.mtp.yml). On pre-merge images: harmless, graphs were runtime-disabled for cc < 8.0 |
 
 ## 2. Keep a rollback copy of the current image
 

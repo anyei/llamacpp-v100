@@ -1,5 +1,12 @@
 # Expert-Frequency Profiling → Hot-Expert Placement (TASKS #74/#75)
 
+> **Status (2026-07-24): #74 DONE on hy3** — coverage@25.5% = **0.913** vs
+> 0.255 uniform, cross-domain 0.912 (worst layer 0.56, median 0.94); emphatic
+> GO (bar was ~0.35). hy3 has a structurally-cold expert tail: ~75% of expert
+> bytes serve <9% of reads in any domain. **#75 v1 landed** (gates 1-4 passed:
+> byte-exact, PPL-neutral, ownership audit) — fleet A/B is the remaining gate.
+> GLM-5.2 remains to be profiled per the policy below.
+
 How to measure per-layer router expert-selection frequencies on a serving
 model and turn them into a frequency-ranked VRAM placement. General workflow
 first, then the model-specific procedures (hy3, GLM-5.2).

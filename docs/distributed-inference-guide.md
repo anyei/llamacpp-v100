@@ -746,9 +746,13 @@ Everything here is automatic — no new flags on the happy path:
   (task 13 closed): quality validated by perplexity, but temp-0 outputs can
   diverge from single-GPU runs (MoE-router-amplified reduction noise) — do
   not gate MLA tensor/island setups on byte-exactness.
-- No *runtime* fault tolerance: a worker that dies mid-session aborts the
-  coordinator (load-time degradation exists — see `--rpc-skip-unavailable`
-  in §6). No auth/TLS:
+- Runtime fault tolerance EXISTS (task 29, closed 2026-07-15): a worker that
+  dies mid-session is recovered by surgical re-provision (default-on;
+  `LLAMA_RPC_NO_SURGICAL` to opt out) or a full `--rpc-reload` re-split that
+  drops the dead endpoint, and a discovered worker can join later via the
+  fleet UI / `POST /fleet/reload` (exit-42 reload). A failed endpoint is
+  poisoned rather than aborting the coordinator. Residual gaps are tracked
+  as TASKS.md #72 (load-path robustness cluster). No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
 - **GTX 16xx workers (TU116/117)**: those cards are cc 7.5 WITHOUT tensor
