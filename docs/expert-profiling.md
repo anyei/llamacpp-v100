@@ -74,8 +74,37 @@ frequency-placed. Two ways to get the profile, choose by box availability:
   ≈ 20-30 min), profiler on from the first token; then RELOAD with the
   frequency placement (warm caches make the re-place reload cheap). You pay
   one extra reload, not an extra serve.
-- **Never profile a truncated GLM** — truncation changes hidden states and
-  therefore routing; per-layer profiles from truncated runs are not valid.
+- **Path C — PREFIX truncation (new 2026-07-26, and it corrects the rule that
+  used to sit here).** The old note said never profile a truncated GLM because
+  truncation changes hidden states. That is true for dropping MIDDLE layers; it
+  is NOT true for a prefix. Block i consumes only blocks < i, so with the same
+  weights and the same tokens, blocks 0..N-1 of a prefix compute bit-identically
+  to the full model and their router histograms are EXACT. Confirmation that the
+  vehicle is faithful: the profile's dense/MoE boundary falls exactly at
+  `leading_dense_block_count`. Build one with
+  `scripts/gguf-truncate.py <shard1> -n <blocks> -o out.gguf` (copies tensor
+  bytes, no dequantisation; sets block_count, zeroes nextn_predict_layers, drops
+  split.*). Two traps, both hit on the first run:
+    - **The LAST kept block is under-sampled** - llama.cpp prunes the final
+      layer to output tokens only, so it sees ~1 row per ubatch instead of one
+      per token (measured 18 rows vs 9055). Truncate one block deeper than you
+      need and discard the last layer.
+    - **A block that straddles a shard boundary is PARTIAL** and the model dies
+      at load; the tool now detects this and names the `-n` that stops before it.
+      For the Q2_K_XL split, shard 1 holds blocks 0..17 complete (18 is split).
+- **MEASURED 2026-07-26 (glm52-trunc18-q2, layers 3-16, 9055 wikitext tokens):
+  GLM-5.2's routing is essentially UNIFORM and placement would buy it ~nothing.**
+  peak/mean expert load 1.02-1.05x per layer; the top 25.5% of experts capture
+  25.5-25.6% of selections (= the uniform baseline exactly); 231 of 256 experts
+  are needed to cover 90% of selections. hy3 at the same cut captures 91.3%.
+  The mechanism is visible in the tensor list: GLM carries
+  `blk.N.exp_probs_b.bias`, the DeepSeek aux-loss-free load-balancing bias whose
+  job is to equalise expert load. This CONTRADICTS the field prior below - do not
+  build a GLM placement artifact on the assumption of skew.
+  Limits of the measurement: layers 3-16 of 78 (no trend toward more skew across
+  those 14), one domain, Q2 quant. Deep layers still need path A or B, and
+  `scripts/gguf-truncate.py` only reads a single shard, so a deeper prefix needs
+  cross-shard support first.
 - Budget to evaluate: owners contribute ~40-46 GiB of 216.2 = **18.5-21%**
   → decision number is Cov@~20%. Field prior for DeepSeek-lineage routing
   says this is where skew is largest (up to 27x peak-to-mean per layer), so
