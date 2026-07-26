@@ -190,24 +190,87 @@ are valid here (NOT on the GPU fleet - gotcha #4).
    off - zero audit output. Negative control: GGML_META_DEBUG=2 selftests fire
    (injected bad table caught at load; injected non-owned non-dummy pair warns),
    and a hand-corrupted artifact hard-errors at load naming the field.**
-5. **Fleet A/B** (only after 1-4): record hy3 EP config, uniform vs placement,
+4b. **Ownership audit ON CUDA** (added 2026-07-26, was the hole that let a fatal
+   bug through gates 1-4): gates 1-4 all ran on CPU loopback, where an
+   out-of-range expert id is a silent garbage read that the mask usually zeroes.
+   The same graph on CUDA faults. Vehicle - 2 minutes, no fleet:
+
+   ```bash
+   docker run -d --name llama-ep-trunc --gpus all \
+     -v "$BUILD:/srcbin:ro" -v "$ART_DIR:/place:ro" -v /mnt/files:/models:ro --network host \
+     -e LD_LIBRARY_PATH=/srcbin/bin -e GGML_META_DEBUG=1 \
+     -e LLAMA_META_EP_ONLY=1 -e LLAMA_META_ATTN_OWNER=0,1 -e LLAMA_META_ALLOW_MULTI_LOCAL=1 \
+     -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_META_EXPERT_PLACEMENT=/place/trunc-place-4.json \
+     --entrypoint /srcbin/bin/llama-server nvidia/cuda:12.8.1-devel-ubuntu24.04 \
+     -m /models/hy3-trunc5-mtp.gguf --override-kv hy_v3.block_count=int:5 \
+     --device CUDA0,CUDA1 -sm tensor -ts 1,1 -ngl 99 --no-mmap \
+     -c 4096 -ub 256 -b 256 --host 0.0.0.0 --port 8099 -np 1 -fit off
+   ```
+
+   The artifact is a 4-layer/2-member placement (the model keeps
+   `block_count=81` in its metadata, so the override is what makes n_layer=4;
+   generate from a truncated copy of `profiles/hy3-full.json`). PASS = zero
+   `EXPERT_AUDIT: WARN` lines across at least two DIFFERENT graph shapes
+   (prefill then decode) - one clean graph proves nothing, the failure only
+   appears on the first execution of a NEWLY BUILT shape. Run the identity
+   permutation too: it is the cheapest way to separate a mechanism bug from a
+   ranking bug.
+5. **Fleet A/B** (only after 1-4b): record hy3 EP config, uniform vs placement,
    same image, coherence-read + t/s; optionally PPL spot-check. Expectation:
    owner VRAM hit fraction ~91% vs 25.5%, decode toward 8-10 t/s.
+   **BLOCKED 2026-07-26** by the CUDA fault above - see TASKS.md #75 for the
+   evidence chain and the meta-backend shadow-ring root-cause hypothesis.
 
 ## 5. Open risks
 
 - mul_mat_id on a dim-2-sliced shadow must accept local ids in [0, cnt_j) -
-  true for all backends (ne[2] is the expert count it sees).
+  true for all backends (ne[2] is the expert count it sees). **THIS RISK WAS
+  UNDER-STATED AND IT IS WHAT BROKE GATE 5 (2026-07-26).** In-range is not
+  enough: ggml's CUDA mul_mat_id also requires a token's ids to be DISTINCT,
+  because top-k normally selects distinct experts. `mm_ids_helper` (mmid.cu:44)
+  keeps ONE lane per (token, expert) in `iex_used` while `nex_prev` counts every
+  lane below that expert index, and the host sorted path does the same with a
+  `break` after the first match (ggml-cuda.cu:1997). Section 2c maps EVERY
+  non-owned lane onto local slot 0, so one token lands up to n_expert_used lanes
+  on the same slot; `expert_bounds` and the compact row space then disagree and
+  `quantize_mmq_q8_1` writes outside its staging buffer (compute-sanitizer:
+  `Invalid __global__ write of size 4 bytes`). The CPU backend loops lanes
+  independently and is immune - which is exactly why gates 1-4 passed.
+  The skip-sentinel fix below is therefore MANDATORY, not a v2 nicety.
 - get_rows on I32 src (remap table): verify backend support; fall back to
   f32 table + cast if not.
 - Prefill: a big ubatch routes to most experts - masked pairs still ride the
-  mul_mat_id call. Cost is bounded by today's behavior (every member already
-  computes every pair today, on row slices). Decode is the win target.
+  mul_mat_id call. **CORRECTED 2026-07-26:** the bound holds for the pair COUNT
+  only, not for the work. Today every member computes every pair on a ROW SLICE
+  (dst derives split), while placement makes the mul_mat_id dst MIRRORED, so each
+  member does FULL-width GEMMs for every pair: per-member expert FLOPs rise ~n_members
+  (5x on the record roster) and the MoE intermediates grow the same way. Harmless
+  on the V100 owners, but the CPU/RAM workers do 5x their previous expert math -
+  budget a prefill regression and watch whether a worker becomes the new critical path.
+- **The dummy slot is a traffic floor** (2026-07-26): a member reads its owned
+  selected experts PLUS local slot 0 for every non-owned lane, i.e. one full expert
+  (11.3 MB on hy3) per layer even when it owns nothing in that token. For a cold
+  member (~3% of selections) that is 0.24 + 1.0 experts/layer against 2.23 in the
+  uniform split - a ~1.8x traffic cut, not the projected 8.5x. Slot 0 is the member's
+  HOTTEST expert by construction (perm is hottest-first, ranges are contiguous), which
+  is why the owners barely feel it and the cold members pay it in full. v2 fix: a skip
+  sentinel in mul_mat_id ids (write zero rows, read no weights) makes non-owned pairs
+  actually free and retires the mask.
 - Graph build cache: tables are static leaves (upload-time registration), no
   per-token rebuild; uid/content keys unaffected.
 - `-ts` for non-expert tensors is unchanged; EXPERT shares come from the
   placement JSON when set (the JSON's member_shares should match the serve's
-  expert -ts; the consistency check warns on mismatch).
+  expert -ts; the consistency check warns on mismatch). **NOT IMPLEMENTED as of
+  2026-07-26** - `member_shares` is parsed and never compared, so whole-expert
+  rounding shifts bytes silently: `[25,24,54,58,31]` against `-ts 21,21,46,50,27`
+  puts ~0.5 GB MORE expert weight on CUDA0 than the control leg (measured 25485
+  vs 24853 MiB used). With `-fit off` and `LLAMA_FLEET_CAPACITY_CHECK=0` nothing
+  catches it, and the fleet gate is a POOLED check that would not catch a
+  per-device shortfall anyway.
+- Load-time gates cover routed-expert biases but NOT `ffn_*_exps.scale` /
+  `input_scale` (absent on hy3/GLM Q4_K): those would take a feature-axis split
+  against expert-axis weights. Add the same style of gate before a model that
+  carries them meets placement.
 
 ## 6. Regenerating the artifact for a serve roster (fleet A/B prerequisite)
 
