@@ -13,6 +13,11 @@
 
 #include "ggml-cpp.h"
 
+// mul_mat_id id meaning "this member owns no expert for this (token, k) pair":
+// the backend skips the lane and leaves its dst rows zeroed. Required because a
+// token's ids must be DISTINCT - see docs/expert-placement-plan.md section 5.
+#define LLAMA_EXPERT_SLOT_SKIP (-1)
+
 struct llama_expert_placement {
     std::string model_name; // informational, from the artifact
 

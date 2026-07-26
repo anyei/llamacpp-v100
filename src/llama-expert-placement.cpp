@@ -179,9 +179,10 @@ static void llama_expert_placement_audit_tables(
         }
         const bool owned = member_of[e] == (int32_t) j;
         n_owned += owned;
-        if (!owned && remap_j[e] != 0) {
+        if (!owned && remap_j[e] != LLAMA_EXPERT_SLOT_SKIP) {
             throw std::runtime_error(format("expert placement: layer %u member %zu: remap maps non-owned expert %d "
-                                            "to local slot %d, want dummy slot 0", il, j, e, remap_j[e]));
+                                            "to local slot %d, want the skip sentinel %d", il, j, e, remap_j[e],
+                                            LLAMA_EXPERT_SLOT_SKIP));
         }
         if (owned && (remap_j[e] < 0 || remap_j[e] >= cnt_j)) {
             throw std::runtime_error(format("expert placement: layer %u member %zu: owned expert %d local slot %d "
@@ -260,7 +261,12 @@ std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tab
             for (size_t k = 0; k < j; k++) {
                 first_pos += cnt[k];
             }
-            std::fill(remap_j.begin(), remap_j.end(), 0);
+            // non-owned experts get the SKIP sentinel: mul_mat_id requires a token's
+            // ids to be distinct (top-k selects distinct experts), and collapsing every
+            // non-owned lane onto one local slot violated that - the CUDA id helper
+            // records one lane per (token, expert) while counting all of them, which
+            // walked its index arithmetic out of bounds. See docs/expert-placement-plan.md
+            std::fill(remap_j.begin(), remap_j.end(), LLAMA_EXPERT_SLOT_SKIP);
             std::fill(mask_j.begin(),  mask_j.end(),  0.0f);
             for (int32_t k = first_pos; k < first_pos + cnt[j]; k++) {
                 remap_j[perm[k]] = k - first_pos;

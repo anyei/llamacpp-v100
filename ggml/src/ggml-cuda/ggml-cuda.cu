@@ -1906,6 +1906,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // ids may carry the skip sentinel (a negative id = this lane uses no expert), whose
+    // dst rows no kernel writes - zero dst first so they cannot surface recycled garbage
+    // (a NaN there would survive being multiplied by a zero gating weight).
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+
     // TASKS #75 diagnostic (GGML_CUDA_CHECK_IDS=1): bounds-check the expert ids at the
     // point of use. An id outside [0, src0->ne[2]) is what turns a placement bug into an
     // illegal memory access; reports the node, device and offending value.
@@ -1918,7 +1923,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                        cudaMemcpyDeviceToHost, ctx.stream()));
             CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
             for (int64_t p = 0; p < n_ids; p++) {
-                if (h_ids[p] < 0 || h_ids[p] >= src0->ne[2]) {
+                if (h_ids[p] < -1 || h_ids[p] >= src0->ne[2]) {
                     static int n_bad = 0;
                     if (n_bad++ < 16) {
                         GGML_LOG_ERROR("CHECK_IDS: device %d node '%s' ids '%s' [%" PRId64 "] = %d "
@@ -1997,7 +2002,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02);
+                if (expert_to_use < 0) {
+                    continue; // skip sentinel: this lane uses no expert
+                }
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -2007,7 +2015,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    // with skip sentinels fewer rows than lanes are used; the buffers are sized for the
+    // maximum, and rows that stay unused keep the zeros written to dst below
+    const int64_t ne_rows_used = (int64_t) ids_to_sorted_host.size();
+    GGML_ASSERT(ne_rows_used <= ne_get_rows);
+    ids_to_sorted_host.resize(ne_get_rows, 0);
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 

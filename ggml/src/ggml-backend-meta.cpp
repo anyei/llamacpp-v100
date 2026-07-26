@@ -2636,15 +2636,15 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 // TASKS #75 gate 4 (ownership audit, docs/expert-placement-plan.md section 4):
 // with expert placement active every member computes every selected (token, k)
 // pair against its LOCAL expert slots; owned pairs carry mask 1.0, non-owned
-// pairs ride the dummy local slot 0 and are masked out. Recount the pairs from
+// pairs carry the SKIP sentinel (-1) so the backend leaves their rows alone. Recount from
 // the member shadows after compute: a non-owned pair computed against a slot
 // other than 0 is a bug even when the (masked) output still matches.
 // GGML_META_DEBUG>0 only - zero cost when unset.
 struct ggml_meta_expert_audit_totals {
     uint64_t computed   = 0; // (slot, row) pairs computed across the layer's expert GEMMs
     uint64_t owned      = 0; // pairs the member owns (mask 1.0)
-    uint64_t dummy      = 0; // non-owned pairs computed against the dummy slot 0
-    uint64_t violations = 0; // non-owned pairs off the dummy slot / slots out of range
+    uint64_t skipped    = 0; // non-owned pairs carrying the skip sentinel
+    uint64_t violations = 0; // non-owned pairs on a real slot / slots out of range
 };
 
 static std::vector<ggml_meta_expert_audit_totals> ggml_meta_expert_audit_totals_by_member;
@@ -2659,14 +2659,16 @@ static void ggml_meta_expert_audit_pairs(
         tot.computed += n_gemm;
         if (owned) {
             tot.owned += n_gemm;
-        } else if (slot == 0) {
-            tot.dummy += n_gemm;
+        } else if (slot == -1) {
+            tot.skipped += n_gemm;
         }
         const char * why = nullptr;
-        if (slot < 0 || slot >= n_local) {
+        if (slot != -1 && (slot < 0 || slot >= n_local)) {
             why = "slot out of range";
-        } else if (!owned && slot != 0) {
-            why = "non-owned pair off the dummy slot";
+        } else if (owned && slot == -1) {
+            why = "owned pair carries the skip sentinel";
+        } else if (!owned && slot != -1) {
+            why = "non-owned pair on a real slot (mul_mat_id needs distinct ids)";
         }
         if (why != nullptr) {
             tot.violations += n_gemm;
@@ -2719,14 +2721,14 @@ static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cg
         static bool selftest_done = false;
         if (!selftest_done) {
             selftest_done = true;
-            const int32_t ids_bad [] = {1, 0, 3, 0}; // pair 2: mask 0 but slot 3
+            const int32_t ids_bad [] = {1, -1, 3, -1}; // pair 2: mask 0 but a real slot
             const float   mask_bad[] = {1, 0, 0, 1};
-            fprintf(stderr, "EXPERT_AUDIT: SELFTEST injecting 1 non-owned non-dummy pair (expect 1 WARN + 1 violation)\n");
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST injecting 1 non-owned pair on a real slot (expect 1 WARN + 1 violation)\n");
             ggml_meta_expert_audit_totals tot;
             ggml_meta_expert_audit_pairs(tot, ids_bad, mask_bad, 4, 2, 4, 1, 0, -1, " SELFTEST");
-            fprintf(stderr, "EXPERT_AUDIT: SELFTEST counted computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST counted computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
                     " violations=%" PRIu64 " (want 4/2/1/1)\n",
-                    tot.computed, tot.owned, tot.dummy, tot.violations);
+                    tot.computed, tot.owned, tot.skipped, tot.violations);
         }
     }
 
@@ -2779,11 +2781,11 @@ static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cg
     for (size_t j = 0; j < n_backends; j++) {
         const ggml_meta_expert_audit_totals & b = before[j];
         const ggml_meta_expert_audit_totals & t = totals[j];
-        fprintf(stderr, "EXPERT_AUDIT: member %zu graph #%" PRIu64 ": computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
-                " violations=%" PRIu64 " | total computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64 " violations=%" PRIu64 "\n",
+        fprintf(stderr, "EXPERT_AUDIT: member %zu graph #%" PRIu64 ": computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
+                " violations=%" PRIu64 " | total computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64 " violations=%" PRIu64 "\n",
                 j, n_graphs,
-                t.computed - b.computed, t.owned - b.owned, t.dummy - b.dummy, t.violations - b.violations,
-                t.computed, t.owned, t.dummy, t.violations);
+                t.computed - b.computed, t.owned - b.owned, t.skipped - b.skipped, t.violations - b.violations,
+                t.computed, t.owned, t.skipped, t.violations);
     }
 }
 
@@ -2793,9 +2795,9 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     // TASKS #75 gate 4: final ownership-audit totals (only if the audit ran)
     for (size_t j = 0; j < ggml_meta_expert_audit_totals_by_member.size(); j++) {
         const ggml_meta_expert_audit_totals & t = ggml_meta_expert_audit_totals_by_member[j];
-        fprintf(stderr, "EXPERT_AUDIT: FINAL member %zu: computed=%" PRIu64 " owned=%" PRIu64 " dummy=%" PRIu64
+        fprintf(stderr, "EXPERT_AUDIT: FINAL member %zu: computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
                 " violations=%" PRIu64 "%s\n",
-                j, t.computed, t.owned, t.dummy, t.violations, t.violations == 0 ? "" : " - BUGS DETECTED");
+                j, t.computed, t.owned, t.skipped, t.violations, t.violations == 0 ? "" : " - BUGS DETECTED");
     }
     ggml_meta_expert_audit_totals_by_member.clear();
     delete backend_ctx;

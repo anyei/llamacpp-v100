@@ -773,7 +773,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const int32_t channel_x_id = ids[channel_dst + token_idx * ids_stride];
+    if (channel_x_id < 0) {
+        return; // skip sentinel: this lane uses no expert, dst rows stay zeroed
+    }
+    const uint32_t channel_x = channel_x_id;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;

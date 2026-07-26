@@ -30,11 +30,17 @@ static __global__ void mul_mat_vec_f(
         // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
         token_idx  = blockIdx.z;
         channel_x  = ids[channel_dst + token_idx * ids_stride];
+        if (channel_x < 0) {
+            return; // skip sentinel: this lane uses no expert, dst rows stay zeroed
+        }
         channel_y  = fastmodulo(channel_dst, nchannels_y);
         sample_dst = 0;
     } else {
         token_idx  = ids ? blockIdx.z                                          : 0;
         channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
+        if (ids && channel_x < 0) {
+            return; // skip sentinel: this lane uses no expert, dst rows stay zeroed
+        }
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
