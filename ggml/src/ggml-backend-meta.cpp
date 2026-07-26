@@ -2767,6 +2767,21 @@ static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cg
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_tensor * st_ids  = bcj.nodes[i_gemm]->src[2];
             const ggml_tensor * st_mask = bcj.nodes[i_mask];
+            // The end-of-graph readback is only trustworthy on host members. On CUDA
+            // it returns foreign bytes and reports violations that GGML_CUDA_CHECK_IDS
+            // (no bad ids at the point of use), the CPU audit (0 violations over 2376
+            // pairs) and the CUDA PPL gate all contradict - the ggml_set_output pins do
+            // not keep these gathers readable on a device member. Counting there would
+            // be worse than not counting: it cries wolf on a correct run.
+            if (st_ids->buffer == nullptr || !ggml_backend_buffer_is_host(st_ids->buffer)) {
+                static std::set<size_t> warned;
+                if (warned.insert(j).second) {
+                    GGML_LOG_ERROR("EXPERT_AUDIT: member %zu is not a host backend - runtime pair counting "
+                                   "SKIPPED there (readback unreliable). The load-time static table audit still "
+                                   "covers it; use a CPU-loopback member for the runtime gate.\n", j);
+                }
+                continue;
+            }
             const int64_t n_local = bcj.nodes[i_gemm]->src[0]->ne[2]; // member's local expert count
             GGML_ASSERT(ggml_nelements(st_ids) == n_ids && ggml_nelements(st_mask) == n_ids);
             GGML_ASSERT(st_ids->type == GGML_TYPE_I32 && st_mask->type == GGML_TYPE_F32);

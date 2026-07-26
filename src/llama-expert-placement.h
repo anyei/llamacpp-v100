@@ -29,6 +29,11 @@ struct llama_expert_placement {
     // never-routed layers in the profile).
     std::vector<std::vector<int32_t> > perm;
 
+    // informational: the expert byte shares the artifact was generated for
+    // (scripts/expert-placement.py --ts). Compared against the serve's -ts at
+    // load so a stale artifact or a retuned -ts is visible - plan section 5.
+    std::vector<double> member_shares;
+
     // per layer: experts per member in permuted order; member j owns permuted
     // positions [sum(counts[il][0..j-1]), sum(counts[il][0..j])). Empty for
     // unplaced layers. counts[il].size() == n_members for placed layers.

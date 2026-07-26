@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <ctime>
 #include <regex>
@@ -425,6 +426,38 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     pl_path, model->hparams.n_layer(), model->hparams.n_expert, model->get_split_state_ud.n_devices);
                 ml.expert_placement = model->expert_placement.get();
 
+                // plan section 5: the artifact is generated for a specific expert -ts.
+                // Whole-expert rounding also shifts bytes on its own (the record roster
+                // puts ~0.5 GB more on member 0 than -ts asks for), and with -fit off +
+                // LLAMA_FLEET_CAPACITY_CHECK=0 nothing else would say so.
+                if (params.tensor_split != nullptr) {
+                    const size_t n_dev = model->get_split_state_ud.n_devices;
+                    double ts_sum = 0.0;
+                    for (size_t j = 0; j < n_dev; j++) {
+                        ts_sum += params.tensor_split[j];
+                    }
+                    const auto & cnt0 = model->expert_placement->counts;
+                    const std::vector<int32_t> * cnt = nullptr;
+                    for (uint32_t il = 0; il < cnt0.size() && cnt == nullptr; il++) {
+                        if (!cnt0[il].empty()) {
+                            cnt = &cnt0[il];
+                        }
+                    }
+                    if (ts_sum > 0.0 && cnt != nullptr) {
+                        for (size_t j = 0; j < n_dev; j++) {
+                            const double want = params.tensor_split[j] / ts_sum;
+                            const double got  = (double) (*cnt)[j] / (double) model->hparams.n_expert;
+                            if (std::fabs(want - got) > 0.005) {
+                                LLAMA_LOG_WARN("%s: expert placement: member %zu holds %.2f%% of the experts "
+                                               "(%d/%u) but -ts asks for %.2f%% - regenerate the artifact for this "
+                                               "roster if that is not intended (whole-expert rounding accounts for "
+                                               "up to half an expert)\n",
+                                               __func__, j, 100.0*got, (*cnt)[j], model->hparams.n_expert, 100.0*want);
+                            }
+                        }
+                    }
+                }
+
                 // v1 gate: an -ot override on a placed expert tensor displaces it
                 // from the meta buffer (the loader would then upload with no
                 // buffer set - ggml-backend.cpp tensor_set assert) - reject at load
@@ -469,6 +502,16 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     layer.ffn_down_exps_b != nullptr || layer.ffn_gate_up_exps_b != nullptr) {
                     throw std::runtime_error(format("expert placement does not support routed-expert biases (v1): "
                                                     "layer %zu has ffn_*_exps.bias", il));
+                }
+                // per-expert scales are indexed by expert like the weights are, but the
+                // split policy only moves the WEIGHTS to the expert axis - a scale would
+                // keep a feature-axis split and silently pair with the wrong expert
+                if (layer.ffn_gate_exps_s != nullptr || layer.ffn_up_exps_s != nullptr ||
+                    layer.ffn_down_exps_s != nullptr ||
+                    layer.ffn_gate_exps_in_s != nullptr || layer.ffn_up_exps_in_s != nullptr ||
+                    layer.ffn_down_exps_in_s != nullptr) {
+                    throw std::runtime_error(format("expert placement does not support per-expert scales (v1): "
+                                                    "layer %zu has ffn_*_exps.(input_)scale", il));
                 }
             }
 

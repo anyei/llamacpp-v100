@@ -45,6 +45,10 @@ std::unique_ptr<llama_expert_placement> llama_expert_placement_load(
             throw std::runtime_error(format("n_expert mismatch: artifact %u, model %u", placement->n_expert, n_expert));
         }
 
+        if (j.contains("member_shares")) {
+            placement->member_shares = j["member_shares"].get<std::vector<double> >();
+        }
+
         const json & j_perm = j.at("perm");
         const json & j_cnt  = j.at("counts_per_layer");
         if (j_perm.size() != n_layer || j_cnt.size() != n_layer) {

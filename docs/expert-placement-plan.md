@@ -292,17 +292,17 @@ mounted read-only.
   per-token rebuild; uid/content keys unaffected.
 - `-ts` for non-expert tensors is unchanged; EXPERT shares come from the
   placement JSON when set (the JSON's member_shares should match the serve's
-  expert -ts; the consistency check warns on mismatch). **NOT IMPLEMENTED as of
-  2026-07-26** - `member_shares` is parsed and never compared, so whole-expert
+  expert -ts; the consistency check warns on mismatch). **IMPLEMENTED 2026-07-26**
+  (was missing until then) - `member_shares` is parsed and never compared, so whole-expert
   rounding shifts bytes silently: `[25,24,54,58,31]` against `-ts 21,21,46,50,27`
   puts ~0.5 GB MORE expert weight on CUDA0 than the control leg (measured 25485
   vs 24853 MiB used). With `-fit off` and `LLAMA_FLEET_CAPACITY_CHECK=0` nothing
   catches it, and the fleet gate is a POOLED check that would not catch a
   per-device shortfall anyway.
-- Load-time gates cover routed-expert biases but NOT `ffn_*_exps.scale` /
-  `input_scale` (absent on hy3/GLM Q4_K): those would take a feature-axis split
-  against expert-axis weights. Add the same style of gate before a model that
-  carries them meets placement.
+- Load-time gates cover routed-expert biases AND, since 2026-07-26,
+  `ffn_*_exps.scale` / `input_scale` (absent on hy3/GLM, so the gate is untested
+  against a real model - it mirrors the bias gate: a per-expert scale would keep
+  a feature-axis split while its weights moved to the expert axis).
 
 ## 6. Regenerating the artifact for a serve roster (fleet A/B prerequisite)
 
