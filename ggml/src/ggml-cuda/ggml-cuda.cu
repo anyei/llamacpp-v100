@@ -1909,7 +1909,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // ids may carry the skip sentinel (a negative id = this lane uses no expert), whose
     // dst rows no kernel writes - zero dst first so they cannot surface recycled garbage
     // (a NaN there would survive being multiplied by a zero gating weight).
-    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    // GGML_CUDA_MMID_NO_DST_ZERO=1 skips it to measure its cost; only valid where no
+    // sentinel can appear (i.e. expert placement off).
+    {
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
 
     // TASKS #75 diagnostic (GGML_CUDA_CHECK_IDS=1): bounds-check the expert ids at the
     // point of use. An id outside [0, src0->ne[2]) is what turns a placement bug into an
