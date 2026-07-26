@@ -10,6 +10,14 @@ Design agreed 2026-07-24: permutation + contiguous split; config artifact
 `LLAMA_META_EXPERT_PLACEMENT=<json>`; branch `expert-placement`; truncated-hy3
 CPU-loopback gates before any fleet A/B.
 
+**STATUS 2026-07-26.** Shipped and gated: split policy, permuted upload, remap +
+mask tables, and the mul_mat_id SKIP SENTINEL that replaced v1's dummy-slot-0
+encoding (that encoding produced duplicate ids per token and crashed CUDA - see
+section 5). Gates: off/identity/skew byte-identical on the CPU loopback, CUDA
+PPL-neutral, no regression on the MTP serving path. NOT yet measured: the fleet
+A/B (gate 5) - it needs all workers on an image carrying the sentinel, and the
+projected numbers in the line above are still PROJECTIONS, not results.
+
 ## 0. Why the feature-dim split cannot bank coverage
 
 Today `ffn_{gate,up,gate_up}_exps.weight` split AXIS_1 and `ffn_down_exps.weight`
@@ -71,10 +79,15 @@ than per-member subgraphs (the meta backend builds ONE structural graph), two
 constant per-layer lookup tables turn ownership into data:
 
 - `exp_remap[il]`: `[n_expert]` per member - global expert id -> member-LOCAL
-  slot for owned experts, 0 (any valid local slot) for non-owned. Split state
-  MIRRORED with per-member CONTENTS (uploaded via a member-targeted set API) -
-  a benign state lie: the remap only chooses which garbage lane non-owned
-  pairs compute, and those lanes are zeroed by the mask below.
+  slot for owned experts, the SKIP SENTINEL `-1` for non-owned
+  (`LLAMA_EXPERT_SLOT_SKIP`). Split state MIRRORED with per-member CONTENTS
+  (uploaded via a member-targeted set API) - a benign state lie: the contents
+  differ per member, and the state only has to be consistent.
+  **v1 used local slot 0 for non-owned lanes and that was WRONG** (2026-07-26):
+  mul_mat_id requires a token's ids to be DISTINCT, so collapsing lanes onto one
+  slot corrupted the CUDA id helper's index arithmetic - see section 5. The
+  sentinel also means a member reads NO weights for lanes it does not own, which
+  is what makes the projected traffic reduction reachable at all.
 - `exp_mask[il]`: F32 `[n_expert]` per member - 1.0 owned, 0.0 non-owned.
   Registered MIRRORED with per-member CONTENTS (same member-targeted upload as
   the remap); the member masks SUM to the all-ones vector, which is what makes
@@ -83,11 +96,14 @@ constant per-layer lookup tables turn ownership into data:
 Graph (env-gated branch in build_moe_ffn):
 
 - `ids_local = get_rows(exp_remap, selected_experts)` feeds mul_mat_id/add_id.
+  Non-owned lanes carry `-1`; the backend skips them and their dst rows stay
+  zeroed (CUDA zeroes dst up front, the CPU binning loop does the same).
 - `weights = mul(weights, get_rows(exp_mask, selected_experts))` AFTER weight
   normalization (norm_w must see the mirrored un-masked weights or member-local
-  sums would diverge), zeroing the gating weight of non-owned pairs. The
-  non-owned mul_mat_id output (computed against the harmless local slot 0) is
-  finite garbage that contributes exactly 0 to the weighted sum.
+  sums would diverge), zeroing the gating weight of non-owned pairs. With the
+  sentinel their expert output is already zero, so the mask is now belt-and-braces
+  for the value - but it is still LOAD-BEARING for the split derivation below,
+  which is why it stays.
 
 **Derivation chain (the part the first draft of this plan got wrong):** with
 only masking, every intermediate would derive MIRRORED and no reduce boundary
@@ -156,8 +172,24 @@ Vehicle: `/mnt/files/hy3-trunc5-mtp.gguf` + CPU loopback workers (dev-container
 build, docs/dev-workflow.md §1c). CPU meta paths are deterministic - byte gates
 are valid here (NOT on the GPU fleet - gotcha #4).
 
+**RE-RUN 2026-07-26 against the skip-sentinel build** (gates 1-3 below were
+first measured against the v1 dummy-slot encoding, which is gone). Vehicle:
+trunc-hy3, 2 loopback RPC members, temp 0, seed 1234, 24 tokens, sha over the
+generated answer only - the loading spinner and the t/s banner are timing
+dependent and must be excluded. All four hashed identically (`f61930b5`):
+placement off on the pre-fix build, placement off on the sentinel build,
+identity artifact, hot-first under `GGML_META_NO_DELAY=1`, and hot-first with
+the delayed reduce. Placement was confirmed ACTIVE in the placed runs via
+`EXPERT_AUDIT` (owned+skipped == computed every graph, 0 violations over 2376
+pairs) - identical shas alone cannot distinguish a pass from a silent
+artifact-load fallback, so always check that.
+Harness notes: this fork's CLI needs `-st` or it parks in
+`console::readline_advanced`; `-DLLAMA_UI_GZIP=OFF` is required when `/src` is
+mounted read-only.
+
 1. **Off-gate**: placement env unset on this branch == master build,
-   byte-identical (feature is a no-op).
+   byte-identical (feature is a no-op). Since the sentinel touches shared
+   mul_mat_id code, this gate now also covers every NON-placement MoE model.
 2. **Identity gate**: placement JSON with identity permutation + uniform counts
    == placement-off, byte-identical (upload path + remap/mask plumbing exact).
 3. **Skew gate**: real hottest-first placement == placement-off,
