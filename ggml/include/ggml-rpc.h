@@ -14,8 +14,11 @@ extern "C" {
 // arrives f16-compressed / FETCH response returns f16). Opt-in via
 // GGML_RPC_WIRE_F16 on the coordinator; per-connection fallback keeps
 // minor<=11 workers on f32.
+// minor 13: q8_0 boundary payloads (flags 32/64, GGML_RPC_WIRE_Q8; ~3.76x
+// cut vs f32, block size 32 - non-multiple sizes fall back to f16/f32).
+// Same per-connection degradation: q8_0 -> f16 -> f32 by server minor.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    12
+#define RPC_PROTO_MINOR_VERSION    13
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
