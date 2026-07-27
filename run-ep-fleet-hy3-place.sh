@@ -29,14 +29,16 @@ fi
 docker rm -f llama-ep-hy3 >/dev/null 2>&1 || true
 exec docker run --name llama-ep-hy3 --gpus all \
   -v "$SRC:/srcbin:ro" -v "$REPO:/repo:ro" -v "$MODELS_DIR:/models:ro" --network host \
+  -e LD_LIBRARY_PATH=/srcbin/bin \
   -e LLAMA_META_EP_ONLY=1 -e LLAMA_META_ATTN_OWNER=0,1 -e LLAMA_META_ALLOW_MULTI_LOCAL=1 \
   -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_API_KEY="$API_KEY" \
   -e LLAMA_FLEET_KV_RESERVE_MB=6144 -e LLAMA_FLEET_CAPACITY_CHECK=0 \
+  -e GGML_META_BCAST_FUSE="${BCAST_FUSE:-2}" \
   "${PLACE_ENV[@]}" \
   --entrypoint /srcbin/bin/llama-server \
   nvidia/cuda:12.8.1-devel-ubuntu24.04 \
   -m "/models/$MODEL" \
   --rpc 127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055 \
-  --device CUDA0,CUDA1,RPC0,RPC2,RPC3 -sm tensor -ts 21,21,46,50,27 \
+  --device CUDA0,CUDA1,RPC0,RPC1,RPC2 -sm tensor -ts 21,21,46,50,27 \
   -ngl 99 --no-mmap --rpc-reload \
   -c 4096 -ub 256 -b 256 --host 0.0.0.0 --port "$PORT" -np 1 -fit off

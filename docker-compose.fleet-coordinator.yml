@@ -36,6 +36,10 @@ services:
       # which local GPUs join the pipeline alongside the discovered workers;
       # empty = pure orchestration, every layer goes to the fleet
       - CUDA_VISIBLE_DEVICES=${COORD_GPUS:-0,1}
+      # TASKS #9 boundary fusion (needs an image with 45b58c09d+; older images
+      # ignore it). Only acts on single-contributor (dedicated-attention/EP)
+      # boundaries - verified no-op elsewhere. COORD_BCAST_FUSE=0 to disable.
+      - GGML_META_BCAST_FUSE=${COORD_BCAST_FUSE:-2}
       # COORD_DISCOVER=0 pins the fleet to COORD_RPC only (no LAN discovery)
       - LLAMA_ARG_RPC_DISCOVER=${COORD_DISCOVER:-1}
       - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
