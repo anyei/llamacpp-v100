@@ -185,6 +185,33 @@ Only worth it with RDMA/RoCE or >= 25 GbE + kernel-bypass; otherwise skip.
 - 4x V100 single host: `-sm tensor` 4-way vs 2 TP islands of 2 (`-sm layer`
   between islands) - the NVLink pair topology decides the winner.
 
+## 6b. Measured update 2026-07-27: the fleet is boundary-bound (gate 5, #75)
+
+Hot-expert placement A/B on the record hy3 EP roster: uniform 3.43 t/s vs
+placed 3.29 t/s - a null result with the implementation verified correct.
+Cutting the slow members' expert bytes ~3.6x moved nothing, so the binding
+constraint is the per-layer boundary cost (~294 ms/token / 80 layers ~= 3.7
+ms/boundary, one GbE RTT + reduce), not bandwidth. A GGML_META_TIMING
+decomposition (TASKS #7) splits compute vs reduce vs wire before further
+roadmap commitment.
+
+Consequence - "more workers -> faster single-stream tokens" has exactly three
+escapes (full survey: docs/research/2026-07-24-horizontal-scaling.md section 9
+and the 2026-07-27 addendum in 2026-07-parallel-decoding-and-distribution.md):
+
+| Escape | Mechanism | Leading candidates |
+|---|---|---|
+| (a) cheaper boundaries | cut the per-hop latency floor | soft-RoCE (rxe) prototype, then cheap ConnectX (#60); UCCL-EP CPU-proxy pattern |
+| (b) fewer boundaries | cut sync points or participants | Layer Parallelism pair-fusion (80->40 syncs, quality-gated); METRO-style member-skipping reduce |
+| (c) fill the boundaries | overlap the wait with useful work | spec-over-boundary (#71 stage 1), SpecPipe/PipeInfer pipeline filling, ktransformers Expert Deferral (corroborated by APEX's deferred-sync) |
+
+distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
+q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
+its "similar-speed nodes" condition maps to keeping stragglers off the
+critical path (replica/class routing for the slow boxes). Placement-family
+work (static, v2 budgets, adaptive re-place, GLM artifact) is CLOSED on this
+fleet unless #7 contradicts the reduce/wire-dominance expectation.
+
 ## 7. Decision summary
 
 | Scenario | Recommended mode | Needs code? |

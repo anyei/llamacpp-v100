@@ -10,7 +10,17 @@ Design agreed 2026-07-24: permutation + contiguous split; config artifact
 `LLAMA_META_EXPERT_PLACEMENT=<json>`; branch `expert-placement`; truncated-hy3
 CPU-loopback gates before any fleet A/B.
 
-**STATUS 2026-07-26.** Shipped and gated: split policy, permuted upload, remap +
+**FINAL STATUS 2026-07-27: gate 5 measured - NO GAIN; placement work on this
+fleet is CLOSED.** Uniform 3.43 t/s vs placed 3.29 t/s on the record roster,
+identical footing, both coherent, 0 RPC errors. The implementation is correct
+(CPU byte-exact; CUDA decode character-identical after the mmvq sentinel fix)
+- the fleet is boundary-latency-bound, so cutting member bytes does not pay.
+Successor direction: docs/distributed-inference-plan.md section 6b (three
+escapes), gated on the TASKS #7 timing decomposition. The mechanism stays in
+the tree behind its default-off env gate; the skip sentinel and the mul_mat_id
+contract documentation stand on their own merits.
+
+**STATUS 2026-07-26 (superseded, kept for history).** Shipped and gated: split policy, permuted upload, remap +
 mask tables, and the mul_mat_id SKIP SENTINEL that replaced v1's dummy-slot-0
 encoding (that encoding produced duplicate ids per token and crashed CUDA - see
 section 5). Gates: off/identity/skew byte-identical on the CPU loopback, CUDA
