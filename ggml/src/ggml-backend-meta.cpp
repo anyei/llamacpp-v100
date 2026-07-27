@@ -2552,6 +2552,22 @@ struct ggml_backend_meta_context {
     // shadows and must be discarded. Mirrors the buffer context's ring sizing.
     int          ring_slots;
 
+    // GGML_META_BOUNDARY_STATS tallies (TASKS #9 follow-up: aim the next
+    // reduce-share lever). Pure counters - no device syncs, so unlike
+    // GGML_META_TIMING they are valid on a production-speed run.
+    int64_t bs_bcast1        = 0; // single-computer boundaries (owner broadcast)
+    int64_t bs_star          = 0; // star reduces
+    int64_t bs_butterfly     = 0; // fold/butterfly fallbacks
+    int64_t bs_parts_fused   = 0; // partials that arrived via fused_recv (pre-requested, no fresh RTT)
+    int64_t bs_parts_wire    = 0; // partials read from wire members via get_batch/tensor_get
+    int64_t bs_parts_local   = 0; // partials read from local members
+    int64_t bs_gather_bytes  = 0; // bytes gathered from wire members
+    int64_t bs_deliver_wire  = 0; // boundary values delivered to wire members
+    int64_t bs_deliver_skip  = 0; // wire deliveries withheld (BCAST_FUSE=2)
+    int64_t bs_deliver_bytes = 0; // bytes delivered to wire members
+    int64_t bs_repairs       = 0; // stale-value repair copies executed
+    int64_t bs_graphs        = 0;
+
     // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
     int64_t tm_compute_us = 0;
     int64_t tm_reduce_us  = 0;
@@ -3777,6 +3793,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+        backend_ctx->bs_repairs += (int64_t) build_a->repairs.size();
         for (const auto & rc : build_a->repairs) {
             ggml_tensor * src_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_src);
             ggml_tensor * dst_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_dst);
@@ -3896,6 +3913,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // still carries the subgraph chain (value-less messages are the
                 // exact shape the NO_WRITEBACK probe priced at ~47 ms/token)
                 const bool deliver_j = !probe_no_wb && bcj.cgraphs[i].deliver;
+                if (backend_ctx->wire_member[j]) {
+                    if (deliver_j) {
+                        backend_ctx->bs_deliver_wire++;
+                        backend_ctx->bs_deliver_bytes += nbytes_v;
+                    } else {
+                        backend_ctx->bs_deliver_skip++;
+                    }
+                }
                 if (have_next && backend_ctx->wire_member[j]) {
                     chain.clear();
                     for (size_t g = i_next; g <= chain_end; g++) {
@@ -3975,6 +4000,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 star_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
             }
             if (star_ok) {
+                backend_ctx->bs_star++;
                 const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
                 const size_t n_vals = nbytes/sizeof(float);
                 auto & scratch = backend_ctx->star_scratch;
@@ -3990,12 +4016,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
                     if (fused_fetch_pending[j]) {
+                        backend_ctx->bs_parts_fused++;
                         continue; // its partial arrives as a fused response, collected below
                     }
                     if (!backend_ctx->wire_member[j]) {
                         // a local partial is read directly from device memory - order
                         // it behind the compute that produced it
                         ggml_backend_synchronize(bcj.backend);
+                        backend_ctx->bs_parts_local++;
+                    } else {
+                        backend_ctx->bs_parts_wire++;
+                        backend_ctx->bs_gather_bytes += nbytes;
                     }
                     get_backends[n_plain] = bcj.backend;
                     get_tensors[n_plain]  = boundary_node(j);
@@ -4065,6 +4096,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         if (part.size() == 1) {
             // the sum IS the single computer's value: broadcast it
+            backend_ctx->bs_bcast1++;
             const size_t j_src = part[0];
             auto & bcs = backend_ctx->backend_configs[j_src];
             ggml_tensor * node_src = boundary_node(j_src);
@@ -4106,6 +4138,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             return GGML_STATUS_SUCCESS;
         }
+
+        backend_ctx->bs_butterfly++;
 
         // pulls of one reduce step are collected and flushed together: the batch
         // proc (RPC) overlaps them on the wire, the per-pair path serializes on
@@ -4330,6 +4364,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->tm_graphs     = 0;
         backend_ctx->tm_build_hits   = 0;
         backend_ctx->tm_build_misses = 0;
+    }
+    // GGML_META_BOUNDARY_STATS=1: structural tallies of the boundary traffic
+    // (production-valid - pure counters, no drains). Aims the next reduce-share
+    // lever: how many partials ride the fused pre-request vs cost a plain read,
+    // and how much writeback the delivery skip actually removes.
+    static const bool bs_enabled = getenv("GGML_META_BOUNDARY_STATS") != nullptr;
+    if (bs_enabled && ++backend_ctx->bs_graphs >= 128) {
+        fprintf(stderr, "META_BOUNDARY_STATS: %" PRId64 " graphs: bcast1 %.1f star %.1f butterfly %.1f /graph; "
+                "parts fused %.1f wire %.1f local %.1f /graph, gather %.1f KiB/graph; "
+                "wire deliveries %.1f (skipped %.1f) /graph, %.1f KiB/graph; repairs %.2f /graph\n",
+                backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_bcast1      / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_star        / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_butterfly   / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_fused / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_wire  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_local / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_gather_bytes  / 1024.0 / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_wire  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_skip  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_bytes / 1024.0 / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_repairs       / backend_ctx->bs_graphs);
+        backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
+        backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;
+        backend_ctx->bs_gather_bytes = backend_ctx->bs_deliver_wire = backend_ctx->bs_deliver_skip = 0;
+        backend_ctx->bs_deliver_bytes = backend_ctx->bs_repairs = 0;
+        backend_ctx->bs_graphs = 0;
     }
     // TASKS #75 gate 4: expert ownership audit (no-op unless GGML_META_DEBUG>0)
     ggml_backend_meta_expert_audit(backend, cgraph);

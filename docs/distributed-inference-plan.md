@@ -286,6 +286,21 @@ the 2026-07-27c pause note. The 47 ms probe priced ALL writebacks; the SAFE
 subset prices near zero. Next lever on the reduce share: the B2 gather
 (irreducible read RTT/layer) and escape (c) fill-the-bubble.
 
+**Boundary traffic census 2026-07-27g (GGML_META_BOUNDARY_STATS, record
+roster, fuse=2, production speed - pure counters, no drains):** per token: 80
+bcast1 (B1) + 79 star (B2); wire partials arrive **96-98% via the fused
+pre-request** (212-218 fused vs 3.5-8.6 plain reads/graph) - the B2 gather has
+essentially NO request-RTT left to remove; delivery skip removes **all 237
+B2 wire writebacks** (79 x 3 wire members), the 240 delivered are exactly the
+B1 ffn_inp broadcasts (~4.3 MiB/graph); repairs 0 (single-piece decode
+graphs). Total boundary wire bytes ~8 MiB/token ~= **~68 ms/token of GbE byte
+time** (23% of the 292 ms token) split evenly between B1 broadcasts out and
+fused gather responses in. => The next lever is **wire-format compression of
+boundary payloads** (f16 halves: ~-34 ms/token ~ +13%; q8_0: ~-49 ms/token ~
++20%; distributed-llama ships q80 sync as precedent) - needs an RPC proto
+bump + worker roll (both directions convert worker-side). After that, only
+arrival-latency overlap (escape (c)) remains.
+
 **MTP prod-config A/B 2026-07-27f - fuse is a verified no-op there:** Qwen3.6
 -27B-MTP, 2x V100 `-sm tensor -ts 0.5,0.5`, full prod compose flags, same #9
 binary, 3x 500-token temp-0 gens per leg: off 66.5-66.7 vs fuse=2 66.3-66.5
