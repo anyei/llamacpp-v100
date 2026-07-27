@@ -549,6 +549,12 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    if (ncols_dst == 1 && ids && ids[channel_dst] < 0) {
+        return; // skip sentinel: this lane uses no expert, dst rows stay zeroed.
+                // channel_x is unsigned, so a negative id would wrap to ~4e9 and read
+                // far outside the weights - silent garbage, not a fault. This is the
+                // single-token DECODE path; prefill-only checks (PPL) never see it.
+    }
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
