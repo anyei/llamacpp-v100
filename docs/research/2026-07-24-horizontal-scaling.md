@@ -360,3 +360,42 @@ stand as ranked there.
   4-GPU expansion.
 - llama.cpp upstream #24675 (RPC async/events) and #25818 (remote spec)
   - already tracked from iteration 2; unchanged.
+
+## 9. Post-gate-5 addendum (2026-07-27): the measurement arrived
+
+Gate 5 (#75) ran uniform vs hot-expert placement on the record hy3 roster,
+identical footing: **uniform 3.43 t/s, placement 3.29 t/s** - a null result
+against a projected +20-30%, with the implementation verified correct (CPU
+byte-exact; CUDA decode character-identical to uniform after the mmvq
+sentinel fix). Cutting the slow members' expert bytes ~3.6x moved nothing.
+
+This is section 0's alpha-dominance law measured on our own fleet, and it
+matches HybriMoE's finding verbatim: transfer time is
+transaction-dominated, not byte-dominated. 3.4 t/s = ~294 ms/token over 80
+layers = ~3.7 ms/layer, the order of one GbE round trip + reduce per layer.
+A GGML_META_TIMING decomposition (TASKS #7) is running to split
+compute vs reduce vs wire before any further roadmap commitment.
+
+Consequences for the steal list ranking:
+
+- **Steal #5 (expert placement v2) and the adaptive re-place family
+  (ViBE/Director/Edge-MoE Prism, vLLM live-EPLB cadence): CLOSED unless #7
+  surprises.** The static form measured null; the online forms optimize the
+  same non-binding axis. GLM-5.2 additionally measured ~uniform routing
+  (peak/mean 1.02-1.05x, layers 3-16), so its placement artifact is void too.
+- **Promoted - ktransformers Expert Deferral**: defer a subset of experts to
+  overlap the NEXT layer's attention (+33% decode, <=0.5% accuracy, needs
+  eval gating). The only single-stream lever here that needs no hardware and
+  no second stream: it fills the per-layer RTT bubble with compute. Composes
+  with the delayed-reduce machinery, which already moves boundaries.
+- **Promoted - METRO-style member-skipping**: route/mask so a token touches
+  fewer MEMBERS, then let a mask-aware reduce skip silent members. Attacks
+  participants-per-boundary (the alpha cost), not bytes. The #75 ownership
+  masks/tables are exactly the infrastructure this needs, repointed.
+- Steals #1 (RDMA/soft-RoCE transport floor), #2 (speculative pipeline
+  filling), #3 (ping-pong micro-batch) stand as ranked - they attack the
+  measured axis directly.
+- **Position note**: the GbE-EP literature gap flagged in section 2 is now
+  OUR data - EP-over-Ethernet serving numbers, a verified placement null
+  result, and (pending #7) a latency decomposition. Upstream-or-differentiate
+  material per #67(a).
