@@ -58,11 +58,13 @@ services:
       # Fleet-measured +9-23% decode on the hy3 record roster, no-op on
       # non-EP topologies. COORD_BCAST_FUSE=0 for an A/B leg.
       - GGML_META_BCAST_FUSE=${COORD_BCAST_FUSE:-2}
-      # f16 boundary payloads (proto 4.12, needs coordinator image bc4387b95+
-      # AND workers on rpc-worker-bc4387b95+; old workers per-connection
-      # fall back to f32). +19.6% decode, PPL-neutral (3.767 vs 3.790
-      # +/- 0.21). COORD_WIRE_F16=0 for an A/B leg.
+      # compressed boundary payloads: with both set, each connection rides the
+      # best format its worker speaks - q8_0 (proto 4.13, ~3.76x cut) > f16
+      # (proto 4.12, 2x) > f32. Both PPL-neutral on the record roster (q8
+      # 3.7950 / f16 3.7669 vs f32 3.7895 +/- 0.21); fleet decode ~+15-20%
+      # over f32 wire. COORD_WIRE_F16=0 / COORD_WIRE_Q8=0 for A/B legs.
       - GGML_RPC_WIRE_F16=${COORD_WIRE_F16:-1}
+      - GGML_RPC_WIRE_Q8=${COORD_WIRE_Q8:-1}
       # Coordinator auth + Fleet web UI restart button (TASKS.md #35). COORD_API_KEY
       # protects every endpoint (enter it in the UI's Settings to load /fleet/status).
       # COORD_FLEET_ADMIN=1 additionally allows POST /fleet/worker/restart; workers

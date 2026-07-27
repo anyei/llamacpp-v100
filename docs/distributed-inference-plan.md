@@ -327,6 +327,17 @@ values track within ~1%. f16 boundary payloads are quality-neutral on the
 production model; enabled in the fleet run scripts alongside BCAST_FUSE
 (WIRE_F16=0 / COORD_WIRE_F16=0 for A/B legs).
 
+**q8_0 wire level MEASURED 2026-07-27j (proto 4.13, f57c82a8d,
+GGML_RPC_WIRE_Q8): PPL 3.7950 +/- 0.2129 (vs f32 3.7895 - delta ~40x inside
+the error bar) and decode 3.87-4.20 mean 4.01 t/s, the tightest spread of the
+wire-format legs** (local + .11 on 4.13; .15 on 4.12 riding f16 fallback).
+q8 vs f16 is within noise (~4.0 vs ~3.9 pooled): the remaining f16->q8 byte
+cut (~17 ms/token) sits at this fleet's noise floor - **the wire-byte lever
+is effectively exhausted**; what remains of the token is compute + arrival
+latency, i.e. escape (c) fill-the-bubble (#71) is the next frontier. Scripts
+and composes now set BOTH WIRE_F16 and WIRE_Q8 so every connection rides the
+best format its worker speaks (q8_0 > f16 > f32).
+
 **MTP prod-config A/B 2026-07-27f - fuse is a verified no-op there:** Qwen3.6
 -27B-MTP, 2x V100 `-sm tensor -ts 0.5,0.5`, full prod compose flags, same #9
 binary, 3x 500-token temp-0 gens per leg: off 66.5-66.7 vs fuse=2 66.3-66.5
