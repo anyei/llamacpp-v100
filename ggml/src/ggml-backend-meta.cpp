@@ -2539,6 +2539,9 @@ struct ggml_backend_meta_context {
     int64_t tm_compute_us = 0;
     int64_t tm_reduce_us  = 0;
     int64_t tm_reduces    = 0;
+    // TASKS #9: bucket boundary cost by kind - attention-owner broadcast vs true reduce
+    int64_t tm_bcast_us   = 0;
+    int64_t tm_bcasts     = 0;
     int64_t tm_graphs     = 0;
     int64_t tm_build_hits   = 0;
     int64_t tm_build_misses = 0;
@@ -3969,22 +3972,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (tm_enabled) {
                 tm_sync_all();
                 const int64_t t = ggml_time_us();
-                backend_ctx->tm_reduce_us += t - tm_last;
+                // classify by the boundary node's name: attn_out* boundaries are the
+                // owner broadcast (non-owners contribute exact zeros); the rest are
+                // true partial-sum reduces (expert merge, exit projections)
+                const ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                const char * bname = cg0->n_nodes > 0 ? cg0->nodes[cg0->n_nodes-1]->name : "";
+                if (strncmp(bname, "attn_out", 8) == 0) {
+                    backend_ctx->tm_bcast_us += t - tm_last;
+                    backend_ctx->tm_bcasts++;
+                } else {
+                    backend_ctx->tm_reduce_us += t - tm_last;
+                    backend_ctx->tm_reduces++;
+                }
                 tm_last = t;
-                backend_ctx->tm_reduces++;
             }
         }
     }
     if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
-        fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
+        fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, attn-bcast %.2f ms/graph over %.1f, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
                 backend_ctx->tm_graphs,
                 backend_ctx->tm_compute_us / 1000.0 / backend_ctx->tm_graphs,
+                backend_ctx->tm_bcast_us   / 1000.0 / backend_ctx->tm_graphs,
+                (double) backend_ctx->tm_bcasts / backend_ctx->tm_graphs,
                 backend_ctx->tm_reduce_us  / 1000.0 / backend_ctx->tm_graphs,
                 (double) backend_ctx->tm_reduces / backend_ctx->tm_graphs,
                 backend_ctx->tm_build_hits, backend_ctx->tm_build_hits + backend_ctx->tm_build_misses);
         backend_ctx->tm_compute_us = 0;
         backend_ctx->tm_reduce_us  = 0;
         backend_ctx->tm_reduces    = 0;
+        backend_ctx->tm_bcast_us   = 0;
+        backend_ctx->tm_bcasts     = 0;
         backend_ctx->tm_graphs     = 0;
         backend_ctx->tm_build_hits   = 0;
         backend_ctx->tm_build_misses = 0;

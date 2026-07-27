@@ -220,6 +220,18 @@ boundaries (RDMA-class) -> **9.2 t/s**. The per-layer boundary pair is the
 single most concrete new target: escape (b) has a named, code-only first
 step (boundary fusion) before any hardware.
 
+**Per-kind split (2026-07-27b):** attn-broadcast 79 ms/graph over 80
+boundaries (0.99 ms each) vs true reduce 110 ms/graph over 79 (1.39 ms each).
+Production time ~= instrumented compute + B1 + B2 (109+79+110 ~= 292), so the
+pipeline has effectively NO overlap: the RPC client issues writes async, but
+per-socket ordering queues the next boundary's READ behind them. Fusion plan
+refined accordingly (TASKS #9): (1) let the delay walker push a
+single-contributor PARTIAL (the owner-broadcast pattern) across the mirrored
+residual ADD so B1 broadcasts ffn_inp instead of attn_out; (2) make B2
+gather-only, delivering just to the members that compute before the next
+broadcast (the next layer's owner - an NVLink write). Workers' residual copies
+then go permanently stale by design. Estimated -40-60 ms/token -> ~4.1-4.3 t/s.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the
