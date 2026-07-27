@@ -286,6 +286,15 @@ the 2026-07-27c pause note. The 47 ms probe priced ALL writebacks; the SAFE
 subset prices near zero. Next lever on the reduce share: the B2 gather
 (irreducible read RTT/layer) and escape (c) fill-the-bubble.
 
+**MTP prod-config A/B 2026-07-27f - fuse is a verified no-op there:** Qwen3.6
+-27B-MTP, 2x V100 `-sm tensor -ts 0.5,0.5`, full prod compose flags, same #9
+binary, 3x 500-token temp-0 gens per leg: off 66.5-66.7 vs fuse=2 66.3-66.5
+t/s AND byte-identical responses on all three pairs (multi-contributor
+attention means the crossing never fires; no wire members means delivery skip
+never engages; NCCL/P2P allreduce path bypasses the fallback entirely).
+Setting GGML_META_BCAST_FUSE globally is safe for the local serving configs -
+the flag only acts on EP/dedicated-attention fleet topologies.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the
