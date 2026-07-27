@@ -218,3 +218,37 @@ No new runnable technique, two takeaways adopted:
    small enough for near-exhaustive search. FTPipe's non-adjacent-layer
    assignment also generalizes our layer-mode contiguous slabs, though #61
    showed layer mode is near-physics, so low priority.
+
+## Addendum 2026-07-27: folder re-read after the gate-5 null result (#75/#67)
+
+Gate 5 measured hot-expert placement at -4% vs uniform on the record roster:
+the fleet is boundary-cost-bound, not byte-bound. Re-ranking of this folder's
+verdicts under that measurement ("more workers -> faster tokens" lens):
+
+- **Layer Parallelism (2502.02790): PROMOTED from parked to candidate.** Its
+  entire win is halving sequential sync points; it was reviewed when bytes
+  still looked binding and its 1.19-1.46x was priced on ~us NVLink hops. Our
+  hops cost ~1000x more, so depth-halving attacks OUR binding constraint
+  disproportionately: 80 -> 40 boundaries at ~3.7 ms/boundary is a ~1.9x
+  ceiling on the fleet before quality costs. Gates unchanged and mandatory:
+  offline GGUF pair-fusion transform, ppl + task suite (GSM8K collapses
+  without a light finetune; hy3 is a reasoning model), and #7's timing split
+  must first confirm the boundary share. Prototype vehicle: trunc-hy3 pairs.
+- **APEX (2506.03296): still DOA across GbE as proposed, but its deferred-sync
+  pattern (consume a subordinate result one iteration late; never stall the
+  critical path) is the same mechanism as ktransformers' Expert Deferral
+  (+33% decode) promoted in the horizontal-scaling addendum. Two independent
+  sources on defer-and-overlap upgrade that candidate's confidence.**
+- **distributed-llama stands as the existence proof** that more workers CAN
+  speed single-stream over plain Ethernet (RPi5 1->4: 5.95 -> 13.68 t/s,
+  q80 sync, star, similar-speed nodes). Its conditions map to our roadmap:
+  similar-speed nodes := don't put stragglers on the critical path (replica/
+  class routing for the slow boxes), q80 sync := wire activation quant
+  (steal #7), star := already our reduce shape.
+- Brakel/TML verdicts unchanged (frame + gate methodology respectively).
+
+Net: the folder's contribution to "more workers -> faster token generation"
+is mechanism (b) of the three escapes - FEWER boundaries (Layer Parallelism)
+- plus corroboration for (c) fill-the-bubble (APEX pattern -> Expert
+Deferral). Mechanism (a), cheaper boundaries, lives in the horizontal doc
+(soft-RoCE/UCCL). All three wait on #7's compute/reduce/wire split.
