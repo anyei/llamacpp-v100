@@ -33,7 +33,7 @@ exec docker run --name llama-ep-hy3 --gpus all \
   -e LLAMA_META_EP_ONLY=1 -e LLAMA_META_ATTN_OWNER=0,1 -e LLAMA_META_ALLOW_MULTI_LOCAL=1 \
   -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_API_KEY="$API_KEY" \
   -e LLAMA_FLEET_KV_RESERVE_MB=6144 -e LLAMA_FLEET_CAPACITY_CHECK=0 \
-  -e GGML_META_BCAST_FUSE="${BCAST_FUSE:-2}" \
+  -e GGML_META_BCAST_FUSE="${BCAST_FUSE:-2}" -e GGML_RPC_WIRE_F16="${WIRE_F16:-1}" \
   "${PLACE_ENV[@]}" \
   --entrypoint /srcbin/bin/llama-server \
   nvidia/cuda:12.8.1-devel-ubuntu24.04 \

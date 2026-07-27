@@ -199,11 +199,18 @@ Consequence - "more workers -> faster single-stream tokens" has exactly three
 escapes (full survey: docs/research/2026-07-24-horizontal-scaling.md section 9
 and the 2026-07-27 addendum in 2026-07-parallel-decoding-and-distribution.md):
 
-| Escape | Mechanism | Leading candidates |
-|---|---|---|
-| (a) cheaper boundaries | cut the per-hop latency floor | soft-RoCE (rxe) prototype, then cheap ConnectX (#60); UCCL-EP CPU-proxy pattern |
-| (b) fewer boundaries | cut sync points or participants | Layer Parallelism pair-fusion (80->40 syncs, quality-gated); METRO-style member-skipping reduce |
-| (c) fill the boundaries | overlap the wait with useful work | spec-over-boundary (#71 stage 1), SpecPipe/PipeInfer pipeline filling, ktransformers Expert Deferral (corroborated by APEX's deferred-sync) |
+| Escape | Mechanism | Leading candidates | State (2026-07-27 eve) |
+|---|---|---|---|
+| (a) cheaper boundaries | cut the per-hop latency floor / byte cost | **f16 wire format LANDED (proto 4.12, +19.6%)**; q8_0 wire next if PPL allows; soft-RoCE (rxe) prototype, then cheap ConnectX (#60); UCCL-EP CPU-proxy pattern | f16 measured, PPL gate pending |
+| (b) fewer boundaries | cut sync points or participants | **boundary fusion LANDED (GGML_META_BCAST_FUSE, +15% pooled)**; Layer Parallelism pair-fusion (80->40 syncs, quality-gated); METRO-style member-skipping reduce | fusion measured + default-on in fleet scripts |
+| (c) fill the boundaries | overlap the wait with useful work | spec-over-boundary (#71 stage 1), SpecPipe/PipeInfer pipeline filling, ktransformers Expert Deferral (corroborated by APEX's deferred-sync) | next frontier once (a)/(b) plateau |
+
+The dated notes below are a chronological ledger - each is superseded by
+later ones. Naming: "TASKS #9" in these notes refers to the 2026-07-24/27
+session tracker's boundary-fusion task, NOT item 9 of TASKS.md (which is the
+unrelated GPU-sampling investigation). Bottom line as of 2026-07-27 evening:
+record-roster decode went 2.97 (all off) -> 3.42 (BCAST_FUSE=2) -> 4.09 t/s
+(+ GGML_RPC_WIRE_F16), all legs coherence-read.
 
 **#7 MEASURED 2026-07-27 (GGML_META_TIMING on the record hy3 EP roster):**
 compute 403-405 ms/graph, reduce 180-186 ms/graph over **159 boundaries/graph
@@ -300,6 +307,25 @@ boundary payloads** (f16 halves: ~-34 ms/token ~ +13%; q8_0: ~-49 ms/token ~
 +20%; distributed-llama ships q80 sync as precedent) - needs an RPC proto
 bump + worker roll (both directions convert worker-side). After that, only
 arrival-latency overlap (escape (c)) remains.
+
+**f16 wire format MEASURED 2026-07-27h - +19.6% on top of boundary fusion:**
+proto 4.12 (`GGML_RPC_WIRE_F16`, commit bc4387b95) rides fused SET payloads
+and FETCH responses as f16. Record-roster A/B, same binary and freshly rolled
+workers (local + .11 on rpc-worker-bc4387b95; .15 still proto-old = f32
+fallback on that connection): f32 wire 3.07-3.71 mean 3.42 vs f16 wire
+3.69-4.34 **mean 4.09 t/s**, both legs coherent. Cumulative today: 2.97
+(fuse off) -> 3.42 (BCAST_FUSE=2) -> 4.09 (+ f16 wire) = **+38%**, with .15's
+roll still pending for full f16 coverage. The gain EXCEEDS the ~+13%
+serialized-bytes projection - halving payloads also cuts response arrival
+latency and per-socket contention at the star root. Quality: PPL A/B legs on
+the record roster (this doc's next dated note) gate any default-on decision.
+Gates so far: env-off CPU loopback byte-identical (a9294d12); f16 trunc smoke
+token-identical to f32. **PPL GATE PASSED 2026-07-27i (record roster, wikitext
+8 chunks, -c 512, .15 on 4.12 for the f16 leg): f32 wire 3.7895 +/- 0.2116 vs
+f16 wire 3.7669 +/- 0.2074** - delta ~9x inside the error bar, per-chunk
+values track within ~1%. f16 boundary payloads are quality-neutral on the
+production model; enabled in the fleet run scripts alongside BCAST_FUSE
+(WIRE_F16=0 / COORD_WIRE_F16=0 for A/B legs).
 
 **MTP prod-config A/B 2026-07-27f - fuse is a verified no-op there:** Qwen3.6
 -27B-MTP, 2x V100 `-sm tensor -ts 0.5,0.5`, full prod compose flags, same #9

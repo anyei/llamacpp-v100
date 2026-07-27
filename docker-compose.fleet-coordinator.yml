@@ -40,6 +40,10 @@ services:
       # ignore it). Only acts on single-contributor (dedicated-attention/EP)
       # boundaries - verified no-op elsewhere. COORD_BCAST_FUSE=0 to disable.
       - GGML_META_BCAST_FUSE=${COORD_BCAST_FUSE:-2}
+      # f16 boundary payloads (proto 4.12; workers on old images fall back to
+      # f32 per connection). PPL-neutral, +19.6% on the EP record roster.
+      # COORD_WIRE_F16=0 to disable.
+      - GGML_RPC_WIRE_F16=${COORD_WIRE_F16:-1}
       # COORD_DISCOVER=0 pins the fleet to COORD_RPC only (no LAN discovery)
       - LLAMA_ARG_RPC_DISCOVER=${COORD_DISCOVER:-1}
       - LLAMA_ARG_RPC_SKIP_UNAVAILABLE=1
