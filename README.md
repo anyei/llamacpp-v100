@@ -325,17 +325,27 @@ containment/fault-injection knobs):
 |---|---|---|
 | `GGML_CUDA_ALLREDUCE=p2p` | NCCL | One-shot P2P NVLink AllReduce for 2 GPUs (falls back to NCCL). |
 | `GGML_CUDA_AR_P2P_MAX_BYTES` | 4 MB | Size cap above which P2P defers to NCCL. |
-| `GGML_CUDA_FORCE_GRAPHS` | off | Force CUDA graphs on Volta (cc<8.0; no measured gain here). |
+| `GGML_CUDA_FORCE_GRAPHS` | off | No-op since 601ad05a9 (upstream enables Volta graphs by default now); kept for older images. |
+| `GGML_CUDA_DISABLE_GRAPHS` | off | Disable CUDA graphs — set in the MTP compose (~5% loss with spec shape churn); leave on for plain decode. |
 
 **Meta tensor-split backend**
 
 | Env gate | Default | What it does |
 |---|---|---|
 | `GGML_META_MAX_GRAPHS` | 8 | Shadow-container slots (raise if many decode graph shapes are cached). |
-| `GGML_META_DEBUG` | off | Split-state diagnostics (`=2` also prints per-source resolution). |
+| `GGML_META_DEBUG` | off | Split-state diagnostics (`=2` also prints per-source resolution); with expert placement active, `>=1` runs the `EXPERT_AUDIT` ownership counters. |
 | `GGML_META_DEBUG_REDUCE` | off | Print AllReduce boundary placement. |
 | `GGML_META_TIMING` | off | Per-step compute-vs-reduce timing. |
 | `LLAMA_META_DUP_DEVICE` | 1 | Duplicate the device list N× so one GPU runs a genuine N-way split (validation harness). |
+
+**Expert-parallel / hot-expert placement**
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `LLAMA_META_EP_ONLY` | off | Expert-parallel split shape: segment only routed experts across members, mirror the rest. |
+| `LLAMA_META_ATTN_OWNER` | -1 | Dedicate attention/KV to a member; accepts an owner group (`0,1`) with layers interleaved across owners (#70). |
+| `LLAMA_EXPERT_PROFILE` | off | Per-layer router expert-frequency profiler to a JSON path (#74; ~1.5 t/s overhead while on). |
+| `LLAMA_META_EXPERT_PLACEMENT` | off | Frequency-ranked whole-expert placement from an artifact JSON (#75; unset = uniform behavior). |
 
 **Decode graph cache · Distributed/RPC · KV cache**
 
@@ -357,6 +367,12 @@ containment/fault-injection knobs):
 | [`docs/perf-tuning-v100.md`](docs/perf-tuning-v100.md) | consolidated results, per-change details, Volta facts, deployment plan |
 | [`docs/distributed-inference-guide.md`](docs/distributed-inference-guide.md) | how to run coordinator/workers/TP islands |
 | [`docs/distributed-inference-plan.md`](docs/distributed-inference-plan.md) | the distributed design rationale |
+| [`docs/expert-parallel-plan.md`](docs/expert-parallel-plan.md) | expert-parallel fleet design + gated experiments (task 28) |
+| [`docs/expert-profiling.md`](docs/expert-profiling.md) | router-frequency profiling → placement procedure (tasks 74/75) |
+| [`docs/expert-placement-plan.md`](docs/expert-placement-plan.md) | hot-expert placement design + validation staircase (task 75) |
+| [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md) | mermaid diagrams: placement, splits, EP, caching, fleet |
+| [`docs/v4-single-box-benchmark.md`](docs/v4-single-box-benchmark.md) | V4 single-box vs fleet measurements (#54/#65) |
+| [`docs/research/`](docs/research/) | #67 research iterations: parallel decoding, horizontal scaling |
 | [`docs/validation-playbook.md`](docs/validation-playbook.md) | test scenarios + exact commands used to validate all of this |
 | [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, CPU + GPU-landing tiers (task 15) |
 | [`docs/env-gates.md`](docs/env-gates.md) | every fork env gate + CLI flag, grouped, with usage examples |
@@ -396,27 +412,32 @@ For multi-machine setups see the
 
 Tracked in detail in [`TASKS.md`](TASKS.md):
 
-- **SSD streaming** (task 15) — **beta; usable via CLI flags.** Stream MoE
-  experts from SSD to run models larger than VRAM+RAM: `--ssd-streaming`
-  (RAM-cached expert tier, O_DIRECT), plus `--ssd-stream-gpu` to compute the
-  hot experts on the GPU via a persistent VRAM slot cache (auto-offload +
-  auto-sized pools). DeepSeek-V4-Flash **81 GB runs on one 32 GB V100 + 46 GB
-  RAM**. GPU landing is **byte-exact and a ~3x decode win where the cache covers
-  the hot expert set** (Qwen-35B-A3B 2.5 → ~9 t/s); for the >>VRAM extreme
-  (DeepSeek) it reaches CPU parity. **GPU landing is single-GPU today** (no-op
-  under `-sm tensor`/`-sm layer`); the CPU-tier `--ssd-streaming` works on 2 GPUs
-  (layer-split, DeepSeek 81 GB runs) but buys no speedup over one card, and
-  `-sm tensor` + DeepSeek crashes at load (meta split-state). Remaining:
-  multi-GPU GPU landing, prefetch/overlap, DeepSeek-scale tuning — see
-  `docs/ssd-streaming-plan.md §8` and `docs/env-gates.md`.
-- **Distributed, hardware-gated** — two-box measurement of the
-  worker-to-worker transfers; phase 3 cross-host NCCL (only worth it with
-  RDMA / 25 GbE+).
-- **Distributed polish** — worker fault tolerance (a dead worker still
-  aborts the coordinator); RPC auth/TLS (WireGuard covers this in practice).
-- **Minor debt** — CUDA OOM during meta buffer allocation asserts instead
-  of erroring cleanly; `-ot` cannot target non-default buffer types.
-- Tasks 13 (MLA tensor mode) and 14 (init-failure crashes) closed 2026-07-07.
+- **Expert-parallel hot-expert placement (#74/#75)** — the current main line.
+  Router-frequency profiling landed (`LLAMA_EXPERT_PROFILE`; hy3 coverage@25.5%
+  = 0.913 vs 0.255 uniform, cross-domain stable) and frequency-ranked placement
+  v1 is in (`LLAMA_META_EXPERT_PLACEMENT`, gates 1-4 passed: byte-exact,
+  PPL-neutral, ownership audit). Remaining: the fleet A/B measurement
+  (`run-ep-fleet-hy3-place.sh`), then GLM-5.2 profiling before its EP debut.
+- **Distributed serving, measured** — layer fleets: V4 4.6-4.8 t/s, hy3 2.74
+  t/s; EP is RTT-serialized on GbE (~2.5-2.8 t/s). V4 production answer is
+  single-box `-ngl 99 -ncmoe 37` (9.7-9.9 t/s post-merge, matches upstream);
+  the fleet remains for over-RAM models (GLM-5.2 class). Fault tolerance and
+  fleet UI are done (#29/#35: surgical re-provision, `--rpc-reload`,
+  `/fleet/*`); RPC auth/TLS still open (WireGuard covers this in practice).
+- **Parallel decoding** (branch `parallel-inference`, #71) — stage 1 landed
+  (coordinator-local MTP draft, `LLAMA_META_LOCAL_DRAFT`); stage 2
+  (draft-on-VRAM-experts) unblocked by #75. Research track: #67 iterations in
+  `docs/research/`.
+- **RDMA / fast NICs** (#60, hardware pending) — the measured EP revival
+  path (boundary RTT is the fleet's wire tax); `GGML_RPC_RDMA` plumbing is
+  already in the transport.
+- **SSD streaming** (task 15) — **beta; usable via CLI flags** (unchanged):
+  `--ssd-streaming` + `--ssd-stream-gpu`; DeepSeek-V4-Flash 81 GB runs on one
+  32 GB V100 + 46 GB RAM. GPU landing is single-GPU today; `-sm tensor` +
+  DeepSeek crashes at load (parked). See `docs/ssd-streaming-plan.md §8`.
+- **Bug queue** — #66 (two EP corners post-merge), #68 (auto-weight trusts
+  iGPU memory reports), #72 (load-path robustness cluster), #73 (worker score
+  staleness), #53 (strip reasoning from chat history).
 - Token-generation round closed 2026-07-08: **17** overlap AllReduce with
   compute — negative, reverted (`97dffd25f`); **18** MMVQ sm70 tuning — +1.8%
   batch-1 nospec decode, ppl-identical (`b912d1b1e`); **19** FA long-context

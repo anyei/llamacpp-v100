@@ -105,3 +105,150 @@ rig today. WATCH (esp. PR #24423 + llama-server support), don't build.
 
 Upstream merge cadence: WEEKLY (17 days of drift cost 31% on V4, #65). Each
 merge cycle re-runs the watch list above (#67a).
+
+## Addendum 2026-07-24: research/true-parallel-inference folder review (#71)
+
+Reviewed the remaining unread items in `research/true-parallel-inference/`:
+
+- **Median Selection Subset Aggregation** (`9b81f...-Paper.pdf`, NeurIPS 2014,
+  Wang/Peng/Dunson): parallel *statistical* inference - Lasso/GIC feature
+  selection fitted per data subset, combined by median inclusion + coefficient
+  averaging. "Inference" = parameter estimation; terminology collision, no
+  applicability to generative decoding. OFF-TOPIC.
+- **Parallel Inference for Real-Time ML Applications** (Al Bayyat et al. 2024):
+  sklearn `RandomizedSearchCV(n_jobs=-1)` Random-Forest hyperparameter tuning
+  benchmark. OFF-TOPIC.
+- **`5-288`**: dead page capture (tracking scripts only, no article body).
+- **Defeating Nondeterminism in LLM Inference** (`index.html`, Thinking
+  Machines Lab): RELEVANT - batch-invariance. Explains the temp-0 output drift
+  we measure across split configs and between spec-verify batches and plain
+  decode (reduction order changes with batch shape -> logit drift -> token
+  divergence). Consequences adopted:
+  1. Byte-identity gates are SHAPE-LOCAL: only compare runs with identical
+     split + batch shape; cross-shape drift at temp-0 is expected physics, not
+     corruption (nearly mis-diagnosed twice on 2026-07-23).
+  2. Batch-invariant kernels are a #71 stage-2+ enabler: bitwise-equal
+     verify-batch vs single-token logits would make speculation provably
+     identity-preserving, restoring the byte-identity gate for all spec work.
+     Re-derivation cost for sm70 unknown; watch for upstream/community
+     batch-invariant kernel work before building.
+
+Collection note: filter future paper hauls on "parallel/speculative DECODING"
+or "token generation" - "parallel inference" collides with statistics and
+classic-ML serving literature.
+
+## Iteration 2 — 2026-07-24 (post-#70/#71-stage-1 refocus)
+
+### (a) Upstream watch (merge base ~Jul 5 -> Jul 24)
+- **RPC core stagnant** (nothing merged since May). Issue #25890 (15-min serialized
+  535 GB loads) is third-party validation of our caching/manifest moat. WATCH:
+  **#24675** (RPC async/events -> pipeline parallelism over RPC - the one PR that
+  narrows the gap), **#25818** ("remote speculative decoding via ethernet",
+  draft on a separate llama-server - the FIRST upstream distributed-spec
+  feature; absorb or differentiate at merge time).
+- **Meta backend**: #19378 merged Apr (LOCAL TP only); July hardening (TP+ncmoe
+  MoE fix #25028, DSV4 fused ops #25585). No sign of meta+RPC composition.
+  Merge-friction risk concentrates in ggml-backend-meta.cpp + spec sidecar
+  auto-config churn in common/ (#25811/#25955/#25989).
+- **Upstream circles hot-experts single-box**: #25932 (--pin-hotexperts, usage
+  tracking + mlock top-N) and #26003 (--lazy-experts, page-cache prefetch of
+  routed experts). Read both before building ours; nothing cross-node.
+- Spec framework: DSpark drafter PR #25173 (DFlash + semi-AR Markov head,
+  60-85% over MTP-1 in DSV4 production; DFlash itself already merged).
+
+### (b) Hot-expert placement — GO, gated on a 1-day profiling counter
+Field consensus: balancing losses equalize GLOBAL expert load, not per-layer/
+per-domain load ("globally balanced, locally imbalanced"). Measured coverage at
+a 25% budget on balanced-trained MoEs: **37-53%** (MoE-Sieve: OLMoE 53%, Qwen-MoE
+37.4%, DeepSeek-MoE 42.6%; CRAFT: per-layer peak-to-mean 2.5x-27x on R1/Kimi-K2).
+Frequency beats recency (LFU +84% over LRU, CMU 2511.05814); static profiled
+placement is the working floor (Fiddler, ktransformers, SlimCaching, Prism).
+FOR US: uniform owner slice = 25.5% VRAM hit fraction by construction; frequency
+placement projects **37-43% conservative** (+12-18 pp) -> CPU expert bytes/token
+drop ~20-25% -> up to ~1.2-1.3x decode on the record config (5.06-5.22 -> ~6-6.7
+ceiling). Per-layer top-k frequency ranking suffices for static placement
+(submodular-greedy optimal, Prism); uniform per-layer budget first, entropy-
+weighted budgets as v2. Risks to verify on-workload: hy3's shared experts may
+have absorbed the skew; mixed traffic flattens hot sets. DECISIVE MEASUREMENT
+(filed as #74): per-layer router-selection counters, few thousand decode tokens
+of representative traffic, compute top-25.5% coverage per layer + cross-domain
+stability. An afternoon of counter code, zero placement changes.
+
+### (c) Watch list resolutions
+- **MoE x speculation expert-read explosion is now a NAMED problem**: MoE-Spec
+  (2602.16052, +10-30% via expert budgeting), EcoSpec (2607.12696, expert-reuse-
+  aware draft selection, 1.62x), Utility-Driven SD (2506.20675). Our #71 stage-1
+  parity-minus verdict independently reproduced by the field; their mitigations
+  are the stage-2 toolbox.
+- **Self-Speculative MoE (WWW 2026, 3.72x claimed): draft with a reduced expert
+  subset of the SAME model — zero extra weight reads.** Fused with dual-role:
+  draft by routing ONLY to VRAM-resident experts (no RAM traffic), verify full.
+  Marries hot-expert placement and speculation into one mechanism — adopted as
+  the #71 STAGE-2 CANDIDATE (after #74/#75 land, which also make the reduced
+  set accurate).
+- Batch-invariance: vLLM mode is sm80+ (no V100); llama.cpp PR #16016 (covers
+  mul_mat_id) is a maintainer-rejected draft -> fork-carry option if/when we
+  want provable spec identity.
+- DiffusionGemma: GGUFs exist (unsloth 26B-A4B), llama.cpp still cli-only draft
+  (#24423/#24427, "diffusion server" at design stage). TiDAR: still paper-only.
+  LLaDA2.X: open diffusion MoEs (16B/100B) with cli-path support.
+
+### Iteration-2 prioritized candidates
+1. **#74 expert-frequency profiling** (1 day): router counters + coverage report
+   -> gates #75. 2. **#75 hot-expert placement**: per-layer expert-ID scatter
+   list replacing the contiguous owner slice (+20-30% decode expected).
+3. **#71 stage 2 = draft-on-VRAM-experts self-speculation** (needs #75).
+4. Absorb DSpark when merged; track #25818 + #24675 at each weekly merge.
+
+## Addendum 2026-07-24b: Brakel et al., "Model Parallelism on Distributed
+## Infrastructure" (arXiv 2403.03699) — folder review
+
+Survey of model parallelism (intra-op vs inter-op taxonomy, auto-parallelisation
+search: Alpa/FlexFlow-SOAP/PipeDream/FTPipe/Metis; training-era case studies).
+No new runnable technique, two takeaways adopted:
+1. Independent confirmation of the fleet laws the guide already states
+   (intra-op needs NVLink-class links; inter-op pipelines tolerate Ethernet;
+   micro-batching amortizes bubbles).
+2. **Auto-parallelisation-as-search is the right frame for #70-tail
+   auto-weight v2 ("auto-place")**: today's auto-weight is a greedy
+   bandwidth-proportional splitter, blind to owner groups/dual-role/expert
+   scatter. Formulate placement (per-device role + byte share + hot-expert
+   list) as a search over our MEASURED cost model (worker scores, capacities,
+   link RTTs, #74 coverage curves) — Alpa-style two-level, but our fleet is
+   small enough for near-exhaustive search. FTPipe's non-adjacent-layer
+   assignment also generalizes our layer-mode contiguous slabs, though #61
+   showed layer mode is near-physics, so low priority.
+
+## Addendum 2026-07-27: folder re-read after the gate-5 null result (#75/#67)
+
+Gate 5 measured hot-expert placement at -4% vs uniform on the record roster:
+the fleet is boundary-cost-bound, not byte-bound. Re-ranking of this folder's
+verdicts under that measurement ("more workers -> faster tokens" lens):
+
+- **Layer Parallelism (2502.02790): PROMOTED from parked to candidate.** Its
+  entire win is halving sequential sync points; it was reviewed when bytes
+  still looked binding and its 1.19-1.46x was priced on ~us NVLink hops. Our
+  hops cost ~1000x more, so depth-halving attacks OUR binding constraint
+  disproportionately: 80 -> 40 boundaries at ~3.7 ms/boundary is a ~1.9x
+  ceiling on the fleet before quality costs. Gates unchanged and mandatory:
+  offline GGUF pair-fusion transform, ppl + task suite (GSM8K collapses
+  without a light finetune; hy3 is a reasoning model), and #7's timing split
+  must first confirm the boundary share. Prototype vehicle: trunc-hy3 pairs.
+- **APEX (2506.03296): still DOA across GbE as proposed, but its deferred-sync
+  pattern (consume a subordinate result one iteration late; never stall the
+  critical path) is the same mechanism as ktransformers' Expert Deferral
+  (+33% decode) promoted in the horizontal-scaling addendum. Two independent
+  sources on defer-and-overlap upgrade that candidate's confidence.**
+- **distributed-llama stands as the existence proof** that more workers CAN
+  speed single-stream over plain Ethernet (RPi5 1->4: 5.95 -> 13.68 t/s,
+  q80 sync, star, similar-speed nodes). Its conditions map to our roadmap:
+  similar-speed nodes := don't put stragglers on the critical path (replica/
+  class routing for the slow boxes), q80 sync := wire activation quant
+  (steal #7), star := already our reduce shape.
+- Brakel/TML verdicts unchanged (frame + gate methodology respectively).
+
+Net: the folder's contribution to "more workers -> faster token generation"
+is mechanism (b) of the three escapes - FEWER boundaries (Layer Parallelism)
+- plus corroboration for (c) fill-the-bubble (APEX pattern -> Expert
+Deferral). Mechanism (a), cheaper boundaries, lives in the horizontal doc
+(soft-RoCE/UCCL). All three wait on #7's compute/reduce/wire split.

@@ -21,6 +21,8 @@ struct llama_layer;
 
 struct llama_memory_context_i;
 
+struct llama_expert_placement_tables; // TASKS #75
+
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsv4_raw_context;
@@ -707,6 +709,9 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // TASKS #75: hot-expert placement ownership tables (null = placement off)
+    const llama_expert_placement_tables * expert_tables = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -931,6 +936,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    const llama_expert_placement_tables * expert_tables = nullptr;
 
     llm_graph_result * res;
 

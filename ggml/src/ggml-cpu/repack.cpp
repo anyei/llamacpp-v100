@@ -4452,13 +4452,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
 
+            // ids may carry the skip sentinel (negative = this lane uses no expert);
+            // nothing writes those dst rows, so zero dst before the barrier below
+            memset(dst->data, 0, ggml_nbytes(dst));
+
             // group rows by src0 matrix
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                    if (i02 < 0) {
+                        continue; // skip sentinel
+                    }
+                    GGML_ASSERT(i02 < n_as);
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;

@@ -5,6 +5,11 @@ serving via `llama-server` in tensor-split mode.
 Task-by-task history: `TASKS.md`. Image rebuild: `REBUILD-IMAGE.md`.
 Serving profiles: `docker-compose.mtp.yml` / `docker-compose.nospec.yml`.
 
+> Note: per-change numbers below are the historical record of each round's
+> build. The **current** reference benchmark tables live in `README.md`
+> (refreshed 2026-07-09, task 21); post-merge single-box V4 numbers are in
+> `docs/v4-single-box-benchmark.md`.
+
 Models used throughout (mounted at `/models` inside the containers):
 
 | Model file | Role |

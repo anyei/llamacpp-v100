@@ -1,9 +1,11 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "ggml-ssd-stream.h"
 #include "gguf.h"
+#include "llama-expert-placement.h"
 #include "llama-hparams.h"
 
 #include <algorithm>
@@ -1572,6 +1574,43 @@ bool llama_model_loader::load_all_data(
         // branches (both would otherwise make the tensor resident).
         if (ggml_ssd_stream_is_streamed(cur)) {
             ggml_ssd_stream_note(cur, files.at(weight->idx)->file_id(), weight->offs);
+            size_done += n_size;
+            continue;
+        }
+
+        // TASKS #75: placed routed-expert weights - read the whole tensor into a
+        // staging buffer with its dim-2 expert chunks PERMUTED (hottest-first),
+        // then upload through the normal set path. The meta buffer sees an
+        // already-permuted logical tensor, so its unchanged AXIS_2 contiguous
+        // chunk splice gives member j exactly its placement experts. Bypasses
+        // the mmap-alias and chunked-async fast paths (needs a mutable copy).
+        // Only fire for tensors that actually landed on the meta buffer - a
+        // displaced tensor (-ot, partial -ngl) falls through to the normal path
+        // and the load-time guard in llama.cpp rejects the config gracefully.
+        if (const std::vector<int32_t> * perm = llama_expert_placement_perm_for(expert_placement, ggml_get_name(cur));
+                perm != nullptr && cur->buffer != nullptr && ggml_backend_buffer_is_meta(cur->buffer)) {
+            GGML_ASSERT(ggml_is_contiguous(cur) && cur->ne[3] == 1);
+            GGML_ASSERT((int64_t) perm->size() == cur->ne[2]);
+            const size_t chunk_size = cur->nb[2]; // one expert
+            GGML_ASSERT(chunk_size * perm->size() == n_size);
+            read_buf.resize(n_size);
+            const auto & file = files.at(weight->idx);
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                const uint8_t * src = (const uint8_t *) mapping->addr() + weight->offs;
+                for (size_t k = 0; k < perm->size(); k++) {
+                    memcpy(read_buf.data() + k*chunk_size, src + (size_t) (*perm)[k]*chunk_size, chunk_size);
+                }
+            } else {
+                for (size_t k = 0; k < perm->size(); k++) {
+                    file->seek(weight->offs + (size_t) (*perm)[k]*chunk_size, SEEK_SET);
+                    file->read_raw(read_buf.data() + k*chunk_size, chunk_size);
+                }
+            }
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
             size_done += n_size;
             continue;
         }

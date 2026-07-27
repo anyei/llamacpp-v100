@@ -1442,6 +1442,13 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // ids: the expert selected for each (token, lane). A token's ids must be
+    //      DISTINCT - top-k selects distinct experts, and the backends rely on it
+    //      (the CUDA id helper records one lane per (token, expert) while counting
+    //      all of them, so duplicates walk its index arithmetic out of bounds).
+    //      A NEGATIVE id is the fork's skip sentinel: the lane uses no expert, the
+    //      backend computes nothing for it and its dst rows are left zeroed
+    //      (TASKS #75 expert placement; CUDA + CPU honour it).
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,

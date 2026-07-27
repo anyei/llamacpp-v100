@@ -1906,6 +1906,43 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // ids may carry the skip sentinel (a negative id = this lane uses no expert), whose
+    // dst rows no kernel writes - zero dst first so they cannot surface recycled garbage
+    // (a NaN there would survive being multiplied by a zero gating weight).
+    // GGML_CUDA_MMID_NO_DST_ZERO=1 skips it to measure its cost; only valid where no
+    // sentinel can appear (i.e. expert placement off).
+    {
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
+
+    // TASKS #75 diagnostic (GGML_CUDA_CHECK_IDS=1): bounds-check the expert ids at the
+    // point of use. An id outside [0, src0->ne[2]) is what turns a placement bug into an
+    // illegal memory access; reports the node, device and offending value.
+    {
+        static const bool ids_check = getenv("GGML_CUDA_CHECK_IDS") != nullptr;
+        if (ids_check && ids != nullptr && ids->type == GGML_TYPE_I32) {
+            const int64_t n_ids = ggml_nelements(ids);
+            std::vector<int32_t> h_ids(n_ids);
+            CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, n_ids*sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            for (int64_t p = 0; p < n_ids; p++) {
+                if (h_ids[p] < -1 || h_ids[p] >= src0->ne[2]) {
+                    static int n_bad = 0;
+                    if (n_bad++ < 16) {
+                        GGML_LOG_ERROR("CHECK_IDS: device %d node '%s' ids '%s' [%" PRId64 "] = %d "
+                                       "outside [0, %" PRId64 ") - OOB expert index\n",
+                                       ggml_cuda_get_device(), dst->name, ids->name, p, h_ids[p], src0->ne[2]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -1972,7 +2009,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02);
+                if (expert_to_use < 0) {
+                    continue; // skip sentinel: this lane uses no expert
+                }
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -1982,7 +2022,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    // with skip sentinels fewer rows than lanes are used; the buffers are sized for the
+    // maximum, and rows that stay unused keep the zeros written to dst below
+    const int64_t ne_rows_used = (int64_t) ids_to_sorted_host.size();
+    GGML_ASSERT(ne_rows_used <= ne_get_rows);
+    ids_to_sorted_host.resize(ne_get_rows, 0);
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
@@ -3947,7 +3991,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
+            // TASKS #75 diagnostic: GGML_CUDA_NO_CONCURRENT_STREAMS=1 keeps every node on
+            // the main stream (isolates cross-stream ordering bugs from everything else)
+            static const bool no_concurrent = getenv("GGML_CUDA_NO_CONCURRENT_STREAMS") != nullptr;
+            if (!no_concurrent && stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
@@ -4081,6 +4128,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                // TASKS #75 diagnostic (GGML_CUDA_SYNC_NODES=1): synchronize after every
+                // node so a faulting kernel is named at its own launch instead of poisoning
+                // the context and surfacing somewhere unrelated. Compute only - unlike
+                // CUDA_LAUNCH_BLOCKING it leaves the weight upload at full speed.
+                {
+                    static const bool sync_nodes = getenv("GGML_CUDA_SYNC_NODES") != nullptr;
+                    if (sync_nodes) {
+                        const cudaError_t err_sync = cudaStreamSynchronize(cuda_ctx->stream());
+                        if (err_sync != cudaSuccess) {
+                            GGML_LOG_ERROR("SYNC_NODES: device %d FAULTED at node %d '%s' (%s): %s\n",
+                                           cuda_ctx->device, i, node->name, ggml_op_name(node->op),
+                                           cudaGetErrorString(err_sync));
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (node->src[s] != nullptr) {
+                                    GGML_LOG_ERROR("SYNC_NODES:   src[%d] '%s' (%s) ne=[%" PRId64 ",%" PRId64
+                                                   ",%" PRId64 ",%" PRId64 "] data=%p\n",
+                                                   s, node->src[s]->name, ggml_type_name(node->src[s]->type),
+                                                   node->src[s]->ne[0], node->src[s]->ne[1], node->src[s]->ne[2],
+                                                   node->src[s]->ne[3], node->src[s]->data);
+                                }
+                            }
+                            GGML_ABORT("SYNC_NODES: first faulting node reported above");
+                        }
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

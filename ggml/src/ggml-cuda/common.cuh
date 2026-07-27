@@ -1355,7 +1355,18 @@ struct ggml_cuda_concurrent_event {
                     continue;
                 }
 
+                // a src reached through a view carries the dependency of the tensor that
+                // actually writes the memory - look the src up by its root, or a producer
+                // in another branch stays invisible and the two run unordered
+                const ggml_tensor * src_root = tensor->src[i];
+                while (src_root->view_src != nullptr) {
+                    src_root = src_root->view_src;
+                }
+
                 auto it = stream_mapping.find(tensor->src[i]);
+                if (it == stream_mapping.end() && src_root != tensor->src[i]) {
+                    it = stream_mapping.find(src_root);
+                }
 
                 if (it == stream_mapping.end()) {
                     continue;
