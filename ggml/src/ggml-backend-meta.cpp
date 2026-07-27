@@ -3570,6 +3570,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     next_nbytes = ggml_nbytes(next_node(0));
                 }
             }
+            // TASKS #9 probe: GGML_META_PROBE_NO_WRITEBACK=1 skips delivering the
+            // reduced value to non-root members (chain-only fused messages; no plain
+            // set). OUTPUT IS GARBAGE BY DESIGN - this exists solely to price the
+            // writeback's true wall-clock share, which the per-boundary timing drains
+            // cannot see. Never serve with it.
+            static const bool probe_no_wb = getenv("GGML_META_PROBE_NO_WRITEBACK") != nullptr;
             std::vector<ggml_cgraph *> chain;
             for (size_t j = 0; j < n_backends; j++) {
                 if (j == j_skip) {
@@ -3582,13 +3588,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         chain.push_back(bcj.cgraphs[g].cgraph_main);
                     }
                     const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
-                    if (backend_ctx->fused_send(bcj.backend, boundary_node(j), value, nbytes_v,
+                    if (backend_ctx->fused_send(bcj.backend, probe_no_wb ? nullptr : boundary_node(j),
+                            value, probe_no_wb ? 0 : nbytes_v,
                             chain.data(), (int) chain.size(),
                             want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
                         fused_carried[j]       = (int) chain.size();
                         fused_fetch_pending[j] = want_fetch ? 1 : 0;
                         continue;
                     }
+                }
+                if (probe_no_wb) {
+                    continue;
                 }
                 ggml_backend_tensor_set(boundary_node(j), value, 0, nbytes_v);
             }

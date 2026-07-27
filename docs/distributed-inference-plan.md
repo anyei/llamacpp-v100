@@ -245,6 +245,20 @@ levers are the B2 GATHER (the only irreducible read RTT per layer) and escape
 (c) fill-the-bubble. Walker-crossing + delivery-skip design details and the
 cross-piece safety question are recorded in TASKS #9.
 
+**Probe (ii) MEASURED 2026-07-27d - the writeback costs ~47 ms/token:**
+GGML_META_PROBE_NO_WRITEBACK=1 (chain-only fused messages, reduced values
+never delivered; garbage output by design) on the record roster: eval
+244.9/227.7/260.9 ms/token = mean 244.5 vs 291.5 baseline -> the boundary
+writeback's true critical-path price is ~47 ms/token (~16%), i.e. ~4.1 t/s
+if eliminated where unconsumed. So fused_send does NOT hide it in production
+(per-socket ordering queues the next gather behind it, as suspected). The #9
+build decision is GO: walker crossing + delivery skip, prize ~+20% decode,
+with the value-less fused message path already validated by this probe (it IS
+one). Caveat: garbage activations could shift CPU compute time slightly
+(denormals/NaN); direction and magnitude match the wire arithmetic, so
+accepted. Cross-piece consumer safety remains the one open design question
+before delivery-skip ships.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the
