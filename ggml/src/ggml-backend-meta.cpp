@@ -2773,12 +2773,17 @@ static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cg
             // pairs) and the CUDA PPL gate all contradict - the ggml_set_output pins do
             // not keep these gathers readable on a device member. Counting there would
             // be worse than not counting: it cries wolf on a correct run.
-            if (st_ids->buffer == nullptr || !ggml_backend_buffer_is_host(st_ids->buffer)) {
+            const char * buft_name = st_ids->buffer != nullptr && st_ids->buffer->buft != nullptr ?
+                                     ggml_backend_buft_name(st_ids->buffer->buft) : "";
+            const bool readback_ok = st_ids->buffer != nullptr &&
+                                     (ggml_backend_buffer_is_host(st_ids->buffer) ||
+                                      strstr(buft_name, "RPC") != nullptr);
+            if (!readback_ok) {
                 static std::set<size_t> warned;
                 if (warned.insert(j).second) {
-                    GGML_LOG_ERROR("EXPERT_AUDIT: member %zu is not a host backend - runtime pair counting "
-                                   "SKIPPED there (readback unreliable). The load-time static table audit still "
-                                   "covers it; use a CPU-loopback member for the runtime gate.\n", j);
+                    GGML_LOG_ERROR("EXPERT_AUDIT: member %zu (%s) - runtime pair counting SKIPPED: the "
+                                   "end-of-graph readback is only trustworthy on host and RPC members. The "
+                                   "load-time static table audit still covers it.\n", j, buft_name);
                 }
                 continue;
             }
