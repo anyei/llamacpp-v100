@@ -232,6 +232,19 @@ gather-only, delivering just to the members that compute before the next
 broadcast (the next layer's owner - an NVLink write). Workers' residual copies
 then go permanently stale by design. Estimated -40-60 ms/token -> ~4.1-4.3 t/s.
 
+**Fusion design status (2026-07-27c, TASKS #9):** design complete, paused
+before code on an honest measurement gap. The delivery of a boundary value to
+a wire member rides fused_send, which bundles value + next-subgraph trigger in
+ONE message - so the B2 writeback may already cost zero extra round trips, and
+the per-kind timing above cannot distinguish pipelined from serialized cost
+(its per-boundary drains serialize everything they measure). Before any code:
+(i) a wall-time-only A/B toggling GGML_META_NO_STAR, (ii) a probe leg with the
+B2 writeback payload zeroed inside fused_send to price it truly, (iii)
+async-completion timestamps. If the writeback prices at ~0, the remaining
+levers are the B2 GATHER (the only irreducible read RTT per layer) and escape
+(c) fill-the-bubble. Walker-crossing + delivery-skip design details and the
+cross-piece safety question are recorded in TASKS #9.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the
