@@ -10,8 +10,12 @@ extern "C" {
 // fused hyper-connections) - the op enum shifted on the wire, so pre-merge
 // workers must be rejected. patch tracks upstream's op-enum fingerprint and
 // is enforced at HELLO (a mismatch decodes graphs to the wrong ops).
+// minor 12: f16 boundary payloads in GRAPH_FUSED (flags 8/16 - SET data
+// arrives f16-compressed / FETCH response returns f16). Opt-in via
+// GGML_RPC_WIRE_F16 on the coordinator; per-connection fallback keeps
+// minor<=11 workers on f32.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    11
+#define RPC_PROTO_MINOR_VERSION    12
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus

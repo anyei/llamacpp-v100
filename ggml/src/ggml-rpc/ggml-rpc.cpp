@@ -609,6 +609,11 @@ struct ggml_backend_rpc_async_state {
     bool manifest_fetched = false;
     std::unordered_set<uint64_t> manifest;
     std::vector<rpc_msg_set_tensor_hash_batch_entry> pending_batch;
+    // proto 4.12 f16 boundary payloads: the pending fused FETCH on this
+    // connection was requested f16-compressed - the paired fused_recv must
+    // expand it (exactly one recv per requesting send, same contract as
+    // fused_fetch_pending in the meta backend)
+    bool fused_fetch_f16 = false;
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -2098,6 +2103,20 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         }
         flags |= 2;
     }
+    // proto 4.12: f16 boundary payloads. Boundary values are F32 activations;
+    // halving their wire bytes attacks the measured ~68 ms/token of GbE byte
+    // time (BOUNDARY_STATS census 2026-07-27g). Lossy - opt-in, default off.
+    static const bool wire_f16 = getenv("GGML_RPC_WIRE_F16") != nullptr;
+    const bool f16_ok = wire_f16 && rpc_async_state(sock.get()).server_minor >= 12;
+    if (wire_f16) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+            GGML_LOG_INFO("rpc: f16 boundary payloads %s (first fused endpoint %s, server proto 4.%d)\n",
+                          f16_ok ? "ACTIVE" : "requested but UNAVAILABLE",
+                          rpc_ctx->endpoint.c_str(), rpc_async_state(sock.get()).server_minor);
+        }
+    }
+
     rpc_tensor set_rt = {}, fetch_rt = {};
     uint64_t set_off = 0, fetch_off = 0;
     if (set_tensor != nullptr) {
@@ -2109,7 +2128,12 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         set_rt  = serialize_tensor(rpc_resolve_view(set_tensor, off));
         set_off = off;
         flags |= 1;
+        if (f16_ok && set_tensor->type == GGML_TYPE_F32 && set_size % sizeof(float) == 0) {
+            flags |= 8; // SET payload rides as f16; the server expands
+        }
     }
+    const bool fetch_f16 = f16_ok && fetch_tensor != nullptr && fetch_tensor->type == GGML_TYPE_F32 &&
+        fetch_size % sizeof(float) == 0;
     if (fetch_tensor != nullptr) {
         if (fetch_tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(fetch_tensor->buffer) ||
             ((ggml_backend_rpc_buffer_context *) fetch_tensor->buffer->context)->sock != sock) {
@@ -2119,6 +2143,9 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         fetch_rt  = serialize_tensor(rpc_resolve_view(fetch_tensor, off));
         fetch_off = off;
         flags |= 4;
+        if (fetch_f16) {
+            flags |= 16; // FETCH response returns f16; the paired recv expands
+        }
     }
     if (flags == 0) {
         return false;
@@ -2132,11 +2159,20 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
     put(&rpc_ctx->device, sizeof(uint32_t));
     put(&flags, sizeof(flags));
     if (flags & 1) {
+        // the size field always carries the LOGICAL (f32) byte count; under
+        // flag 8 the wire payload is half that
         uint64_t sz = set_size;
         put(&set_rt, sizeof(set_rt));
         put(&set_off, sizeof(set_off));
         put(&sz, sizeof(sz));
-        put(set_data, set_size);
+        if (flags & 8) {
+            const size_t n_vals = set_size / sizeof(float);
+            const size_t base   = input.size();
+            input.resize(base + n_vals * sizeof(ggml_fp16_t));
+            ggml_fp32_to_fp16_row((const float *) set_data, (ggml_fp16_t *) (input.data() + base), (int64_t) n_vals);
+        } else {
+            put(set_data, set_size);
+        }
     }
     if (flags & 2) {
         uint32_t n_uids = (uint32_t) n_graphs;
@@ -2160,6 +2196,7 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         return false;
     }
+    st.fused_fetch_f16 = fetch_f16;
     return true;
 }
 
@@ -2174,12 +2211,29 @@ static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * 
     }
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
+    const bool f16 = st.fused_fetch_f16;
+    st.fused_fetch_f16 = false;
+    const uint64_t expect = f16 ? size / 2 : size;
     uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size)) ||
-        out_size != size ||
-        !sock->recv_data(data, size)) {
+    if (!sock->recv_data(&out_size, sizeof(out_size)) || out_size != expect) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         memset(data, 0, size); // deterministic instead of stale garbage
+        return false;
+    }
+    if (f16) {
+        static thread_local std::vector<uint8_t> scratch;
+        scratch.resize(expect);
+        if (!sock->recv_data(scratch.data(), expect)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            memset(data, 0, size);
+            return false;
+        }
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) scratch.data(), (float *) data, (int64_t) (size / sizeof(float)));
+        return true;
+    }
+    if (!sock->recv_data(data, size)) {
+        rpc_mark_failed(rpc_ctx->endpoint, __func__);
+        memset(data, 0, size);
         return false;
     }
     return true;
@@ -3937,6 +3991,9 @@ bool rpc_server::graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & req
 //           | if flags&2 (GRAPH): u64 uid  (recompute of a uid-cached graph)
 //           | if flags&4 (FETCH): rpc_tensor | u64 offset | u64 size |
 // response: | data[fetch size] |  (empty when no FETCH)
+// proto 4.12 modifiers: flags&8 - the SET payload is f16-compressed (size
+// still counts the LOGICAL f32 bytes; the wire carries size/2, expanded here);
+// flags&16 - the FETCH response returns f16 (size/2 bytes on the wire).
 // Failure semantics match the unfused commands: any error drops the connection.
 bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
     size_t pos = 0;
@@ -3980,7 +4037,9 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
             return false;
         }
-        if (pos + size > input.size()) {
+        const bool f16 = (flags & 8) != 0; // proto 4.12: payload is f16, size is the f32 byte count
+        const uint64_t wire_size = f16 ? size / 2 : size;
+        if (pos + wire_size > input.size() || (f16 && (size % sizeof(float) != 0))) {
             return false;
         }
         ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
@@ -3988,8 +4047,16 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
             GGML_LOG_ERROR("[%s] invalid SET segment\n", __func__);
             return false;
         }
-        ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
-        pos += size;
+        if (f16) {
+            static thread_local std::vector<float> expand;
+            const size_t n_vals = size / sizeof(float);
+            expand.resize(n_vals);
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) (input.data() + pos), expand.data(), (int64_t) n_vals);
+            ggml_backend_tensor_set(tensor, expand.data(), offset, size);
+        } else {
+            ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
+        }
+        pos += wire_size;
     }
     if (flags & 2) { // GRAPH chain (uid recomputes, in order)
         uint32_t n_uids;
@@ -4013,13 +4080,26 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
             return false;
         }
+        const bool f16 = (flags & 16) != 0; // proto 4.12: respond f16, size is the f32 byte count
+        if (f16 && (size % sizeof(float) != 0)) {
+            return false;
+        }
         ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
         if (!bounds_ok(&rt, tensor, offset, size)) {
             GGML_LOG_ERROR("[%s] invalid FETCH segment\n", __func__);
             return false;
         }
-        response.resize(size, 0);
-        ggml_backend_tensor_get(tensor, response.data(), offset, size);
+        if (f16) {
+            static thread_local std::vector<float> full;
+            const size_t n_vals = size / sizeof(float);
+            full.resize(n_vals);
+            ggml_backend_tensor_get(tensor, full.data(), offset, size);
+            response.resize(n_vals * sizeof(ggml_fp16_t));
+            ggml_fp32_to_fp16_row(full.data(), (ggml_fp16_t *) response.data(), (int64_t) n_vals);
+        } else {
+            response.resize(size, 0);
+            ggml_backend_tensor_get(tensor, response.data(), offset, size);
+        }
     }
     return true;
 }
