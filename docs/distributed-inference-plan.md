@@ -259,6 +259,33 @@ one). Caveat: garbage activations could shift CPU compute time slightly
 accepted. Cross-piece consumer safety remains the one open design question
 before delivery-skip ships.
 
+**#9 BUILT AND MEASURED 2026-07-27e - boundary fusion lands +15% pooled
+(conservative +7-9%):** `GGML_META_BCAST_FUSE` (default OFF; env-gates.md) in
+ggml-backend-meta.cpp. Level 1 walker crossing: a single-contributor PARTIAL
+(owner-broadcast) crosses the mirrored residual ADD in get_i_delayed, so B1
+broadcasts `ffn_inp` instead of `attn_out` (guarded against ADD_ID partial
+merges - after one, the owner's local value is no longer the logical sum).
+Level 2 delivery skip: rebuild-time consumer DFS per reduce boundary per WIRE
+member (view-chain aware; unsafe on reduce-contribution / OUTPUT / in-place /
+piece-end contamination); withheld values ride value-less fused messages.
+Cross-piece consumers (the open design question) SOLVED by a stale-value
+registry keyed (buffer uid, data offset) + fingerprint, with repair copies at
+piece start from a member holding the true value - engagement visible via
+`SKIP-WB:`/`REPAIR:` under GGML_META_DEBUG_REDUCE=1. Gates: CPU loopback
+byte-exact (pre-change == off == 1 == 2, sha a9294d12, trunc-hy3 2 RPC
+members); CUDA trunc roster (CUDA0,CUDA1,RPC0,RPC1) deterministic per config,
+crossing on all layers, skip engages exactly where safe (refuses layer-3 cell
+whose closure reaches result_output). Fleet A/B (record hy3 roster, same
+binary, 6x 100-tok greedy each, coherence READ on every leg): off 2.79 then
+3.16 (warm control) vs fuse=1 3.44, fuse=2 3.37 - pooled +15% (t~3.6),
+conservative vs warm control +7-9%. Delivery skip is NEUTRAL on top of the
+crossing on this roster: the skippable writebacks (mid-layer expert reduces to
+wire members) were already piggybacked on chain messages, and the mid-layer
+ffn_inp broadcasts cannot be skipped (experts consume them) - consistent with
+the 2026-07-27c pause note. The 47 ms probe priced ALL writebacks; the SAFE
+subset prices near zero. Next lever on the reduce share: the B2 gather
+(irreducible read RTT/layer) and escape (c) fill-the-bubble.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the

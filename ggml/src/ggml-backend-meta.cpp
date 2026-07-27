@@ -19,6 +19,8 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2487,6 +2489,11 @@ struct ggml_backend_meta_context {
         // partial node, or under per-node debug execution - and skipping its
         // reduce silently corrupts every consumer of that tensor.
         bool          reduce      = false;
+        // TASKS #9 delivery skip (GGML_META_BCAST_FUSE=2): false when the reduced
+        // boundary value is provably never consumed by a computing node on THIS
+        // member - the writeback is withheld (the fused message still carries the
+        // subgraph chain) and the member's copy goes permanently stale.
+        bool          deliver     = true;
     };
     struct backend_config {
         ggml_backend_t backend;
@@ -2514,6 +2521,16 @@ struct ggml_backend_meta_context {
         ggml_context_ptr ctx;   // owns this build's cgraph_main structures
         std::vector<std::vector<cgraph_config>> cgraphs; // [n_backends][...]
         std::vector<std::vector<ggml_tensor *>> nodes;   // [n_backends][n_nodes]
+        // TASKS #9: copies restoring stale member values this piece actually reads
+        // (a value skipped or window-hidden by an earlier piece); recomputed when
+        // the stale registry changes
+        struct repair_copy {
+            int                 j_src;
+            int                 j_dst;
+            const ggml_tensor * t; // meta tensor to restore on j_dst
+        };
+        uint64_t                 repair_seq = 0;
+        std::vector<repair_copy> repairs;
     };
     std::string                 name;
     std::vector<backend_config> backend_configs;
@@ -2558,6 +2575,39 @@ struct ggml_backend_meta_context {
     std::vector<bool>    wire_member;
     std::vector<uint8_t> star_scratch; // host staging for star-reduce partials
 
+    // TASKS #9 (GGML_META_BCAST_FUSE): registry of member copies left stale by
+    // design - single-contributor window nodes never computed off-owner, and
+    // boundary cells whose delivery was skipped. A later graph piece that READS
+    // one on a computing node repairs it first (see the repair pass in
+    // graph_compute); everything inside the deciding piece is proven safe at
+    // rebuild. Keyed by (buffer generation, logical data offset): meta tensor
+    // ->data is an offset, identical across same-shaped arenas, so it is only
+    // unique per buffer generation. Fingerprint-checked on every hit.
+    struct stale_entry {
+        ggml_backend_meta_tensor_fingerprint fp;
+        int src_member; // member holding a valid copy to repair from
+    };
+    std::vector<std::map<std::pair<uint64_t, const void *>, stale_entry>> stale_map; // [n_backends]
+    uint64_t stale_seq = 0; // bumped on registry change; validates cached repair lists
+
+    void mark_stale(size_t j, const ggml_tensor * t, int src_member) {
+        if (t->data == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+            return;
+        }
+        const uint64_t buf_uid = ((ggml_backend_meta_buffer_context *) t->buffer->context)->uid;
+        const auto key = std::make_pair(buf_uid, (const void *) t->data);
+        stale_entry e;
+        e.fp         = ggml_backend_meta_tensor_fingerprint(t);
+        e.src_member = src_member;
+        auto it = stale_map[j].find(key);
+        if (it != stale_map[j].end() &&
+                memcmp(&it->second.fp, &e.fp, sizeof(e.fp)) == 0 && it->second.src_member == src_member) {
+            return; // unchanged (same build re-registering) - keep repair caches valid
+        }
+        stale_map[j][key] = e;
+        stale_seq++;
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2565,6 +2615,7 @@ struct ggml_backend_meta_context {
         const char * GGML_META_MAX_GRAPHS = getenv("GGML_META_MAX_GRAPHS");
         ring_slots = std::max(2, GGML_META_MAX_GRAPHS ? atoi(GGML_META_MAX_GRAPHS) : 8);
         name = "Meta(";
+        stale_map.resize(n_devs);
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
         simple_backends.reserve(n_devs);
@@ -3029,6 +3080,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    // TASKS #9 boundary fusion, default OFF:
+    //   1 = walker crossing: a single-contributor PARTIAL (owner-broadcast
+    //       pattern) may cross an ADD with a MIRRORED operand, so the boundary
+    //       broadcasts the residual sum (ffn_inp) instead of attn_out
+    //   2 = additionally skip delivering a reduce boundary's value to wire
+    //       members that provably never consume it (gather-only B2)
+    static const int bcast_fuse = getenv("GGML_META_BCAST_FUSE") ? atoi(getenv("GGML_META_BCAST_FUSE")) : 0;
+
     // The scheduler skips view ops when splitting, so views whose data lives on
     // another backend (CPU-hosted weights via -ncmoe / partial -ngl, coordinator
     // CPU tensors over RPC) sit positionally inside the meta split's node range.
@@ -3203,6 +3262,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[id];
                 int32_t n_used = ggml_node_get_use_count(cgraph, id);
 
+                // TASKS #9 walker crossing: when exactly ONE member computes the
+                // PARTIAL (owner-broadcast pattern - dedicated attention exits),
+                // the member sum IS the owner's value, so the delay window may
+                // additionally cross an ADD with a MIRRORED operand (the residual
+                // add): the owner computes it exactly and the boundary broadcasts
+                // the result. Invalid once another PARTIAL source has been merged
+                // into the window (ADD_ID below) - the owner then holds only its
+                // own slice of that source and its local value is no longer the
+                // logical one.
+                bool single_contrib = false;
+                if (bcast_fuse >= 1) {
+                    int n_contrib = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                            n_contrib++;
+                        }
+                    }
+                    single_contrib = n_contrib == 1;
+                }
+                bool partials_merged = false;
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
@@ -3249,24 +3329,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         id++;
                         idr = id;
                         n_used = ggml_node_get_use_count(cgraph, id);
+                        partials_merged = true;
                     }
                 }
-                // Chain of MULs with MIRRORED src[1]
+                // Chain of MULs with MIRRORED src[1] (and, for a single-contributor
+                // window, ADDs with a MIRRORED operand - TASKS #9)
                 while (true) {
                     skip_unrelated();
                     if (id + 1 >= cgraph->n_nodes) {
                         return idr;
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
+                    bool crossed = false;
                     if (n_used == 1 && next->op == GGML_OP_MUL && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                        node = next;
-                        id++;
-                        idr = id;
-                        n_used = ggml_node_get_use_count(cgraph, id);
-                    } else {
+                        crossed = true;
+                    } else if (single_contrib && !partials_merged && n_used == 1 && next->op == GGML_OP_ADD &&
+                            ((next->src[0] == node &&
+                              ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+                             (next->src[1] == node &&
+                              ggml_backend_meta_get_split_state(next->src[0], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED))) {
+                        crossed = true;
+                    }
+                    if (!crossed) {
                         break;
                     }
+                    node = next;
+                    id++;
+                    idr = id;
+                    n_used = ggml_node_get_use_count(cgraph, id);
                 }
 
                 if (n_used != node->ne[1] || id + 2*n_used-1 >= cgraph->n_nodes) {
@@ -3353,6 +3444,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
 
+                // TASKS #9: a single-contributor window leaves nodes [i, i_delayed)
+                // permanently unwritten on the non-contributing members (only the
+                // boundary node i_delayed is overwritten by the broadcast). Register
+                // them so a LATER graph piece that reads one on a computing node can
+                // repair from the owner first (cross-piece consumer safety).
+                if (bcast_fuse >= 1 && i_delayed > i &&
+                        split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    int owner = -1;
+                    int n_contrib = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                            owner = (int) j;
+                            n_contrib++;
+                        }
+                    }
+                    if (n_contrib == 1) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            if ((int) j == owner) {
+                                continue;
+                            }
+                            for (int ii = i; ii < i_delayed; ii++) {
+                                backend_ctx->mark_stale(j, cgraph->nodes[ii], owner);
+                            }
+                        }
+                    }
+                }
+
                 i = i_delayed;
 
                 for (size_t j = 0; j < n_backends; j++) {
@@ -3368,6 +3486,131 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+        }
+
+        // TASKS #9 delivery skip (GGML_META_BCAST_FUSE=2): decide per reduce
+        // boundary and per WIRE member whether the reduced value must be written
+        // back. It may be withheld when every path from the boundary cell to a
+        // node that member actually computes is dead: consumers that are
+        // COMPUTE-off on the member never execute, and contaminated computing
+        // consumers are safe only while their garbage provably never reaches a
+        // reduce contribution, a graph output, an in-place write, or the end of
+        // the piece. Local members are always delivered - they are the repair
+        // sources, and member 0 anchors host reads (get_tensor MIRRORED).
+        if (bcast_fuse >= 2 && n_backends > 1 &&
+                !backend_ctx->wire_member.empty() && !backend_ctx->wire_member[0]) {
+            const auto & cfg0 = backend_ctx->backend_configs[0].cgraphs;
+            std::vector<char> is_cell(cgraph->n_nodes, 0);
+            for (size_t g = 0; g < n_subgraphs; g++) {
+                if (!cfg0[g].reduce) {
+                    continue;
+                }
+                const int b = (int) (g + 1 < n_subgraphs ? cfg0[g + 1].offset : cgraph->n_nodes) - 1;
+                is_cell[b] = 1;
+            }
+            // consumer adjacency, view-chain aware: reading a view reads its base,
+            // so a node consuming any view ancestor is a consumer of that ancestor
+            std::unordered_map<const ggml_tensor *, int> node_index;
+            node_index.reserve(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                node_index.emplace(cgraph->nodes[n], n);
+            }
+            std::vector<std::vector<int>> consumers(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const ggml_tensor * r = t->src[s];
+                    while (r != nullptr) {
+                        auto it = node_index.find(r);
+                        if (it != node_index.end() && it->second < n) {
+                            consumers[it->second].push_back(n);
+                        }
+                        r = r->view_src;
+                    }
+                }
+            }
+            std::vector<char> seen(cgraph->n_nodes, 0);
+            std::vector<int>  work;
+            std::vector<int>  closure;
+            for (size_t g = 0; g < n_subgraphs; g++) {
+                if (!cfg0[g].reduce) {
+                    continue;
+                }
+                const int b = (int) (g + 1 < n_subgraphs ? cfg0[g + 1].offset : cgraph->n_nodes) - 1;
+                ggml_tensor * cell = cgraph->nodes[b];
+                if (cell->view_src != nullptr || (cell->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                        b == cgraph->n_nodes - 1) {
+                    continue; // host/sched may read the cell itself - always deliver
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (!backend_ctx->wire_member[j]) {
+                        continue;
+                    }
+                    std::fill(seen.begin(), seen.end(), 0);
+                    work.assign(1, b);
+                    closure.clear();
+                    seen[b] = 1;
+                    bool safe = true;
+                    while (safe && !work.empty()) {
+                        const int gi = work.back();
+                        work.pop_back();
+                        for (const int c : consumers[gi]) {
+                            if (seen[c]) {
+                                continue;
+                            }
+                            seen[c] = 1;
+                            const ggml_tensor * ct = cgraph->nodes[c];
+                            if (ct->op == GGML_OP_VIEW || ct->op == GGML_OP_RESHAPE ||
+                                    ct->op == GGML_OP_PERMUTE || ct->op == GGML_OP_TRANSPOSE) {
+                                work.push_back(c); // pure view: aliases, executes nothing
+                                continue;
+                            }
+                            const ggml_tensor * cj = backend_ctx->backend_configs[j].nodes[c];
+                            if (cj == nullptr || cj == ct) {
+                                safe = false; // host view - opaque to this analysis
+                                break;
+                            }
+                            if ((cj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                                continue; // never executed on j
+                            }
+                            // executes on j reading a stale value -> garbage result
+                            if (is_cell[c] || (ct->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                                    ct->view_src != nullptr || c == cgraph->n_nodes - 1) {
+                                safe = false; // would reach a reduce / output / in-place write / piece end
+                                break;
+                            }
+                            closure.push_back(c);
+                            work.push_back(c);
+                        }
+                    }
+                    // contaminated nodes must be repairable cross-piece: a local
+                    // member that computes them holds the true value
+                    std::vector<int> closure_src(closure.size(), -1);
+                    for (size_t k = 0; safe && k < closure.size(); k++) {
+                        for (size_t m = 0; m < n_backends; m++) {
+                            if (!backend_ctx->wire_member[m] &&
+                                    (backend_ctx->backend_configs[m].nodes[closure[k]]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                                closure_src[k] = (int) m;
+                                break;
+                            }
+                        }
+                        safe = closure_src[k] >= 0;
+                    }
+                    if (!safe) {
+                        continue;
+                    }
+                    backend_ctx->backend_configs[j].cgraphs[g].deliver = false;
+                    backend_ctx->mark_stale(j, cell, 0);
+                    for (size_t k = 0; k < closure.size(); k++) {
+                        backend_ctx->mark_stale(j, cgraph->nodes[closure[k]], closure_src[k]);
+                    }
+                    static const bool debug_skip = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                    if (debug_skip) {
+                        fprintf(stderr, "SKIP-WB: boundary %4d '%s' member %zu (closure %zu)\n",
+                                b, cell->name, j, closure.size());
+                    }
+                }
+            }
         }
 
         backend_ctx->n_subgraphs = n_subgraphs;
@@ -3477,6 +3720,72 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->build_active = backend_ctx->builds.back().get();
     }
 
+    // TASKS #9 repair pass: if any member holds by-design-stale values (skipped
+    // deliveries / hidden single-contributor windows, both decided by an EARLIER
+    // piece) and a node of THIS piece computes on one, restore it first from a
+    // member that holds the true value. This is what makes cross-piece consumers
+    // safe: the deciding piece can only prove safety within itself. The per-build
+    // repair list is cached and revalidated whenever the stale registry changes.
+    if (bcast_fuse >= 1 && backend_ctx->stale_seq != 0) {
+        ggml_backend_meta_context::meta_build * build_a = backend_ctx->build_active;
+        if (build_a->repair_seq != backend_ctx->stale_seq) {
+            build_a->repair_seq = backend_ctx->stale_seq;
+            build_a->repairs.clear();
+            std::unordered_set<const ggml_tensor *> produced;
+            produced.reserve(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                produced.insert(cgraph->nodes[n]);
+            }
+            std::set<std::pair<const ggml_tensor *, size_t>> dedup;
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const ggml_tensor * r = t->src[s];
+                    if (r == nullptr) {
+                        continue;
+                    }
+                    while (r->view_src != nullptr) {
+                        r = r->view_src; // reading a view reads its base
+                    }
+                    if (r->buffer == nullptr || !ggml_backend_buffer_is_meta(r->buffer)) {
+                        continue;
+                    }
+                    if (produced.count(r) != 0) {
+                        continue; // recomputed by this piece before any use
+                    }
+                    const uint64_t buf_uid = ((ggml_backend_meta_buffer_context *) r->buffer->context)->uid;
+                    const auto key = std::make_pair(buf_uid, (const void *) r->data);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        const auto it = backend_ctx->stale_map[j].find(key);
+                        if (it == backend_ctx->stale_map[j].end() || !it->second.fp.matches(r)) {
+                            continue;
+                        }
+                        const ggml_tensor * nj = backend_ctx->backend_configs[j].nodes[n];
+                        if (nj == nullptr || nj == t || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                            continue; // not executed on j - the stale value stays unread
+                        }
+                        if (!dedup.insert({r, j}).second) {
+                            continue;
+                        }
+                        build_a->repairs.push_back({it->second.src_member, (int) j, r});
+                        static const bool debug_repair = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                        if (debug_repair) {
+                            fprintf(stderr, "REPAIR: piece reads stale '%s' on member %zu - restoring from member %d\n",
+                                    r->name, j, it->second.src_member);
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto & rc : build_a->repairs) {
+            ggml_tensor * src_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_src);
+            ggml_tensor * dst_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_dst);
+            GGML_ASSERT(src_t != nullptr && dst_t != nullptr);
+            ggml_backend_tensor_copy_async(backend_ctx->backend_configs[rc.j_src].backend,
+                                           backend_ctx->backend_configs[rc.j_dst].backend, src_t, dst_t);
+        }
+    }
+
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
 
@@ -3582,14 +3891,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 auto & bcj = backend_ctx->backend_configs[j];
+                // TASKS #9 delivery skip: the value is withheld from members whose
+                // rebuild-time analysis proved it unconsumed; the fused message
+                // still carries the subgraph chain (value-less messages are the
+                // exact shape the NO_WRITEBACK probe priced at ~47 ms/token)
+                const bool deliver_j = !probe_no_wb && bcj.cgraphs[i].deliver;
                 if (have_next && backend_ctx->wire_member[j]) {
                     chain.clear();
                     for (size_t g = i_next; g <= chain_end; g++) {
                         chain.push_back(bcj.cgraphs[g].cgraph_main);
                     }
                     const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
-                    if (backend_ctx->fused_send(bcj.backend, probe_no_wb ? nullptr : boundary_node(j),
-                            value, probe_no_wb ? 0 : nbytes_v,
+                    if (backend_ctx->fused_send(bcj.backend, deliver_j ? boundary_node(j) : nullptr,
+                            value, deliver_j ? nbytes_v : 0,
                             chain.data(), (int) chain.size(),
                             want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
                         fused_carried[j]       = (int) chain.size();
@@ -3597,7 +3911,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         continue;
                     }
                 }
-                if (probe_no_wb) {
+                if (!deliver_j) {
                     continue;
                 }
                 ggml_backend_tensor_set(boundary_node(j), value, 0, nbytes_v);
@@ -3775,7 +4089,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             std::vector<ggml_backend_t> backends_src, backends_dst;
             std::vector<ggml_tensor *>  srcs, dsts;
             for (size_t j = 0; j < n_backends; j++) {
-                if (j == j_src) {
+                if (j == j_src || !backend_ctx->backend_configs[j].cgraphs[i].deliver) {
                     continue;
                 }
                 backends_src.push_back(bcs.backend);
@@ -3984,10 +4298,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const int64_t t = ggml_time_us();
                 // classify by the boundary node's name: attn_out* boundaries are the
                 // owner broadcast (non-owners contribute exact zeros); the rest are
-                // true partial-sum reduces (expert merge, exit projections)
+                // true partial-sum reduces (expert merge, exit projections). Under
+                // GGML_META_BCAST_FUSE the owner broadcast lands on ffn_inp instead.
                 const ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
                 const char * bname = cg0->n_nodes > 0 ? cg0->nodes[cg0->n_nodes-1]->name : "";
-                if (strncmp(bname, "attn_out", 8) == 0) {
+                if (strncmp(bname, "attn_out", 8) == 0 || strncmp(bname, "ffn_inp", 7) == 0) {
                     backend_ctx->tm_bcast_us += t - tm_last;
                     backend_ctx->tm_bcasts++;
                 } else {
