@@ -205,6 +205,21 @@ and the 2026-07-27 addendum in 2026-07-parallel-decoding-and-distribution.md):
 | (b) fewer boundaries | cut sync points or participants | Layer Parallelism pair-fusion (80->40 syncs, quality-gated); METRO-style member-skipping reduce |
 | (c) fill the boundaries | overlap the wait with useful work | spec-over-boundary (#71 stage 1), SpecPipe/PipeInfer pipeline filling, ktransformers Expert Deferral (corroborated by APEX's deferred-sync) |
 
+**#7 MEASURED 2026-07-27 (GGML_META_TIMING on the record hy3 EP roster):**
+compute 403-405 ms/graph, reduce 180-186 ms/graph over **159 boundaries/graph
+= 1.99 per layer** (attention-owner broadcast + expert-sum reduce), reduce
+cost **1.15 ms/boundary**. Instrumentation serializes overlap (instrumented
+sum 587 ms = 1.70 t/s vs 292 ms = 3.43 t/s uninstrumented), and reduce is
+synchronous network work that does not compress when uninstrumented, so the
+inferred production split is **reduce ~183 ms (63%) / compute ~109 ms (37%)
+of each 292 ms token**. This confirms the boundary-bound hypothesis AND
+explains the gate-5 null quantitatively: placement attacked a slice of the
+37%. Ceilings from the same numbers: halve the boundaries (2/layer -> 1 by
+fusing the owner broadcast into the expert reduce) -> **5.0 t/s**; free
+boundaries (RDMA-class) -> **9.2 t/s**. The per-layer boundary pair is the
+single most concrete new target: escape (b) has a named, code-only first
+step (boundary fusion) before any hardware.
+
 distributed-llama's RPi5 result (1->4 workers, 5.95->13.68 t/s over plain TCP,
 q80 sync, star, similar-speed nodes) is the existence proof the goal is sound;
 its "similar-speed nodes" condition maps to keeping stragglers off the
