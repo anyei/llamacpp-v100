@@ -1923,11 +1923,37 @@ void server_models_routes::init_routes() {
                     if (++scanned > 500) break;
                     if (it->is_regular_file(ec) && it->path().extension() == ".gguf") ggufs++;
                 }
-                mounts.push_back({{"path", mp}, {"fstype", fs},
+                struct stat st{};
+                const uint64_t dev = ::stat(mp.c_str(), &st) == 0 ? (uint64_t) st.st_dev : 0;
+                mounts.push_back({{"path", mp}, {"fstype", fs}, {"dev", dev},
                                   {"free_mib",  (uint64_t)(sp.available/(1024*1024))},
                                   {"total_mib", (uint64_t)(sp.capacity /(1024*1024))},
                                   {"gguf_count", ggufs}});
             }
+            // scaffolding filter: a mount point that merely HOSTS other mounts
+            // (e.g. /mnt itself, whose stats are the rootfs) is not a storage
+            // suggestion; and bind aliases of the same device collapse to the
+            // entry with the most ggufs (shortest path on ties)
+            json filtered = json::array();
+            for (const auto & a : mounts) {
+                const std::string apath = a["path"].get<std::string>();
+                const std::string ap = apath == "/" ? "/" : apath + "/";
+                bool drop = false;
+                for (const auto & b : mounts) {
+                    if (a == b) continue;
+                    const std::string bp = b["path"].get<std::string>();
+                    if (bp.rfind(ap, 0) == 0) { drop = true; break; } // a is an ancestor mount
+                    if (a["dev"] == b["dev"] && a["dev"].get<uint64_t>() != 0) {
+                        const int ag = a["gguf_count"], bg = b["gguf_count"];
+                        if (bg > ag || (bg == ag && bp.size() < apath.size())) { drop = true; break; }
+                    }
+                }
+                if (!drop) {
+                    json e = a; e.erase("dev");
+                    filtered.push_back(std::move(e));
+                }
+            }
+            mounts = std::move(filtered);
         }
 #endif
         res_ok(res, {{"dirs", dirs}, {"mounts", mounts}});
