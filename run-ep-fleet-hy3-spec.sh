@@ -53,6 +53,18 @@ if [[ "${STATS:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_BOUNDARY_STATS=1)
 fi
 
+# wait for every roster worker to LISTEN: a freshly restarted rpc-server
+# benchmarks for ~15-20 s before binding, and --rpc aborts on the first
+# unreachable endpoint (raced twice on 2026-07-29)
+for ep in 127.0.0.1:50053 10.5.5.11:50052 10.5.5.15:50055; do
+    h=${ep%:*}; p=${ep#*:}
+    for i in $(seq 1 24); do
+        timeout 3 bash -c "echo > /dev/tcp/$h/$p" 2>/dev/null && break
+        [[ $i == 24 ]] && { echo "worker $ep not listening after 2 min" >&2; exit 1; }
+        sleep 5
+    done
+done
+
 docker rm -f llama-ep-hy3 >/dev/null 2>&1 || true
 exec docker run --name llama-ep-hy3 --gpus all \
   -v "$SRC:/srcbin:ro" -v "$REPO:/repo:ro" -v "$MODELS_DIR:/models:ro" --network host \
