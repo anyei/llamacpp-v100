@@ -194,6 +194,10 @@ const familyOf   = id => (id.toLowerCase().match(/^([a-z]+[\d.]*)/)||["",""])[1]
 const versionTok = id => (id.toLowerCase().match(/\d+\.\d+/)||[""])[0];
 
 async function loadData() {
+  try {
+    const dr = await fetch("./wizard/dirs");
+    if (dr.ok) S.dirs = (await dr.json()).dirs || [];
+  } catch(e) {}
   const r = await fetch("./models?reload=1");
   const j = await r.json();
   SCAN = (j.data||[]).map(e => {
@@ -442,7 +446,7 @@ function advOptions(m, md, specId) {
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", adv:{cachereuse:true}, mmproj:"", launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", adv:{cachereuse:true}, mmproj:"", dirs:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -454,7 +458,10 @@ function chips() {
     `<span class="chip"><b>${HW.ssd}</b></span>` +
     `<span class="chip"><b>fleet</b> <span class="dim">${HW.fleet.workers} workers · ${HW.fleet.pooledGB} GB RAM</span></span>` +
     `<span class="chip" style="color:var(--muted)" title="hardware values are assumptions until detection lands">assumed</span>` +
-    `<button class="rescan" id="hwedit">edit</button>`;
+    `<button class="rescan" id="hwedit">edit</button>` +
+    `<button class="rescan" id="srcedit">sources</button>`;
+  const sb = document.getElementById("srcedit");
+  if (sb) sb.onclick = () => { S.showDirs = true; S.dirsReport = null; render(); };
   const b = document.getElementById("hwedit");
   if (b) b.onclick = () => {
     const v = prompt("Hardware assumptions (JSON)", JSON.stringify(HW));
@@ -486,9 +493,58 @@ function crumb() {
   return h ? `<div class="crumb">${h}</div>` : "";
 }
 
+function renderDirs(v) {
+  const rows = S.dirs.map((d,i)=>{
+    const rep = S.dirsReport && S.dirsReport.find(r=>r.path===d);
+    return `<div class="bl"><span class="name" style="min-width:0;flex:1;font-family:var(--mono);font-size:12px;overflow-wrap:anywhere">${d}</span>
+      ${rep && !rep.exists ? '<span class="tag t-warn">not found</span>' : ""}
+      <button class="rescan" data-rmdir="${i}">remove</button></div>`;
+  }).join("");
+  v.innerHTML = `
+    <div class="panel"><h3>Model sources</h3>
+      <div class="why" style="margin-bottom:10px">Add the directories that hold your .gguf files. All of them are scanned; when two directories carry the same model name, the one higher in this list wins. The list is saved on the server and survives restarts (a CLI <span style="font-family:var(--mono)">--models-dir</span> overrides it).</div>
+      ${rows || '<div class="empty" style="padding:8px 4px">no directories yet</div>'}
+      <div class="kvrow" style="margin-top:10px">
+        <input id="newdir" type="text" placeholder="/mnt/files"
+          style="flex:1;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:7px 10px">
+        <button class="btn ghost" id="adddir">Add</button>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="savedirs" ${S.dirs.length?"":"disabled"}>Save &amp; scan</button>
+      ${MODELS.length?'<button class="btn ghost" id="canceldirs">Back</button>':""}
+    </div>`;
+  const add = () => {
+    const val = $("newdir").value.trim();
+    if (!val) return;
+    if (val.includes(",")) { alert("one directory per entry - no commas"); return; }
+    if (!S.dirs.includes(val)) S.dirs.push(val);
+    S.dirsReport = null; render();
+    const n=$("newdir"); if (n) n.focus();
+  };
+  $("adddir").onclick = add;
+  $("newdir").onkeydown = e => { if (e.key==="Enter") { e.preventDefault(); add(); } };
+  v.querySelectorAll("[data-rmdir]").forEach(b=>b.onclick=()=>{ S.dirs.splice(+b.dataset.rmdir,1); S.dirsReport=null; render(); });
+  const cd = $("canceldirs"); if (cd) cd.onclick = ()=>{ S.showDirs=false; render(); };
+  $("savedirs").onclick = async () => {
+    $("savedirs").textContent = "Scanning..."; $("savedirs").disabled = true;
+    try {
+      const r = await fetch("./wizard/dirs", { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({dirs: S.dirs}) });
+      const j = await r.json();
+      if (!r.ok || j.error) { alert("save failed: " + (j.error && j.error.message || r.status)); render(); return; }
+      S.dirsReport = j.dirs || null;
+      await loadData();
+      S.showDirs = MODELS.length === 0;  // stay here if still nothing found
+      S.step = 1; render();
+    } catch(e) { alert("save failed: " + e); render(); }
+  };
+}
+
 function render() {
   rail();
   const v = $("view");
+  if (S.showDirs || (MODELS.length === 0 && S.step === 1)) { renderDirs(v); return; }
 
   if (S.step===1) {
     const q = S.q.trim().toLowerCase();

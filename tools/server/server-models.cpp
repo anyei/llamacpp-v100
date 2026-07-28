@@ -324,6 +324,19 @@ server_models::server_models(
               base_preset(ctx_preset.load_from_args(argc, argv)) {
     // clean up base preset
     unset_reserved_args(base_preset, true);
+    // launch wizard: dirs added through the UI persist across restarts; a CLI
+    // --models-dir always wins over the persisted list
+    if (base_params.models_dir.empty()) {
+        try {
+            std::ifstream f(std::filesystem::path(fs_get_cache_directory()) / "router-models-dirs.txt");
+            if (f.good()) {
+                std::getline(f, base_params.models_dir);
+                if (!base_params.models_dir.empty()) {
+                    SRV_INF("restored models dirs from cache: %s\n", base_params.models_dir.c_str());
+                }
+            }
+        } catch (...) {}
+    }
     // set binary path
     try {
         bin_path = get_server_exec_path().string();
@@ -405,6 +418,30 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
     }
     SRV_DBG("notifying SSE clients about event '%s' for model '%s': %s\n", event.c_str(), model_id.c_str(), safe_json_to_str(result->data).c_str());
     sse.broadcast(std::move(result));
+}
+
+std::string server_models::get_models_dirs() {
+    std::lock_guard<std::mutex> lk(mutex);
+    return base_params.models_dir;
+}
+
+void server_models::set_models_dirs(const std::string & dirs) {
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        base_params.models_dir = dirs;
+    }
+    try {
+        const std::string cache = fs_get_cache_directory();
+        fs_create_directory_with_parents(cache);
+        std::ofstream f(std::filesystem::path(cache) / "router-models-dirs.txt");
+        f << dirs;
+        if (!f.good()) {
+            SRV_WRN("failed to persist models dirs under %s\n", cache.c_str());
+        }
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to persist models dirs: %s\n", e.what());
+    }
+    load_models();
 }
 
 void server_models::load_models() {
@@ -1770,7 +1807,7 @@ void server_models_routes::init_routes() {
         // models dirs free space (comma-separated list supported)
         {
             json dirs = json::array();
-            for (const auto & dir : string_split<std::string>(params.models_dir, ',')) {
+            for (const auto & dir : string_split<std::string>(models.get_models_dirs(), ',')) {
                 if (dir.empty()) continue;
                 std::error_code ec;
                 const auto sp = std::filesystem::space(dir, ec);
@@ -1846,10 +1883,45 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    this->get_wizard_dirs = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json dirs = json::array();
+        for (const auto & d : string_split<std::string>(models.get_models_dirs(), ',')) {
+            if (!d.empty()) dirs.push_back(d);
+        }
+        res_ok(res, {{"dirs", dirs}});
+        return res;
+    };
+
+    this->post_wizard_dirs = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        std::vector<std::string> dirs;
+        json report = json::array();
+        for (const auto & d : json_value(body, "dirs", json::array())) {
+            const std::string dir = d.get<std::string>();
+            if (dir.empty() || dir.find(',') != std::string::npos) {
+                res_err(res, format_error_response("directory paths must be non-empty and must not contain commas", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::error_code ec;
+            const bool ok = std::filesystem::is_directory(dir, ec) && !ec;
+            report.push_back({{"path", dir}, {"exists", ok}});
+            dirs.push_back(dir);
+        }
+        std::string joined;
+        for (const auto & d : dirs) {
+            joined += (joined.empty() ? "" : ",") + d;
+        }
+        models.set_models_dirs(joined);
+        res_ok(res, {{"success", true}, {"dirs", report}});
+        return res;
+    };
+
     this->get_wizard_sweeps = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json sweeps = json::object();
-        for (const auto & dir : string_split<std::string>(params.models_dir, ',')) {
+        for (const auto & dir : string_split<std::string>(models.get_models_dirs(), ',')) {
             if (dir.empty()) continue;
             std::ifstream f(std::filesystem::path(dir) / "sweeps.json");
             if (!f.good()) continue;

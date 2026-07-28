@@ -201,6 +201,11 @@ public:
     //   - if a model is not running, it will be added or updated according to the source
     void load_models();
 
+    // launch wizard: the live models-dir list (comma-joined), settable at
+    // runtime from the UI; persisted under the llama cache dir
+    std::string get_models_dirs();
+    void set_models_dirs(const std::string & dirs);
+
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
 
@@ -322,6 +327,8 @@ struct server_models_routes {
     // CUDA - GPUs come from an nvidia-smi subprocess, workers from beacons)
     server_http_context::handler_t get_wizard_hw;
     server_http_context::handler_t get_wizard_sweeps;
+    server_http_context::handler_t get_wizard_dirs;
+    server_http_context::handler_t post_wizard_dirs;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out
