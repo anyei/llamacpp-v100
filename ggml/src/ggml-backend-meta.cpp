@@ -2648,6 +2648,9 @@ struct ggml_backend_meta_context {
     int64_t bs_deliver_skip  = 0; // wire deliveries withheld (BCAST_FUSE=2)
     int64_t bs_deliver_bytes = 0; // bytes delivered to wire members
     int64_t bs_repairs       = 0; // stale-value repair copies executed
+    int64_t ed_defers        = 0; // wire partials deferred to the next reduce (GGML_META_EXPERT_DEFER)
+    int64_t ed_injects       = 0; // deferred partials injected one reduce late
+    int64_t ed_lost          = 0; // deferred partials dropped at graph end (should stay 0)
     int64_t bs_graphs        = 0;
 
     // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
@@ -3941,20 +3944,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // compute overlapping wire arrival). Never serve with it. Draining one
     // boundary late (not at graph end) keeps TCP backpressure off the workers.
     static const bool probe_defer_gather = getenv("GGML_META_PROBE_DEFER_GATHER") != nullptr;
+    // TASKS #71 Expert Deferral (the real mechanism the probe priced at +32%):
+    // an ELIGIBLE reduce sums local contributions only and distributes; the wire
+    // members' fused partials are drained at the NEXT reduce and ADDED there, so
+    // the stream is corrected additively one reduce late and owners never stall
+    // on wire arrival. Eligible = a next same-size star reduce exists (the
+    // injection point) - the last reduce of a graph always gathers fully, which
+    // keeps the logits path exact-sum. Lossy by construction (the layer between
+    // defer and inject reads the uncorrected stream): PPL + coherence gated,
+    // default off.
+    static const bool expert_defer = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER");
+        return env != nullptr && atoi(env) != 0;
+    }();
     std::vector<char>    defer_drain_pending(n_backends, 0);
     std::vector<size_t>  defer_drain_nbytes (n_backends, 0);
-    std::vector<uint8_t> defer_drain_scratch;
+    std::vector<char>    defer_drained(n_backends, 0);      // drained this boundary, awaiting injection
+    std::vector<size_t>  defer_drained_nbytes(n_backends, 0);
+    std::vector<std::vector<uint8_t>> defer_bufs(n_backends);
     auto drain_deferred = [&]() {
         for (size_t j = 0; j < n_backends; j++) {
             if (!defer_drain_pending[j]) {
                 continue;
             }
-            if (defer_drain_scratch.size() < defer_drain_nbytes[j]) {
-                defer_drain_scratch.resize(defer_drain_nbytes[j]);
+            if (defer_bufs[j].size() < defer_drain_nbytes[j]) {
+                defer_bufs[j].resize(defer_drain_nbytes[j]);
             }
             backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
-                                    defer_drain_scratch.data(), defer_drain_nbytes[j]);
-            defer_drain_pending[j] = 0;
+                                    defer_bufs[j].data(), defer_drain_nbytes[j]);
+            defer_drained[j]        = 1;
+            defer_drained_nbytes[j] = defer_drain_nbytes[j];
+            defer_drain_pending[j]  = 0;
         }
     };
 
@@ -4118,21 +4138,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<const ggml_tensor *> get_tensors(part.size());
                 std::vector<void *>              get_datas(part.size());
                 std::vector<size_t>              get_sizes(part.size(), nbytes);
-                if (probe_defer_gather) {
-                    drain_deferred(); // previous reduce's deferred wire responses, discarded
+                if (probe_defer_gather || expert_defer) {
+                    drain_deferred(); // previous reduce's deferred wire responses
+                }
+                // deferral eligibility: the next reduce subgraph must be a
+                // same-size star (F32, contiguous, >= 2 contributors) so the
+                // deferred partial has an injection point of identical shape
+                bool defer_ok = false;
+                if (expert_defer && fused_enabled) {
+                    // walk to the next MULTI-contributor reduce (single-contributor
+                    // reduces are owner broadcasts - drains do not run there); it
+                    // must be a same-size star so the injection shape matches
+                    for (size_t i_r2 = i + 1; i_r2 < backend_ctx->n_subgraphs; i_r2++) {
+                        if (!backend_ctx->backend_configs[0].cgraphs[i_r2].reduce) {
+                            continue;
+                        }
+                        size_t n_comp2 = 0;
+                        bool   ok2     = true;
+                        for (size_t j2 = 0; j2 < n_backends && ok2; j2++) {
+                            ggml_cgraph * cg2 = backend_ctx->backend_configs[j2].cgraphs[i_r2].cgraph_main;
+                            ggml_tensor * nd2 = cg2->nodes[cg2->n_nodes - 1];
+                            if (nd2->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                                n_comp2++;
+                                ok2 = nd2->type == GGML_TYPE_F32 && ggml_is_contiguous(nd2) &&
+                                      ggml_nbytes(nd2) == nbytes;
+                            }
+                        }
+                        if (n_comp2 >= 2) {
+                            defer_ok = ok2; // the first multi-contributor reduce decides
+                            break;
+                        }
+                    }
                 }
                 size_t n_plain = 0;
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
+                    if (backend_ctx->wire_member[j] && fused_fetch_pending[j] &&
+                            (probe_defer_gather || defer_ok)) {
+                        // do not wait: defer the fused response to the next reduce;
+                        // zero the slot so the sum holds local contributions only
+                        defer_drain_pending[j] = 1;
+                        defer_drain_nbytes[j]  = nbytes;
+                        fused_fetch_pending[j] = 0;
+                        backend_ctx->ed_defers++;
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
                     if (probe_defer_gather && backend_ctx->wire_member[j]) {
-                        // do not wait: defer the fused response to the next reduce,
-                        // skip the plain read; zero the slot so the sum stays finite
-                        if (fused_fetch_pending[j]) {
-                            defer_drain_pending[j] = 1;
-                            defer_drain_nbytes[j]  = nbytes;
-                            fused_fetch_pending[j] = 0;
-                        }
+                        // probe only: skip even the plain read (garbage by design);
+                        // real deferral reads non-fused wire partials synchronously
+                        // (their buffer cells recycle member-side, a late read is unsafe)
                         memset(scratch.data() + k*nbytes, 0, nbytes);
                         continue;
                     }
@@ -4174,6 +4230,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const float * p = (const float *) (scratch.data() + k*nbytes);
                     for (size_t v = 0; v < n_vals; v++) {
                         acc[v] += p[v];
+                    }
+                }
+                if (expert_defer) {
+                    // inject the previous reduce's deferred wire partials: the
+                    // stream downstream of this boundary is corrected additively
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (!defer_drained[j]) {
+                            continue;
+                        }
+                        if (defer_drained_nbytes[j] != nbytes) {
+                            backend_ctx->ed_lost++; // shape moved under us - drop, count loudly
+                            defer_drained[j] = 0;
+                            continue;
+                        }
+                        const float * p = (const float *) defer_bufs[j].data();
+                        for (size_t v = 0; v < n_vals; v++) {
+                            acc[v] += p[v];
+                        }
+                        defer_drained[j] = 0;
+                        backend_ctx->ed_injects++;
                     }
                 }
                 fused_distribute(SIZE_MAX, acc, nbytes);
@@ -4468,8 +4544,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
-    if (probe_defer_gather) {
+    if (probe_defer_gather || expert_defer) {
         drain_deferred(); // the last reduce's deferred responses
+        if (expert_defer) {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (defer_drained[j]) {
+                    // no reduce left to inject into - contribution dropped; the
+                    // eligibility rule should keep this at zero
+                    backend_ctx->ed_lost++;
+                    defer_drained[j] = 0;
+                }
+            }
+        }
     }
     if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
         fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, attn-bcast %.2f ms/graph over %.1f, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
@@ -4510,6 +4596,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 (double) backend_ctx->bs_deliver_skip  / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_deliver_bytes / 1024.0 / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_repairs       / backend_ctx->bs_graphs);
+        if (backend_ctx->ed_defers + backend_ctx->ed_injects + backend_ctx->ed_lost > 0) {
+            fprintf(stderr, "META_EXPERT_DEFER: defers %.1f injects %.1f LOST %.2f /graph\n",
+                    (double) backend_ctx->ed_defers  / backend_ctx->bs_graphs,
+                    (double) backend_ctx->ed_injects / backend_ctx->bs_graphs,
+                    (double) backend_ctx->ed_lost    / backend_ctx->bs_graphs);
+            backend_ctx->ed_defers = backend_ctx->ed_injects = backend_ctx->ed_lost = 0;
+        }
         backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
         backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;
         backend_ctx->bs_gather_bytes = backend_ctx->bs_deliver_wire = backend_ctx->bs_deliver_skip = 0;
