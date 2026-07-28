@@ -98,6 +98,20 @@ t/s from the #7 numbers); a realistic partial deferral (wire members only,
 1-layer staleness) targets the ktransformers-class +30% -> ~5.2 t/s, and it
 COMPOSES with 2.1 (deferral cuts L; spec amortizes what remains).
 
+**Ceiling MEASURED 2026-07-28 (GGML_META_PROBE_DEFER_GATHER, commit
+649742b3b + the response-FIFO transport fix 95db33ef6): probe plateau
+5.0-5.55, mean ~5.3 t/s vs 4.00 control = +32%, zero worker errors over 12
+runs.** The probe zeroes wire contributions outright (output garbage by
+design), so +32% is the no-quality-cost bound; real deferral (late
+injection) captures some fraction of it. The number matches ktransformers'
++33% claim for the same pattern. Build is GO. The transport half is DONE
+and general: the RPC client now keeps a per-socket in-order response FIFO
+(pings + fused fetches; early-read fetches stash) - a deferred fetch no
+longer desyncs interleaved traffic, which is the async-arrival primitive
+the real mechanism needs. Remaining: the graph half (inject the drained
+value into the residual stream one layer late, staleness cap, deferral-rate
+counter, PPL + coherence gates).
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
