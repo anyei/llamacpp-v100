@@ -276,6 +276,41 @@ quality soak before making EXPERT_DEFER=1 the default. Sweep artifacts
 control speed (rate 5.9%); SYNC_EDGE composes if a decode-quality issue
 ever surfaces.
 
+### 2.2c After v3: what the sweep re-ranks (escape (b) design frame)
+
+The WAIT_US=3000 leg is the load-bearing measurement for the roadmap: at a
+5.9% defer rate t/s equals control, so the per-boundary wait is the
+MEMBER-COMPUTE GAP (wire members' per-layer expert time exceeding the
+owners' layer time), not fixed transport latency. Consequences:
+
+1. **#75 hot-expert placement is RE-OPENED under v3.** Its gate-5 null (-4%)
+   was measured in the exact regime, where the fleet was latency-bound and
+   cutting member bytes could not shorten the critical path. Under v3 the
+   owner is drain-throttled by member per-layer time - exactly the term
+   placement shrinks (fewer cold expert bytes per member per token). The
+   machinery is DONE and gated (skip sentinel, record artifact
+   placements/hy3-record-21-21-46-50-27.json); the A/B is zero new code:
+   `PLACE=1 EXPERT_DEFER=1 STATS=1 ./run-ep-fleet-hy3-spec.sh` vs today's
+   v3 plateau (4.93-5.35), defer rate as the secondary instrument (if
+   placement speeds members up, ready-rate should RISE). ~1.5 h fleet
+   window (2 loads + runs).
+2. **Layer Parallelism pair-fusion's 1.9x ceiling (addendum pricing) is
+   STALE.** It assumed ~3.7 ms/boundary of removable cost; the sweep shows
+   most of that is elastic member compute, which pairing does NOT reduce
+   (members do both layers' experts per cycle). LP's real exact-path win is
+   the halved count of FIXED per-boundary costs (socket turnaround, host
+   reduce, payload latency) - order +10-15%, and it composes POORLY with
+   v3 (deferral already hides per-boundary fixed costs one layer deep).
+   LP also carries the known reasoning-quality collapse risk and a
+   model-graph rewrite (residual rewiring is builder-side, not a GGUF
+   transform alone). VERDICT: parked again until the member-compute axis
+   is exhausted. Cheapest ceiling probe if revisited: 40-layer
+   block_count-truncated record serve (upper bound: halves compute AND
+   boundaries; if THAT is not >= ~1.5x, LP is dead here).
+3. **The member-compute axis is now the multiplier lane**: placement (1),
+   member CPU upgrades/threads, and expert replication (hot experts on
+   multiple members so gathers shrink). In that order of cheapness.
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:

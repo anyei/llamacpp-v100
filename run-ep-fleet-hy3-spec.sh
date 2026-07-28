@@ -42,6 +42,12 @@ if [[ "${EXPERT_DEFER:-0}" != "0" ]]; then
     [[ -n "${DEFER_WAIT_US:-}" ]]   && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_WAIT_US="${DEFER_WAIT_US}")
     [[ -n "${DEFER_SYNC_EDGE:-}" ]] && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_SYNC_EDGE="${DEFER_SYNC_EDGE}")
 fi
+# PLACE=1: hot-expert placement artifact (#75). Gate 5 measured it null in the
+# EXACT latency-bound regime; v3 deferral (EXPERT_DEFER=1) makes the fleet
+# member-THROUGHPUT-bound, which is placement's premise - re-test combined.
+if [[ "${PLACE:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e LLAMA_META_EXPERT_PLACEMENT=/repo/placements/hy3-record-21-21-46-50-27.json)
+fi
 # STATS=1: GGML_META_BOUNDARY_STATS counters (production-valid, no drains)
 if [[ "${STATS:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_BOUNDARY_STATS=1)
