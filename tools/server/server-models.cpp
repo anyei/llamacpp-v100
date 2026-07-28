@@ -905,6 +905,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
 
+        // wizard overlay: appended argv wins over the preset's flags; env
+        // entries reach the child through its environment like any gate
+        child_args.insert(child_args.end(), opts.extra_args.begin(), opts.extra_args.end());
+        child_env.insert(child_env.end(), opts.extra_env.begin(), opts.extra_env.end());
+
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
@@ -1708,7 +1713,20 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.load(meta->name);
+        // launch-wizard overlay (optional): raw argv tokens + KEY=VALUE env
+        server_models::load_options opts;
+        for (const auto & a : json_value(body, "extra_args", json::array())) {
+            opts.extra_args.push_back(a.get<std::string>());
+        }
+        for (const auto & e : json_value(body, "extra_env", json::array())) {
+            const std::string kv = e.get<std::string>();
+            if (kv.find('=') == std::string::npos || kv.rfind("LLAMA_SERVER_", 0) == 0) {
+                res_err(res, format_error_response("extra_env entries must be KEY=VALUE and must not touch LLAMA_SERVER_*", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            opts.extra_env.push_back(kv);
+        }
+        models.load(meta->name, opts);
         res_ok(res, {{"success", true}});
         return res;
     };

@@ -214,6 +214,11 @@ public:
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
+        // launch-wizard overlay: extra argv tokens appended after the preset's
+        // rendered args (later flags win), and extra KEY=VALUE env entries for
+        // the child (gates like GGML_META_*); one-shot, not persisted
+        std::vector<std::string> extra_args;
+        std::vector<std::string> extra_env;
     };
 
     // load and unload model instances

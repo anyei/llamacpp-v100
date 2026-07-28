@@ -1,0 +1,695 @@
+<title>Launch a model</title>
+<style>
+  :root {
+    --bg: #f7f8f9; --fg: #1a1e24; --muted: #66707d; --card: #ffffff;
+    --inset: #eef0f2; --border: #dfe3e8; --accent: #d95f1e; --accent-fg: #ffffff;
+    --ok: #1a7f43; --warn: #a06a08; --bad: #c23c34;
+    --ok-bg: #1a7f4314; --warn-bg: #a06a0814; --bad-bg: #c23c3414; --accent-bg: #d95f1e14;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1013; --fg: #e8eaed; --muted: #8b93a1; --card: #16191e;
+      --inset: #1d2127; --border: #2a2f37; --accent: #ff8a4c; --accent-fg: #1a1006;
+      --ok: #46c07a; --warn: #d9a53a; --bad: #e5645c;
+      --ok-bg: #46c07a17; --warn-bg: #d9a53a17; --bad-bg: #e5645c17; --accent-bg: #ff8a4c17;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1013; --fg: #e8eaed; --muted: #8b93a1; --card: #16191e;
+    --inset: #1d2127; --border: #2a2f37; --accent: #ff8a4c; --accent-fg: #1a1006;
+    --ok: #46c07a; --warn: #d9a53a; --bad: #e5645c;
+    --ok-bg: #46c07a17; --warn-bg: #d9a53a17; --bad-bg: #e5645c17; --accent-bg: #ff8a4c17;
+  }
+  :root[data-theme="light"] {
+    --bg: #f7f8f9; --fg: #1a1e24; --muted: #66707d; --card: #ffffff;
+    --inset: #eef0f2; --border: #dfe3e8; --accent: #d95f1e; --accent-fg: #ffffff;
+    --ok: #1a7f43; --warn: #a06a08; --bad: #c23c34;
+    --ok-bg: #1a7f4314; --warn-bg: #a06a0814; --bad-bg: #c23c3414; --accent-bg: #d95f1e14;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:var(--sans);
+         font-size:14px; line-height:1.45; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width: 820px; margin:0 auto; padding:20px 16px 56px; }
+  h1 { font-size:17px; font-weight:640; letter-spacing:-0.01em; margin:0; }
+  .draft { font-family:var(--mono); font-size:10px; letter-spacing:0.08em; text-transform:uppercase;
+           border:1px dashed var(--border); color:var(--muted); padding:2px 7px; border-radius:4px;
+           margin-left:8px; vertical-align:2px; }
+  .sub { color:var(--muted); font-size:12.5px; margin-top:3px; }
+  a { color:var(--accent); }
+
+  .hw { display:flex; flex-wrap:wrap; gap:6px; margin-top:14px; align-items:center; }
+  .chip { font-family:var(--mono); font-size:11px; background:var(--inset); border:1px solid var(--border);
+          border-radius:5px; padding:3px 8px; color:var(--fg); white-space:nowrap; }
+  .chip b { font-weight:600; }
+  .chip .dim { color:var(--muted); }
+  .rescan { font-size:11px; color:var(--muted); background:none; border:none; cursor:pointer;
+            text-decoration:underline; text-underline-offset:2px; font-family:var(--sans); padding:2px; }
+
+  .rail { display:flex; gap:0; margin:22px 0 14px; border-bottom:1px solid var(--border); }
+  .rail button { font:inherit; font-size:12.5px; font-weight:560; background:none; border:none;
+                 color:var(--muted); padding:8px 2px 9px; margin-right:22px; cursor:pointer;
+                 border-bottom:2px solid transparent; }
+  .rail button.on { color:var(--fg); border-bottom-color:var(--accent); }
+  .rail button:disabled { opacity:0.45; cursor:default; }
+  .rail .n { font-family:var(--mono); font-size:10px; color:var(--muted); margin-right:5px; }
+  .rail button.on .n { color:var(--accent); }
+
+  .search { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+  .search input { flex:1; font:inherit; font-size:13px; color:var(--fg); background:var(--card);
+                  border:1px solid var(--border); border-radius:7px; padding:8px 12px; }
+  .search input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .search .count { font-size:11.5px; color:var(--muted); white-space:nowrap;
+                   font-variant-numeric:tabular-nums; }
+  .empty { color:var(--muted); font-size:12.5px; padding:18px 4px; }
+
+  .mrow { display:flex; align-items:center; gap:12px; width:100%; text-align:left; font:inherit;
+          background:var(--card); border:1px solid var(--border); border-radius:8px;
+          padding:10px 14px; margin-bottom:8px; cursor:pointer; color:var(--fg); }
+  .mrow:hover { border-color:var(--muted); }
+  .mrow:focus-visible, .mode:focus-visible, .btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .mname { font-family:var(--mono); font-size:12.5px; font-weight:600; overflow-wrap:anywhere; }
+  .mmeta { color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .mrow .grow { flex:1; min-width:0; }
+  .tag { font-size:10px; font-weight:620; letter-spacing:0.05em; text-transform:uppercase;
+         border-radius:4px; padding:2px 6px; white-space:nowrap; }
+  .t-ok { color:var(--ok); background:var(--ok-bg); }
+  .t-warn { color:var(--warn); background:var(--warn-bg); }
+  .t-bad { color:var(--bad); background:var(--bad-bg); }
+  .t-idle { color:var(--muted); background:var(--inset); }
+  .t-acc { color:var(--accent); background:var(--accent-bg); }
+
+  .mode { display:block; width:100%; text-align:left; font:inherit; color:var(--fg);
+          background:var(--card); border:1px solid var(--border); border-radius:8px;
+          padding:12px 14px; margin-bottom:8px; cursor:pointer; position:relative; }
+  .mode.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .mode:hover { border-color:var(--muted); }
+  .mode.sel:hover { border-color:var(--accent); }
+  .mhead { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .mhead .name { font-weight:620; font-size:13.5px; }
+  .mhead .speed { font-family:var(--mono); font-size:12px; margin-left:auto; white-space:nowrap; }
+  .speed b { font-size:14px; font-weight:640; }
+  .speed .est { color:var(--muted); font-weight:400; }
+  .why { color:var(--muted); font-size:12.5px; margin-top:3px; }
+  .mode details { margin-top:8px; }
+  .mode summary { font-size:11px; color:var(--muted); cursor:pointer; user-select:none; }
+  .flags { font-family:var(--mono); font-size:11.5px; background:var(--inset); border-radius:6px;
+           padding:8px 10px; margin-top:6px; overflow-x:auto; white-space:pre; line-height:1.65; }
+  .spec { margin-top:9px; border-top:1px dashed var(--border); padding-top:8px; }
+  .spec .lbl { font-size:10.5px; font-weight:640; letter-spacing:0.05em; text-transform:uppercase;
+               color:var(--muted); margin-bottom:5px; }
+  .spec label { display:flex; align-items:baseline; gap:7px; font-size:12.5px; padding:2px 0; cursor:pointer; }
+  .spec input { accent-color:var(--accent); }
+  .spec .gain { font-family:var(--mono); font-size:11px; color:var(--ok); }
+  .spec .estg { font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .spec .off { color:var(--muted); cursor:default; }
+  .spec .offwhy { font-size:11.5px; color:var(--muted); font-style:italic; }
+  .blocked-list { margin-top:16px; }
+  .blocked-list summary { font-size:12px; color:var(--muted); cursor:pointer; }
+  .bl { display:flex; gap:10px; align-items:baseline; padding:8px 4px; border-bottom:1px solid var(--border); }
+  .bl .name { font-size:12.5px; min-width:170px; }
+  .bl .why { font-size:12px; }
+
+  .panel { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:10px; }
+  .panel h3 { margin:0 0 8px; font-size:11px; font-weight:640; letter-spacing:0.06em;
+              text-transform:uppercase; color:var(--muted); }
+  .cmd { font-family:var(--mono); font-size:11.5px; background:var(--inset); border-radius:6px;
+         padding:10px 12px; overflow-x:auto; white-space:pre; line-height:1.65; }
+  .seg { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .seg button { font:inherit; font-size:11.5px; font-family:var(--mono); background:var(--card);
+                color:var(--muted); border:none; padding:5px 12px; cursor:pointer; }
+  .seg button + button { border-left:1px solid var(--border); }
+  .seg button.on { background:var(--accent-bg); color:var(--accent); font-weight:640; }
+  .kvrow { display:flex; align-items:center; gap:12px; margin-top:12px; flex-wrap:wrap; }
+  .kvrow .klbl { font-size:12px; color:var(--muted); }
+  .kvrow .note { font-size:11px; color:var(--muted); font-style:italic; }
+  .ctxchips { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+  .ctxchips button { font-family:var(--mono); font-size:12px; background:var(--card); color:var(--fg);
+                     border:1px solid var(--border); border-radius:6px; padding:5px 11px; cursor:pointer;
+                     font-variant-numeric:tabular-nums; }
+  .ctxchips button.on { background:var(--accent-bg); border-color:var(--accent); color:var(--accent); font-weight:640; }
+  .ctxchips button.yarn { border-style:dashed; }
+  .ctxchips button:disabled { opacity:0.38; cursor:default; text-decoration:line-through; }
+  .membar { height:8px; border-radius:4px; background:var(--inset); margin-top:10px; overflow:hidden; display:flex; }
+  .membar .used { background:var(--accent); height:100%; }
+  .membar .kvpart { background:var(--warn); height:100%; opacity:0.8; }
+  .memnote { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px;
+             font-variant-numeric:tabular-nums; }
+  .btn { font:inherit; font-size:13.5px; font-weight:600; color:var(--accent-fg); background:var(--accent);
+         border:none; border-radius:7px; padding:10px 22px; cursor:pointer; }
+  .btn[disabled] { opacity:0.6; cursor:default; }
+  .btn.ghost { background:none; color:var(--muted); font-weight:500; border:1px solid var(--border); }
+  .actions { display:flex; gap:10px; align-items:center; margin-top:4px; }
+  .launchstate { font-family:var(--mono); font-size:12px; margin-left:4px; }
+
+  .foot { margin-top:28px; border-top:1px solid var(--border); padding-top:12px; color:var(--muted); font-size:11.5px; }
+  .foot .cmd { margin-top:8px; }
+  .crumb { font-size:12px; color:var(--muted); margin-bottom:10px; }
+  .crumb b { color:var(--fg); font-family:var(--mono); font-weight:600; font-size:11.5px; }
+  .crumb button { background:none; border:none; color:var(--accent); font-size:11.5px; cursor:pointer;
+                  padding:0 2px; text-decoration:underline; text-underline-offset:2px; font-family:var(--sans); }
+  @media (prefers-reduced-motion: no-preference) { .mode, .mrow { transition: border-color 120ms ease; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Launch a model</h1>
+    <div class="sub">Pick a model, pick how to run it, launch. The wizard reads your hardware and the fleet, and pre-selects the best route.</div>
+    <div class="hw" id="hw"></div>
+  </header>
+
+  <nav class="rail" id="rail" aria-label="Steps">
+    <button id="r1" class="on"><span class="n">1</span>Model</button>
+    <button id="r2" disabled><span class="n">2</span>Run mode</button>
+    <button id="r3" disabled><span class="n">3</span>Launch</button>
+  </nav>
+
+  <main id="view"></main>
+
+  <div class="foot">
+    Entry point: one compose file, three variables. Everything else is decided here.
+    <div class="cmd">llama-server --models-dir /models --host 0.0.0.0 --port 8080   # router mode = no -m</div>
+    <div style="margin-top:6px">Started with no model, llama-server runs as a router: this page reads the models dir, and Launch spawns a child server with the flags above overlaid on the model preset. Speeds marked "measured" come from <span style="font-family:var(--mono)">sweeps.json</span> in the models dir when present.</div>
+  </div>
+</div>
+
+<script>
+// ---------- data layer: real router APIs ----------
+// HW: assumed values, editable + persisted until /wizard/hw detection (inc-3)
+const HW_DEFAULT = {
+  gpus: [{name:"V100", vram:32}, {name:"V100", vram:32}],
+  ram: 64, ssd: "NVMe",
+  fleet: { workers: 3, pooledGB: 198, usableGB: 225, names: "local 70G · .11 64G · .15 64G" }
+};
+let HW = HW_DEFAULT;
+try { HW = Object.assign({}, HW_DEFAULT, JSON.parse(localStorage.getItem("wizardHW")||"{}")); } catch(e) {}
+let totalVram = HW.gpus.reduce((a,g)=>a+g.vram,0);
+
+let SCAN = [], MODELS = [], DRAFTS = [], MMPROJ = [];
+let MEASURED = {};    // sweeps.json overlay: "model|mode|spec" -> t/s
+
+const QUANT_RE = /(IQ\d\S*|Q\d(_[A-Z0-9]+)*|BF16|F16|F32)/i;
+const familyOf   = id => (id.toLowerCase().match(/^([a-z]+[\d.]*)/)||["",""])[1].replace(/[.-]$/,"");
+const versionTok = id => (id.toLowerCase().match(/\d+\.\d+/)||[""])[0];
+
+async function loadData() {
+  const r = await fetch("./models?reload=1");
+  const j = await r.json();
+  SCAN = (j.data||[]).map(e => {
+    const md = e.metadata || {};
+    const id = e.id;
+    return {
+      id, file: id + ".gguf",
+      size: md.size_bytes ? Math.round(md.size_bytes/1073741824*10)/10 : 0,
+      quant: (id.match(QUANT_RE)||["?"])[0].toUpperCase(),
+      moe: (md.n_expert||0) > 0,
+      mtp: !!md.has_mtp,
+      nctx: md.n_ctx_train || 32768,
+      kvtok: md.kv_bytes_per_token_f16 || 0,
+      kind: e.kind || "model",
+      status: (e.status||{}).value || "unloaded",
+      family: familyOf(id),
+      note: [md.arch, md.block_count ? md.block_count+" layers" : "",
+             (md.n_expert||0)>0 ? "MoE "+md.n_expert+" experts" : (md.arch?"dense":""),
+             md.has_mtp ? "MTP head" : ""].filter(Boolean).join(" · ") || "no metadata",
+    };
+  });
+  MMPROJ = SCAN.filter(x => x.kind==="mmproj");
+  DRAFTS = SCAN.filter(x => x.kind==="draft");
+  MODELS = SCAN.filter(x => x.kind==="model");
+  MODELS.forEach(m => { m.yarn = m.family.startsWith("qwen"); });
+  try {
+    const sw = await fetch("./sweeps.json");
+    if (sw.ok) MEASURED = await sw.json();
+  } catch(e) {}
+}
+
+const kvEst = (m, ctx, kv) => (m.kvtok ? m.kvtok*ctx/1073741824
+                             : (ctx/8192) * (m.size>100?2.5:1.2)) * KVQ[kv||"f16"].mult;
+const mmprojFor = m => m.family ? MMPROJ.find(p=>p.id.toLowerCase().includes(m.family)) : undefined;
+const visionCapable = m => !!mmprojFor(m) || (m.family && /^qwen3\.[5-9]|^qwen[4-9]/.test(m.family));
+const dflashFor = m => DRAFTS.find(d => {
+  const dl = d.id.toLowerCase();
+  return (m.family && dl.includes(m.family)) ||
+         (versionTok(m.id) && dl.includes(versionTok(m.id)));
+});
+
+// ---------- mode catalog + fit + speculation logic ----------
+// specs: which speculation routes exist for (model, mode) and what we know about them.
+// GPU modes offer MTP (native head) and dflash (paired draft file); the fleet EP mode
+// shows them disabled with the measured reason (verify lanes pay full boundary cost).
+function specOptions(m, modeId) {
+  const opts = [];
+  const gpuMode = modeId==="gpu1"||modeId==="ts";
+  if (m.mtp) opts.push({ id:"mtp", name:"MTP speculation", gain: gpuMode?"+2.4x measured":null,
+    disabled: modeId==="fleet", offwhy:"measured break-even over the fleet boundary — verify lanes pay full wire cost",
+    flags:"--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
+  const d = dflashFor(m);
+  if (d && gpuMode) opts.push({ id:"dflash", name:"dflash speculation", est:true,
+    sub:`draft found: ${d.file}`,
+    flags:`--spec-type draft-dflash --spec-draft-model /models/${d.file}\nGGML_CUDA_DISABLE_GRAPHS=1` });
+  if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
+    sub:"train-free, no draft model - shines on repetitive/structured output",
+    flags:`--spec-type ngram-simple\nGGML_CUDA_DISABLE_GRAPHS=1` });
+  return opts;
+}
+
+function modesFor(m, ctx, kv) {
+  // viability is judged on weights + KV at the PLANNED context. A mode that fits
+  // only with quantized KV stays offered, annotated. Only physical impossibility
+  // (even at q4_0 KV) lands in the blocked list. Suboptimal-but-valid modes are
+  // ranked low with a "why not first" note instead of being hidden.
+  const out = { ranked: [], blocked: [] };
+  const meas = (mode,spec) => MEASURED[m.file+"|"+mode+"|"+(spec||"none")];
+  const kvNow = kvEst(m, ctx, kv), kvMin = kvEst(m, ctx, "q4_0");
+  const caps = { gpu1: HW.gpus[0].vram, ts: totalVram, ncmoe: totalVram+HW.ram,
+                 cpu: HW.ram, ssd: totalVram+HW.ram, fleet: HW.fleet.usableGB+totalVram };
+  const fit = id => m.size + kvNow <= caps[id];
+  const fitQ = id => m.size + kvMin <= caps[id];   // fits if KV quantized
+  const kvNote = id => fit(id) ? "" : ` Needs quantized KV at ${fmtCtx(ctx)} (picked in step 3).`;
+  const push = (mode) => out.ranked.push(mode);
+
+  // single GPU
+  if (fitQ("gpu1")) push({ id:"gpu1", name:"Single GPU",
+    speed:s2=>meas("gpu1",s2)||"~"+Math.round(1100/m.size*(m.quant.startsWith("Q8")?0.7:1)), est:s2=>!meas("gpu1",s2),
+    why:`${m.size} GB on one ${HW.gpus[0].name} ${HW.gpus[0].vram} GB.${kvNote("gpu1")}`,
+    flags:`-ngl 99 -c {CTX} --no-mmap` });
+  else out.blocked.push({ name:"Single GPU", why:`${m.size} GB + ~${kvMin.toFixed(0)} GB KV (q4_0) exceeds one ${HW.gpus[0].vram} GB GPU at ${fmtCtx(ctx)}.` });
+
+  // multi-GPU tensor split: valid whenever it fits pooled VRAM, even if one GPU would do -
+  // the pooled KV headroom is exactly why you'd pick it for long contexts
+  if (m.size <= totalVram && fitQ("ts")) push({ id:"ts", name:"Multi-GPU · tensor split",
+    speed:s2=>meas("ts",s2)||"~"+Math.round(900/m.size*10)/10, est:s2=>!meas("ts",s2),
+    why:`${HW.gpus.length}×${HW.gpus[0].vram} GB pooled = ${totalVram} GB for weights + KV - the long-context route when one GPU is tight.${kvNote("ts")} Gates preset: p2p allreduce, FA on.`,
+    flags:`-sm tensor -ts 0.5,0.5 -ngl 99 -c {CTX} --no-mmap -fa on\nGGML_CUDA_ALLREDUCE=p2p` });
+  else if (m.size <= totalVram) out.blocked.push({ name:"Multi-GPU · tensor split", why:`Weights fit but KV at ${fmtCtx(ctx)} exceeds ${totalVram} GB even at q4_0.` });
+  else out.blocked.push({ name:"Multi-GPU · tensor split", why:`${m.size} GB exceeds ${totalVram} GB pooled VRAM.` });
+
+  if (m.size <= totalVram && fitQ("ts")) push({ id:"sml", name:"Multi-GPU · layer split",
+    speed:s2=>meas("sml",s2)||"~"+Math.round(700/m.size*10)/10, est:s2=>!meas("sml",s2),
+    why:`Whole layers per GPU - one hop per boundary instead of per-op sync. Usually slower than tensor split on NVLink boxes; the fallback when tensor-split gates misbehave.${kvNote("ts")}`,
+    flags:`-sm layer -ngl 99 -c {CTX} --no-mmap -fa on` });
+
+  // MoE CPU offload
+  if (m.moe && fitQ("ncmoe")) push({ id:"ncmoe", name:"GPU + CPU expert offload",
+    speed:()=>"~6–9", est:()=>true,
+    why:`Attention and shared layers on GPU, routed experts in ${HW.ram} GB RAM (-ncmoe).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${kvNote("ncmoe")}`,
+    flags:`-ngl 99 -ncmoe auto -c {CTX} --no-mmap -fa on` });
+  else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GB).` });
+  else out.blocked.push({ name:"GPU + CPU expert offload", why:"Dense model - no expert tier to offload." });
+
+  // fleet: two REAL variants (expert parallel for MoE, layer split for anything
+  // oversized). Full tensor split across the wire is structurally blocked: every
+  // attention/FFN op would sync over GbE - EP is tensor mode with only the
+  // expert tier segmented, which is the viable form of it.
+  if (HW.fleet.workers > 0 && m.size + kvMin <= caps.fleet) {
+    const margin = caps.fleet - m.size;
+    const border = margin < 25 ? ` CAPACITY-BORDERLINE: ~${margin.toFixed(0)} GB headroom for KV + overheads - keep context modest.` : "";
+    if (m.moe) {
+      const epMeas = meas("fleet-ep");
+      push({ id:"fleet", name:"Distributed fleet · expert parallel",
+        speed:s2=>meas("fleet-ep",s2)||"~3–5", est:s2=>!meas("fleet-ep",s2),
+        why:`Experts spread across ${HW.fleet.workers} workers' RAM (${HW.fleet.names}); attention stays on the V100s.${border}`+
+            (epMeas ? " Gates preset: boundary fusion, q8 wire, decode-only expert deferral."
+                    : " UNSWEPT for this model - run layer split first to collect its expert profile (a profiled first EP layout beats uniform)."),
+        hasRecordTs: !!MEASURED[m.file+"|fleet-ep|none"],
+        flags:`--rpc 127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055 --rpc-reload\n-sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
+    }
+    push({ id:"fleetl", name:"Distributed fleet · layer split",
+      speed:s2=>meas("fleet-layer",s2)||"~1.5–2.5", est:s2=>!meas("fleet-layer",s2),
+      why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture.${border}`+
+          (m.moe ? ` Also the PROFILING vehicle: add LLAMA_EXPERT_PROFILE to collect router histograms for a first ${m.file.split("-")[0]} EP layout.` : ""),
+      flags:`--rpc 127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055 --rpc-reload\n-sm layer --rpc-auto-weight -ngl 99 -c {CTX} --no-mmap -fit off`+
+            (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
+    out.blocked.push({ name:"Distributed · full tensor split",
+      why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
+  } else if (HW.fleet.workers > 0 && m.size + kvMin > caps.fleet) out.blocked.push({ name:"Distributed fleet", why:`${m.size} GB + KV exceeds usable fleet capacity (${caps.fleet} GB).` });
+
+  // SSD streaming: always offered for MoE - choosing to spare RAM/VRAM is the user's call
+  if (m.moe) push({ id:"ssd", name:"SSD streaming",
+    speed:s2=>meas("ssd",s2)||"~0.5–2", est:s2=>!meas("ssd",s2),
+    why:`Experts stream from ${HW.ssd} on demand.${m.size<=totalVram+HW.ram?" Optional here - trades speed for leaving RAM/VRAM free.":" Works alone on this box - slow, but zero extra hardware."}`,
+    ssdGpuOpt:true,
+    flags:`--ssd-streaming --ssd-stream-budget 8192 -c {CTX}` });
+  else out.blocked.push({ name:"SSD streaming", why:"Streams the expert tier - dense models have none." });
+
+  // CPU only
+  if (fitQ("cpu")) push({ id:"cpu", name:"CPU only", speed:()=>"~1–4", est:()=>true,
+    why:`Fits ${HW.ram} GB RAM. No GPU dependency.${kvNote("cpu")}`,
+    flags:`-ngl 0 -c {CTX}` });
+  else out.blocked.push({ name:"CPU only", why:`${m.size} GB + KV exceeds ${HW.ram} GB RAM.` });
+
+  out.ranked.sort((a,b)=>(b.est("none")?0:1)-(a.est("none")?0:1) ||
+                        (parseFloat(b.speed("none"))||0)-(parseFloat(a.speed("none"))||0));
+  // policy: for MoE with NO measured EP sweep, the layer-split fleet ranks above
+  // EP - profile first, commit an informed EP layout second
+  if (m.moe && !MEASURED[m.file+"|fleet-ep|none"]) {
+    const li = out.ranked.findIndex(r=>r.id==="fleetl"), ei = out.ranked.findIndex(r=>r.id==="fleet");
+    if (ei>=0 && li>ei) { const [l]=out.ranked.splice(li,1); out.ranked.splice(ei,0,l); }
+  }
+  return out;
+}
+const fmtCtx = c => c>=1048576?(c/1048576)+"M":(c/1024)+"k";
+
+function fitTag(m) {
+  if (m.size + 4 <= HW.gpus[0].vram) return ["fits 1 GPU","t-ok"];
+  if (m.size + 6 <= totalVram) return ["fits "+HW.gpus.length+" GPUs","t-ok"];
+  if (m.size + 8 <= totalVram + HW.ram) return ["needs CPU offload","t-warn"];
+  if (m.size <= HW.fleet.usableGB + totalVram) return ["needs fleet / SSD","t-warn"];
+  return ["exceeds fleet","t-bad"];
+}
+
+// the intentionally-quiet knobs: resilience, diagnostics, tuning, experimental.
+// Grouped per relevance to the chosen mode; each checked item appends its flags.
+function advOptions(m, md, specId) {
+  const fleet = md.id==="fleet"||md.id==="fleetl";
+  const g = [];
+  g.push({ label:"Caching & sessions", items:[
+    { id:"cachereuse", name:"--cache-reuse 256", note:"reuse KV chunks across shifted prompts - big win for multi-turn chat and RAG re-prompts (per-request prompt caching is on by default regardless)", flags:"--cache-reuse 256" },
+    { id:"slotsave", name:"--slot-save-path", note:"persist session KV to disk - resume conversations after a restart, skip re-prefill of long contexts", flags:"--slot-save-path /cache/slots" },
+    { id:"ctxshift", name:"--ctx-shift", note:"endless chat: drop the oldest tokens when the context fills - the model silently loses what scrolled off", flags:"--ctx-shift" },
+    { id:"defrag", name:"--defrag-thold 0.1", note:"periodic KV defragmentation - keeps long-running multi-slot serves from fragmenting the cache", flags:"--defrag-thold 0.1" },
+    { id:"cacheprompt", name:"--cache-prompt", note:"server-side prompt caching default (per-request cache_prompt can still override)", flags:"--cache-prompt" },
+    { id:"cacheram", name:"--cache-ram 12288", note:"host-RAM budget (MiB) for cached prompts beyond what stays in slot KV", flags:"--cache-ram 12288" },
+    { id:"ctxckpt", name:"--ctx-checkpoints 8", note:"keep N KV checkpoints per slot - fast rollback for regenerate/branching instead of full re-prefill", flags:"--ctx-checkpoints 8" },
+  ]});
+  if (fleet) g.push({ label:"Resilience", items:[
+    { id:"skipun", name:"--rpc-skip-unavailable", note:"drop unreachable workers at startup instead of failing the load", flags:"--rpc-skip-unavailable" },
+    { id:"preflight", name:"--fleet-preflight", note:"verify every worker with a tiny model before the long load", flags:"--fleet-preflight /models/preflight-tiny.gguf" },
+  ]});
+  const diag = [];
+  if (fleet) diag.push(
+    { id:"bstats", name:"GGML_META_BOUNDARY_STATS", note:"boundary traffic + expert-deferral counters every 128 graphs (production-safe)", flags:"GGML_META_BOUNDARY_STATS=1" },
+    { id:"rpcstats", name:"GGML_RPC_STATS", note:"per-RPC-command call/byte counters at exit", flags:"GGML_RPC_STATS=1" });
+  if (specId!=="none") diag.push(
+    { id:"spectiming", name:"LLAMA_SPEC_TIMING", note:"draft/verify/accept phase timings", flags:"LLAMA_SPEC_TIMING=1" });
+  if (md.id==="ssd") diag.push(
+    { id:"ssddebug", name:"GGML_SSD_STREAM_DEBUG", note:"hit/miss/evict rate log line", flags:"GGML_SSD_STREAM_DEBUG=1" });
+  if (diag.length) g.push({ label:"Diagnostics", items:diag });
+  const tune = [];
+  if (md.id==="ssd") tune.push(
+    { id:"ssdthreads", name:"read threads ×4", note:"parallel SSD miss-path reads", flags:"LLAMA_SSD_STREAM_READ_THREADS=4" },
+    { id:"ssdprefetch", name:"router-lookahead prefetch", note:"predict + prefetch next experts", flags:"LLAMA_SSD_STREAM_PREFETCH=2" },
+    { id:"ssdslru", name:"segmented LRU", note:"scan-resistant RAM expert cache", flags:"LLAMA_SSD_STREAM_SLRU=1" });
+  if (specId!=="none") tune.push(
+    { id:"specadaptive", name:"LLAMA_SPEC_ADAPTIVE", note:"cap draft length by acceptance EMA - measured neutral here", flags:"LLAMA_SPEC_ADAPTIVE=1" });
+  if (!fleet && md.id!=="ssd") tune.push(
+    { id:"mlock", name:"--mlock", note:"pin weights in RAM (no swap-out); needs memlock ulimit", flags:"--mlock" });
+  if (!md.flags.includes("-fa on")) tune.push(
+    { id:"faon", name:"-fa on", note:"force flash attention on (default auto; KV quantization adds it automatically)", flags:"-fa on" });
+  if (!fleet) tune.push(
+    { id:"fitoff", name:"-fit off", note:"disable parameter auto-fit - respect the explicit device/layer split exactly (fleet recipes always set this)", flags:"-fit off" });
+  if (tune.length) g.push({ label:"Tuning", items:tune });
+  const srv = [
+    { id:"contbatch", name:"--cont-batching", note:"continuous batching across slots (server default on - set explicitly)", flags:"--cont-batching" },
+    { id:"timeout10", name:"--timeout 10", note:"read/write timeout for HTTP clients (seconds)", flags:"--timeout 10" },
+  ];
+  if (!fleet) srv.unshift(
+    { id:"batch4096", name:"batch 4096/4096", note:"large prefill batches - faster prompt processing on big-VRAM boxes (fleet recipes stay at 256 to bound boundary payloads)", flags:"--batch-size 4096 --ubatch-size 4096" });
+  if (!md.flags.includes("--no-mmap")) srv.push(
+    { id:"nommap", name:"--no-mmap", note:"load weights into RAM instead of mmap - slower load, steadier serving", flags:"--no-mmap" });
+  g.push({ label:"Server & batching", items:srv });
+  g.push({ label:"Chat & template", items:[
+    { id:"noprefill", name:"--no-prefill-assistant", note:"send the template without pre-opening the assistant turn - some reasoning templates require it", flags:"--no-prefill-assistant" },
+    { id:"reaspreserve", name:"--reasoning-preserve", note:"keep reasoning/thinking blocks in chat history instead of stripping them before templating", flags:"--reasoning-preserve" },
+  ]});
+  if (fleet) g.push({ label:"Experimental", items:[
+    { id:"kvannex", name:"KV annex worker", note:"UNTESTED since 2026-07-11 - offload KV to a GPU worker", warn:true, flags:"LLAMA_KV_WORKER_HOST=1" },
+  ]});
+  return g;
+}
+
+// ---------- state + render ----------
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", adv:{cachereuse:true}, mmproj:"", launched:0 };
+const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
+              q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
+const $ = id => document.getElementById(id);
+
+function chips() {
+  $("hw").innerHTML =
+    HW.gpus.map(g=>`<span class="chip"><b>${g.name}</b> <span class="dim">${g.vram} GB</span></span>`).join("") +
+    `<span class="chip"><b>RAM</b> <span class="dim">${HW.ram} GB</span></span>` +
+    `<span class="chip"><b>${HW.ssd}</b></span>` +
+    `<span class="chip"><b>fleet</b> <span class="dim">${HW.fleet.workers} workers · ${HW.fleet.pooledGB} GB RAM</span></span>` +
+    `<span class="chip" style="color:var(--muted)" title="hardware values are assumptions until detection lands">assumed</span>` +
+    `<button class="rescan" id="hwedit">edit</button>`;
+  const b = document.getElementById("hwedit");
+  if (b) b.onclick = () => {
+    const v = prompt("Hardware assumptions (JSON)", JSON.stringify(HW));
+    if (v) { try { HW = JSON.parse(v); totalVram = HW.gpus.reduce((a,g)=>a+g.vram,0);
+                   localStorage.setItem("wizardHW", v); chips();
+document.getElementById("view").innerHTML = '<div class="empty">scanning models...</div>';
+loadData().then(()=>render()).catch(e=>{
+  document.getElementById("view").innerHTML = '<div class="empty">failed to read ./models - is this page served by llama-server in router mode? ('+e+')</div>';
+}); }
+             catch(e) { alert("invalid JSON"); } }
+  };
+}
+
+function rail() {
+  [1,2,3].forEach(n=>{
+    const b=$("r"+n); b.classList.toggle("on", S.step===n);
+    b.disabled = (n===2 && !S.model) || (n===3 && !S.mode);
+    b.onclick = ()=>{ S.step=n; render(); };
+  });
+}
+
+function specName() {
+  return S.spec==="mtp" ? " + MTP" : S.spec==="dflash" ? " + dflash" : "";
+}
+function crumb() {
+  let h = "";
+  if (S.model) h += `model <b>${S.model.file}</b> <button data-go="1">change</button>`;
+  if (S.step===3 && S.mode) h += ` · mode <b>${S.mode.name}${specName()}</b> <button data-go="2">change</button>`;
+  return h ? `<div class="crumb">${h}</div>` : "";
+}
+
+function render() {
+  rail();
+  const v = $("view");
+
+  if (S.step===1) {
+    const q = S.q.trim().toLowerCase();
+    const list = MODELS.filter(m => !q || (m.file+" "+m.note).toLowerCase().includes(q));
+    v.innerHTML = `
+      <div class="search">
+        <input id="q" type="search" placeholder="Filter models — name, quant, MoE, MTP…" value="${S.q.replace(/"/g,"&quot;")}" aria-label="Filter models">
+        <span class="count">${list.length} of ${MODELS.length}${DRAFTS.length?` · ${DRAFTS.length} draft`:""}</span>
+      </div>` +
+      (list.length ? list.map(m=>{
+        const [t,c]=fitTag(m); const i=MODELS.indexOf(m);
+        return `<button class="mrow" data-i="${i}">
+          <span class="grow"><span class="mname">${m.file}</span>
+          <div class="mmeta">${m.size} GB · ${m.note}</div></span>
+          ${m.status!=="unloaded" ? `<span class="tag t-ok">${m.status}</span>`:""}
+          ${m.mtp?'<span class="tag t-acc">MTP able</span>':""}
+          ${dflashFor(m)?'<span class="tag t-acc">dflash able</span>':""}
+          ${mmprojFor(m)?'<span class="tag t-ok">vision</span>':visionCapable(m)?'<span class="tag t-idle">vision capable</span>':""}
+          ${m.moe?'<span class="tag t-idle">MoE</span>':""}
+          <span class="tag ${c}">${t}</span></button>`;
+      }).join("") : `<div class="empty">No models match "${S.q}". Draft models (${DRAFTS.map(d=>d.file).join(", ")}) are offered as speculation options on their target models, not listed here.</div>`);
+    const qi=$("q");
+    qi.oninput=e=>{ S.q=e.target.value; render(); const n=$("q"); n.focus(); n.setSelectionRange(n.value.length,n.value.length); };
+    v.querySelectorAll(".mrow").forEach(b=>b.onclick=()=>{
+      S.model=MODELS[+b.dataset.i]; S.mode=null; S.spec="none";
+      const mp = mmprojFor(S.model); S.mmproj = mp ? "/models/"+mp.file : "";
+      S.ctx=Math.min(S.ctx, S.model.nctx||32768); S.step=2; render();
+    });
+  }
+
+  if (S.step===2) {
+    const {ranked, blocked} = modesFor(S.model, S.ctx, S.kv);
+    if (S.mode && !ranked.find(r=>r.id===S.mode.id)) S.mode = null;
+    if (!S.mode) {
+      S.mode = ranked[0];
+      const so = specOptions(S.model, S.mode.id).filter(o=>!o.disabled);
+      S.spec = so.find(o=>o.id==="mtp") ? "mtp" : "none"; // MTP head => suggested on
+    }
+    const nctx2 = S.model.nctx||32768, maxCtx2 = S.model.yarn ? nctx2*4 : nctx2;
+    const steps2 = []; for (let c=4096; c<=maxCtx2; c*=2) steps2.push(c);
+    if (!steps2.includes(nctx2)) { steps2.push(nctx2); steps2.sort((a,b)=>a-b); }
+    if (!steps2.includes(maxCtx2)) steps2.push(maxCtx2);
+    if (!steps2.includes(S.ctx)) S.ctx = steps2.filter(c=>c<=S.ctx).pop() || steps2[0];
+    v.innerHTML = crumb() + `
+      <div class="panel" style="padding:10px 14px"><h3>Planned context - changes which modes fit</h3>
+        <div class="ctxchips">${steps2.map(c=>
+          `<button data-pctx="${c}" class="${S.ctx===c?"on":""} ${c>nctx2?"yarn":""}">${fmtCtx(c)}</button>`).join("")}</div>
+      </div>` + ranked.map((md,i)=>{
+      const sel = S.mode.id===md.id;
+      const opts = specOptions(S.model, md.id);
+      const curSpec = sel ? S.spec : "none";
+      const spd = md.speed(curSpec), est = md.est(curSpec);
+      return `
+      <div class="mode ${sel?"sel":""}" data-i="${i}" tabindex="0" role="button">
+        <div class="mhead">
+          ${i===0?'<span class="tag t-acc">recommended</span>':""}
+          <span class="name">${md.name}</span>
+          <span class="speed"><b>${spd}</b> t/s ${est?'<span class="est">est.</span>':"measured"}</span>
+        </div>
+        <div class="why">${md.why}</div>
+        ${md.id==="fleet"?`<div class="spec"><div class="lbl">Device weights</div>
+          ${md.hasRecordTs?`<label><input type="radio" name="fw-${md.id}" value="record" ${S.fleetW==="record"?"checked":""} ${sel?"":"disabled"}>
+            measured record split <span class="gain">-ts 21,21,46,50,27 · swept</span></label>`:""}
+          <label><input type="radio" name="fw-${md.id}" value="auto" ${S.fleetW==="auto"||!md.hasRecordTs?"checked":""} ${sel?"":"disabled"}>
+            auto-weight <span class="estg">· scored worker benchmarks fill -ts (--rpc-auto-weight)</span></label>
+        </div>`:""}
+        ${md.ssdGpuOpt?`<div class="spec"><div class="lbl">Expert landing</div>
+          <label><input type="checkbox" data-ssdgpu="1" ${sel&&S.ssdGpu?"checked":""} ${sel?"":"disabled"}>
+          GPU landing cache <span class="estg">· hot experts land in VRAM slots (single-GPU only - inert under -sm)</span></label>
+        </div>`:""}
+        ${opts.length?`<div class="spec"><div class="lbl">Speculation</div>
+          <label><input type="radio" name="spec-${md.id}" value="none" ${curSpec==="none"?"checked":""} ${sel?"":"disabled"}> none</label>
+          ${opts.map(o=>o.disabled
+            ? `<label class="off"><input type="radio" disabled> ${o.name} <span class="offwhy">— ${o.offwhy}</span></label>`
+            : `<label><input type="radio" name="spec-${md.id}" value="${o.id}" ${curSpec===o.id?"checked":""} ${sel?"":"disabled"}>
+               ${o.name} ${o.gain?`<span class="gain">${o.gain}</span>`:o.est?'<span class="estg">est. gain — sweep it</span>':""}
+               ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>`).join("")}
+        </div>`:""}
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
+      </div>`;}).join("") +
+      `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
+      `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
+        ${blocked.map(b=>`<div class="bl"><span class="name">${b.name}</span><span class="why">${b.why}</span></div>`).join("")}
+      </details>`;
+    v.querySelectorAll(".mode").forEach((el)=>{
+      const pick = e => {
+        if (e.target.closest("details")||e.target.closest(".spec")) return;
+        S.mode=ranked[+el.dataset.i];
+        const so = specOptions(S.model, S.mode.id).filter(o=>!o.disabled);
+        S.spec = so.find(o=>o.id==="mtp") ? "mtp" : "none";
+        render();
+      };
+      el.onclick = pick;
+      el.onkeydown = e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); pick(e); } };
+    });
+    v.querySelectorAll("[data-pctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.pctx; render(); });
+    v.querySelectorAll("[data-ssdgpu]").forEach(cb=>cb.onchange=e=>{ S.ssdGpu=e.target.checked; render(); });
+    v.querySelectorAll("[name^=fw-]").forEach(r=>r.onchange=e=>{ S.fleetW=e.target.value; render(); });
+    v.querySelectorAll(".spec input[type=radio]:not([disabled])").forEach(r=>r.onchange=e=>{ S.spec=e.target.value; render(); });
+    $("next2").onclick=()=>{ S.step=3; render(); };
+    bindCrumb();
+  }
+
+  if (S.step===3) {
+    const m=S.model, md=S.mode;
+    const opts = specOptions(m, md.id);
+    const kvGB = kvEst(m, S.ctx, S.kv) * S.np;
+    const capGB = md.id==="fleet"||md.id==="fleetl" ? HW.fleet.usableGB+totalVram : md.id==="cpu" ? HW.ram
+                 : md.id==="ncmoe"||md.id==="ssd" ? totalVram+HW.ram : md.id==="gpu1" ? HW.gpus[0].vram : totalVram;
+    const usedPct = Math.min(100, m.size/capGB*100), kvPct = Math.min(100-usedPct, kvGB/capGB*100);
+    const spec = opts.find(o=>o.id===S.spec);
+    const kvFlags = S.kv==="f16" ? "" : `\n-ctk ${S.kv} -ctv ${S.kv} -fa on`;
+    const nctx = m.nctx || 32768, maxCtx = m.yarn ? nctx*4 : nctx;
+    const ctxSteps = [];
+    for (let c=4096; c<=maxCtx; c*=2) ctxSteps.push(c);
+    if (!ctxSteps.includes(nctx)) { ctxSteps.push(nctx); ctxSteps.sort((a,b)=>a-b); }
+    if (!ctxSteps.includes(maxCtx)) ctxSteps.push(maxCtx);
+    if (!ctxSteps.includes(S.ctx)) S.ctx = ctxSteps.filter(c=>c<=S.ctx).pop() || ctxSteps[0];
+    const yarnOn = m.yarn && S.ctx > nctx;
+    const yarnFlags = yarnOn ? `\n--rope-scaling yarn --rope-scale ${(S.ctx/nctx).toFixed(4)} --yarn-orig-ctx ${nctx}` : "";
+    const extra = (S.mmproj ? `\n--mmproj ${S.mmproj}` : "") +
+                  (md.ssdGpuOpt && S.ssdGpu ? `\nLLAMA_SSD_STREAM_GPU=1 LLAMA_SSD_STREAM_VRAM_BUDGET=6000` : "") +
+                  (S.np>1 ? `\n-np ${S.np}` : "");
+    const advGroups = advOptions(m, md, S.spec);
+    const advFlags = advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).map(it=>"\n"+it.flags).join("");
+    const flags = md.flags.replace("{CTX}", S.ctx)
+                          .replace("{TS}", S.fleetW==="record"&&md.hasRecordTs ? "-ts 21,21,46,50,27" : "--rpc-auto-weight")
+                  + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+spec.flags : "") + advFlags;
+    v.innerHTML = crumb() + `
+      <div class="panel"><h3>Context &amp; KV cache</h3>
+        <div class="ctxchips">${ctxSteps.map(c=>{
+          const kvNeed=(c/8192)*(m.size>100?2.5:1.2)*KVQ[S.kv].mult;
+          const fits=m.size+kvNeed<=capGB;
+          const lab=c>=1048576?(c/1048576)+"M":(c/1024)+"k";
+          return `<button data-ctx="${c}" class="${S.ctx===c?"on":""} ${c>nctx?"yarn":""}"
+            ${fits?"":"disabled"} title="${fits?(c>nctx?"extended via YaRN":""):"KV would not fit at "+S.kv+" — try a smaller context or quantize the KV cache"}">${lab}</button>`;
+        }).join("")}</div>
+        <div class="kvrow" style="margin-top:8px"><span class="note">native ${nctx>=1048576?(nctx/1048576)+"M":(nctx/1024)+"k"}${m.yarn?` · dashed chips extend via YaRN`:""}${yarnOn?`</span><span class="tag t-acc">YaRN ×${(S.ctx/nctx).toFixed(2)}</span><span class="note">rope flags added below`:""}</span></div>
+        <div class="kvrow"><span class="klbl">Parallel slots</span>
+          <span class="seg">${[1,2,4,8].map(n=>
+            `<button data-np="${n}" class="${S.np===n?"on":""}">${n}</button>`).join("")}</span>
+          <span class="note">${S.np>1?`KV ×${S.np} — throughput serving; single-stream latency unchanged at best`:"single stream — lowest latency"}</span></div>
+        <div class="kvrow"><span class="klbl">KV cache</span>
+          <span class="seg">${["f16","q8_0","q4_0"].map(k=>
+            `<button data-kv="${k}" class="${S.kv===k?"on":""}">${k}</button>`).join("")}</span>
+          <span class="note">${KVQ[S.kv].note}${S.kv!=="f16"?" · needs flash attention (-fa on, added)":""}</span></div>
+        <div class="membar"><div class="used" style="width:${usedPct}%"></div><div class="kvpart" style="width:${kvPct}%"></div></div>
+        <div class="memnote"><span>weights ${m.size} GB + KV ~${kvGB.toFixed(1)} GB @ ${S.kv}${S.np>1?` ×${S.np} slots`:""}${S.spec!=="none"?" + draft ctx":""}${S.mmproj?" + vision proj":""}</span>
+        <span>${capGB} GB available (${md.name}${specName()})</span></div>
+      </div>
+      ${visionCapable(m)?`<div class="panel"><h3>Vision projector</h3>
+        <div class="kvrow" style="margin-top:0"><input id="mmproj" type="text" value="${S.mmproj.replace(/"/g,"&quot;")}"
+          placeholder="${mmprojFor(m)?"":"no projector found in the models dir - enter a path to enable vision"}"
+          style="flex:1;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:7px 10px">
+        </div>
+        <div class="memnote" style="margin-top:6px"><span>${mmprojFor(m)?`auto-detected ${mmprojFor(m).file} - clear the field to serve text-only`:"this family supports vision with a paired --mmproj file"}</span></div>
+      </div>`:""}
+      <div class="panel"><h3>Resolved launch — flags &amp; env gates</h3><div class="cmd">${flags}</div>
+        <div class="memnote" style="margin-top:6px"><span>model path, host and port come from the router preset; these flags overlay it</span></div></div>
+      <details class="panel" style="margin-top:0"><summary style="font-size:12px;color:var(--muted);cursor:pointer">Advanced — ${advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).length} of ${advGroups.flatMap(g=>g.items).length} enabled</summary>
+        ${advGroups.map(g=>`<div class="spec"><div class="lbl">${g.label}</div>
+          ${g.items.map(it=>`<label><input type="checkbox" data-adv="${it.id}" ${S.adv[it.id]?"checked":""}>
+            <span style="font-family:var(--mono);font-size:12px">${it.name}</span>
+            ${it.warn?'<span class="tag t-warn">untested</span>':""}
+            <span class="estg">· ${it.note}</span></label>`).join("")}
+        </div>`).join("")}
+      </details>
+      <div class="actions">
+        <button class="btn" id="go" ${S.launched?"disabled":""}>${S.launched?"Launching":"Launch"}</button>
+        <button class="btn ghost" id="copy">Copy compose override</button>
+        <span class="launchstate" id="lst"></span>
+      </div>`;
+    v.querySelectorAll("[data-ctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.ctx; render(); });
+    v.querySelectorAll("[data-np]").forEach(b=>b.onclick=()=>{ S.np=+b.dataset.np; render(); });
+    v.querySelectorAll("[data-adv]").forEach(cb=>cb.onchange=e=>{ S.adv[cb.dataset.adv]=e.target.checked; render(); });
+    const mpi=$("mmproj"); if (mpi) mpi.onchange=e=>{ S.mmproj=e.target.value.trim(); render(); };
+    v.querySelectorAll("[data-kv]").forEach(b=>b.onclick=()=>{ S.kv=b.dataset.kv; render(); });
+    $("go").onclick=()=>{ S.launched=1; render(); realLaunch(flags); };
+    $("copy").onclick=e=>{ e.target.textContent="Copied"; setTimeout(()=>e.target.textContent="Copy compose override",1200); };
+    bindCrumb();
+  }
+}
+function bindCrumb(){ document.querySelectorAll(".crumb button").forEach(b=>b.onclick=()=>{ S.step=+b.dataset.go; S.launched=0; render(); }); }
+let launchPoll=null;
+function splitFlags(text){
+  // KEY=VALUE tokens are env; everything else argv; comments stripped
+  const args=[], env=[];
+  for (let line of text.split("\n")) {
+    line = line.replace(/#.*$/,"").trim();
+    if (!line) continue;
+    for (const tok of line.split(/\s+/)) {
+      if (/^[A-Z][A-Z0-9_]*=/.test(tok)) env.push(tok); else args.push(tok);
+    }
+  }
+  return {args, env};
+}
+async function realLaunch(flagsText){
+  const {args, env} = splitFlags(flagsText);
+  if ($("lst")) $("lst").textContent = "requesting launch...";
+  try {
+    const r = await fetch("./models/load", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ model: S.model.id, extra_args: args, extra_env: env }) });
+    const j = await r.json();
+    if (!r.ok || j.error) { if ($("lst")) $("lst").textContent = "launch failed: " + (j.error && j.error.message || r.status); S.launched=0; return; }
+  } catch(e) { if ($("lst")) $("lst").textContent = "launch failed: " + e; S.launched=0; return; }
+  const poll = async () => {
+    try {
+      const r = await fetch("./models"); const j = await r.json();
+      const me = (j.data||[]).find(x=>x.id===S.model.id);
+      const st = me ? me.status.value : "?";
+      if (!$("lst")) return;
+      if (st === "loaded") { $("lst").innerHTML = 'ready — <a href="./">open chat</a>'; return; }
+      if (me && me.status.failed) { $("lst").textContent = "load failed (exit " + me.status.exit_code + ") - check router logs"; S.launched=0; return; }
+      $("lst").textContent = "status: " + st;
+      launchPoll = setTimeout(poll, 2000);
+    } catch(e) { launchPoll = setTimeout(poll, 4000); }
+  };
+  poll();
+}
+chips();
+document.getElementById("view").innerHTML = '<div class="empty">scanning models...</div>';
+loadData().then(()=>render()).catch(e=>{
+  document.getElementById("view").innerHTML = '<div class="empty">failed to read ./models - is this page served by llama-server in router mode? ('+e+')</div>';
+});
+</script>
