@@ -133,11 +133,16 @@ server flags (NMAX/PMIN in run-ep-fleet-hy3-spec.sh) change the draft shape;
 and single-serve measurements drift +0.5 t/s from cold to warm, so only
 plateau-vs-plateau comparisons are honest.
 
-Open before abandoning the spec lane: (i) a BOUNDARY_STATS spec leg to split
-the verify-pass cost into bytes vs compute, (ii) one NMAX=6 PMIN=0.3 serve -
-at 90%+ acceptance, longer chains raise tokens/pass faster than the byte
-term if bytes are not already dominant. Expert Deferral (2.2) is unblocked
-either way and attacks the latency term that speculation could not.
+Follow-up (ii) MEASURED same night and it CLOSES the spec lane: NMAX=6
+PMIN=0.3 (server flags) = 2.34 t/s mean (1.87-2.80, 12 runs, coherent),
+acceptance 27-45% at 125-172 drafted per 100 generated. Rejected lanes pay
+full verify-batch bytes + reads, so aggressive drafting is a 0.59 ratio.
+Spec on this fleet: best-acceptance config breaks even, anything looser
+loses - SHELVED until the per-lane boundary cost falls (RDMA-class
+transport, #60) or tree-verify with expert-reuse-aware selection changes
+lane economics. The BOUNDARY_STATS split (i) is now optional - the sweep
+demonstrates lane-cost dominance behaviorally. Expert Deferral (2.2) is the
+active escape-(c) lever.
 
 ## 3. Probe ladder (each gated before the next)
 
