@@ -3,22 +3,23 @@
 # Router mode = llama-server with NO model argument. The wizard lives at
 # http://<host>:<port>/wizard.html ; the normal chat UI is at / and serves
 # whichever model the wizard launched. Model dirs can be left unset - the
-# wizard's "Model sources" screen manages them at runtime and the list
-# persists in the container's llama cache across restarts.
+# wizard's "Model sources" screen suggests mounted storage, and the list
+# persists in the launcher-cache volume across restarts.
 #
 #   MODELS_DIR=/mnt/files PORT=8399 docker compose -f docker-compose.launcher.yml up -d
 #
-# Optional: MODELS_DIRS_FLAG="--models-dir /models" pins the dirs from the
-# CLI (overrides anything set in the UI).
+# Optional:
+#   COORD_IMAGE=llamacpp-local-v100:<tag>       pin an image (default :latest)
+#   MODELS_DIRS_FLAG="--models-dir /models"     pin dirs from the CLI (beats the UI list)
 #
-# This runs the DEV layout: binaries from the build tree + the UI dist dir
-# mounted in, matching the fleet run scripts. Once wizard.html is embedded
-# in the production image's UI assets, the two mounts and --path go away.
+# wizard.html is embedded in llamacpp-local-v100 images >= 64c68933b. For a
+# dev tree, override the image and add back the /srcbin + /ui mounts with
+# --path /ui (see git history of this file for the dev layout).
 
 services:
   llama-launcher:
     container_name: llama-launcher
-    image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
     restart: unless-stopped
     network_mode: host
     deploy:
@@ -29,15 +30,10 @@ services:
               count: all
               capabilities: [gpu]
     volumes:
-      - ${SRC:-~/server/git-projects/llama.cpp-work/build-cuda75}:/srcbin:ro
-      - ${UI_DIST:-~/server/git-projects/llama.cpp/tools/ui/dist}:/ui:ro
       - ${MODELS_DIR:-/mnt/files}:/models:ro
       - launcher-cache:/root/.cache
-    environment:
-      - LD_LIBRARY_PATH=/srcbin/bin
-    entrypoint: /srcbin/bin/llama-server
+    entrypoint: /app/llama-server
     command: >
-      --path /ui
       --host ${HOST:-0.0.0.0}
       --port ${PORT:-8399}
       ${MODELS_DIRS_FLAG:-}
