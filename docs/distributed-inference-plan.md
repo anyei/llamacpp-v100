@@ -338,6 +338,20 @@ latency, i.e. escape (c) fill-the-bubble (#71) is the next frontier. Scripts
 and composes now set BOTH WIRE_F16 and WIRE_Q8 so every connection rides the
 best format its worker speaks (q8_0 > f16 > f32).
 
+**#71 probe 0 MEASURED 2026-07-27/28k - spec-over-boundary on the full
+default stack is a wash:** expert-placement merged into parallel-inference
+(37cf1c45e), loopback gate byte-identical with LOCAL_DRAFT engagement proven
+by GGML_RPC_STATS cmd counts. Record roster, plateau-vs-plateau (the fleet
+warms ~+0.5 t/s over a serve's first 20 min - 6-run legs are NOT comparable):
+plain 4.00 t/s vs draft-mtp + LLAMA_META_LOCAL_DRAFT 3.99, acceptance
+84-97%, both coherent. The same config is +58% on CPU loopback (no wire), so
+the verify batch's n-lane multiplication of boundary BYTES + member expert
+reads eats the entire amortization on GbE. Details + open follow-ups
+(BOUNDARY_STATS split of the verify pass; NMAX/PMIN server-flag sweep -
+per-request overrides are silently ignored for draft-mtp) in
+docs/fill-the-bubble-plan.md 2.1a. Escape (c)'s remaining lever is Expert
+Deferral; escape (b) Layer Parallelism unaffected.
+
 **MTP prod-config A/B 2026-07-27f - fuse is a verified no-op there:** Qwen3.6
 -27B-MTP, 2x V100 `-sm tensor -ts 0.5,0.5`, full prod compose flags, same #9
 binary, 3x 500-token temp-0 gens per leg: off 66.5-66.7 vs fuse=2 66.3-66.5

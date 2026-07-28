@@ -114,6 +114,31 @@ COMPOSES with 2.1 (deferral cuts L; spec amortizes what remains).
 - Layer Parallelism pair-fusion is escape (b) (fewer boundaries), tracked in
   the research addendum - not this doc.
 
+### 2.1a Probe 0 MEASURED 2026-07-27/28 - ratio 1.00, spec is still shelved
+(at n-max 3 / p-min 0.75)
+
+Merged tree (37cf1c45e), record roster, both legs coherence-read. The 6-run
+protocol proved too short - the fleet warms over a serve's first ~20 minutes
+- so both legs were run to plateau: control 4.00 t/s (15 runs, 3.62-4.36),
+spec + LLAMA_META_LOCAL_DRAFT 3.99 t/s (9 runs, 3.60-4.69). Acceptance
+84-97%, and the loopback vehicle (no wire cost) shows +58% for the same
+config - so the fleet-side loss is in the verify pass itself: an n-lane
+verify multiplies BOTH member expert reads (the #52 law) and per-boundary
+payload bytes (B1/B2 carry n lanes; q8 shrank the unit cost, not the
+scaling), and together they currently price at exactly the amortization won.
+
+Learned along the way: per-request speculative.n_max/p_min overrides are
+IGNORED for draft-mtp (server-schema.cpp "disabled for now" TODO) - only the
+server flags (NMAX/PMIN in run-ep-fleet-hy3-spec.sh) change the draft shape;
+and single-serve measurements drift +0.5 t/s from cold to warm, so only
+plateau-vs-plateau comparisons are honest.
+
+Open before abandoning the spec lane: (i) a BOUNDARY_STATS spec leg to split
+the verify-pass cost into bytes vs compute, (ii) one NMAX=6 PMIN=0.3 serve -
+at 90%+ acceptance, longer chains raise tokens/pass faster than the byte
+term if bytes are not already dominant. Expert Deferral (2.2) is unblocked
+either way and attacks the latency term that speculation could not.
+
 ## 3. Probe ladder (each gated before the next)
 
 1. Merge expert-placement -> parallel-inference; CPU loopback byte gate:
