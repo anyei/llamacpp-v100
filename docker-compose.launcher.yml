@@ -1,0 +1,46 @@
+# Launch wizard / model router (docs/launcher-wizard-plan.md).
+#
+# Router mode = llama-server with NO model argument. The wizard lives at
+# http://<host>:<port>/wizard.html ; the normal chat UI is at / and serves
+# whichever model the wizard launched. Model dirs can be left unset - the
+# wizard's "Model sources" screen manages them at runtime and the list
+# persists in the container's llama cache across restarts.
+#
+#   MODELS_DIR=/mnt/files PORT=8399 docker compose -f docker-compose.launcher.yml up -d
+#
+# Optional: MODELS_DIRS_FLAG="--models-dir /models" pins the dirs from the
+# CLI (overrides anything set in the UI).
+#
+# This runs the DEV layout: binaries from the build tree + the UI dist dir
+# mounted in, matching the fleet run scripts. Once wizard.html is embedded
+# in the production image's UI assets, the two mounts and --path go away.
+
+services:
+  llama-launcher:
+    container_name: llama-launcher
+    image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    restart: unless-stopped
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${SRC:-~/server/git-projects/llama.cpp-work/build-cuda75}:/srcbin:ro
+      - ${UI_DIST:-~/server/git-projects/llama.cpp/tools/ui/dist}:/ui:ro
+      - ${MODELS_DIR:-/mnt/files}:/models:ro
+      - launcher-cache:/root/.cache
+    environment:
+      - LD_LIBRARY_PATH=/srcbin/bin
+    entrypoint: /srcbin/bin/llama-server
+    command: >
+      --path /ui
+      --host ${HOST:-0.0.0.0}
+      --port ${PORT:-8399}
+      ${MODELS_DIRS_FLAG:-}
+
+volumes:
+  launcher-cache:
