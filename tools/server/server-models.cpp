@@ -1889,7 +1889,48 @@ void server_models_routes::init_routes() {
         for (const auto & d : string_split<std::string>(models.get_models_dirs(), ',')) {
             if (!d.empty()) dirs.push_back(d);
         }
-        res_ok(res, {{"dirs", dirs}});
+        // mounted filesystems as pick-one suggestions: real storage only, with
+        // free space and a shallow .gguf count so the UI can rank them
+        json mounts = json::array();
+#ifdef __linux__
+        {
+            static const std::set<std::string> good_fs = {
+                "ext4","ext3","xfs","btrfs","zfs","nfs","nfs4","cifs","9p",
+                "virtiofs","ntfs","ntfs3","exfat","vfat","fuseblk"
+            };
+            std::ifstream mt("/proc/mounts");
+            std::string dev, mp, fs, rest;
+            std::set<std::string> seen;
+            while (mt >> dev >> mp >> fs && std::getline(mt, rest)) {
+                if (good_fs.count(fs) == 0 && fs.rfind("fuse.", 0) != 0) continue;
+                // /proc/mounts octal-escapes spaces
+                string_replace_all(mp, "\\040", " ");
+                if (mp.rfind("/proc",0)==0 || mp.rfind("/sys",0)==0 || mp.rfind("/dev",0)==0 ||
+                    mp.rfind("/run",0)==0  || mp.rfind("/boot",0)==0 || mp.rfind("/etc",0)==0 ||
+                    mp.rfind("/usr",0)==0  || mp.rfind("/lib",0)==0  || mp.rfind("/bin",0)==0 ||
+                    mp.rfind("/sbin",0)==0 || mp.rfind("/root",0)==0 ||
+                    mp.rfind("/srcbin",0)==0 || mp.rfind("/ui",0)==0) continue;
+                if (!seen.insert(mp).second) continue;
+                std::error_code ec;
+                // the nvidia container toolkit bind-mounts single FILES; only
+                // directories are model-source candidates
+                if (!std::filesystem::is_directory(mp, ec) || ec) continue;
+                const auto sp = std::filesystem::space(mp, ec);
+                if (ec) continue;
+                int ggufs = 0, scanned = 0;
+                for (auto it = std::filesystem::directory_iterator(mp, ec);
+                     !ec && it != std::filesystem::directory_iterator(); ++it) {
+                    if (++scanned > 500) break;
+                    if (it->is_regular_file(ec) && it->path().extension() == ".gguf") ggufs++;
+                }
+                mounts.push_back({{"path", mp}, {"fstype", fs},
+                                  {"free_mib",  (uint64_t)(sp.available/(1024*1024))},
+                                  {"total_mib", (uint64_t)(sp.capacity /(1024*1024))},
+                                  {"gguf_count", ggufs}});
+            }
+        }
+#endif
+        res_ok(res, {{"dirs", dirs}, {"mounts", mounts}});
         return res;
     };
 
