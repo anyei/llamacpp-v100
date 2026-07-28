@@ -311,6 +311,21 @@ owners' layer time), not fixed transport latency. Consequences:
    member CPU upgrades/threads, and expert replication (hot experts on
    multiple members so gathers shrink). In that order of cheapness.
 
+**(1) MEASURED 2026-07-28 late night - placement NULL under v3 too;
+#75 closed on this roster in both regimes.** Placed 4.68 t/s mean
+(12 runs, 4.01-5.18) vs same-session control 5.04 (4.61-5.50), both
+coherent, LOST 0. The mechanism-level tell: defer rate 74.9-75.4% vs
+76.0% - the ready rate did not rise, i.e. placement did not measurably
+shorten member per-layer time. Whatever the wire members' bottleneck is
+per layer (RAM bandwidth on the full routed set, thread scheduling, the
+q8 encode), it is not the cold-expert byte mix placement optimizes.
+Remaining member-compute levers: worker thread/affinity tuning, expert
+REPLICATION (different mechanism: replicas let gathers shrink - fewer
+contributors per boundary), faster member hardware. Also note the
+placed leg pays a real operational tax: permuted single-threaded loads
+(~35 min) and a second cache layout (the #72(b) wedge needed the cache
+limits raised to load at all).
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
