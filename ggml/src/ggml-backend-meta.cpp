@@ -4171,11 +4171,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (probe_defer_gather || expert_defer) {
                     drain_deferred(); // previous reduce's deferred wire responses
                 }
+                // v3: defer only on DECODE-shaped boundaries (single token).
+                // A late injection during prefill corrupts the KV every later
+                // token conditions on - measured on the record roster: ~10
+                // prefill defers/graph cost the same +0.6 PPL as 123 (the
+                // damage rides the poisoned context, not the defer count),
+                // and the serve-side artifact (prompt-quoting glitches) was
+                // prompt-KV corruption. Prefill amortizes boundaries across
+                // the ubatch anyway - the bubble deferral fills is a decode
+                // phenomenon. Override for measurement only.
+                static const bool defer_prefill = getenv("GGML_META_EXPERT_DEFER_PREFILL") != nullptr;
                 // deferral eligibility: the next reduce subgraph must be a
                 // same-size star (F32, contiguous, >= 2 contributors) so the
                 // deferred partial has an injection point of identical shape
                 bool defer_ok = false;
-                if (expert_defer && fused_enabled) {
+                if (expert_defer && fused_enabled &&
+                        (defer_prefill || boundary_node(part[0])->ne[1] == 1)) {
                     // walk to the next MULTI-contributor reduce (single-contributor
                     // reduces are owner broadcasts - drains do not run there); it
                     // must be a same-size star so the injection shape matches

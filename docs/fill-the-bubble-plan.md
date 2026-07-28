@@ -182,6 +182,100 @@ byte-identity applies only to 0-defer configs. Harness trap that burned a
 cycle: stale relative-path workers from the prior session held 50901/50902
 past an anchored pkill - gate run 1 measured yesterday's worker binary.
 
+**v2 FLEET LEG 1 MEASURED 2026-07-28 (record roster, commit 6229e354a,
+binary env-verified): pure readiness gating = t/s WIN, PPL FAIL.**
+Same-day warm control 3.67 t/s (8 runs, 3.15-3.98, pre-v2 binary, 8h-warm
+serve; the overnight 15-run plateau was 4.00). EXPERT_DEFER=1: plateau
+mean 5.17 t/s over 11 runs (4.79-5.57) = +41% vs same-day control, +29%
+vs 4.00 - above v1's +27% and at/above the +32% probe ceiling band.
+Defer rate 65.5-69.1% (defers ~139-149, ready ~67-74 /graph), LOST 0.
+Coherence READ: genuinely coherent physics reasoning (nothing like v1's
+repetition collapse), BUT a rare single-CJK-token intrusion when quoting
+the prompt (2 of 13 reads: "in这样.", "in其 detail") - a visible quality
+scar. Fleet PPL (wikitext 8x -c 512): **4.5735 +/- 0.27 vs baseline
+family 3.7669-3.7950 +/- 0.21 = ~+21% - OUTSIDE the bar, do not serve
+pure readiness gating.** Lesson repeated: the coherence read alone is not
+a quality gate; 66% of wire mass one layer late reads fluent and still
+costs a fifth of the model's likelihood. Sweep in progress: SYNC_EDGE=8
+leg (protect shallow/deep reduces at ~10% of boundaries' t/s cost), then
+WAIT_US ~400 - walking the frontier between exact +0% and v1's
+incoherent +27%.
+
+**Sweep leg A (SYNC_EDGE=8) MEASURED: t/s 4.82 mean over 12 runs (+31%
+vs 3.67), defers 123/graph rate 71%, all 12 coherence reads CLEAN (the
+CJK-intrusion artifact is gone - the edges were its source), but PPL
+4.3910 +/- 0.26 = still ~+16% outside the bar.** Reading: the PPL damage
+is DISTRIBUTED over the ~123 middle-layer defers, not concentrated at
+the edges (edge protection removed only 0.18 of the 0.78 PPL excess).
+Linear damage model: PPL-neutral needs defers down to roughly ~35/graph
+(rate ~20-25%). Leg C = SYNC_EDGE=8 + WAIT_US=600 (grace window sized
+to ~70% of the 0.85 ms mean boundary wait) - measures how much of the
++31% survives at a materially lower defer rate.
+
+**Leg C (WAIT_US=600 + SYNC_EDGE=8) NULL: rate 73.2%, defers 123.8 -
+the sub-ms grace window catches essentially nothing.** In the deferred
+steady state the pipeline phase-shifts: wire responses run MILLISECONDS
+behind the owner's gather (member layer time exceeds owner layer time,
+and once deferring the member stays a boundary behind), so readiness is
+a CLIFF, not a slope, at sub-ms windows. Early t/s 3.93/4.80 (failed
+waits still bill ~600us x straggler boundaries). Leg D = WAIT_US=3000:
+a window that actually catches the response should RE-SYNCHRONIZE the
+pipeline (the member stops falling behind - the loopback m1dw leg showed
+exactly this flip: rate 66.7% -> 0 at 5% t/s cost), so the rate may
+collapse rather than shave. If it lands ~20-30% rate at t/s >= ~4.3,
+that is the PPL-candidate frontier point; if it regresses to control
+t/s, the readiness dial has no servable middle on this fleet and the
+verdict follows plan section 4 (fall back to escape (b)).
+
+**Leg D (WAIT_US=3000 + SYNC_EDGE=8): the resync flip is REAL - decode
+defer rate collapsed 73% -> 5.0-5.9% (defers ~10/graph) - but t/s 3.90
+mean (8 runs, 3.64-4.20) = control, and PPL came back 4.3965 +/- 0.26 =
+IDENTICAL to edge8's 4.3910 at 71% rate. ~10 defers/graph cost the same
++0.6 PPL as 123. THE LINEAR DAMAGE MODEL IS FALSIFIED - and the failure
+mode identifies itself: PPL is an all-PREFILL instrument, and a late
+injection during prefill corrupts the KV that every subsequent position
+of the chunk conditions on, so even rare prefill defers poison the whole
+context (the serve-side CJK artifact was the same mechanism - it struck
+exactly where the model quotes its own prompt, i.e. corrupted prompt
+KV; note the serve counters I steered by were decode-graph rates, while
+the PPL vehicle's own defer rate went unrecorded - the BOUNDARY_STATS
+dump needs >=128 graphs and an 8-chunk run never prints one).**
+
+### 2.2b Deferral v3: decode-only (prefill always exact)
+
+One-line mechanism change: deferral eligibility additionally requires
+the boundary tensor to be DECODE-shaped (ne[1] == 1);
+GGML_META_EXPERT_DEFER_PREFILL=1 re-enables prefill deferral for
+measurement. Rationale: prefill already amortizes each boundary across
+the whole ubatch (the per-token boundary cost that deferral attacks is
+a decode phenomenon), and prefill exactness keeps the KV - and thus
+everything the model conditions on - bit-clean. Expected: the decode
+speedup survives (~+30-40%), the prompt-KV artifact class disappears,
+and fleet PPL returns to baseline BY CONSTRUCTION - which also means
+PPL STOPS BEING THE QUALITY GATE for v3 (it no longer exercises the
+lossy path); the decode-side quality evidence must come from generative
+reads and long-generation degeneration checks. Loopback regate: off
+byte-identical c80261ff; engagement decode-only (defers 2.3/graph vs
+3.0 with prefill included), LOST 0.
+
+**v3 FLEET MEASURED 2026-07-28 - ALL GATES GREEN. This is the serve
+candidate.** Decode defer rate 66.6% (defers 139 / ready 70 per graph),
+LOST 0; plateau 4.93 t/s mean over 12 runs (4.60-5.35, last five 5.08-
+5.35 still warming) = +34% vs the same-day 3.67 control, ~+25% vs the
+overnight 4.00 plateau; coherence 14/14 CLEAN reads including two
+300-token generations (coherent essay + well-formed poem, zero CJK
+intrusions, no degeneration - the prompt-KV artifact class is gone with
+prefill exactness); fleet PPL 3.7819 +/- 0.21 = the baseline family
+dead-center (and identical to the earlier mislabeled 'pre-deferral
+binary' run - both measure the exact-prefill path, a tidy cross-check
+that the decode-only gate engages on the PPL vehicle). Honest residual
+risk: PPL cannot see the decode-path perturbation by construction; the
+generative evidence is 14 greedy reads - recommend a real-workload
+quality soak before making EXPERT_DEFER=1 the default. Sweep artifacts
+(v2 knobs) remain available: WAIT_US=3000 gives exact-class behavior at
+control speed (rate 5.9%); SYNC_EDGE composes if a decode-quality issue
+ever surfaces.
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
