@@ -4028,7 +4028,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--models-dir"}, "PATH",
-        "directory containing models for the router server (default: disabled)",
+        "directory containing models for the router server; accepts a comma-separated list of directories, earlier dirs win on name collisions (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.models_dir = value;
         }

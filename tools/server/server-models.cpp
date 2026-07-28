@@ -415,8 +415,26 @@ void server_models::load_models() {
     // 2. local models from --models-dir
     common_presets local_models;
     if (!base_params.models_dir.empty()) {
-        local_models = ctx_preset.load_from_models_dir(base_params.models_dir);
-        SRV_INF("Loaded %zu local model presets from %s\n", local_models.size(), base_params.models_dir.c_str());
+        // comma-separated list of dirs; on a name collision the EARLIER dir wins
+        for (const auto & dir : string_split<std::string>(base_params.models_dir, ',')) {
+            if (dir.empty()) {
+                continue;
+            }
+            try {
+                common_presets dir_models = ctx_preset.load_from_models_dir(dir);
+                SRV_INF("Loaded %zu local model presets from %s\n", dir_models.size(), dir.c_str());
+                for (auto & it : dir_models) {
+                    if (local_models.count(it.first) > 0) {
+                        SRV_WRN("duplicate model name '%s' in %s - keeping the earlier dir's entry\n",
+                                it.first.c_str(), dir.c_str());
+                        continue;
+                    }
+                    local_models[it.first] = std::move(it.second);
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("skipping models dir %s: %s\n", dir.c_str(), e.what());
+            }
+        }
     }
     // 3. custom-path models from presets
     common_preset global = {};
@@ -1749,12 +1767,19 @@ void server_models_routes::init_routes() {
             hw["ram_avail_mib"] = avail;
         }
 #endif
-        // models dir free space
-        if (!params.models_dir.empty()) {
-            std::error_code ec;
-            const auto sp = std::filesystem::space(params.models_dir, ec);
-            if (!ec) {
-                hw["models_dir_free_mib"] = (uint64_t) (sp.available / (1024*1024));
+        // models dirs free space (comma-separated list supported)
+        {
+            json dirs = json::array();
+            for (const auto & dir : string_split<std::string>(params.models_dir, ',')) {
+                if (dir.empty()) continue;
+                std::error_code ec;
+                const auto sp = std::filesystem::space(dir, ec);
+                dirs.push_back({{"path", dir},
+                                {"free_mib", ec ? 0 : (uint64_t) (sp.available / (1024*1024))}});
+            }
+            hw["models_dirs"] = dirs;
+            if (!dirs.empty()) {
+                hw["models_dir_free_mib"] = dirs[0]["free_mib"]; // back-compat
             }
         }
         // GPUs via nvidia-smi subprocess: the router itself must never create
@@ -1824,12 +1849,18 @@ void server_models_routes::init_routes() {
     this->get_wizard_sweeps = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json sweeps = json::object();
-        if (!params.models_dir.empty()) {
-            std::ifstream f(std::filesystem::path(params.models_dir) / "sweeps.json");
-            if (f.good()) {
-                try { sweeps = json::parse(f); }
-                catch (const std::exception & e) { LOG_WRN("sweeps.json parse failed: %s\n", e.what()); }
-            }
+        for (const auto & dir : string_split<std::string>(params.models_dir, ',')) {
+            if (dir.empty()) continue;
+            std::ifstream f(std::filesystem::path(dir) / "sweeps.json");
+            if (!f.good()) continue;
+            try {
+                const json part = json::parse(f);
+                for (auto it = part.begin(); it != part.end(); ++it) {
+                    if (!sweeps.contains(it.key())) {
+                        sweeps[it.key()] = it.value();
+                    }
+                }
+            } catch (const std::exception & e) { LOG_WRN("sweeps.json in %s parse failed: %s\n", dir.c_str(), e.what()); }
         }
         res_ok(res, sweeps);
         return res;
