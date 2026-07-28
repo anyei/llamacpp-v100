@@ -609,11 +609,17 @@ struct ggml_backend_rpc_async_state {
     bool manifest_fetched = false;
     std::unordered_set<uint64_t> manifest;
     std::vector<rpc_msg_set_tensor_hash_batch_entry> pending_batch;
-    // proto 4.12/4.13 compressed boundary payloads: the pending fused FETCH on
-    // this connection was requested compressed - the paired fused_recv must
-    // expand it (exactly one recv per requesting send, same contract as
-    // fused_fetch_pending in the meta backend). 0 = f32, 1 = f16, 2 = q8_0.
-    uint8_t fused_fetch_fmt = 0;
+    // unified in-order FIFO of the responses outstanding on this socket: PING
+    // markers (empty responses) and fused FETCH payloads (proto 4.12/4.13 may
+    // compress them: fmt 0 = f32, 1 = f16, 2 = q8_0). The server answers in
+    // command order, so any read must process the FIFO head first; a FETCH
+    // consumed early to clear the line is decoded to f32 and stashed until its
+    // fused_recv. This replaces the single fused_fetch_fmt slot, whose contract
+    // (the pending fetch is always the very next read) the #71 deferred gather
+    // breaks by design.
+    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint64_t logical_size; }; // kind 0 = ping, 1 = fetch
+    std::deque<rpc_pending_rsp> rsp_fifo;
+    std::deque<std::vector<uint8_t>> fetch_stash; // early-read FETCH payloads, f32, FIFO
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -821,8 +827,15 @@ static bool send_rpc_cmd_raw(socket_ptr sock, ggml_backend_rpc_async_state & st,
     return true;
 }
 
-static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state & st, uint64_t target) {
-    while (st.pings_done < target) {
+// caller must hold st.mutex. Read the response at the FIFO head off the stream:
+// a PING's empty response, or a FETCH payload decoded to f32 and stashed.
+static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state & st) {
+    if (st.rsp_fifo.empty()) {
+        return false; // accounting broke - nothing should be read here
+    }
+    const auto e = st.rsp_fifo.front();
+    st.rsp_fifo.pop_front();
+    if (e.kind == 0) {
         uint64_t size;
         if (!sock->recv_data(&size, sizeof(size))) {
             return false;
@@ -831,6 +844,50 @@ static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state
             return false; // stream out of sync - a PING response is always empty
         }
         st.pings_done++;
+        return true;
+    }
+    const int64_t  n_vals = (int64_t) (e.logical_size / sizeof(float));
+    const uint64_t expect = e.fmt == 2 ? ggml_row_size(GGML_TYPE_Q8_0, n_vals)
+                          : e.fmt == 1 ? e.logical_size / 2
+                          : e.logical_size;
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size)) || out_size != expect) {
+        return false;
+    }
+    std::vector<uint8_t> payload(e.logical_size);
+    if (e.fmt != 0) {
+        std::vector<uint8_t> wire(expect);
+        if (!sock->recv_data(wire.data(), expect)) {
+            return false;
+        }
+        if (e.fmt == 2) {
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(wire.data(), (float *) payload.data(), n_vals);
+        } else {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) wire.data(), (float *) payload.data(), n_vals);
+        }
+    } else if (!sock->recv_data(payload.data(), e.logical_size)) {
+        return false;
+    }
+    st.fetch_stash.push_back(std::move(payload));
+    return true;
+}
+
+static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state & st, uint64_t target) {
+    while (st.pings_done < target) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// caller must hold st.mutex. Clear the line completely (pings AND outstanding
+// fetches) so the next command's response is the next read on the stream.
+static bool rpc_drain_all_locked(socket_ptr sock, ggml_backend_rpc_async_state & st) {
+    while (!st.rsp_fifo.empty()) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            return false;
+        }
     }
     return true;
 }
@@ -845,7 +902,7 @@ static bool rpc_batch_flush_locked(socket_ptr sock, ggml_backend_rpc_async_state
     }
     std::vector<rpc_msg_set_tensor_hash_batch_entry> batch;
     batch.swap(st.pending_batch); // before the send: send_rpc_cmd_raw re-enters the flush check
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    if (!rpc_drain_all_locked(sock, st)) {
         return false;
     }
     const uint64_t count = batch.size();
@@ -883,7 +940,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    if (!rpc_drain_all_locked(sock, st)) {
         return false;
     }
     const auto t_start = std::chrono::steady_clock::now();
@@ -915,6 +972,8 @@ static uint64_t rpc_ping_async(socket_ptr sock) {
     bool status = send_rpc_cmd_raw(sock, st, RPC_CMD_PING, nullptr, 0);
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
+    } else {
+        st.rsp_fifo.push_back({0, 0, 0});
     }
     return ++st.pings_sent;
 }
@@ -928,6 +987,7 @@ static void rpc_sync_pings(socket_ptr sock, uint64_t seq) {
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
         st.pings_done = target; // never re-wait for pongs that will not arrive
+        st.rsp_fifo.clear();
     }
 }
 
@@ -1312,7 +1372,7 @@ static void rpc_manifest_ensure(socket_ptr sock) {
         return;
     }
     st.manifest_fetched = true; // one attempt; on failure the load just streams
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    if (!rpc_drain_all_locked(sock, st)) {
         return;
     }
     if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GET_MANIFEST, nullptr, 0)) {
@@ -1941,7 +2001,7 @@ static void ggml_backend_rpc_cpy_tensor_batch_async(int n_copies, ggml_backend_t
             locks.emplace_back(st.mutex);
             LOG_DBG("[w2w_batch] send k=%d dst=%s pings=%" PRIu64 "/%" PRIu64 " cmds=%" PRIu64 "\n",
                     k, pulls[k].dst_endpoint.c_str(), st.pings_done, st.pings_sent, st.cmds_sent);
-            if (!rpc_drain_pings_locked(pulls[k].sock_dst, st, st.pings_sent) ||
+            if (!rpc_drain_all_locked(pulls[k].sock_dst, st) ||
                 !send_rpc_cmd_raw(pulls[k].sock_dst, st, RPC_CMD_COPY_FROM_REMOTE, pulls[k].input.data(), pulls[k].input.size())) {
                 rpc_mark_failed(pulls[k].dst_endpoint, __func__);
                 fast[k] = false;
@@ -2031,7 +2091,7 @@ static void ggml_backend_rpc_get_tensor_batch(int n_gets, ggml_backend_t * backe
             if (reqs[k].sock.get() != locked) {
                 locks.emplace_back(st.mutex);
                 locked  = reqs[k].sock.get();
-                sock_ok = rpc_drain_pings_locked(reqs[k].sock, st, st.pings_sent);
+                sock_ok = rpc_drain_all_locked(reqs[k].sock, st);
             }
             if (!sock_ok ||
                 !send_rpc_cmd_raw(reqs[k].sock, st, RPC_CMD_GET_TENSOR, &reqs[k].request, sizeof(reqs[k].request))) {
@@ -2218,12 +2278,22 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
 
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent) ||
-        !send_rpc_cmd_raw(sock, st, RPC_CMD_GRAPH_FUSED, input.data(), input.size())) {
+    // drain only the LEADING ping responses: a deferred FETCH at the FIFO head
+    // must not be waited on here (the send does not read, and blocking on the
+    // fetch would undo the deferral this path exists to allow)
+    while (!st.rsp_fifo.empty() && st.rsp_fifo.front().kind == 0) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            return false;
+        }
+    }
+    if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GRAPH_FUSED, input.data(), input.size())) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         return false;
     }
-    st.fused_fetch_fmt = fetch_fmt;
+    if (flags & 4) {
+        st.rsp_fifo.push_back({1, fetch_fmt, (uint64_t) fetch_size});
+    }
     return true;
 }
 
@@ -2238,38 +2308,23 @@ static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * 
     }
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    const uint8_t fmt = st.fused_fetch_fmt;
-    st.fused_fetch_fmt = 0;
-    const int64_t  n_vals = (int64_t) (size / sizeof(float));
-    const uint64_t expect = fmt == 2 ? ggml_row_size(GGML_TYPE_Q8_0, n_vals)
-                          : fmt == 1 ? size / 2
-                          : size;
-    uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size)) || out_size != expect) {
-        rpc_mark_failed(rpc_ctx->endpoint, __func__);
-        memset(data, 0, size); // deterministic instead of stale garbage
-        return false;
-    }
-    if (fmt != 0) {
-        static thread_local std::vector<uint8_t> scratch;
-        scratch.resize(expect);
-        if (!sock->recv_data(scratch.data(), expect)) {
+    // process the FIFO (leading pings, then the fetch) until a fetch payload is
+    // available; a fetch consumed early by another read is already stashed
+    while (st.fetch_stash.empty()) {
+        if (!rpc_process_rsp_locked(sock, st)) {
             rpc_mark_failed(rpc_ctx->endpoint, __func__);
-            memset(data, 0, size);
+            memset(data, 0, size); // deterministic instead of stale garbage
             return false;
         }
-        if (fmt == 2) {
-            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(scratch.data(), (float *) data, n_vals);
-        } else {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) scratch.data(), (float *) data, n_vals);
-        }
-        return true;
     }
-    if (!sock->recv_data(data, size)) {
+    auto & payload = st.fetch_stash.front();
+    if (payload.size() != size) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         memset(data, 0, size);
         return false;
     }
+    memcpy(data, payload.data(), size);
+    st.fetch_stash.pop_front();
     return true;
 }
 
