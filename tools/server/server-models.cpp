@@ -2070,7 +2070,8 @@ void server_models_routes::init_routes() {
                 std::string lname = meta.name;
                 std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
                 model_info["kind"] = lname.find("mmproj") != std::string::npos ? "mmproj"
-                                   : lname.find("draft")  != std::string::npos ? "draft"
+                                   : lname.find("draft")  != std::string::npos ||
+                                     lname.find("dflash") != std::string::npos ? "draft"
                                    : "model";
             }
 

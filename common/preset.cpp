@@ -1,5 +1,7 @@
 #include "arg.h"
 #include "preset.h"
+
+#include <functional>
 #include "peg-parser.h"
 #include "log.h"
 #include "download.h"
@@ -367,37 +369,66 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
     }
 
     std::vector<local_model> models;
-    auto scan_subdir = [&models](const std::string & subdir_path, const std::string & name) {
-        auto files = fs_list(subdir_path, false);
-        common_file_info model_file;
-        common_file_info first_shard_file;
+    // recursive walk (fork): nested layouts like <dir>/collection/model.gguf are
+    // common. Shard sets collapse to their -00001- entry; a directory holding
+    // exactly one model keeps the directory's name and its mmproj pairing
+    // (upstream convention); a directory with several distinct ggufs emits each
+    // by filename. Hidden dirs and lost+found are skipped.
+    std::function<void(const std::string &, const std::string &, int)> scan_subdir =
+        [&](const std::string & subdir_path, const std::string & name, int depth) {
+        auto files = fs_list(subdir_path, true);
+        std::vector<common_file_info> candidates;
         common_file_info mmproj_file;
         for (const auto & file : files) {
-            if (string_ends_with(file.name, ".gguf")) {
-                if (file.name.find("mmproj") != std::string::npos) {
-                    mmproj_file = file;
-                } else if (file.name.find("-00001-of-") != std::string::npos) {
-                    first_shard_file = file;
-                } else {
-                    model_file = file;
+            if (file.is_dir) {
+                if (depth < 4 && !file.name.empty() && file.name[0] != '.' && file.name != "lost+found") {
+                    scan_subdir(file.path, file.name, depth + 1);
+                }
+                continue;
+            }
+            if (!string_ends_with(file.name, ".gguf")) {
+                continue;
+            }
+            if (file.name.find("mmproj") != std::string::npos) {
+                mmproj_file = file;
+                continue;
+            }
+            if (file.name.find("-of-") != std::string::npos) {
+                // shard set: only the -00001- member represents the model
+                if (file.name.find("-00001-of-") == std::string::npos) {
+                    continue;
                 }
             }
+            candidates.push_back(file);
         }
-        // single file model
-        local_model model{
-            /* name        */ name,
-            /* path        */ first_shard_file.path.empty() ? model_file.path : first_shard_file.path,
-            /* path_mmproj */ mmproj_file.path // can be empty
-        };
-        if (!model.path.empty()) {
-            models.push_back(model);
+        if (candidates.size() == 1) {
+            models.push_back({ name, candidates[0].path, mmproj_file.path });
+        } else {
+            for (const auto & c : candidates) {
+                std::string n = c.name;
+                string_replace_all(n, ".gguf", "");
+                const size_t sh = n.find("-00001-of-");
+                if (sh != std::string::npos) {
+                    n = n.substr(0, sh);
+                }
+                models.push_back({ n, c.path, "" });
+            }
+            if (!mmproj_file.path.empty()) {
+                // ambiguous pairing - surface the projector as its own entry
+                // so the wizard can offer it (kind=mmproj downstream)
+                std::string n = mmproj_file.name;
+                string_replace_all(n, ".gguf", "");
+                models.push_back({ n, mmproj_file.path, "" });
+            }
         }
     };
 
     auto files = fs_list(models_dir, true);
     for (const auto & file : files) {
         if (file.is_dir) {
-            scan_subdir(file.path, file.name);
+            if (!file.name.empty() && file.name[0] != '.' && file.name != "lost+found") {
+                scan_subdir(file.path, file.name, 1);
+            }
         } else if (string_ends_with(file.name, ".gguf")) {
             // single file model
             std::string name = file.name;
