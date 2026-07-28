@@ -220,8 +220,29 @@ async function loadData() {
   MODELS = SCAN.filter(x => x.kind==="model");
   MODELS.forEach(m => { m.yarn = m.family.startsWith("qwen"); });
   try {
-    const sw = await fetch("./sweeps.json");
+    const sw = await fetch("./wizard/sweeps");
     if (sw.ok) MEASURED = await sw.json();
+  } catch(e) {}
+  try {
+    if (!localStorage.getItem("wizardHW")) {
+      const hr = await fetch("./wizard/hw");
+      if (hr.ok) {
+        const h = await hr.json();
+        const det = {};
+        if (h.gpus && h.gpus.length) det.gpus = h.gpus.map(g=>({
+          name: g.name.replace(/^(NVIDIA|Tesla)\s+/,"").split("-")[0],
+          vram: Math.round(g.total_mib/1024) }));
+        if (h.ram_total_mib) det.ram = Math.round(h.ram_total_mib/1024);
+        if (h.discovered && h.discovered.length) {
+          const gb = h.discovered.reduce((a,w)=>a+(w.free_mib||0),0)/1024;
+          det.fleet = { workers: h.discovered.length,
+                        pooledGB: Math.round(gb), usableGB: Math.round(gb*0.92),
+                        names: h.discovered.map(w=>w.endpoint+" "+Math.round((w.free_mib||0)/1024)+"G").join(" · ") };
+        }
+        HW = Object.assign({}, HW_DEFAULT, det);
+        totalVram = HW.gpus.reduce((a,g)=>a+g.vram,0);
+      }
+    }
   } catch(e) {}
 }
 

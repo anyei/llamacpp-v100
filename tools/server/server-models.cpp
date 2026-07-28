@@ -26,6 +26,7 @@
 #include <chrono>
 #include <queue>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <sstream>
 #include <cstring>
@@ -1728,6 +1729,109 @@ void server_models_routes::init_routes() {
         }
         models.load(meta->name, opts);
         res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    this->get_wizard_hw = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json hw;
+        // RAM (Linux)
+#ifdef __linux__
+        {
+            std::ifstream mi("/proc/meminfo");
+            std::string k; uint64_t v; std::string unit;
+            uint64_t total = 0, avail = 0;
+            while (mi >> k >> v >> unit) {
+                if (k == "MemTotal:")     total = v / 1024;
+                if (k == "MemAvailable:") avail = v / 1024;
+            }
+            hw["ram_total_mib"] = total;
+            hw["ram_avail_mib"] = avail;
+        }
+#endif
+        // models dir free space
+        if (!params.models_dir.empty()) {
+            std::error_code ec;
+            const auto sp = std::filesystem::space(params.models_dir, ec);
+            if (!ec) {
+                hw["models_dir_free_mib"] = (uint64_t) (sp.available / (1024*1024));
+            }
+        }
+        // GPUs via nvidia-smi subprocess: the router itself must never create
+        // a CUDA context (see the no-device-enumeration rule in server.cpp)
+        {
+            json gpus = json::array();
+#ifndef _WIN32
+            FILE * p = popen("nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null", "r");
+            if (p != nullptr) {
+                char line[512];
+                while (fgets(line, sizeof(line), p) != nullptr) {
+                    std::string l(line);
+                    std::vector<std::string> f;
+                    size_t pos = 0, c;
+                    while ((c = l.find(',', pos)) != std::string::npos) {
+                        f.push_back(l.substr(pos, c - pos));
+                        pos = c + 1;
+                    }
+                    f.push_back(l.substr(pos));
+                    if (f.size() >= 3) {
+                        auto trim = [](std::string x){ x.erase(0, x.find_first_not_of(" \t\n")); x.erase(x.find_last_not_of(" \t\n")+1); return x; };
+                        try {
+                            gpus.push_back({{"name", trim(f[0])},
+                                            {"total_mib", std::stoull(trim(f[1]))},
+                                            {"free_mib",  std::stoull(trim(f[2]))}});
+                        } catch (...) {}
+                    }
+                }
+                pclose(p);
+            }
+#endif
+            hw["gpus"] = gpus;
+        }
+        // RPC worker beacons: one 1.5 s multicast listen (network only)
+        {
+            json discovered = json::array();
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            if (reg != nullptr) {
+                typedef int (*discover_t)(const char *, int, void (*)(const char *, const char *, void *), void *);
+                auto discover_fn = (discover_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_discover");
+                if (discover_fn != nullptr) {
+                    const std::string group = params.rpc_discover_group;
+                    discover_fn(group.empty() ? nullptr : group.c_str(), /*timeout_ms=*/ 1500,
+                        [](const char * ep, const char * payload, void * ud) {
+                            auto * arr = (json *) ud;
+                            json e = {{"endpoint", ep}, {"payload", std::string(payload)}};
+                            // beacons are space-separated k=v pairs
+                            std::istringstream ss(payload);
+                            std::string tok;
+                            while (ss >> tok) {
+                                const size_t eq = tok.find('=');
+                                if (eq == std::string::npos) continue;
+                                const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+                                try { e[k] = std::stod(v); if (v.find('.') == std::string::npos) e[k] = (int64_t) std::stoll(v); }
+                                catch (...) { e[k] = v; }
+                            }
+                            arr->push_back(std::move(e));
+                        }, &discovered);
+                }
+            }
+            hw["discovered"] = discovered;
+        }
+        res_ok(res, hw);
+        return res;
+    };
+
+    this->get_wizard_sweeps = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json sweeps = json::object();
+        if (!params.models_dir.empty()) {
+            std::ifstream f(std::filesystem::path(params.models_dir) / "sweeps.json");
+            if (f.good()) {
+                try { sweeps = json::parse(f); }
+                catch (const std::exception & e) { LOG_WRN("sweeps.json parse failed: %s\n", e.what()); }
+            }
+        }
+        res_ok(res, sweeps);
         return res;
     };
 

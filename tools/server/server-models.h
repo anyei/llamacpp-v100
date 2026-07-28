@@ -318,6 +318,10 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+    // launch wizard: hardware + fleet discovery snapshot (router never inits
+    // CUDA - GPUs come from an nvidia-smi subprocess, workers from beacons)
+    server_http_context::handler_t get_wizard_hw;
+    server_http_context::handler_t get_wizard_sweeps;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out
