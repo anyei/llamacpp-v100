@@ -1,6 +1,8 @@
 # Launch wizard: guided model serving on the router (design + increments)
 
-Status: design v1, 2026-07-28. UX spec = the "Model Launch Wizard" artifact
+Status: SHIPPED 2026-07-29 (increments 1-3 + extras; see section 5 for the
+as-built state and the remaining polish list). Originally design v1,
+2026-07-28. UX spec = the "Model Launch Wizard" artifact
 (interactive mock, draft 3): 3 steps (model -> run mode -> launch), smart
 recommendations from model metadata + hardware, measured-over-estimated
 speeds, full env-gate surface (mode cards + advanced drawer).
@@ -109,3 +111,39 @@ Wizard at `http://host:port/wizard.html`; the normal chat UI stays at `/`.
   production fleet up (workers must appear via beacons).
 - Every increment: the wizard page must render with JS disabled-gracefully
   (plain /models JSON link) and in both themes.
+
+## 5. As-built (2026-07-29, commits f4414d169..597270e8e)
+
+Landed beyond the original increments:
+
+- `--models-dir` accepts a comma list (earlier dir wins on name collisions,
+  bad dirs warn-and-skip) and the scan RECURSES: nested folders emit every
+  gguf (shard sets collapse to -00001- with the suffix stripped; one-model
+  dirs keep the dir name + mmproj pairing; multi-model dirs emit by filename
+  and surface their mmproj separately). dflash files classify as kind=draft.
+- Runtime sources: GET/POST /wizard/dirs with persistence in the llama
+  cache (router-models-dirs.txt; CLI flag beats the UI list) + mounted-
+  storage suggestions from /proc/mounts (real fs, directories only,
+  scaffolding mounts and device aliases filtered, shallow gguf counts).
+  The UI opens on the sources screen when nothing is scanned; the header
+  "sources" button reopens it.
+- GET /wizard/hw: RAM, per-dir disk, GPUs via nvidia-smi subprocess (the
+  router never inits CUDA), workers via beacon listen (k=v parsed).
+- GET /wizard/sweeps: merged sweeps.json from every source dir (measured
+  t/s per model|mode|spec keys; /mnt/files/sweeps.json seeded).
+- POST /models/load: extra_args + extra_env overlay (LLAMA_SERVER_* refused).
+- wizard.html embedded in the image UI assets (no-cache so browsers track
+  updates); docker-compose.launcher.yml = image + /models + host /mnt tree
+  (ro, rslave) + launcher-cache volume + HOST/PORT.
+- Coordinator images: 64c68933b (first embed) -> 0ad6f9327 (no-cache) ->
+  597270e8e (recursive scan + mount filter). Registry pushes go via the
+  127.0.0.1:5000 alias (the daemon only trusts 127.0.0.0/8 as insecure).
+
+Remaining polish (none blocking):
+
+- trunc-vehicle ggufs launch-fail without LLAMA_TRUNC_ARR - hide or annotate.
+- sharded models report size of the first shard only (Laguna shows small).
+- wizard link from the main webui; fleet-mode launches are copy-paste
+  commands by design (child-spawned fleet serving works but is unproven).
+- fold #73 (score staleness) + #68 (auto-weight iGPU trust) into the fleet
+  card data path; --fleet-preflight as a pre-launch check for fleet modes.
