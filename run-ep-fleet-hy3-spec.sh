@@ -33,6 +33,15 @@ fi
 if [[ "${DEFER:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_PROBE_DEFER_GATHER=1)
 fi
+# EXPERT_DEFER=1: the real mechanism - wire partials injected one reduce late
+# (see fill-the-bubble-plan 2.2).
+if [[ "${EXPERT_DEFER:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e GGML_META_EXPERT_DEFER=1)
+fi
+# STATS=1: GGML_META_BOUNDARY_STATS counters (production-valid, no drains)
+if [[ "${STATS:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e GGML_META_BOUNDARY_STATS=1)
+fi
 
 docker rm -f llama-ep-hy3 >/dev/null 2>&1 || true
 exec docker run --name llama-ep-hy3 --gpus all \

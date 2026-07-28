@@ -112,6 +112,45 @@ the real mechanism needs. Remaining: the graph half (inject the drained
 value into the residual stream one layer late, staleness cap, deferral-rate
 counter, PPL + coherence gates).
 
+**Graph half BUILT + QUALITY-GATED 2026-07-28 (GGML_META_EXPERT_DEFER,
+f5dd4e1fb):** an eligible reduce sums local contributions and distributes;
+wire partials drain at the next multi-contributor star reduce (the response
+FIFO makes the interleaved traffic safe) and are ADDED there - the stream is
+corrected additively one reduce late, staleness structurally capped at one
+boundary. Eligibility requires a next same-size star reduce, so the last
+reduce (logits path) always gathers exactly. Gates: off-gate byte-identical
+(sha 91a2d41a); engagement defers == injects, LOST 0.00; trunc PPL +1.8%
+inside its error bar (5-layer stub exaggerates per-boundary share);
+record-roster fleet PPL pending on a CORRECT binary - the first attempt
+(3.7819 +/- 0.211) ran a pre-deferral CUDA build with the env silently
+ignored, so it is another BASELINE point (usefully: baseline family now
+3.7669-3.7950), not a deferral measurement. Known caveat: the first
+execution of a newly built graph shape partitions subgraphs differently
+from the cached one, so run 1 of a shape differs textually from runs 2+
+(deterministic thereafter; batch-invariance class). Trap for the gate list:
+before ANY fleet leg, verify the binary carries the feature (strings/commit
+stamp) - an env the binary does not know is silently ignored and the leg
+measures the baseline.
+
+**v1 FLEET MEASURED 2026-07-28 (correct binary, engagement 212-216
+defers==injects/graph, LOST 0, zero worker errors): decode 4.43-5.43 mean
+5.07 t/s vs 4.00 control = +27%, capturing most of the +32% probe ceiling -
+but the COHERENCE GATE FAILS: the output collapses into a repetition
+spiral.** Diagnosis: v1 defers EVERY wire partial = the majority of each
+layer's expert mass arrives one layer late (the three wire members hold
+~123 GiB of the experts); ktransformers' quality result defers a small
+subset. The trunc PPL +1.8% was the honest early warning. **v2 design =
+READINESS-GATED deferral: at the gather, poll each wire member's socket -
+consume exactly (no defer) when the fused response has already arrived,
+defer only actual stragglers.** Quality perturbation then scales with real
+lateness (rare, straggler-sized) instead of total wire mass, while the
+speedup lives exactly where the wait was. Fallbacks if quality still moves:
+layer-range cap (full sync first/last k layers), member cap (defer only the
+slowest member). Transport needs one new primitive: a non-blocking
+"response head ready" check on the socket fd (poll(2); once the head has
+arrived the remaining KBs follow at wire speed, so blocking on the tail is
+cheap).
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
