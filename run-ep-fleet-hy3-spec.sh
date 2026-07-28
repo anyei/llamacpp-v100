@@ -27,6 +27,12 @@ if [[ "${SPEC:-0}" == "1" ]]; then
     SPEC_ARGS=(--spec-type draft-mtp --spec-draft-n-max "${NMAX:-3}" --spec-draft-n-min 1 --spec-draft-p-min "${PMIN:-0.75}")
     SPEC_ENV=(-e LLAMA_SPEC_DRAFT_NO_PAD=1 -e LLAMA_SPEC_TIMING=1 -e LLAMA_META_LOCAL_DRAFT=1)
 fi
+# DEFER=1: GGML_META_PROBE_DEFER_GATHER wall-time probe - OUTPUT IS GARBAGE BY
+# DESIGN (star gather stops waiting for wire partials); prices the Expert-
+# Deferral ceiling. Never serve users with it.
+if [[ "${DEFER:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e GGML_META_PROBE_DEFER_GATHER=1)
+fi
 
 docker rm -f llama-ep-hy3 >/dev/null 2>&1 || true
 exec docker run --name llama-ep-hy3 --gpus all \

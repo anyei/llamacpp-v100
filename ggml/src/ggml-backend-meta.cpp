@@ -3933,6 +3933,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     std::vector<int>  fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
     std::vector<char> fused_fetch_pending(n_backends, 0); // member's boundary-i partial arrives via fused_recv
 
+    // TASKS #71 probe: GGML_META_PROBE_DEFER_GATHER=1 - the star gather stops
+    // waiting for WIRE members' partials: their fused responses are drained one
+    // reduce boundary LATE (values DISCARDED, slot zeroed) and their plain reads
+    // are skipped, so each sum holds local contributions only. OUTPUT IS GARBAGE
+    // BY DESIGN - this exists solely to price the Expert-Deferral ceiling (owner
+    // compute overlapping wire arrival). Never serve with it. Draining one
+    // boundary late (not at graph end) keeps TCP backpressure off the workers.
+    static const bool probe_defer_gather = getenv("GGML_META_PROBE_DEFER_GATHER") != nullptr;
+    std::vector<char>    defer_drain_pending(n_backends, 0);
+    std::vector<size_t>  defer_drain_nbytes (n_backends, 0);
+    std::vector<uint8_t> defer_drain_scratch;
+    auto drain_deferred = [&]() {
+        for (size_t j = 0; j < n_backends; j++) {
+            if (!defer_drain_pending[j]) {
+                continue;
+            }
+            if (defer_drain_scratch.size() < defer_drain_nbytes[j]) {
+                defer_drain_scratch.resize(defer_drain_nbytes[j]);
+            }
+            backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                    defer_drain_scratch.data(), defer_drain_nbytes[j]);
+            defer_drain_pending[j] = 0;
+        }
+    };
+
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
@@ -4093,10 +4118,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<const ggml_tensor *> get_tensors(part.size());
                 std::vector<void *>              get_datas(part.size());
                 std::vector<size_t>              get_sizes(part.size(), nbytes);
+                if (probe_defer_gather) {
+                    drain_deferred(); // previous reduce's deferred wire responses, discarded
+                }
                 size_t n_plain = 0;
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
+                    if (probe_defer_gather && backend_ctx->wire_member[j]) {
+                        // do not wait: defer the fused response to the next reduce,
+                        // skip the plain read; zero the slot so the sum stays finite
+                        if (fused_fetch_pending[j]) {
+                            defer_drain_pending[j] = 1;
+                            defer_drain_nbytes[j]  = nbytes;
+                            fused_fetch_pending[j] = 0;
+                        }
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
                     if (fused_fetch_pending[j]) {
                         backend_ctx->bs_parts_fused++;
                         continue; // its partial arrives as a fused response, collected below
@@ -4428,6 +4467,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 tm_last = t;
             }
         }
+    }
+    if (probe_defer_gather) {
+        drain_deferred(); // the last reduce's deferred responses
     }
     if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
         fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, attn-bcast %.2f ms/graph over %.1f, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
