@@ -31,6 +31,15 @@ services:
               capabilities: [gpu]
     volumes:
       - ${MODELS_DIR:-/mnt/files}:/models:ro
+      # the host's whole /mnt tree, so any drive is addable as a model source
+      # without recreating the container; rslave propagation makes drives
+      # mounted on the host AFTER startup appear inside too
+      - type: bind
+        source: /mnt
+        target: /mnt
+        read_only: true
+        bind:
+          propagation: rslave
       - launcher-cache:/root/.cache
     entrypoint: /app/llama-server
     command: >
