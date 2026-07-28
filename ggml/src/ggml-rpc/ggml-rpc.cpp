@@ -2297,6 +2297,37 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
     return true;
 }
 
+// TASKS #71 deferral v2: non-blocking readiness check for the pending fused
+// FETCH. True when its payload is already stashed, or when every response ahead
+// of it in the FIFO plus its own head has arrived - entries are consumed only
+// while the socket reports readable bytes, and once a head has arrived the tail
+// follows at wire speed, so the blocking reads inside cannot stall on the peer.
+// Failure modes return true: the paired fused_recv runs the loud failure path
+// instead of the caller deferring forever on a dead connection.
+static bool ggml_backend_rpc_boundary_fused_ready(ggml_backend_t backend) {
+    GGML_ASSERT(backend->iface.get_name == ggml_backend_rpc_name);
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return true;
+    }
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    while (st.fetch_stash.empty()) {
+        if (st.rsp_fifo.empty()) {
+            return true; // no fetch outstanding - accounting broke, fail in recv
+        }
+        if (!sock->recv_ready()) {
+            return false;
+        }
+        if (!rpc_process_rsp_locked(sock, st)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            return true;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * data, size_t size) {
     GGML_ASSERT(backend->iface.get_name == ggml_backend_rpc_name);
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
@@ -4849,6 +4880,15 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 if (!server.graph_fused(input, response)) {
                     return;
                 }
+                // test hook (#71 deferral): delay the FETCH response so the
+                // client's readiness gate sees a straggler on loopback
+                static const int64_t debug_fused_delay_us = [] {
+                    const char * env = getenv("GGML_RPC_DEBUG_FUSED_DELAY_US");
+                    return env != nullptr ? (int64_t) atoll(env) : 0;
+                }();
+                if (!response.empty() && debug_fused_delay_us > 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(debug_fused_delay_us));
+                }
                 // a response exists only when the message carried a FETCH - a
                 // SET+GRAPH message is fire-and-forget like its unfused parts
                 if (!response.empty() && !send_msg(sock, response.data(), response.size())) {
@@ -5920,6 +5960,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_boundary_fused_recv") == 0) {
         return (void *)ggml_backend_rpc_boundary_fused_recv;
+    }
+    if (std::strcmp(name, "ggml_backend_boundary_fused_ready") == 0) {
+        return (void *)ggml_backend_rpc_boundary_fused_ready;
     }
     // fleet introspection + worker ops (proto 4.7, TASKS.md #35)
     if (std::strcmp(name, "ggml_backend_rpc_log_append") == 0) {

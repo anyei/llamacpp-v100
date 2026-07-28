@@ -19,6 +19,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 #include <chrono>
@@ -31,9 +32,6 @@
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -567,6 +565,22 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+bool socket_t::recv_ready() {
+    if (pimpl->use_rdma) {
+        return true; // no cheap readiness probe - claim ready, callers take the exact path
+    }
+#ifdef _WIN32
+    WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
+    int r = WSAPoll(&pfd, 1, 0);
+#else
+    struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
+    int r = poll(&pfd, 1, 0);
+#endif
+    // HUP/ERR count as ready: the next recv fails loudly instead of the
+    // caller deferring forever on a dead connection
+    return r > 0 && pfd.revents != 0;
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

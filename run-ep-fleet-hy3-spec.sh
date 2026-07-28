@@ -33,10 +33,14 @@ fi
 if [[ "${DEFER:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_PROBE_DEFER_GATHER=1)
 fi
-# EXPERT_DEFER=1: the real mechanism - wire partials injected one reduce late
-# (see fill-the-bubble-plan 2.2).
-if [[ "${EXPERT_DEFER:-0}" == "1" ]]; then
-    SPEC_ENV+=(-e GGML_META_EXPERT_DEFER=1)
+# EXPERT_DEFER: the real mechanism - wire partials injected one reduce late
+# (see fill-the-bubble-plan 2.2/2.2a). 1 = v2 readiness-gated (defer only
+# stragglers), 2 = v1 defer-all (coherence FAILS - measurement only).
+# DEFER_WAIT_US / DEFER_SYNC_EDGE pass the quality-fallback knobs through.
+if [[ "${EXPERT_DEFER:-0}" != "0" ]]; then
+    SPEC_ENV+=(-e GGML_META_EXPERT_DEFER="${EXPERT_DEFER}")
+    [[ -n "${DEFER_WAIT_US:-}" ]]   && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_WAIT_US="${DEFER_WAIT_US}")
+    [[ -n "${DEFER_SYNC_EDGE:-}" ]] && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_SYNC_EDGE="${DEFER_SYNC_EDGE}")
 fi
 # STATS=1: GGML_META_BOUNDARY_STATS counters (production-valid, no drains)
 if [[ "${STATS:-0}" == "1" ]]; then

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -2649,6 +2650,7 @@ struct ggml_backend_meta_context {
     int64_t bs_deliver_bytes = 0; // bytes delivered to wire members
     int64_t bs_repairs       = 0; // stale-value repair copies executed
     int64_t ed_defers        = 0; // wire partials deferred to the next reduce (GGML_META_EXPERT_DEFER)
+    int64_t ed_ready         = 0; // deferral candidates whose response had already arrived (consumed exactly)
     int64_t ed_injects       = 0; // deferred partials injected one reduce late
     int64_t ed_lost          = 0; // deferred partials dropped at graph end (should stay 0)
     int64_t bs_graphs        = 0;
@@ -2670,6 +2672,7 @@ struct ggml_backend_meta_context {
     ggml_backend_get_tensor_batch_t       get_batch     = nullptr;
     ggml_backend_boundary_fused_send_t    fused_send    = nullptr;
     ggml_backend_boundary_fused_recv_t    fused_recv    = nullptr;
+    ggml_backend_boundary_fused_ready_t   fused_ready   = nullptr;
 
     // members whose reg provides the batched-get proc reach their data over a wire
     // (RPC-class); a member without it is local and can root a star reduce
@@ -2758,6 +2761,10 @@ struct ggml_backend_meta_context {
                 if (fused_recv == nullptr) {
                     fused_recv = (ggml_backend_boundary_fused_recv_t)
                         ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_recv");
+                }
+                if (fused_ready == nullptr) {
+                    fused_ready = (ggml_backend_boundary_fused_ready_t)
+                        ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_ready");
                 }
             }
         }
@@ -3953,10 +3960,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // keeps the logits path exact-sum. Lossy by construction (the layer between
     // defer and inject reads the uncorrected stream): PPL + coherence gated,
     // default off.
-    static const bool expert_defer = [] {
+    //   =1 (v2) READINESS-GATED: each candidate's socket is polled at the
+    //      gather - a response that already arrived is consumed exactly, only
+    //      actual stragglers defer, so the perturbation scales with real
+    //      lateness instead of total wire mass.
+    //   =2 (v1) defer ALL wire partials - measurement only: the majority of
+    //      each layer's expert mass lands one reduce late and coherence
+    //      COLLAPSES on real fleets (measured 2026-07-28).
+    // GGML_META_EXPERT_DEFER_WAIT_US: grace window a not-yet-ready response is
+    // given before it is declared a straggler (busy-poll; 0 = none).
+    // GGML_META_EXPERT_DEFER_SYNC_EDGE: the first/last k multi-contributor
+    // reduces of the graph never defer (shallow/deep layers tolerate it worst).
+    static const int expert_defer_mode = [] {
         const char * env = getenv("GGML_META_EXPERT_DEFER");
-        return env != nullptr && atoi(env) != 0;
+        return env != nullptr ? atoi(env) : 0;
     }();
+    const bool expert_defer = expert_defer_mode != 0;
+    static const int64_t defer_wait_us = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_WAIT_US");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
+    static const int64_t defer_sync_edge = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_SYNC_EDGE");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
+    int64_t ed_star_ord = 0; // ordinal of the current multi-contributor star reduce
+    std::vector<char>    defer_now(n_backends, 0); // this boundary's per-member defer decision
     std::vector<char>    defer_drain_pending(n_backends, 0);
     std::vector<size_t>  defer_drain_nbytes (n_backends, 0);
     std::vector<char>    defer_drained(n_backends, 0);      // drained this boundary, awaiting injection
@@ -4128,6 +4157,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (star_ok) {
                 backend_ctx->bs_star++;
+                ed_star_ord++;
                 const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
                 const size_t n_vals = nbytes/sizeof(float);
                 auto & scratch = backend_ctx->star_scratch;
@@ -4149,6 +4179,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // walk to the next MULTI-contributor reduce (single-contributor
                     // reduces are owner broadcasts - drains do not run there); it
                     // must be a same-size star so the injection shape matches
+                    int64_t n_multi_after = 0;
                     for (size_t i_r2 = i + 1; i_r2 < backend_ctx->n_subgraphs; i_r2++) {
                         if (!backend_ctx->backend_configs[0].cgraphs[i_r2].reduce) {
                             continue;
@@ -4165,8 +4196,61 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             }
                         }
                         if (n_comp2 >= 2) {
-                            defer_ok = ok2; // the first multi-contributor reduce decides
-                            break;
+                            if (n_multi_after == 0) {
+                                defer_ok = ok2; // the first multi-contributor reduce decides
+                                if (defer_sync_edge == 0) {
+                                    break;
+                                }
+                            }
+                            n_multi_after++; // the edge cap needs the full remaining count
+                        }
+                    }
+                    if (defer_sync_edge > 0 &&
+                            (ed_star_ord <= defer_sync_edge || n_multi_after < defer_sync_edge)) {
+                        defer_ok = false;
+                    }
+                }
+                // per-member defer decision. Mode 1 (v2): poll each candidate's
+                // socket - an already-arrived response is consumed exactly (the
+                // normal fused path below), only actual stragglers defer, after
+                // an optional grace window. Mode 2 / probe: every candidate defers.
+                if (defer_ok || probe_defer_gather) {
+                    int64_t n_wait = 0;
+                    for (size_t k = 0; k < part.size(); k++) {
+                        const size_t j = part[k];
+                        const bool cand = backend_ctx->wire_member[j] && fused_fetch_pending[j];
+                        if (cand && defer_ok && expert_defer_mode == 1) {
+                            defer_now[j] = backend_ctx->fused_ready != nullptr &&
+                                !backend_ctx->fused_ready(backend_ctx->backend_configs[j].backend) ? 1 : 0;
+                            n_wait += defer_now[j];
+                        } else {
+                            defer_now[j] = cand ? 1 : 0;
+                        }
+                    }
+                    if (n_wait > 0 && defer_wait_us > 0) {
+                        const int64_t t_end = ggml_time_us() + defer_wait_us;
+                        while (n_wait > 0 && ggml_time_us() < t_end) {
+                            for (size_t k = 0; k < part.size(); k++) {
+                                const size_t j = part[k];
+                                if (defer_now[j] &&
+                                        backend_ctx->fused_ready(backend_ctx->backend_configs[j].backend)) {
+                                    defer_now[j] = 0;
+                                    n_wait--;
+                                }
+                            }
+                            if (n_wait > 0) {
+                                // yield between sweeps - a hard spin starves the
+                                // very compute the window is waiting on
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            }
+                        }
+                    }
+                    if (defer_ok && expert_defer_mode == 1) {
+                        for (size_t k = 0; k < part.size(); k++) {
+                            const size_t j = part[k];
+                            if (backend_ctx->wire_member[j] && fused_fetch_pending[j] && !defer_now[j]) {
+                                backend_ctx->ed_ready++;
+                            }
                         }
                     }
                 }
@@ -4175,7 +4259,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
                     if (backend_ctx->wire_member[j] && fused_fetch_pending[j] &&
-                            (probe_defer_gather || defer_ok)) {
+                            (probe_defer_gather || defer_ok) && defer_now[j]) {
                         // do not wait: defer the fused response to the next reduce;
                         // zero the slot so the sum holds local contributions only
                         defer_drain_pending[j] = 1;
@@ -4596,12 +4680,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 (double) backend_ctx->bs_deliver_skip  / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_deliver_bytes / 1024.0 / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_repairs       / backend_ctx->bs_graphs);
-        if (backend_ctx->ed_defers + backend_ctx->ed_injects + backend_ctx->ed_lost > 0) {
-            fprintf(stderr, "META_EXPERT_DEFER: defers %.1f injects %.1f LOST %.2f /graph\n",
+        if (backend_ctx->ed_defers + backend_ctx->ed_ready + backend_ctx->ed_injects + backend_ctx->ed_lost > 0) {
+            const double cand = (double) (backend_ctx->ed_defers + backend_ctx->ed_ready);
+            fprintf(stderr, "META_EXPERT_DEFER: defers %.1f ready %.1f (rate %.1f%%) injects %.1f LOST %.2f /graph\n",
                     (double) backend_ctx->ed_defers  / backend_ctx->bs_graphs,
+                    (double) backend_ctx->ed_ready   / backend_ctx->bs_graphs,
+                    cand > 0 ? 100.0 * backend_ctx->ed_defers / cand : 0.0,
                     (double) backend_ctx->ed_injects / backend_ctx->bs_graphs,
                     (double) backend_ctx->ed_lost    / backend_ctx->bs_graphs);
-            backend_ctx->ed_defers = backend_ctx->ed_injects = backend_ctx->ed_lost = 0;
+            backend_ctx->ed_defers = backend_ctx->ed_ready = backend_ctx->ed_injects = backend_ctx->ed_lost = 0;
         }
         backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
         backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;

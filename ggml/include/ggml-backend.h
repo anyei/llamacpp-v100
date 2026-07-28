@@ -224,6 +224,9 @@ extern "C" {
     // must be collected before any other blocking call on the same backend.
     typedef bool   (*ggml_backend_boundary_fused_send_t)(ggml_backend_t backend, struct ggml_tensor * set_tensor, const void * set_data, size_t set_size, struct ggml_cgraph ** cgraphs, int n_graphs, const struct ggml_tensor * fetch_tensor, size_t fetch_size);
     typedef bool   (*ggml_backend_boundary_fused_recv_t)(ggml_backend_t backend, void * data, size_t size);
+    // non-blocking: true when the pending fused read's bytes have started to
+    // arrive (a recv now completes at wire speed instead of waiting on the peer)
+    typedef bool   (*ggml_backend_boundary_fused_ready_t)(ggml_backend_t backend);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

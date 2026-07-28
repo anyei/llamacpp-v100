@@ -151,6 +151,37 @@ slowest member). Transport needs one new primitive: a non-blocking
 arrived the remaining KBs follow at wire speed, so blocking on the tail is
 cheap).
 
+**v2 BUILT 2026-07-28:** `socket_t::recv_ready()` (poll(2)/WSAPoll, 0
+timeout) + `ggml_backend_boundary_fused_ready` on the RPC client (walks the
+response FIFO consuming entries only while the socket reports readable
+bytes; true once the pending FETCH payload is stashed) + the meta gather
+polls each candidate and defers only stragglers. `GGML_META_EXPERT_DEFER=1`
+is now v2 readiness-gated; `=2` preserves the v1 defer-all behavior for
+measurement. Two quality fallbacks shipped alongside so a failed fleet gate
+does not cost another build cycle: `GGML_META_EXPERT_DEFER_WAIT_US` (busy-
+poll grace window per boundary before a straggler defers) and
+`GGML_META_EXPERT_DEFER_SYNC_EDGE` (first/last k multi-contributor reduces
+always exact). New `ready` counter in the `META_EXPERT_DEFER` line: defer
+rate = defers/(defers+ready) is the primary fleet instrument - if it sits
+near 100%, readiness gating has degenerated to v1 and quality will follow;
+the honest expectation on the record roster is HIGH (the wire members'
+per-layer time exceeds the owners', so their responses are rarely early) -
+the WAIT_US/SYNC_EDGE knobs exist to buy quality back at measured latency
+cost. Worker-side test hook `GGML_RPC_DEBUG_FUSED_DELAY_US` fakes a
+straggler on loopback. **Loopback gates PASSED 2026-07-28**
+(71-defer-v2-gate.sh, trunc-hy3, 3 loopback workers, fuse=2 + q8):
+off = stable byte-identical c80261ff (no-op when off); m1 engages at
+defers 3.0 / ready 2.8 per graph (51.5% - loopback workers are genuinely
+marginal at gather time), injects==defers, LOST 0; m1d (3 ms delay on one
+worker) rate rises to 66.7% = the straggler defers; m1dw (delay +
+WAIT_US=10000) defers 0.0, STABLE, byte-identical - the grace window fully
+recovers exactness at ~5% loopback t/s cost; m2 reproduces v1 (rate 100%,
+text 45a9d603); m2e (SYNC_EDGE=3) syncs all ~6 stub reduces, byte-identical.
+v2 output is run-to-run NONDETERMINISTIC by design (readiness races);
+byte-identity applies only to 0-defer configs. Harness trap that burned a
+cycle: stale relative-path workers from the prior session held 50901/50902
+past an anchored pkill - gate run 1 measured yesterday's worker binary.
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
