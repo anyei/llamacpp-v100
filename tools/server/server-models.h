@@ -84,6 +84,7 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    json gguf_meta; // offline gguf header facts (size, arch, moe, mtp, kv/token) for the launch wizard
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     bool is_ready() const {

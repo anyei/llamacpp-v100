@@ -8,6 +8,7 @@
 #include "preset.h"
 #include "download.h"
 #include "http.h"
+#include "gguf.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
@@ -211,6 +212,72 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     }
 }
 
+// offline gguf HEADER read (no tensor data, no backend init - safe on the
+// router, which must never touch the GPU). Feeds the launch wizard's sizing
+// and badges via GET /models. Returns null on any failure.
+static json server_model_read_gguf_meta(const std::string & path) {
+    gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        return json();
+    }
+    json meta;
+    std::error_code ec;
+    const auto fsize = std::filesystem::file_size(path, ec);
+    if (!ec) {
+        meta["size_bytes"] = (uint64_t) fsize;
+    }
+    const int64_t k_arch = gguf_find_key(g, "general.architecture");
+    if (k_arch >= 0) {
+        const std::string arch = gguf_get_val_str(g, k_arch);
+        meta["arch"] = arch;
+        auto get_u32 = [&](const char * suffix, uint32_t def) -> uint32_t {
+            const int64_t k = gguf_find_key(g, (arch + suffix).c_str());
+            return k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, k) : def;
+        };
+        const uint32_t n_layer = get_u32(".block_count", 0);
+        meta["block_count"]  = n_layer;
+        meta["n_ctx_train"]  = get_u32(".context_length", 0);
+        meta["n_expert"]     = get_u32(".expert_count", 0);
+        // MTP head: the nextn KV when present, else any nextn tensor
+        bool has_nextn = get_u32(".nextn_predict_layers", 0) > 0;
+        for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !has_nextn; i++) {
+            has_nextn = strstr(gguf_get_tensor_name(g, i), "nextn.") != nullptr;
+        }
+        meta["has_mtp"] = has_nextn;
+        // KV bytes per context token at f16, the wizard's sizing input
+        // (same estimate the fleet capacity gate uses; MLA models cache one
+        // shared latent per layer and no V)
+        const double ts_f16 = 2.0;
+        const uint32_t kv_lora_rank = get_u32(".attention.kv_lora_rank", 0);
+        double kv_per_tok = 0.0;
+        if (kv_lora_rank > 0) {
+            kv_per_tok = (double) n_layer * (kv_lora_rank + get_u32(".rope.dimension_count", 0)) * ts_f16;
+        } else {
+            const uint32_t n_head = get_u32(".attention.head_count", 1);
+            const uint32_t n_embd = get_u32(".embedding_length", 0);
+            const uint32_t len_k  = get_u32(".attention.key_length",   n_head > 0 ? n_embd / n_head : 0);
+            const uint32_t len_v  = get_u32(".attention.value_length", n_head > 0 ? n_embd / n_head : 0);
+            double hckv_sum = 0.0;
+            const int64_t k_hckv = gguf_find_key(g, (arch + ".attention.head_count_kv").c_str());
+            if (k_hckv >= 0 && gguf_get_kv_type(g, k_hckv) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(g, k_hckv) == GGUF_TYPE_UINT32) {
+                const uint32_t * a = (const uint32_t *) gguf_get_arr_data(g, k_hckv);
+                const size_t an = std::min<size_t>(gguf_get_arr_n(g, k_hckv), n_layer);
+                for (size_t i = 0; i < an; ++i) {
+                    hckv_sum += a[i];
+                }
+            } else {
+                hckv_sum = (double) n_layer * get_u32(".attention.head_count_kv", n_head);
+            }
+            kv_per_tok = hckv_sum * (len_k + len_v) * ts_f16;
+        }
+        meta["kv_bytes_per_token_f16"] = (uint64_t) kv_per_tok;
+    }
+    gguf_free(g);
+    return meta;
+}
+
 void server_model_meta::update_caps() {
     try {
         common_params params;
@@ -230,6 +297,11 @@ void server_model_meta::update_caps() {
             multimodal = { false, false };
         } else {
             multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+        }
+        // wizard metadata: header-only gguf read of the resolved local path
+        // (skipped for not-yet-downloaded cache models)
+        if (!params.model.path.empty() && std::filesystem::exists(params.model.path)) {
+            gguf_meta = server_model_read_gguf_meta(params.model.path);
         }
     } catch (const std::exception & e) {
         LOG_WRN("failed to initialize common_params for multimodal capability detection: %s\n", e.what());
@@ -1694,8 +1766,21 @@ void server_models_routes::init_routes() {
                 {"source",        server_model_source_to_string(meta.source)},
                 {"can_remove",    meta.source == SERVER_MODEL_SOURCE_CACHE},
                 // {"need_download", meta.need_download},
-                // TODO: add other fields, may require reading GGUF metadata
             };
+
+            // launch-wizard fields: offline gguf header facts + a filename
+            // classification so the UI can hide projector/draft files from
+            // the launchable list and pair them with their targets
+            if (!meta.gguf_meta.is_null()) {
+                model_info["metadata"] = meta.gguf_meta;
+            }
+            {
+                std::string lname = meta.name;
+                std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+                model_info["kind"] = lname.find("mmproj") != std::string::npos ? "mmproj"
+                                   : lname.find("draft")  != std::string::npos ? "draft"
+                                   : "model";
+            }
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {
