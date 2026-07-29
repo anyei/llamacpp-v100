@@ -97,6 +97,35 @@ two same-split PARTIALs derives PARTIAL (member-side sums are exact:
 transform is pure quality-cost with no speed gain - do NOT run fleet
 quality gates before inc-1b lands (they would price the wrong thing).
 
+## 3d. inc-1b COMPLETE on the stub (2026-07-31): the pair shares ONE boundary
+
+The 3c blocker resolved exactly as diagnosed - two pieces:
+1. **Name-tag derivation**: the builder-tagged `lp_moe_pair` ADD derives
+   PARTIAL by name (its inputs' states read as the post-reduce view, so
+   a state-equality rule can never fire; ffn_moe_weighted_placed
+   precedent).
+2. **Reduce suppression at the tree boundaries**: a PARTIAL boundary
+   whose sole consumer is an lp_moe_pair ADD keeps its subgraph split
+   but SKIPS the reduce (GGML_META_PARTIAL_MERGE=1) - members hold
+   their tree partials across the intervening pieces (gallocr keeps the
+   slots live until the pair consumes them), the pair ADD computes
+   a_j + b_j member-side, and its OWN boundary reduces once.
+
+The failed window-crossing attempts (3c) stay in the tree, dormant and
+gated - the linear-piece structure makes spanning windows the wrong
+shape (a sibling layer's attention boundary must exist INSIDE any
+spanned window).
+
+Stub gates (trunc-hy3, 3 loopback workers, fuse=2 + q8): off = stable
+byte-identical c80261ff, star 3.0 (production untouched); LP+merge =
+**star 3.0 -> 2.0** with sha 2265c9e7 = BYTE-IDENTICAL to the unmerged
+LP graph (member-side sum then one reduce == two reduces then add -
+the exactness proof in the wild); +EXPERT_DEFER=1 composes (star 2.0,
+defers==injects, LOST 0, 6/6 responses). REMAINING = the plan's quality
+ladder (3) and fleet A/B (4) on the record roster - needs a fleet
+window (the V4 soak serve holds the GPUs); expected star count on the
+full model at SYNC_EDGE=2: 79 -> ~41.
+
 ## 3c. inc-1b state (2026-07-31, parked mid-build with precise handoff)
 
 Landed behind default-off gates (off-legs byte-identical c80261ff at

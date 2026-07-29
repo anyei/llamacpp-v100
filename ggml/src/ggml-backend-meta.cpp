@@ -1054,12 +1054,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (tensor->op == GGML_OP_MUL && strstr(tensor->name, "ffn_moe_weighted_placed") != nullptr) {
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
-        // TASKS #71 LP pair fusion (lp-pair-fusion-plan 3b): the sum of two
-        // PARTIALs is itself PARTIAL - member-side (a+b)_j = a_j + b_j sums to
-        // a+b, exactly. Lets a layer pair's two expert partials share ONE
-        // reduce boundary (the first mirror-consumer after the pair-out add
-        // forces it). ADD only: applying a mirrored operand member-wise (SUB/
-        // MUL/DIV) would repeat it n_members times.
+        // TASKS #71 LP pair fusion (lp-pair-fusion-plan 3c): the builder-tagged
+        // pair ADD sums two expert partials member-side ((a+b)_j = a_j + b_j,
+        // exact) - it is PARTIAL by construction. Tagged by NAME because its
+        // inputs' derived states read as the post-reduce view (the shadow pass
+        // bakes in per-tree boundaries); the reduce at the upstream trees is
+        // SUPPRESSED by the boundary scan when their sole consumer is this
+        // node, so ONE boundary serves the pair. ffn_moe_weighted_placed
+        // precedent above.
+        if (tensor->op == GGML_OP_ADD && strncmp(tensor->name, "lp_moe_pair", 11) == 0) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // generic form of the same rule (kept: exact whenever both inputs
+        // genuinely derive PARTIAL)
         if (tensor->op == GGML_OP_ADD &&
                 src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -3716,6 +3723,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 i = i_delayed;
 
+                // TASKS #71 LP pair fusion (GGML_META_PARTIAL_MERGE=1): a tree
+                // boundary whose value is consumed ONLY by a builder-tagged
+                // lp_moe_pair ADD keeps its subgraph split but SKIPS the reduce -
+                // members hold their partials until the pair ADD (itself PARTIAL
+                // by the name-tag derivation) reduces both at ONE boundary.
+                bool lp_suppress = false;
+                {
+                    static const bool pm_on = getenv("GGML_META_PARTIAL_MERGE") != nullptr
+                        && atoi(getenv("GGML_META_PARTIAL_MERGE")) != 0;
+                    if (pm_on && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                            ggml_node_get_use_count(cgraph, i_delayed) == 1) {
+                        const ggml_tensor * bt = cgraph->nodes[i_delayed];
+                        for (int k = i_delayed + 1; k < cgraph->n_nodes; k++) {
+                            const ggml_tensor * cand = cgraph->nodes[k];
+                            if (cand->src[0] == bt || cand->src[1] == bt) {
+                                lp_suppress = cand->op == GGML_OP_ADD &&
+                                        strncmp(cand->name, "lp_moe_pair", 11) == 0;
+                                break;
+                            }
+                        }
+                        static const bool pm_dbg = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                        if (pm_dbg && lp_suppress) {
+                            fprintf(stderr, "PM-SUPPRESS: boundary %d '%s' reduce deferred to pair\n",
+                                    i_delayed, bt->name);
+                        }
+                    }
+                }
+
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
@@ -3723,7 +3758,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // this includes a PARTIAL node that happens to be the LAST node
                     // of the graph (scheduler split or per-node debug execution),
                     // which the old position-based check silently skipped
-                    bcj.cgraphs[n_subgraphs].reduce = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                    bcj.cgraphs[n_subgraphs].reduce = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !lp_suppress;
                 }
                 n_subgraphs++;
                 i_start = i + 1;
