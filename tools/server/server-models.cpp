@@ -227,7 +227,27 @@ static json server_model_read_gguf_meta(const std::string & path) {
     std::error_code ec;
     const auto fsize = std::filesystem::file_size(path, ec);
     if (!ec) {
-        meta["size_bytes"] = (uint64_t) fsize;
+        uint64_t total = (uint64_t) fsize;
+        // shard set: the wizard sees only the -00001- member; size must cover
+        // the whole set (split naming is <prefix>-%05d-of-%05d.gguf)
+        const size_t sh = path.find("-00001-of-");
+        if (sh != std::string::npos && path.size() >= sh + 15) {
+            const int n_split = atoi(path.substr(sh + 10, 5).c_str());
+            const std::string prefix = path.substr(0, sh);
+            int n_found = 1;
+            for (int i = 2; i <= n_split; i++) {
+                char tail[64];
+                snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
+                const auto ssize = std::filesystem::file_size(prefix + tail, ec);
+                if (ec) {
+                    continue; // missing shard: report what is present
+                }
+                total += (uint64_t) ssize;
+                n_found++;
+            }
+            meta["n_shards"] = n_found;
+        }
+        meta["size_bytes"] = total;
     }
     const int64_t k_arch = gguf_find_key(g, "general.architecture");
     if (k_arch >= 0) {
