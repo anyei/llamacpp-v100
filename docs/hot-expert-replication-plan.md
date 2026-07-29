@@ -1,6 +1,6 @@
 # Hot-expert replication / gather leg-skip (TASKS #71, member-compute axis)
 
-Status: design v1, 2026-07-29. Follows the #75 double-null and deferral v3
+Status: **LANE CLOSED 2026-07-30** (fleet A/B null - member lateness is chain phase lag, not leg weight; section 4 stop rule fired). inc-0 counters + proto 4.14 zero short reply remain in-tree (exact, default-on/off as noted). Originally design v1 2026-07-29. Follows the #75 double-null and deferral v3
 green (fill-the-bubble-plan 2.2b/c). Companion: docs/expert-placement-plan.md
 (the machinery this reuses), docs/expert-profiling.md (the hotness source).
 

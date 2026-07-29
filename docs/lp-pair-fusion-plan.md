@@ -1,6 +1,6 @@
 # Layer-Parallel pair fusion (TASKS #71, escape (b): fewer boundaries)
 
-Status: design v1, 2026-07-30, written on the day the ceiling probe passed.
+Status: **LANE CLOSED 2026-08-01** (fleet gates: boundary halving works, +8-13% only, quality catastrophic - see 3e). Machinery stays in-tree default-off. Originally design v1 2026-07-30, written on the day the ceiling probe passed.
 Sources: 2502.02790 (TMLR 2026) via docs/research/2026-07-parallel-decoding-
 and-distribution.md (2026-07-27 addendum re-rank); measured frame from
 fill-the-bubble-plan 2.2c and the 2026-07-30 nulls.

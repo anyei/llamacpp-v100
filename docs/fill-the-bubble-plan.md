@@ -26,6 +26,30 @@ is compute (37%) + arrival latency (~50%): the per-layer wait for the slowest
 member's contribution to clear the wire. Escape (c) = keep the fleet busy
 DURING that wait instead of shrinking it.
 
+## 1b. ESCAPES END-STATE (2026-08-01)
+
+All three escapes are now fully measured on the record roster:
+
+- **(a) cheaper boundaries: CLOSED.** q8/f16 wire (PPL-neutral, default-on)
+  exhausted the byte axis (q8 == f16); proto 4.14 zero short replies
+  (57KB -> 1B) moved nothing - the wait was never byte-shaped.
+- **(b) fewer boundaries: CLOSED.** LP pair fusion halved boundaries
+  exactly (79 -> 41) for only +8-13%: members compute both layers'
+  experts per lap, so per-lap latency doubles as laps halve - only fixed
+  per-boundary costs are saved - and train-free pairing is quality-
+  catastrophic on a reasoning model (lp-pair-fusion-plan 3e).
+- **(c) fill the bubble: BANKED.** Deferral v3 +34% (serve candidate,
+  soak pending) and -np 2 +40% aggregate at no idle cost. Spec lane
+  shelved (ratio <= 1.0).
+
+Cross-cutting verdict: a wire member's lateness is fused-chain PIPELINE
+PHASE LAG. Levers that survive it: transport-class latency reduction
+(#60 - LP priced the per-lap fixed cost at 10-15% for a mere halving),
+faster member lanes (hardware; the V4 dual-role/lean-roster wins are
+this lever), and -np throughput scaling. Placement (x2), threads,
+leg-weight, boundary-count and spec are all measured dead on this
+hardware.
+
 ## 2. Candidates, ranked
 
 ### 2.1 Probe 0 first: re-measure spec-over-boundary on the current stack
