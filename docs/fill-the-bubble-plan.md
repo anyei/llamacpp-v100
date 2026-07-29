@@ -354,6 +354,19 @@ implication: -np 2 is strictly better (parallel capacity at no
 idle-stream cost); per-stream latency under simultaneous load costs
 ~30%.
 
+**LP CEILING PROBE MEASURED 2026-07-30 (the 2.2c item-2 probe): GO -
+the fewer-boundaries axis is ALIVE.** 40-layer block_count-truncated
+record serve (same roster, v3 stack, wall-time-only): 8.85-9.67 t/s
+mean ~9.3 over 7 valid runs = ~1.8x the 4.97-5.21 full-model plateau,
+above the >=1.5x go/no-go line. Defers 72.5/graph (half of the full
+model's ~148 - boundary count halved as expected), LOST 0. Read with
+the leg-skip null (member lateness = chain phase lag): boundary COUNT
+multiplies the lag laps, and halving it nearly doubles decode - LP
+pair-fusion comes OFF the parked list; its realizable fraction of the
+1.8x is the boundary share (the probe also halves compute). Next:
+LP design (residual rewiring is builder-side; reasoning-collapse risk
+gates apply per the addendum).
+
 **Replication design doc LANDED 2026-07-29:
 docs/hot-expert-replication-plan.md.** Key reframe: replication =
 hot-mass concentration (the shipped #75 artifact already does this,
