@@ -106,6 +106,28 @@ serve; all other output byte-identical (it is read-only).
 
 ### 3.2 inc-1 - dynamic leg skip (the build)
 
+**FLEET A/B MEASURED 2026-07-30 - NULL; the section-4 stop rule FIRES
+and the replication/leg-skip lane CLOSES on this roster.** Placed +
+EXPERT_DEFER=1 + zero short replies (workers local/.11 on proto 4.14,
+-t8/-t6): 4.61 t/s mean (4.07-4.88, 10 runs, coherent, LOST 0,
+markers ACTIVE on both 4.14 connections) vs same-day default-EP v3
+control 4.97-5.21. Defer rate 64.6-69.7% = UNCHANGED vs control 65-70%
+- the loopback signature (rate 51.5% -> 14.1%) did NOT transfer. Reading:
+a wire member's lateness is PIPELINE PHASE LAG - it executes its fused
+chain pieces in order and reaches each fetch a boundary behind the
+owner - so shrinking the reply payload (57KB -> 1B) changes nothing the
+owner waits on; the wait was never byte-bound (consistent with q8==f16).
+Per the stop rule: per-leg cost is not the binding term either; the
+member-compute axis is exhausted on this fleet (placement null twice,
+threads null, leg-skip null). Proto 4.14 STAYS (exact, free, engaged -
+harmless default). Remaining levers: faster member lanes (V4 dual-role
+CUDA1 expert share - user-suggested, filed), fewer boundaries (LP
+pair-fusion, parked), #60-class transport. Load note: the first placed
+load hit the #8 stale-manifest wedge (V4's 144GB LRU-evicted the placed
+slices; 9/9-miss batches streamed slowly, then .15 refused the final
+121KB table alloc after 28 min); the immediate RETRY loaded clean -
+wedge cost ~30 min, filed under #72(a).
+
 **inc-1 BUILT + LOOPBACK-GATED 2026-07-30 (proto 4.14 zero short reply,
 as corrected below):** client sets fused flag bit 128 when the worker
 speaks minor >= 14; the worker's FETCH branch scans the payload for
