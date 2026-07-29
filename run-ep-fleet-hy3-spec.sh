@@ -52,6 +52,11 @@ fi
 if [[ "${STATS:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_BOUNDARY_STATS=1)
 fi
+# LP=1: Layer-Parallel pair fusion (docs/lp-pair-fusion-plan.md) - LOSSY,
+# quality-gate measurement only until the ladder passes. LP_EDGE = sync edge.
+if [[ "${LP:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e LLAMA_LP_PAIRS=1 -e LLAMA_LP_SYNC_EDGE="${LP_EDGE:-2}" -e GGML_META_PARTIAL_MERGE=1)
+fi
 
 # wait for every roster worker to LISTEN: a freshly restarted rpc-server
 # benchmarks for ~15-20 s before binding, and --rpc aborts on the first
