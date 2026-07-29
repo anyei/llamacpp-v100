@@ -415,6 +415,7 @@ then the leg-skip build.
   Its premise (cut draft-side expert reads) targets the byte axis that gate 5
   measured non-binding, and hy3's native MTP head already gives 83%
   acceptance. Reopen only if probe 0 shows spec live but draft cost binding.
+  (Recon 2026-07-29: verdict confirmed pre-build, code map banked - see 2.4.)
 - Layer Parallelism pair-fusion is escape (b) (fewer boundaries), tracked in
   the research addendum - not this doc.
 
@@ -447,6 +448,85 @@ transport, #60) or tree-verify with expert-reuse-aware selection changes
 lane economics. The BOUNDARY_STATS split (i) is now optional - the sweep
 demonstrates lane-cost dominance behaviorally. Expert Deferral (2.2) is the
 active escape-(c) lever.
+
+### 2.4 Stage-2 self-spec RECON 2026-07-29 (no build): stays shelved by its
+own kill math; code map banked; one live spec-family gap found (defer-blind
+verify)
+
+Recon pass before opening the stage-2 lane (docs digest + full code map, no
+code written). Verdict first, then the banked map.
+
+**Kill math - the premise cannot move the measured bottleneck.** Stage 2's
+mechanism is "make the draft cheaper" (route the draft only to VRAM-resident
+experts; zero extra weight reads). But probe 0 (2.1a) already measured the
+economics of a nearly-free draft: LOCAL_DRAFT cut draft cost 13x
+(2949 -> 222 ms/64 iters), acceptance ran 84-97%, and the ratio was still
+1.00. An even cheaper draft with at-best-equal acceptance is bounded by the
+same number - the whole loss lives in the VERIFY pass (n-lane member expert
+reads, the #52 law), which self-spec by definition leaves full. The stated
+reopen gate ("spec live but draft cost binding", 2.3) is unmet on both arms.
+The second reopen key - "VRAM expert fraction grows a lot" - has not moved:
+hy3 owners already held 42 GiB (25.5%) when the null was measured, the V4
+dual-role shape holds ~36 GB (same class), and ~123 GiB of experts still
+live in member RAM. Growing it a lot means hardware, not config. Verdict:
+STAYS SHELVED; unlocks unchanged (#60 transport, big VRAM growth,
+tree-verify with expert-reuse-aware selection per MoE-Spec/EcoSpec).
+
+**Code map banked for whenever an unlock lands** (smallest-diff build path,
+so the future session starts warm):
+
+- The restriction primitive already exists twice: the #75 per-member
+  exp_remap/exp_mask tables consumed in build_moe_ffn
+  (src/llama-graph.cpp:1930-1962, sentinel -1 lanes compute nothing), and
+  the group-limited routing pattern (src/llama-graph.cpp:1898-1911) is the
+  exact template for a pre-topk -INFINITY owner-only mask. build_moe_ffn
+  also has an unused `selected_experts_in` injection parameter.
+- Owner-residence is one lookup at table-build time: the
+  ggml_backend_meta_set_expert_ownership registry + wire_member[] (RPC vs
+  in-process) already distinguish VRAM members
+  (ggml/src/ggml-backend-meta.cpp:2102-2131, 2743-2815).
+- Accidental near-miss: under LLAMA_META_LOCAL_DRAFT a localized draft graph
+  resolves the MIRRORED exp_remap/exp_mask to the first local member's copy
+  - i.e. a placed serve would restrict the draft to that member's owned set
+  FOR FREE - but it cannot fire today: placement arrays are sized
+  hparams.n_layer() (src/llama.cpp:426) so nextn layers are never placed,
+  and the MTP builder's il >= n_layer() fails the table-bounds guard
+  (src/llama-graph.cpp:1930). Closing that gap = extend the artifact/tables
+  over nextn layers, or ship a draft-specific mask.
+- A full-trunk self-draft context (non-MTP) is the expensive variant: a
+  second llama_context over the same model works (that IS draft-mtp,
+  common/speculative.cpp:2338), but ctx_other KV sharing allowlists only
+  GEMMA4_ASSISTANT/EAGLE3/DFLASH (src/llama-context.cpp:302-320), so
+  hy3/V4 would duplicate the full KV and pay catch-up decodes. The MTP head
+  stays the right draft vehicle. A per-context expert-subset knob also
+  needs a cparams field wired into graph-reuse identity (precedent:
+  nextn_layer_offset, src/llama-graph.h:776).
+
+**The gap the recon DID find (live, unexplored, attacks the binding cost):
+verify boundaries are defer-blind.** v3 deferral and the ZL counters both
+gate on single-token boundaries (ne[1]==1,
+ggml/src/ggml-backend-meta.cpp:4430 and :4354), so a spec verify batch
+(ne[1] = 1+n_draft) silently disengages deferral. Two consequences:
+(1) every spec A/B ever run had its verify passes fully exposed to member
+phase lag - the exact term v3 hides on decode; (2) today's production
+baseline INCLUDES v3 (+34%), so a spec config now pays a defer-loss on
+every verify pass relative to it - the wash would re-measure as a loss.
+The one spec-family probe left with a live mechanism:
+GGML_META_EXPERT_DEFER_VERIFY - widen the v3 gate to verify-shaped
+boundaries (ne[1] <= 1 + n_draft), letting straggler member partials inject
+late during verify exactly as they do on decode. Cheap (gate widening + one
+env; the FIFO/readiness transport already handles multi-token fetches).
+Quality risk to state up front: late injection perturbs intra-batch
+conditioning (the prefill-poisoning class, but depth <= n_draft = 3, not a
+512-token chunk) and perturbed verify logits move ACCEPTANCE decisions -
+rejected lanes cost speed not correctness, and accepted-token KV
+perturbation is the same class v3 already ships on decode. Gate protocol =
+section 3 ladder: loopback off-gate byte-identity (c80261ff), engagement
+counters on verify-shaped graphs, then fleet A/B
+(SPEC=1 EXPERT_DEFER=1 + DEFER_VERIFY=1) vs the v3 plateau (4.97-5.21),
+acceptance + coherence-read every leg, long-generation reads. Decision
+rule: only if it clears the v3 plateau by >= +5% does any stage-2 draft
+work (VRAM-subset masks) become worth pricing again.
 
 ## 3. Probe ladder (each gated before the next)
 
