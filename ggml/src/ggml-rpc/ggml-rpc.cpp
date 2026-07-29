@@ -866,7 +866,9 @@ static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state
         }
         st.fetch_stash.push_back(std::vector<uint8_t>(e.logical_size)); // zero-filled
         if (st.zero_replies++ == 0) {
-            GGML_LOG_INFO("rpc: proto 4.14 zero short replies ACTIVE (first on %s)\n", st.endpoint.c_str());
+            // stderr, not GGML_LOG_INFO: the engagement line must be visible at
+            // default serve verbosity (the -lv 1 fleet-load trap)
+            fprintf(stderr, "rpc: proto 4.14 zero short replies ACTIVE (first on %s)\n", st.endpoint.c_str());
         }
         return true;
     }
