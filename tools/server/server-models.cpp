@@ -12,6 +12,7 @@
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
+#include <set>
 #include <sheredom/subprocess.h>
 
 #include <functional>
@@ -452,7 +453,10 @@ void server_models::load_models() {
     // 2. local models from --models-dir
     common_presets local_models;
     if (!base_params.models_dir.empty()) {
-        // comma-separated list of dirs; on a name collision the EARLIER dir wins
+        // comma-separated list of dirs; on a name collision the EARLIER dir wins.
+        // Overlapping sources (e.g. a dir and its own subdir both listed) reach
+        // the same gguf under different names - dedup by model path too.
+        std::set<std::string> seen_paths;
         for (const auto & dir : string_split<std::string>(base_params.models_dir, ',')) {
             if (dir.empty()) {
                 continue;
@@ -464,6 +468,12 @@ void server_models::load_models() {
                     if (local_models.count(it.first) > 0) {
                         SRV_WRN("duplicate model name '%s' in %s - keeping the earlier dir's entry\n",
                                 it.first.c_str(), dir.c_str());
+                        continue;
+                    }
+                    std::string path;
+                    if (it.second.get_option("LLAMA_ARG_MODEL", path) && !seen_paths.insert(path).second) {
+                        SRV_WRN("duplicate model path '%s' via %s - keeping the earlier source's entry\n",
+                                path.c_str(), dir.c_str());
                         continue;
                     }
                     local_models[it.first] = std::move(it.second);

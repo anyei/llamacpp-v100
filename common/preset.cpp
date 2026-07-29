@@ -430,9 +430,18 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
                 scan_subdir(file.path, file.name, 1);
             }
         } else if (string_ends_with(file.name, ".gguf")) {
-            // single file model
+            // loose file at the source root: same shard-collapse rule as subdirs -
+            // only the -00001- member represents a shard set
+            if (file.name.find("-of-") != std::string::npos &&
+                file.name.find("-00001-of-") == std::string::npos) {
+                continue;
+            }
             std::string name = file.name;
             string_replace_all(name, ".gguf", "");
+            const size_t sh = name.find("-00001-of-");
+            if (sh != std::string::npos) {
+                name = name.substr(0, sh);
+            }
             local_model model{
                 /* name        */ name,
                 /* path        */ file.path,
