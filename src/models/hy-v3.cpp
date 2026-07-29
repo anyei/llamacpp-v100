@@ -136,7 +136,8 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
         return v < 1 ? 1 : v;
     }();
 
-    auto build_layer = [&](int il, ggml_tensor * layer_inp) -> ggml_tensor * {
+    auto build_layer = [&](int il, ggml_tensor * layer_inp,
+                           ggml_tensor ** out_moe = nullptr, ggml_tensor ** out_mirror = nullptr) -> ggml_tensor * {
         ggml_tensor * inpSA = layer_inp;
         ggml_tensor * lcur;
 
@@ -214,6 +215,16 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(sh_out, "ffn_shared_out", il);
 
+            // LP pair mode: hand back the PARTIAL expert sum and the MIRRORED
+            // remainder separately so the pair can merge partials FIRST (the
+            // walker's standard one-partial + mirrored-adds shape). cvec is
+            // not applied on this path.
+            if (out_moe != nullptr) {
+                *out_moe    = moe_out;
+                *out_mirror = ggml_add(ctx0, sh_out, ffn_inp);
+                return nullptr;
+            }
+
             lcur = ggml_add(ctx0, moe_out, sh_out);
             cb(lcur, "ffn_out", il);
         }
@@ -234,10 +245,21 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
             model.layers[il + 1].ffn_gate_inp != nullptr;
         if (pair_ok) {
             ggml_tensor * x0 = inpL;
-            ggml_tensor * a  = build_layer(il,     x0);
-            ggml_tensor * b  = build_layer(il + 1, x0);
-            // out = x0 + (a - x0) + (b - x0): both layers' deltas from the SAME input
-            cur = ggml_sub(ctx0, ggml_add(ctx0, a, b), x0);
+            ggml_tensor * moe_a = nullptr, * mir_a = nullptr;
+            ggml_tensor * moe_b = nullptr, * mir_b = nullptr;
+            build_layer(il,     x0, &moe_a, &mir_a);
+            build_layer(il + 1, x0, &moe_b, &mir_b);
+            // out = x0 + da + db = (moe_a + moe_b) + (mir_a + mir_b - x0):
+            // the two expert PARTIALs sum first (member-side exact), then one
+            // mirrored remainder joins - the delayed-reduce walker's standard
+            // shape, so the pair shares ONE expert boundary. The x0 subtract
+            // lives in the mirrored domain (mir_* = sh + attn + x0 each carry
+            // x0 once too many).
+            ggml_tensor * moe_pair = ggml_add(ctx0, moe_a, moe_b);
+            cb(moe_pair, "lp_moe_pair", il);
+            ggml_tensor * mir_pair = ggml_sub(ctx0, ggml_add(ctx0, mir_a, mir_b), x0);
+            cb(mir_pair, "lp_mir_pair", il);
+            cur = ggml_add(ctx0, moe_pair, mir_pair);
             cb(cur, "lp_pair_out", il);
             inpL = cur;
             il += 2;

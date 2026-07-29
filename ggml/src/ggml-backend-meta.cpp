@@ -1054,6 +1054,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (tensor->op == GGML_OP_MUL && strstr(tensor->name, "ffn_moe_weighted_placed") != nullptr) {
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
+        // TASKS #71 LP pair fusion (lp-pair-fusion-plan 3b): the sum of two
+        // PARTIALs is itself PARTIAL - member-side (a+b)_j = a_j + b_j sums to
+        // a+b, exactly. Lets a layer pair's two expert partials share ONE
+        // reduce boundary (the first mirror-consumer after the pair-out add
+        // forces it). ADD only: applying a mirrored operand member-wise (SUB/
+        // MUL/DIV) would repeat it n_members times.
+        if (tensor->op == GGML_OP_ADD &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -3437,10 +3448,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 bool partials_merged = false;
 
+                // TASKS #71 LP pair fusion (GGML_META_PARTIAL_MERGE=1): the
+                // window may additionally (a) skip UNRELATED non-mirrored
+                // nodes (a sibling layer's whole subtree sits between a pair's
+                // two expert trees), guarded by a taint set so nothing that
+                // transitively consumes the window's value is skipped, and
+                // (b) cross an ADD of two PARTIALs (member-side sums are
+                // exact) so the pair shares ONE reduce boundary.
+                static const bool partial_merge = getenv("GGML_META_PARTIAL_MERGE") != nullptr
+                    && atoi(getenv("GGML_META_PARTIAL_MERGE")) != 0;
+                std::unordered_set<const ggml_tensor *> tainted;
+                if (partial_merge) {
+                    tainted.insert(node);
+                }
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (partial_merge) {
+                            // relaxed skip: any split state, as long as no src
+                            // is tainted (nothing here carries node's value)
+                            bool clean = true;
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (next->src[s] != nullptr && tainted.count(next->src[s]) > 0) {
+                                    clean = false;
+                                    break;
+                                }
+                            }
+                            if (!clean) {
+                                static const bool pm_dbg2 = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                                if (pm_dbg2) {
+                                    fprintf(stderr, "PM-SKIPBRK: at %d next '%s'[%s]\n",
+                                            id + 1, next->name, ggml_op_name(next->op));
+                                }
+                                break;
+                            }
+                            id++;
+                            continue;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -3487,7 +3533,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
                 // Chain of MULs with MIRRORED src[1] (and, for a single-contributor
-                // window, ADDs with a MIRRORED operand - TASKS #9)
+                // window, ADDs with a MIRRORED operand - TASKS #9). Under
+                // GGML_META_PARTIAL_MERGE the [crossings + weighted-tree] round
+                // REPEATS: the pair ADD consumes the finished tree's output, so
+                // a second round is what crosses it.
+                for (;;) {
+                const int id_round = id;
                 while (true) {
                     skip_unrelated();
                     if (id + 1 >= cgraph->n_nodes) {
@@ -3504,11 +3555,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                              (next->src[1] == node &&
                               ggml_backend_meta_get_split_state(next->src[0], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED))) {
                         crossed = true;
+                    } else if (partial_merge && n_used == 1 && next->op == GGML_OP_ADD &&
+                            ((next->src[0] == node && next->src[1] != node &&
+                              ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) ||
+                             (next->src[1] == node && next->src[0] != node &&
+                              ggml_backend_meta_get_split_state(next->src[0], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL))) {
+                        // LP pair: ADD of two PARTIALs - member-side (a+b)_j is
+                        // exact, the merged window reduces ONCE downstream
+                        crossed         = true;
+                        partials_merged = true;
+                        single_contrib  = false;
                     }
                     if (!crossed) {
+                        if (partial_merge) {
+                            static const bool pm_dbg3 = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                            if (pm_dbg3) {
+                                fprintf(stderr, "PM-NOCROSS: at %d next '%s'[%s] n_used %d src0==node %d src1==node %d s0 %d s1 %d\n",
+                                        id + 1, next->name, ggml_op_name(next->op), n_used,
+                                        next->src[0] == node, next->src[1] == node,
+                                        next->src[0] ? (int) ggml_backend_meta_get_split_state(next->src[0], false).axis : -99,
+                                        next->src[1] ? (int) ggml_backend_meta_get_split_state(next->src[1], false).axis : -99);
+                            }
+                        }
                         break;
                     }
                     node = next;
+                    if (partial_merge) {
+                        tainted.insert(node);
+                    }
                     id++;
                     idr = id;
                     n_used = ggml_node_get_use_count(cgraph, id);
@@ -3543,7 +3617,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     id++;
                 }
                 idr = id;
-                return idr;
+                if (!partial_merge) {
+                    return idr;
+                }
+                // next round: the finished tree's output is the window value now
+                node = cgraph->nodes[id];
+                tainted.insert(node);
+                n_used = ggml_node_get_use_count(cgraph, id);
+                static const bool pm_debug = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                if (pm_debug) {
+                    fprintf(stderr, "PM-ROUND: tree end %d '%s' n_used %d id_round %d\n",
+                            id, node->name, n_used, id_round);
+                }
+                if (id == id_round) {
+                    return idr;
+                }
+                }
             };
 
             int i_start = 0;

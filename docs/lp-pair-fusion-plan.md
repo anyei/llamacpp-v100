@@ -97,6 +97,33 @@ two same-split PARTIALs derives PARTIAL (member-side sums are exact:
 transform is pure quality-cost with no speed gain - do NOT run fleet
 quality gates before inc-1b lands (they would price the wrong thing).
 
+## 3c. inc-1b state (2026-07-31, parked mid-build with precise handoff)
+
+Landed behind default-off gates (off-legs byte-identical c80261ff at
+every step): (a) derivation rule - ADD of two PARTIALs derives PARTIAL
+(handle_bin_bcast); (b) GGML_META_PARTIAL_MERGE=1 window extensions in
+get_i_delayed: taint-guarded relaxed skip over unrelated non-mirrored
+nodes (a sibling layer's subtree sits inside the pair window) + a
+partial+partial ADD crossing + a round loop (the weighted-tree match
+used to return immediately; the pair ADD consumes the finished tree's
+output so crossing needs a second round). Diagnosis instruments added
+under GGML_META_DEBUG_REDUCE (PM-ROUND / PM-SKIPBRK / PM-NOCROSS).
+
+**Why it still does not merge (the precise blocker):** the round-2 walk
+DOES reach `lp_moe_pair` with the right shape, but
+`get_split_state(src, false)` returns MIRRORED (10) for both tree
+outputs at the junction - their split states were fixed during the
+shadow-creation pass, which bakes in the boundary-at-tree-end world
+(the state IS the post-reduce view). A state-equality test can never
+see partial+partial there. Next steps: (1) crossing test by NAME TAG
+(`lp_moe_pair`, builder-authored - the ffn_moe_weighted_placed
+precedent) instead of state equality; (2) verify the shadow-pass state
+for the pair ADD derives PARTIAL (it may need the same name-tag rule in
+the derivation, since its INPUTS read as mirrored post-boundary states)
+so downstream consumers see a consistent world when the boundary moves
+to the pair; (3) regate: stub star 3.0 -> 2.0, off byte-identity, then
+the quality ladder (3). All current work is default-off and safe.
+
 ## 4. Risks and falsifiers
 
 - **Reasoning collapse** (the paper's GSM8K result) even at edge-
