@@ -456,6 +456,21 @@ extern "C" {
     GGML_API void ggml_backend_meta_tensor_set_member(
         struct ggml_tensor * tensor, size_t member, const void * data, size_t offset, size_t size);
 
+    // TASKS #71 (replication inc-0): register a host copy of one layer's
+    // expert->member ownership (member_of[e] = meta member index, -1 = none)
+    // so the meta backend can attribute routed experts to members at gather
+    // time (GGML_META_ZL_STATS counters; later the dynamic leg skip).
+    // nullptr/0 clears the layer's entry.
+    GGML_API void ggml_backend_meta_set_expert_ownership(
+        int32_t il, const int32_t * member_of, size_t n_expert);
+
+    // TASKS #71 (replication inc-0): note one layer's routed expert ids for the
+    // current decode token, captured at COMPUTE time (eval callback) - the meta
+    // gather consults these for the ZL counters (gather-time reads of the topk
+    // tensor see ring-recycled bytes). nullptr/0 clears.
+    GGML_API void ggml_backend_meta_note_routed_ids(
+        int32_t il, const int32_t * ids, size_t k);
+
     //
     // Utils
     //

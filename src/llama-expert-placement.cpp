@@ -298,6 +298,20 @@ std::unique_ptr<llama_expert_placement_tables> llama_expert_placement_create_tab
             ggml_backend_meta_tensor_set_member(tables->remap[il], j, remap_j.data(), 0, n_expert*sizeof(int32_t));
             ggml_backend_meta_tensor_set_member(tables->mask [il], j, mask_j.data(),  0, n_expert*sizeof(float));
         }
+        // TASKS #71 inc-0: register the host-side member_of view of this
+        // layer's ownership so the meta backend can attribute routed experts
+        // at gather time (GGML_META_ZL_STATS; later the dynamic leg skip)
+        {
+            std::vector<int32_t> member_of(n_expert, -1);
+            int32_t pos = 0;
+            for (size_t j = 0; j < n_members; j++) {
+                for (int32_t k = pos; k < pos + cnt[j]; k++) {
+                    member_of[perm[k]] = (int32_t) j;
+                }
+                pos += cnt[j];
+            }
+            ggml_backend_meta_set_expert_ownership((int32_t) il, member_of.data(), n_expert);
+        }
     }
 
     return tables;

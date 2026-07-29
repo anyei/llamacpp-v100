@@ -88,6 +88,54 @@ struct llama_expert_profile {
     }
 };
 
+// TASKS #71 inc-0 (GGML_META_ZL_STATS): capture each layer's routed ids at
+// compute time for the meta backend's zero-leg counters. Same mechanism as the
+// profiler below (the ask phase forces a sched split so the read is fresh);
+// decode-shaped tensors only - prefill ids are not what the ZL gather counts.
+static bool llama_zl_ids_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    constexpr const char * prefix = "ffn_moe_topk-";
+    constexpr size_t prefix_len = 13;
+    const auto is_base_topk = [&](const char * name) {
+        if (strncmp(name, prefix, prefix_len) != 0 || name[prefix_len] == '\0') {
+            return false;
+        }
+        const char * p = name + prefix_len;
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+        return *p == '\0';
+    };
+    if (ask) {
+        return is_base_topk(t->name);
+    }
+    static const bool zl_debug = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+    // decode-shaped graphs only (an MTP head can make them 2-wide; ids are
+    // [k, n_tok] so token 0's ids are the first k values either way)
+    if (!is_base_topk(t->name) || t->type != GGML_TYPE_I32 || t->ne[1] > 2 || t->ne[0] > 64) {
+        if (zl_debug) {
+            static int n = 0;
+            if (n < 8) {
+                n++;
+                fprintf(stderr, "ZL-CB-SKIP: %s type %d ne %lld,%lld\n",
+                        t->name, (int) t->type, (long long) t->ne[0], (long long) t->ne[1]);
+            }
+        }
+        return true;
+    }
+    int32_t ids[64];
+    ggml_backend_tensor_get(t, ids, 0, t->ne[0]*sizeof(int32_t));
+    ggml_backend_meta_note_routed_ids(atoi(t->name + prefix_len), ids, (size_t) t->ne[0]);
+    if (zl_debug) {
+        static int n = 0;
+        if (n < 8) {
+            n++;
+            fprintf(stderr, "ZL-CB-NOTE: %s ids %d %d %d %d\n", t->name, ids[0], ids[1], ids[2], ids[3]);
+        }
+    }
+    return true;
+}
+
 static bool llama_expert_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     constexpr const char * prefix = "ffn_moe_topk-";
     constexpr size_t prefix_len = 13;
@@ -242,6 +290,12 @@ llama_context::llama_context(
             cparams.cb_eval_user_data = expert_profile.get();
             LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE: recording per-layer expert selections to '%s'\n",
                            __func__, prof_path);
+        } else if (getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) {
+            // TASKS #71 inc-0: routed-id capture for the meta zero-leg counters
+            // (mutually exclusive with the profiler - one eval-callback slot)
+            cparams.cb_eval           = llama_zl_ids_cb;
+            cparams.cb_eval_user_data = nullptr;
+            LLAMA_LOG_INFO("%s: GGML_META_ZL_STATS: capturing routed ids for zero-leg counters\n", __func__);
         }
     }
 

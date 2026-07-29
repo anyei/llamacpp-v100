@@ -75,10 +75,25 @@ essentially uniform (expert-profiling.md), so this axis is worthless there.
 
 ### 3.1 inc-0 - instrument (counters only, zero behavior change)
 
-At the star gather, read the layer's routed ids host-side (the owner
-computed them long before the reduce; `ffn_moe_topk-<il>` is materialized -
-same tensor the profiler reads via eval callback, src/llama-context.cpp:
-91-108) and consult a host-side `member_of[e]` table (derivable at
+**BUILT 2026-07-29 (as-built differs from the sketch below):** gather-time
+reads of the topk tensor return ring-recycled bytes (the member arena
+reuses the slot intra-subgraph and ignores FLAG_OUTPUT), so the ids are
+captured at COMPUTE time instead - an eval callback (`llama_zl_ids_cb`,
+profiler pattern) notes each layer's decode ids via
+`ggml_backend_meta_note_routed_ids`; the gather consults the last-noted
+layer (dataflow: topk-L computes, then L's reduce, then topk-(L+1)).
+Ownership host copy registered at table build via
+`ggml_backend_meta_set_expert_ownership`. Counters + `META_ZL` dump line
+under GGML_META_BOUNDARY_STATS; everything gated on GGML_META_ZL_STATS=1
+(a MEASUREMENT tool: the callback forces sched splits, so instrumented
+legs are batch-invariance-class, not baselines - same caveat family as
+GGML_META_TIMING). Loopback (trunc stub, PLACE=1, hot-first artifact):
+owner slot share 48-54% live (61% profile-predicted - profile-vs-live
+drift is exactly what this instrument measures), zero-leg rates grade
+monotonically with placement rank (m1 4-9%, m2 31-40%, m3 58-70%).
+
+Original sketch (superseded): at the star gather, read the layer's routed
+ids host-side and consult a host-side `member_of[e]` table (derivable at
 table-build time, src/llama-expert-placement.cpp:257-301). New
 BOUNDARY_STATS counters, decode-shaped boundaries only:
 
@@ -90,6 +105,24 @@ Gate: counters match the section-2 model within reason on a PLACE=1 fleet
 serve; all other output byte-identical (it is read-only).
 
 ### 3.2 inc-1 - dynamic leg skip (the build)
+
+**TIMING CORRECTION (2026-07-29, found while building inc-0):** the
+coordinator-side skip described below cannot work as written - the fused
+FETCH for boundary L is pre-issued inside boundary L-1's fused message,
+BEFORE layer L's routing exists anywhere. The owner cannot decide "don't
+request member m's L-contribution" in time. The correct mechanism is
+WORKER-side: the worker already knows its own routed count at compute
+time (every non-owned lane carries the mul_mat_id skip sentinel), so a
+member whose lanes are ALL sentinel for a boundary answers the
+pre-issued fetch with a 1-byte ZERO marker instead of the encoded
+payload (proto rev, "zero-contribution short reply"). The owner treats
+the marker as exact zeros: no payload encode on the member, ~57 KB -> 1 B
+on the wire, near-zero arrival latency, and under v3 the marker is
+consumed instantly (never deferred, no late mass). Graph topology,
+manifests and the response FIFO ordering are all untouched - the reply
+is just shorter. inc-0's counters (below) still price the opportunity
+exactly; the coordinator-side eval-callback id capture they use
+(GGML_META_ZL_STATS) stays a measurement-only tool.
 
 At gather time (ggml-backend-meta.cpp:4145+), with placement tables loaded:
 compute this boundary's zero-routed member set from the ids (host read is

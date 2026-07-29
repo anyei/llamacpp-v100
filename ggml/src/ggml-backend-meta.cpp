@@ -2076,6 +2076,42 @@ static void ggml_backend_meta_buffer_reject_unknown_alias(const struct ggml_tens
     }
 }
 
+// TASKS #71 (replication inc-0): host-side expert ownership registry, one
+// entry per placed layer. Written by the llama loader alongside the #75 table
+// upload; read at gather time to attribute a boundary's routed experts to
+// members (GGML_META_ZL_STATS). Process-global like the placement itself.
+static std::mutex                              g_expert_owner_mtx;
+static std::map<int32_t, std::vector<int32_t>> g_expert_owner;
+// last decode-token routed ids per layer, noted at COMPUTE time by the
+// llama-side eval callback (a gather-time read of the topk tensor returns
+// recycled bytes - the member ring allocator reuses the slot intra-subgraph
+// and ignores the OUTPUT flag)
+static std::map<int32_t, std::vector<int32_t>> g_routed_ids;
+static int32_t                                 g_routed_last_il = -1;
+
+void ggml_backend_meta_note_routed_ids(int32_t il, const int32_t * ids, size_t k) {
+    std::lock_guard<std::mutex> lock(g_expert_owner_mtx);
+    if (ids == nullptr || k == 0) {
+        g_routed_ids.erase(il);
+        return;
+    }
+    g_routed_ids[il].assign(ids, ids + k);
+    g_routed_last_il = il;
+}
+
+void ggml_backend_meta_set_expert_ownership(int32_t il, const int32_t * member_of, size_t n_expert) {
+    std::lock_guard<std::mutex> lock(g_expert_owner_mtx);
+    if (member_of == nullptr || n_expert == 0) {
+        g_expert_owner.erase(il);
+        return;
+    }
+    g_expert_owner[il].assign(member_of, member_of + n_expert);
+    static const bool zl_debug = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+    if (zl_debug) {
+        fprintf(stderr, "ZL: ownership registered layer %d (%zu experts)\n", il, n_expert);
+    }
+}
+
 // TASKS #75: member-targeted write for tensors whose per-member contents differ
 // (expert ownership mask / id-remap tables). Bypasses the split-state fan-out
 // and writes exactly one member's shadow.
@@ -2653,6 +2689,16 @@ struct ggml_backend_meta_context {
     int64_t ed_ready         = 0; // deferral candidates whose response had already arrived (consumed exactly)
     int64_t ed_injects       = 0; // deferred partials injected one reduce late
     int64_t ed_lost          = 0; // deferred partials dropped at graph end (should stay 0)
+    // GGML_META_ZL_STATS (TASKS #71 replication inc-0): decode-gather routed-
+    // ownership tallies - how often each wire member holds ZERO of the routed
+    // experts (the boundary a dynamic leg-skip would remove) and the owner
+    // group's routed-slot share. Needs expert ownership registered (PLACE=1);
+    // cost = one 32-byte host read per decode gather.
+    int64_t zl_gathers       = 0;
+    int64_t zl_free          = 0; // gathers where EVERY wire member had zero routed experts
+    int64_t zl_owner_slots   = 0;
+    int64_t zl_total_slots   = 0;
+    std::array<int64_t, 16> zl_zero {}; // per member: gathers with zero routed experts
     int64_t bs_graphs        = 0;
 
     // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
@@ -4158,6 +4204,77 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (star_ok) {
                 backend_ctx->bs_star++;
                 ed_star_ord++;
+                // TASKS #71 inc-0 (GGML_META_ZL_STATS=1): attribute this decode
+                // gather's routed experts to members - counts how often each wire
+                // member holds ZERO routed experts (exactly the leg a dynamic
+                // skip would remove) and the owner group's routed-slot share.
+                // One 32-byte host read per gather; no-op without PLACE tables.
+                static const bool zl_stats = getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0;
+                static const bool zl_debug  = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+                if (zl_debug) {
+                    static int zl_dbg_n = 0;
+                    if (zl_dbg_n < 6) {
+                        zl_dbg_n++;
+                        std::lock_guard<std::mutex> dbg_lock(g_expert_owner_mtx);
+                        const auto it_dbg = g_routed_ids.find(g_routed_last_il);
+                        fprintf(stderr, "ZL-DBG: sg %zu ne1 %lld last_il %d owners %zu noted %s ids %d %d %d %d\n",
+                                (size_t) i, (long long) boundary_node(part[0])->ne[1],
+                                g_routed_last_il, g_expert_owner.size(),
+                                it_dbg != g_routed_ids.end() ? "yes" : "no",
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[0] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[1] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[2] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[3] : -1);
+                    }
+                }
+                if (zl_stats && boundary_node(part[0])->ne[1] == 1) {
+                    // the boundary consumes the most recently NOTED layer's
+                    // routing (dataflow: topk-L computes, then L's reduce, then
+                    // topk-(L+1)) - robust to eval-callback graph splits
+                    {
+                        std::lock_guard<std::mutex> zl_lock(g_expert_owner_mtx);
+                        const auto it_own = g_expert_owner.find(g_routed_last_il);
+                        const auto it_ids = g_routed_ids.find(g_routed_last_il);
+                        if (it_own != g_expert_owner.end() && it_ids != g_routed_ids.end()) {
+                            const auto &  owner_of = it_own->second;
+                            const auto &  ids      = it_ids->second;
+                            const int64_t kk       = (int64_t) ids.size();
+                            int     member_hits[16] = {0};
+                            int64_t owner_slots     = 0;
+                            for (int64_t s = 0; s < kk; s++) {
+                                const int32_t e = ids[s];
+                                if (e < 0 || (size_t) e >= owner_of.size()) {
+                                    continue;
+                                }
+                                const int32_t jm = owner_of[e];
+                                if (jm >= 0 && jm < 16) {
+                                    member_hits[jm]++;
+                                    if ((size_t) jm < backend_ctx->wire_member.size() &&
+                                            !backend_ctx->wire_member[jm]) {
+                                        owner_slots++;
+                                    }
+                                }
+                            }
+                            backend_ctx->zl_gathers++;
+                            backend_ctx->zl_total_slots += kk;
+                            backend_ctx->zl_owner_slots += owner_slots;
+                            bool all_zero = true;
+                            for (size_t km = 0; km < part.size(); km++) {
+                                const size_t jm = part[km];
+                                if (jm < backend_ctx->wire_member.size() && backend_ctx->wire_member[jm] && jm < 16) {
+                                    if (member_hits[jm] == 0) {
+                                        backend_ctx->zl_zero[jm]++;
+                                    } else {
+                                        all_zero = false;
+                                    }
+                                }
+                            }
+                            if (all_zero) {
+                                backend_ctx->zl_free++;
+                            }
+                        }
+                    }
+                }
                 const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
                 const size_t n_vals = nbytes/sizeof(float);
                 auto & scratch = backend_ctx->star_scratch;
@@ -4700,6 +4817,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     (double) backend_ctx->ed_injects / backend_ctx->bs_graphs,
                     (double) backend_ctx->ed_lost    / backend_ctx->bs_graphs);
             backend_ctx->ed_defers = backend_ctx->ed_ready = backend_ctx->ed_injects = backend_ctx->ed_lost = 0;
+        }
+        if (backend_ctx->zl_gathers > 0) {
+            char zbuf[256];
+            int  zo = 0;
+            for (size_t j = 0; j < backend_ctx->wire_member.size() && j < 16; j++) {
+                if (backend_ctx->wire_member[j]) {
+                    zo += snprintf(zbuf + zo, sizeof(zbuf) - zo, " m%zu %.1f%%", j,
+                                   100.0 * backend_ctx->zl_zero[j] / backend_ctx->zl_gathers);
+                }
+            }
+            fprintf(stderr, "META_ZL: %" PRId64 " decode gathers: zero-leg%s; all-local %.1f%%; owner slot share %.1f%%\n",
+                    backend_ctx->zl_gathers, zbuf,
+                    100.0 * backend_ctx->zl_free / backend_ctx->zl_gathers,
+                    backend_ctx->zl_total_slots > 0 ? 100.0 * backend_ctx->zl_owner_slots / backend_ctx->zl_total_slots : 0.0);
+            backend_ctx->zl_gathers = backend_ctx->zl_free = 0;
+            backend_ctx->zl_owner_slots = backend_ctx->zl_total_slots = 0;
+            backend_ctx->zl_zero.fill(0);
         }
         backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
         backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;
