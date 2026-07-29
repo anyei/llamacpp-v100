@@ -344,6 +344,16 @@ the member-compute gap stands, leg-skip/replication (below) is the
 remaining lever. (.11 corrected: 62 GB RAM box - the "128G" in prior
 notes is its DISK cache limit.)
 
+**-np 2 UNDER v3 MEASURED 2026-07-29 (record roster, winning -t8/-t6
+worker config): AGGREGATE +40%.** Single-stream inside the -np 2 serve:
+5.11-5.68 t/s = NO idle penalty vs -np 1. Two concurrent 100-tok greedy
+streams: per-stream 3.6-3.9, aggregate 7.2-7.7 t/s (warm rounds) vs
+~5.2-5.3 single = the second stream genuinely fills boundary bubbles
+(defer rate ~71%, LOST 0, both streams coherent). Production
+implication: -np 2 is strictly better (parallel capacity at no
+idle-stream cost); per-stream latency under simultaneous load costs
+~30%.
+
 **Replication design doc LANDED 2026-07-29:
 docs/hot-expert-replication-plan.md.** Key reframe: replication =
 hot-mass concentration (the shipped #75 artifact already does this,
