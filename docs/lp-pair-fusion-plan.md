@@ -82,6 +82,21 @@ backend surgery:
    -np 2 aggregate (fewer boundaries shrink the bubble the second
    stream fills - aggregate gain may compress).
 
+## 3b. Build state (2026-07-31)
+
+**inc-0 builder rewire LANDED (hy-v3.cpp): off = verified no-op**
+(loopback 6/6 byte-identical c80261ff after the lambda refactor); on =
+pairs engage, output changes (lossy as designed), stable and finite.
+**Found requirement: the boundary win needs a meta-backend extension.**
+The pair-out add is PARTIAL + PARTIAL, and the delayed-reduce walker
+only crosses ADDs with a MIRRORED operand - so each layer's expert
+partial still reduces separately BEFORE the add (star count unchanged
+on the stub). inc-1b: teach the PARTIAL derivation/delay that an ADD of
+two same-split PARTIALs derives PARTIAL (member-side sums are exact:
+(a+b)_j = a_j + b_j), so ONE boundary serves the pair. Until then the
+transform is pure quality-cost with no speed gain - do NOT run fleet
+quality gates before inc-1b lands (they would price the wrong thing).
+
 ## 4. Risks and falsifiers
 
 - **Reasoning collapse** (the paper's GSM8K result) even at edge-
