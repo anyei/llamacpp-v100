@@ -41,6 +41,9 @@ if [[ "${EXPERT_DEFER:-0}" != "0" ]]; then
     SPEC_ENV+=(-e GGML_META_EXPERT_DEFER="${EXPERT_DEFER}")
     [[ -n "${DEFER_WAIT_US:-}" ]]   && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_WAIT_US="${DEFER_WAIT_US}")
     [[ -n "${DEFER_SYNC_EDGE:-}" ]] && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_SYNC_EDGE="${DEFER_SYNC_EDGE}")
+    # DEFER_VERIFY=k: also defer on spec-verify-shaped boundaries (ne1 <= k,
+    # k = 1 + NMAX). Decode-only when unset.
+    [[ -n "${DEFER_VERIFY:-}" ]]    && SPEC_ENV+=(-e GGML_META_EXPERT_DEFER_VERIFY="${DEFER_VERIFY}")
 fi
 # PLACE=1: hot-expert placement artifact (#75). Gate 5 measured it null in the
 # EXACT latency-bound regime; v3 deferral (EXPERT_DEFER=1) makes the fleet

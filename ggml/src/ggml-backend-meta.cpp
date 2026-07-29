@@ -4154,6 +4154,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const char * env = getenv("GGML_META_EXPERT_DEFER_SYNC_EDGE");
         return env != nullptr ? (int64_t) atoll(env) : 0;
     }();
+    // GGML_META_EXPERT_DEFER_VERIFY: widen the v3 decode-only gate to
+    // spec-verify-shaped boundaries (ne[1] <= value, i.e. set to 1 + n_draft
+    // max). 0/absent = decode-only. Prefill stays excluded either way; the
+    // injection-shape walk below already rejects cross-shape defers.
+    static const int64_t defer_verify_max = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_VERIFY");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
     int64_t ed_star_ord = 0; // ordinal of the current multi-contributor star reduce
     std::vector<char>    defer_now(n_backends, 0); // this boundary's per-member defer decision
     std::vector<char>    defer_drain_pending(n_backends, 0);
@@ -4426,8 +4434,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // same-size star (F32, contiguous, >= 2 contributors) so the
                 // deferred partial has an injection point of identical shape
                 bool defer_ok = false;
+                const int64_t defer_ne1 = boundary_node(part[0])->ne[1];
                 if (expert_defer && fused_enabled &&
-                        (defer_prefill || boundary_node(part[0])->ne[1] == 1)) {
+                        (defer_prefill || defer_ne1 == 1 ||
+                         (defer_verify_max > 0 && defer_ne1 <= defer_verify_max))) {
                     // walk to the next MULTI-contributor reduce (single-contributor
                     // reduces are owner broadcasts - drains do not run there); it
                     // must be a same-size star so the injection shape matches
