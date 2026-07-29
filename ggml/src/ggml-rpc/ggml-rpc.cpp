@@ -617,9 +617,12 @@ struct ggml_backend_rpc_async_state {
     // fused_recv. This replaces the single fused_fetch_fmt slot, whose contract
     // (the pending fetch is always the very next read) the #71 deferred gather
     // breaks by design.
-    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint64_t logical_size; }; // kind 0 = ping, 1 = fetch
+    // zero_ok (proto 4.14): this fetch was sent with the zero-short-reply flag,
+    // so a 1-byte ZERO marker response is legal (stashed as logical_size zeros)
+    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint8_t zero_ok; uint64_t logical_size; }; // kind 0 = ping, 1 = fetch
     std::deque<rpc_pending_rsp> rsp_fifo;
     std::deque<std::vector<uint8_t>> fetch_stash; // early-read FETCH payloads, f32, FIFO
+    uint64_t zero_replies = 0; // proto 4.14 ZERO short replies received (TASKS #71 inc-1)
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -851,7 +854,23 @@ static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state
                           : e.fmt == 1 ? e.logical_size / 2
                           : e.logical_size;
     uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size)) || out_size != expect) {
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    if (e.zero_ok && out_size == 1) {
+        // proto 4.14 ZERO short reply: the member's contribution is bitwise
+        // zero - stash logical_size zeros without moving the payload
+        uint8_t marker;
+        if (!sock->recv_data(&marker, 1) || marker != 0x5A) {
+            return false;
+        }
+        st.fetch_stash.push_back(std::vector<uint8_t>(e.logical_size)); // zero-filled
+        if (st.zero_replies++ == 0) {
+            GGML_LOG_INFO("rpc: proto 4.14 zero short replies ACTIVE (first on %s)\n", st.endpoint.c_str());
+        }
+        return true;
+    }
+    if (out_size != expect) {
         return false;
     }
     std::vector<uint8_t> payload(e.logical_size);
@@ -973,7 +992,7 @@ static uint64_t rpc_ping_async(socket_ptr sock) {
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
     } else {
-        st.rsp_fifo.push_back({0, 0, 0});
+        st.rsp_fifo.push_back({0, 0, 0, 0});
     }
     return ++st.pings_sent;
 }
@@ -2226,6 +2245,13 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         } else if (fetch_fmt == 1) {
             flags |= 16; // FETCH response returns f16; the paired recv expands
         }
+        // proto 4.14 (TASKS #71 inc-1): allow the ZERO short reply - a member
+        // whose contribution is bitwise zero (all mul_mat_id lanes sentinel
+        // under expert placement) answers with a 1-byte marker instead of the
+        // encoded payload
+        if (server_minor >= 14) {
+            flags |= 128;
+        }
     }
     if (flags == 0) {
         return false;
@@ -2292,7 +2318,7 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         return false;
     }
     if (flags & 4) {
-        st.rsp_fifo.push_back({1, fetch_fmt, (uint64_t) fetch_size});
+        st.rsp_fifo.push_back({1, fetch_fmt, (uint8_t) ((flags & 128) ? 1 : 0), (uint64_t) fetch_size});
     }
     return true;
 }
@@ -4232,11 +4258,36 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
             GGML_LOG_ERROR("[%s] invalid FETCH segment\n", __func__);
             return false;
         }
+        // proto 4.14 (flag 128, TASKS #71 inc-1): a bitwise-zero payload (all
+        // of this member's mul_mat_id lanes carried the placement skip
+        // sentinel) answers as a 1-byte ZERO marker - no encode, ~payload->1B
+        // on the wire. Purely an optimization trigger: correctness never
+        // depends on the scan (a missed zero just ships normally).
+        const bool zero_ok = (flags & 128) != 0;
+        auto all_zero = [](const void * p, size_t n) -> bool {
+            const uint8_t * b = (const uint8_t *) p;
+            size_t i = 0;
+            for (; i + sizeof(uint64_t) <= n; i += sizeof(uint64_t)) {
+                uint64_t w;
+                memcpy(&w, b + i, sizeof(w));
+                if (w != 0) {
+                    return false;
+                }
+            }
+            for (; i < n; i++) {
+                if (b[i] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
         if (f16 || q8) {
             static thread_local std::vector<float> full;
             full.resize(n_vals);
             ggml_backend_tensor_get(tensor, full.data(), offset, size);
-            if (q8) {
+            if (zero_ok && all_zero(full.data(), size)) {
+                response.assign(1, 0x5A);
+            } else if (q8) {
                 response.resize(ggml_row_size(GGML_TYPE_Q8_0, n_vals));
                 ggml_quantize_chunk(GGML_TYPE_Q8_0, full.data(), response.data(), 0, 1, n_vals, nullptr);
             } else {
@@ -4246,6 +4297,9 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         } else {
             response.resize(size, 0);
             ggml_backend_tensor_get(tensor, response.data(), offset, size);
+            if (zero_ok && all_zero(response.data(), size)) {
+                response.assign(1, 0x5A);
+            }
         }
     }
     return true;

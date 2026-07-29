@@ -18,7 +18,7 @@ extern "C" {
 // cut vs f32, block size 32 - non-multiple sizes fall back to f16/f32).
 // Same per-connection degradation: q8_0 -> f16 -> f32 by server minor.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    13
+#define RPC_PROTO_MINOR_VERSION    14
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus

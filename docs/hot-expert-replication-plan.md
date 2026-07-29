@@ -106,6 +106,21 @@ serve; all other output byte-identical (it is read-only).
 
 ### 3.2 inc-1 - dynamic leg skip (the build)
 
+**inc-1 BUILT + LOOPBACK-GATED 2026-07-30 (proto 4.14 zero short reply,
+as corrected below):** client sets fused flag bit 128 when the worker
+speaks minor >= 14; the worker's FETCH branch scans the payload for
+bitwise zero (u64 words, early-out) and answers with a 1-byte 0x5A
+marker instead of the encoded payload; the response FIFO accepts
+out_size==1 only for zero_ok entries and stashes logical_size zeros.
+Per-connection: pre-4.14 workers keep full payloads. Gates (trunc stub,
+3 loopback workers, fuse=2 + q8): place-exact = 6/6 byte-identical
+c80261ff with markers ACTIVE x3; default-EP = 6/6 c80261ff, markers 0
+(never fires - row-slices are not bitwise zero); place+EXPERT_DEFER=1 =
+markers ACTIVE, LOST 0, and the stub defer rate FELL 51.5% -> 14.1% -
+zero legs arrive fast enough to be consumed exactly instead of deferred.
+Remaining: worker image rebuild + fleet A/B (PLACE=1 EXPERT_DEFER=1 vs
+the default-EP v3 plateau 4.97-5.21).
+
 **TIMING CORRECTION (2026-07-29, found while building inc-0):** the
 coordinator-side skip described below cannot work as written - the fused
 FETCH for boundary L is pre-issued inside boundary L-1's fused message,
