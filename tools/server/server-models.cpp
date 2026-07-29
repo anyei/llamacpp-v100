@@ -12,6 +12,7 @@
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
+#include <map>
 #include <set>
 #include <sheredom/subprocess.h>
 
@@ -1907,7 +1908,33 @@ void server_models_routes::init_routes() {
                         }, &discovered);
                 }
             }
-            hw["discovered"] = discovered;
+            // merge with recently-seen beacons: a single 1.5 s window routinely
+            // misses a worker whose beacon period straddles it, which made the
+            // wizard's fleet capacity (and its fit badges) flicker between
+            // calls. Keep every worker seen in the last 90 s, refreshed by
+            // newer sightings; age_ms lets the UI flag stale entries.
+            {
+                static std::mutex               beacon_mtx;
+                static std::map<std::string, std::pair<json, int64_t>> beacon_seen;
+                const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::lock_guard<std::mutex> lock(beacon_mtx);
+                for (auto & e : discovered) {
+                    beacon_seen[e["endpoint"].get<std::string>()] = { e, now };
+                }
+                json merged = json::array();
+                for (auto it = beacon_seen.begin(); it != beacon_seen.end(); ) {
+                    if (now - it->second.second > 90 * 1000) {
+                        it = beacon_seen.erase(it);
+                        continue;
+                    }
+                    json e = it->second.first;
+                    e["age_ms"] = now - it->second.second;
+                    merged.push_back(std::move(e));
+                    ++it;
+                }
+                hw["discovered"] = merged;
+            }
         }
         res_ok(res, hw);
         return res;
