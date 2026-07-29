@@ -22,6 +22,12 @@ services:
     image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
     restart: unless-stopped
     network_mode: host
+    # the image's baked-in HEALTHCHECK probes :8080; the launcher listens on PORT
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8399}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     deploy:
       resources:
         reservations:
