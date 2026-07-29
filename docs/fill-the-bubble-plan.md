@@ -326,6 +326,17 @@ placed leg pays a real operational tax: permuted single-threaded loads
 (~35 min) and a second cache layout (the #72(b) wedge needed the cache
 limits raised to load at all).
 
+**Replication design doc LANDED 2026-07-29:
+docs/hot-expert-replication-plan.md.** Key reframe: replication =
+hot-mass concentration (the shipped #75 artifact already does this,
+Cov@25.5% = 0.913) + a DYNAMIC LEG SKIP at the star gather - the piece
+placement never had (the B2 contributor set is graph-build-static;
+a zero-routed member still ships an exactly-zero tensor and the owner
+waits on it). Modeled on the hy3 profile: mean legs 3.00 -> 0.60,
+54% of decode boundaries fully wire-free, exact math (byte-identity
+gate). Sequencing unchanged: thread sweep first, then inc-0 counters,
+then the leg-skip build.
+
 ### 2.3 Later / other axes
 
 - SpecPipe / PipeInfer continuous speculation with early cancellation:
