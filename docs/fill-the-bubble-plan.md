@@ -326,6 +326,24 @@ placed leg pays a real operational tax: permuted single-threaded loads
 (~35 min) and a second cache layout (the #72(b) wedge needed the cache
 limits raised to load at all).
 
+**Worker thread/affinity sweep MEASURED 2026-07-29 (v3 serve, record
+roster, 8x100 greedy + defer counters per leg, cold-vs-cold legs,
+coherence-read all): the thread lever is EXHAUSTED at the current
+config.** L0 baseline (-t 8 local / -t 8 .11, disposable per-subgraph
+pool) 4.97 t/s rate 65-70%; L1 (+GGML_RPC_THREADPOOL_POLL=0 both) 3.98
+(-20%) rate unchanged - the persistent condvar pool is a fleet LOSS
+despite the +2% loopback prior; L2 (-t 12 local / -t 14 .11) 1.79
+(-64%!) - local-box oversubscription slows the OWNER (defer rate fell
+to 60% while t/s collapsed = members looked "readier" because the
+coordinator got slower) and .11's hybrid Ultra 9 (6P+8E) pays E-core
+barrier drag on every op; L3 (-t 8 local / -t 6 .11 = P-cores only)
+5.21 t/s (4.91-5.35) rate 68.8-71.9% - marginal WIN, adopted as the
+serve config. CALIBRATION VERDICT: member per-layer time is not
+thread-elastic upward; ready-rate never materially rose in any leg ->
+the member-compute gap stands, leg-skip/replication (below) is the
+remaining lever. (.11 corrected: 62 GB RAM box - the "128G" in prior
+notes is its DISK cache limit.)
+
 **Replication design doc LANDED 2026-07-29:
 docs/hot-expert-replication-plan.md.** Key reframe: replication =
 hot-mass concentration (the shipped #75 artifact already does this,

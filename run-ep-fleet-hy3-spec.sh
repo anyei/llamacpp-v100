@@ -81,4 +81,4 @@ exec docker run --name llama-ep-hy3 --gpus all \
   --device CUDA0,CUDA1,RPC0,RPC1,RPC2 -sm tensor -ts 21,21,46,50,27 \
   -ngl 99 --no-mmap --rpc-reload \
   "${SPEC_ARGS[@]}" \
-  -c 4096 -ub 256 -b 256 --host 0.0.0.0 --port "$PORT" -np 1 -fit off
+  -c 4096 -ub 256 -b 256 --host 0.0.0.0 --port "$PORT" -np "${NP:-1}" -fit off
