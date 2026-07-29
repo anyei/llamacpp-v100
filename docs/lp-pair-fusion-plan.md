@@ -97,6 +97,39 @@ two same-split PARTIALs derives PARTIAL (member-side sums are exact:
 transform is pure quality-cost with no speed gain - do NOT run fleet
 quality gates before inc-1b lands (they would price the wrong thing).
 
+## 3e. FLEET QUALITY GATES MEASURED 2026-07-31/08-01: LANE CLOSED
+
+Record roster, LP=1 SYNC_EDGE=2 (38 pairs) + PARTIAL_MERGE + EXPERT_DEFER=1:
+
+- **Engagement PERFECT: star 41.0/graph** (79 -> 41 exactly as designed;
+  bcast1 80, defers 72.7 LOST 0). The partial-merge machinery works at
+  fleet scale.
+- **Speed: +8-13% only** - 5.48-5.84 t/s vs the 4.97-5.21 v3 plateau.
+  The phase-lag insight cuts BOTH ways: members compute two layers'
+  experts per piece, so per-boundary member latency ~doubles while lap
+  count halves - the serialized member path is unchanged in total and
+  only FIXED per-boundary costs are saved. The 40-layer probe's 1.8x
+  was compute-halving + boundary-halving; boundary count alone is worth
+  the ~+10-15% the 2.2c re-rank originally priced.
+- **Quality: CATASTROPHIC FAIL.** 2/10 leg runs tripped the response
+  formatter, and a direct read produced token salad (CJK/fragment mix,
+  worse than v1 deferral's repetition collapse). Train-free pairing of
+  ~96% of MoE layers destroys this model. Sparser pairing would restore
+  quality only by shrinking the already-small win (edge=20 ~ 18 pairs
+  ~ +5%) - the economics are dead regardless.
+
+**VERDICT: LP pair-fusion CLOSED on this fleet.** Keep in-tree,
+default-off: the builder transform (LLAMA_LP_PAIRS) and especially the
+partial-merge machinery (name-tag PARTIAL derivation + reduce
+suppression, GGML_META_PARTIAL_MERGE) are correct, gated, and reusable
+- any future mechanism that wants two partials to share one boundary
+(true multi-token decode, tree verify, replicated-expert reduce shapes)
+gets it for free. No PPL run (coherence fail is terminal). Escape (b)
+is now closed alongside (a); remaining #71 levers: transport-class
+latency (#60 soft-RoCE/UCCL attacks the per-lap fixed cost that LP
+proved is worth ~10-15%... x a full removal), faster member lanes, and
+-np>1 throughput scaling (already banked).
+
 ## 3d. inc-1b COMPLETE on the stub (2026-07-31): the pair shares ONE boundary
 
 The 3c blocker resolved exactly as diagnosed - two pieces:
