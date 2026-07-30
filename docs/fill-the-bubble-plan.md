@@ -528,6 +528,44 @@ acceptance + coherence-read every leg, long-generation reads. Decision
 rule: only if it clears the v3 plateau by >= +5% does any stage-2 draft
 work (VRAM-subset masks) become worth pricing again.
 
+**DEFER_VERIFY MEASURED 2026-07-29 night - PROBE FAILS, spec family stays
+closed, and the falsification is mechanism-level.** Built as
+GGML_META_EXPERT_DEFER_VERIFY (61aaa24a5; ne[1] <= value widening, parse-
+VALUES, injection-shape walk unchanged). Loopback gates first: off =
+c80261ff 6/6; padded-spec legs proved the defer-blind claim quantitatively
+(v3 under spec = 0.1 defers/graph; =4 restores 3.7-3.9; z-leg =0 == unset;
+LOST 0 everywhere; server stable 12/12). Fleet A/B, record roster,
+same-session back-to-back, workers identical (-t8/-t6), coherence-read
+every leg:
+- control (EXPERT_DEFER=1 STATS=1): warm 5.25-5.72 (8 runs), plateau
+  5.14-5.96 MEAN 5.49 (10 runs), defers 141.6-152.6/graph rate 65.7-70.8%
+  LOST 0, physics-reasoning read clean. (Above the historical 4.97-5.21 -
+  good fleet day; warm caches.)
+- test (SPEC=1 NMAX=3 LOCAL_DRAFT=1 + v3 + DEFER_VERIFY=4): warm
+  4.22-5.95 mean 4.88, measured 4.18-4.89 MEAN 4.53 (10 runs), acceptance
+  76-98%, defers 49.3-65.9/graph rate 65.5-66.9% LOST 0 (ENGAGED - without
+  the widening this sits near zero under spec), reads clean.
+- RATIO 0.83 (4.53/5.49) - the >= +5% rule fails by ~22 points, outside
+  fleet noise by 3x. Deferral verifiably engaged on verify boundaries and
+  the speed did not come back: hiding member ARRIVAL lateness cannot
+  recover the verify pass, because the cost is member COMPUTE scaling with
+  chain width (the #52 law), which deferral does not reduce. The 0.83
+  ratio matches the pre-fusion stage-1 ratio (~0.85): defer-verify closes
+  the v3-handicap confound and the spec economics are unchanged.
+Verdict: the defer-blind-verify gap is now MEASURED CLOSED as a spec
+recovery lever. DEFER_VERIFY stays in tree default-off (exact-when-off
+gate-proven; useful instrument for any future multi-token-decode work,
+e.g. tree-verify or block decode). Spec-family reopen keys shrink to #60
+transport and tree-verify-with-expert-reuse economics; "compose spec with
+deferral" is no longer an untested rival explanation.
+Incident color for #72(a): the first control load OOM-killed the LOCAL
+worker mid-stream (kernel global OOM, worker anon-rss 50.7GB while the
+coordinator's no-mmap cold-stream peaked; V4->hy3 layout churn forced the
+full streaming path) - decode -3 + connection-lost + untrusted in-process
+reload followed; the clean relaunch on warmed page caches loaded fine and
+the worker peaked at its normal ~46GiB share. Watch worker RSS on the
+FIRST post-churn load.
+
 ## 3. Probe ladder (each gated before the next)
 
 1. Merge expert-placement -> parallel-inference; CPU loopback byte gate:
