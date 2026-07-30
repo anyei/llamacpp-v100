@@ -69,6 +69,12 @@
           background:var(--card); border:1px solid var(--border); border-radius:8px;
           padding:10px 14px; margin-bottom:8px; cursor:pointer; color:var(--fg); }
   .mrow:hover { border-color:var(--muted); }
+  .mrow.live { border-color:var(--ok); background:var(--ok-bg); }
+  .runningp { border-color:var(--ok); }
+  .runrow { display:flex; align-items:center; gap:10px; padding:4px 0; }
+  .runrow .mname { flex:1; min-width:0; }
+  .runrow a { font-size:12px; white-space:nowrap; }
+  .btn.small { font-size:11.5px; padding:5px 12px; font-weight:560; }
   .mrow:focus-visible, .mode:focus-visible, .btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .mname { font-family:var(--mono); font-size:12.5px; font-weight:600; overflow-wrap:anywhere; }
   .mmeta { color:var(--muted); font-size:11.5px; margin-top:2px; }
@@ -670,14 +676,22 @@ function render() {
   if (S.step===1) {
     const q = S.q.trim().toLowerCase();
     const list = MODELS.filter(m => !q || (m.file+" "+m.note).toLowerCase().includes(q));
-    v.innerHTML = `
+    const running = MODELS.filter(m => ["loading","loaded","downloading"].includes(m.status));
+    v.innerHTML = (running.length?`<div class="panel runningp"><h3>Running now</h3>
+      ${running.map(m=>`<div class="runrow">
+        <span class="mname">${m.file}</span>
+        <span class="tag ${m.status==="loaded"?"t-ok":"t-acc"}">${m.status}</span>
+        ${m.status==="loaded"?`<a href="./">open chat</a>`:""}
+        <button class="btn ghost small" data-unload="${m.id}">${m.status==="loaded"?"Unload":"Stop"}</button>
+      </div>`).join("")}
+    </div>`:"") + `
       <div class="search">
         <input id="q" type="search" placeholder="Filter models — name, quant, MoE, MTP…" value="${S.q.replace(/"/g,"&quot;")}" aria-label="Filter models">
         <span class="count">${list.length} of ${MODELS.length}${DRAFTS.length?` · ${DRAFTS.length} draft`:""}</span>
       </div>` +
       (list.length ? list.map(m=>{
         const [t,c]=fitTag(m); const i=MODELS.indexOf(m);
-        return `<button class="mrow" data-i="${i}">
+        return `<button class="mrow${m.status!=="unloaded"?" live":""}" data-i="${i}">
           <span class="grow"><span class="mname">${m.file}</span>
           <div class="mmeta">${m.size} GB · ${m.note}</div></span>
           ${m.status!=="unloaded" ? `<span class="tag t-ok">${m.status}</span>`:""}
@@ -690,6 +704,24 @@ function render() {
       }).join("") : `<div class="empty">No models match "${S.q}". Draft models (${DRAFTS.map(d=>d.file).join(", ")}) are offered as speculation options on their target models, not listed here.</div>`);
     const qi=$("q");
     qi.oninput=e=>{ S.q=e.target.value; render(); const n=$("q"); n.focus(); n.setSelectionRange(n.value.length,n.value.length); };
+    v.querySelectorAll("[data-unload]").forEach(b=>b.onclick=async e=>{
+      e.stopPropagation();
+      b.disabled=true; b.textContent="…";
+      try {
+        await fetch("./models/unload", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({model: b.dataset.unload}) });
+      } catch(_) {}
+      // the child shuts down asynchronously - wait for the status to actually flip
+      for (let i=0; i<10; i++) {
+        await new Promise(r=>setTimeout(r,600));
+        try {
+          const r = await fetch("./models"); const j = await r.json();
+          const me = (j.data||[]).find(x=>x.id===b.dataset.unload);
+          if (!me || !["loading","loaded","downloading"].includes(me.status.value)) break;
+        } catch(_) {}
+      }
+      await loadData(); render();
+    });
     v.querySelectorAll(".mrow").forEach(b=>b.onclick=()=>{
       S.model=MODELS[+b.dataset.i]; S.mode=null; S.spec="none";
       S.gateOn={}; S.gateOff={};

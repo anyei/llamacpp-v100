@@ -157,6 +157,11 @@ Landed beyond the original increments:
   beacons; Copy button actually copies; <meta charset>; details drawers
   survive re-render; trunc vehicles annotated.
 
+Later same day: "Running now" panel on the model step (loaded/loading models
+with status chip, open-chat link, Unload/Stop button posting /models/unload
+with an async-shutdown poll; live rows tinted in the list); gates catalog
+v100/upstream badges (from the doc's *(upstream)* markers).
+
 Remaining polish (none blocking):
 
 - wizard link from the main webui; fleet-mode launches now launch through the
