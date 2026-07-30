@@ -729,7 +729,14 @@ Everything here is automatic — no new flags on the happy path:
   all-workers-dead degrades to local-only (loudly), and a load that cannot
   succeed yet (fleet-sized model, no workers) retries every 10s. Same
   process, HTTP endpoints and queue throughout — no orchestrator needed.
-  Together: a fully self-healing fleet with no manual intervention.
+  Requests that arrive during the reload window are HELD, not raced: every
+  handler acquires a pre-task ctx guard in `create_response()` (released
+  once its tasks are posted), and the reload drains those guards before
+  destroying the model, then releases them when serving resumes (fixed
+  2026-07-29: HTTP threads tokenizing against the mid-reload model were a
+  use-after-free — exit 139 whenever traffic raced a recovery; the same
+  guard also gates router idle-sleep teardown). Together: a fully
+  self-healing fleet with no manual intervention.
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
