@@ -1,7 +1,7 @@
 # Launch wizard: guided model serving on the router (design + increments)
 
-Status: SHIPPED 2026-07-29 (increments 1-3 + extras; see section 5 for the
-as-built state and the remaining polish list). Originally design v1,
+Status: SHIPPED 2026-07-29 (increments 1-3 + extras; section 5 = as-built,
+section 6 = #78 env-gate catalog + 2026-07-30 launch-button fix pass). Originally design v1,
 2026-07-28. UX spec = the "Model Launch Wizard" artifact
 (interactive mock, draft 3): 3 steps (model -> run mode -> launch), smart
 recommendations from model metadata + hardware, measured-over-estimated
@@ -139,11 +139,28 @@ Landed beyond the original increments:
   597270e8e (recursive scan + mount filter). Registry pushes go via the
   127.0.0.1:5000 alias (the daemon only trusts 127.0.0.0/8 as insecure).
 
+## 6. #78 env-gate catalog + launch-button fix pass (2026-07-30)
+
+- Environment-gate catalog (TASKS #78): `scripts/gen-wizard-gates.py` parses
+  docs/env-gates.md into 95 gates embedded in wizard.html (GATES-CATALOG
+  markers; re-run after doc edits). Advanced drawer group with class chips
+  (serve/tune/diag/danger/worker), value editors, mode-stack pre-seeding,
+  danger hard-confirm (incl. GGML_META_EXPERT_DEFER=2 value-level), worker
+  rows inert-annotated. Overlay rewrites the resolved flags -> rides the
+  existing extra_env; no server change.
+- Launch button verified end-to-end (headless chromium vs a real router,
+  Qwen3-0.6B: Launch -> loaded -> ready link, 0 JS errors). Fixed on the way:
+  `-ncmoe auto` invalid -> computed layer estimate (metadata now carries
+  block_count + gguf path); mmproj/dflash substring family match (qwen3 vs
+  qwen3.5 n_embd crash) -> exact equality; `--ctx-shift` -> `--context-shift`;
+  hardcoded /models paths -> metadata paths; fleet --rpc from discovered
+  beacons; Copy button actually copies; <meta charset>; details drawers
+  survive re-render; trunc vehicles annotated.
+
 Remaining polish (none blocking):
 
-- trunc-vehicle ggufs launch-fail without LLAMA_TRUNC_ARR - hide or annotate.
-- sharded models report size of the first shard only (Laguna shows small).
-- wizard link from the main webui; fleet-mode launches are copy-paste
-  commands by design (child-spawned fleet serving works but is unproven).
+- wizard link from the main webui; fleet-mode launches now launch through the
+  router like any mode (flags parse-validated) but a real fleet launch from
+  the wizard is still unproven live.
 - fold #73 (score staleness) + #68 (auto-weight iGPU trust) into the fleet
-  card data path; --fleet-preflight as a pre-launch check for fleet modes.
+  card data path.

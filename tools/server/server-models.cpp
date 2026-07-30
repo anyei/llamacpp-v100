@@ -206,6 +206,10 @@ static json server_model_read_gguf_meta(const std::string & path) {
         return json();
     }
     json meta;
+    // resolved local path, so the wizard can reference sibling files
+    // (mmproj/draft speculation) by their real location instead of
+    // assuming a /models mount
+    meta["path"] = path;
     std::error_code ec;
     const auto fsize = std::filesystem::file_size(path, ec);
     if (!ec) {
