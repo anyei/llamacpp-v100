@@ -17,8 +17,15 @@ extern "C" {
 // minor 13: q8_0 boundary payloads (flags 32/64, GGML_RPC_WIRE_Q8; ~3.76x
 // cut vs f32, block size 32 - non-multiple sizes fall back to f16/f32).
 // Same per-connection degradation: q8_0 -> f16 -> f32 by server minor.
+// minor 15: upstream 5.0.0 absorption (their tensor_memset, #25912).
+// RPC_CMD_MEMSET_TENSOR is appended at the FORK ladder tail so every
+// deployed 4.x worker keeps its command ids; upstream's id differs and
+// upstream peers are rejected on the major anyway. The client sends
+// MEMSET only to minor>=15 workers and falls back to a zero-fill
+// set_tensor otherwise. No ggml op-enum shift in this merge (fingerprint
+// unchanged). Minor 14 (zero short replies) unchanged.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    14
+#define RPC_PROTO_MINOR_VERSION    15
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus

@@ -158,6 +158,11 @@ enum rpc_cmd {
     RPC_CMD_GET_MANIFEST,
     RPC_CMD_SET_TENSOR_HASH_BATCH,
     RPC_CMD_SET_TENSOR_HASH_DATA,
+    // proto 4.15 (upstream 5.0 absorption): raw byte-range memset on a tensor.
+    // Appended at the fork ladder tail so deployed 4.x workers keep their
+    // command ids; upstream assigns this a different id and is rejected on
+    // the major at HELLO. Client-side gated on server minor >= 15.
+    RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_COUNT,
 };
 
@@ -260,6 +265,13 @@ struct rpc_msg_free_buffer_req {
 
 struct rpc_msg_buffer_clear_req {
     uint64_t remote_ptr;
+    uint8_t value;
+};
+
+struct rpc_msg_memset_tensor_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
     uint8_t value;
 };
 
@@ -1629,9 +1641,26 @@ static void ggml_backend_rpc_buffer_set_usage(ggml_backend_buffer_t buffer, enum
 }
 
 static void ggml_backend_rpc_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
-    // no dedicated RPC command: stream a filled buffer through set_tensor. The
-    // memsets that reach here are infrequent cache clears (e.g. the dsv4
-    // compressed-KV per-stream wipes), not hot-path traffic.
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // proto 4.15 (upstream 5.0 tensor_memset): one small command instead of
+    // streaming a filled buffer. Views resolve to the root before serializing
+    // (view links do not survive the wire).
+    if (rpc_async_state(ctx->sock.get()).server_minor >= 15) {
+        size_t root_offset = offset;
+        const ggml_tensor * root = rpc_resolve_view(tensor, root_offset);
+        rpc_msg_memset_tensor_req request;
+        request.tensor = serialize_tensor(root);
+        request.offset = root_offset;
+        request.size   = size;
+        request.value  = value;
+        if (!send_rpc_cmd(ctx->sock, RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0)) {
+            rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+        }
+        return;
+    }
+    // pre-4.15 workers: stream a filled buffer through set_tensor. The memsets
+    // that reach here are infrequent cache clears (e.g. the dsv4 compressed-KV
+    // per-stream wipes), not hot-path traffic.
     std::vector<uint8_t> data(size, value);
     ggml_backend_rpc_buffer_set_tensor(buffer, tensor, data.data(), offset, size);
 }
@@ -2789,6 +2818,7 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
+    bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     // proto 4.10 (TASKS.md #62)
@@ -3173,6 +3203,52 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
         return false;
     }
     ggml_backend_buffer_clear(buffer, request.value);
+    return true;
+}
+
+bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    const uint64_t tensor_size = ggml_nbytes(tensor);
+    if (request.offset > tensor_size || request.size > tensor_size - request.offset) {
+        GGML_LOG_ERROR("[%s] tensor region (offset=%" PRIu64 ", size=%" PRIu64 ") out of tensor bounds [0, %" PRIu64 ")\n",
+                       __func__, request.offset, request.size, tensor_size);
+        return false;
+    }
+
+    const uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const uint64_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+    if (request.tensor.data < buffer_start) {
+        GGML_LOG_ERROR("[%s] tensor data before buffer start\n", __func__);
+        return false;
+    }
+    const uint64_t data_offset = request.tensor.data - buffer_start;
+    if (data_offset > buffer_size ||
+        request.offset > buffer_size - data_offset ||
+        request.size > buffer_size - data_offset - request.offset) {
+        GGML_LOG_ERROR("[%s] tensor region out of buffer bounds\n", __func__);
+        return false;
+    }
+    if (tensor->buffer->iface.memset_tensor == nullptr) {
+        GGML_LOG_ERROR("[%s] memset not implemented by backend buffer\n", __func__);
+        return false;
+    }
+
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", value: %u\n",
+            __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.value);
+    ggml_backend_tensor_memset(tensor, request.value, request.offset, request.size);
     return true;
 }
 
@@ -4751,6 +4827,19 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                     return;
                 }
                 if (!server.buffer_clear(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_MEMSET_TENSOR: {
+                rpc_msg_memset_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.memset_tensor(request)) {
                     return;
                 }
                 if (!send_msg(sock, nullptr, 0)) {
