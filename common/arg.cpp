@@ -3134,7 +3134,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "whose experts exceed VRAM+RAM can still run. implies --no-mmap.\n"
         "sets LLAMA_SSD_STREAM_BUFFER",
         [](common_params & params) {
-            params.use_mmap = false; // streamed experts skip the read; keep others resident
+            params.load_mode = LLAMA_LOAD_MODE_NONE; // no mmap: streamed experts skip the read; keep others resident
             common_set_env("LLAMA_SSD_STREAM_BUFFER", "1");
         }
     ));
