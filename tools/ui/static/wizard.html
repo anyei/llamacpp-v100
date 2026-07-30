@@ -901,7 +901,7 @@ async function realLaunch(flagsText){
 }
 chips();
 document.getElementById("view").innerHTML = '<div class="empty">scanning models...</div>';
-loadData().then(()=>render()).catch(e=>{
+loadData().then(()=>{ chips(); render(); }).catch(e=>{
   document.getElementById("view").innerHTML = '<div class="empty">failed to read ./models - is this page served by llama-server in router mode? ('+e+')</div>';
 });
 </script>
