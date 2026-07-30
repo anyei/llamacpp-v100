@@ -93,4 +93,8 @@ first poll — treat empty status as "not yet", not death).
 - The GPUs/workers are shared with the user's soaks and wizard tests: don't
   relaunch over a serve the user asked to keep down; don't restart workers or
   run CPU-heavy builds during anyone's measurement window.
+- **No memory-heavy co-located work while a fleet serve is up** (#79): the
+  local worker's share leaves only ~20-25GB headroom on the 78GB box; a
+  co-located model load (dev-container repro, second serve) gets the worker
+  OOM-killed and the user sees "Compute error" until surgical recovery.
 - Serve inventory: `docker ps --format '{{.Names}}' | grep llama-ep`.
