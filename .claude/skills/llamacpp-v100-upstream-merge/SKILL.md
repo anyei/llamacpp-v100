@@ -9,8 +9,13 @@ description: The recurring defensive upstream merge for the llamacpp-v100 fork (
 
 Defensive-only: merge to stay current on kernels/models/server, never to adopt
 upstream's distributed roadmap (the fork's meta/EP/RPC layer IS the moat).
-Last merge: `47bd90033` (upstream 6d5a910: V4 fused ops, Volta CUDA graphs,
-n_keep_tail). Weekly cadence intended; check `git log --oneline -5 upstream/master`.
+Last merge: `52be8d1d6` 2026-07-30 (upstream ..master 96 commits: DSpark,
+GLM-5.2 MTP/Indexer, MiniMax-M3, load_mode enum, subproc.h, MCP stdio,
+rpc 5.0 tensor_memset absorbed as fork proto 4.15 - fork command ids kept,
+memset appended at ladder tail, client gated on server_minor>=15).
+Weekly cadence intended; check `git log --oneline -5 upstream/master`.
+The upstream remote may need re-adding: `git remote add upstream
+https://github.com/ggml-org/llama.cpp.git` (https, not ssh).
 
 ## Conflict hotspots (fork-heavy files)
 
