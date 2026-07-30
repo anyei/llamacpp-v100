@@ -156,7 +156,9 @@ def parse(doc_text):
         m = re.match(r"^##+\s+(.*)$", line)
         if m:
             cat = re.sub(r"^\d+b?\.\s*", "", m.group(1)).strip()
-            cat = re.sub(r"\s*[-—(].*$", "", cat).strip()
+            # drop trailing "(task N)" / "— subtitle" qualifiers, keep hyphenated words
+            cat = re.sub(r"\s*\(.*$", "", cat)
+            cat = re.split(r"\s+[—-]\s+", cat)[0].strip()
             continue
         if not line.startswith("|"):
             continue
@@ -185,6 +187,10 @@ def parse(doc_text):
                 "cls": cls or "diag",
                 "note": desc,
             }
+            # doc rows tagged *(upstream)* are stock llama.cpp knobs; the rest
+            # are llamacpp-v100 fork gates - the wizard badges the distinction
+            if "(upstream)" not in cells[3]:
+                g["fork"] = True
             if cls is None:
                 g["unclassified"] = True
             if name in DANGER_VALUES:
