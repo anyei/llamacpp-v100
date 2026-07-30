@@ -311,10 +311,12 @@ function specOptions(m, modeId) {
   if (m.mtp) opts.push({ id:"mtp", name:"MTP speculation", gain: gpuMode?"+2.4x measured":null,
     disabled: modeId==="fleet", offwhy:"measured break-even over the fleet boundary — verify lanes pay full wire cost",
     flags:"--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
+  // dflash drafts are small dense models - they fit VRAM even when the target
+  // runs with its experts offloaded to CPU (-ncmoe), so offer it there too
   const d = dflashFor(m);
-  if (d && gpuMode) opts.push({ id:"dflash", name:"dflash speculation", est:true,
+  if (d && (gpuMode || modeId==="ncmoe")) opts.push({ id:"dflash", name:"dflash speculation", est:true,
     sub:`draft found: ${d.file}`,
-    flags:`--spec-type draft-dflash --spec-draft-model ${d.path}\nGGML_CUDA_DISABLE_GRAPHS=1` });
+    flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
     sub:"train-free, no draft model - shines on repetitive/structured output",
     flags:`--spec-type ngram-simple\nGGML_CUDA_DISABLE_GRAPHS=1` });
