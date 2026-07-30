@@ -16,6 +16,11 @@ private:
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
+    // pre-task ctx window tracking (--rpc-reload segfault fix): HTTP threads
+    // read the model (tokenize, chat templates) between create_response() and
+    // post_tasks(); teardown must not run inside that window
+    bool ctx_hold = false;      // a teardown holds the model: block new guards
+    int  n_ctx_guards = 0;      // HTTP threads currently inside the window
     int64_t time_last_task = 0;
 
     // queues
@@ -50,6 +55,16 @@ public:
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     void wait_until_no_sleep();
+
+    // pre-task ctx guard: enter blocks while a teardown hold is active (and
+    // wakes/waits out the sleeping state, subsuming wait_until_no_sleep);
+    // exit releases. Use via server_response_reader::ctx_guard_acquire/release.
+    void ctx_guard_enter();
+    void ctx_guard_exit();
+    // teardown side (queue thread): block new guards, then wait for in-flight
+    // ones to drain (bounded); end releases the hold
+    void ctx_hold_begin(int timeout_ms);
+    void ctx_hold_end();
 
     bool is_sleeping() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -171,6 +186,7 @@ struct server_response_reader {
     server_response & queue_results;
     size_t received_count = 0;
     bool cancelled = false;
+    bool has_ctx_guard = false;
     int polling_interval_seconds;
 
     // tracking generation state and partial tool calls
@@ -186,6 +202,22 @@ struct server_response_reader {
 
     int get_new_id() {
         return queue_tasks.get_new_id();
+    }
+
+    // pre-task ctx guard: held from create_response() until the tasks are
+    // posted (or the reader dies), covering every model/vocab read on the
+    // HTTP thread; released automatically by post_task/post_tasks/stop
+    void ctx_guard_acquire() {
+        if (!has_ctx_guard) {
+            queue_tasks.ctx_guard_enter();
+            has_ctx_guard = true;
+        }
+    }
+    void ctx_guard_release() {
+        if (has_ctx_guard) {
+            queue_tasks.ctx_guard_exit();
+            has_ctx_guard = false;
+        }
     }
 
     // if front = true, the task will be posted to the front of the queue (high priority)

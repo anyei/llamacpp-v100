@@ -116,6 +116,51 @@ void server_queue::wait_until_no_sleep() {
     }
 }
 
+void server_queue::ctx_guard_enter() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    for (;;) {
+        if (ctx_hold) {
+            condition_tasks.wait(lock, [&]{ return !ctx_hold; });
+            continue;
+        }
+        if (sleeping) {
+            if (!req_stop_sleeping) {
+                QUE_DBG("%s", "requesting to stop sleeping\n");
+                req_stop_sleeping = true;
+                condition_tasks.notify_all();
+            }
+            condition_tasks.wait(lock, [&]{ return !sleeping; });
+            continue; // re-check ctx_hold
+        }
+        break;
+    }
+    n_ctx_guards++;
+}
+
+void server_queue::ctx_guard_exit() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    n_ctx_guards--;
+    if (n_ctx_guards == 0) {
+        condition_tasks.notify_all(); // wake a pending ctx_hold_begin()
+    }
+}
+
+void server_queue::ctx_hold_begin(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    ctx_hold = true;
+    if (!condition_tasks.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                  [&]{ return n_ctx_guards == 0; })) {
+        QUE_WRN("%d request thread(s) still inside the pre-task window after %d ms - proceeding with teardown\n",
+                n_ctx_guards, timeout_ms);
+    }
+}
+
+void server_queue::ctx_hold_end() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    ctx_hold = false;
+    condition_tasks.notify_all();
+}
+
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     running = false;
@@ -174,8 +219,10 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // go back to process new tasks or terminate
             }
 
-            // no tasks, check for sleeping state
-            if (should_sleep()) {
+            // no tasks, check for sleeping state; never enter sleep while an
+            // HTTP thread is inside the pre-task window (it reads the model
+            // the sleeping callback is about to destroy)
+            if (should_sleep() && n_ctx_guards == 0) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
                 callback_sleeping_state(true);
@@ -358,6 +405,7 @@ void server_response_reader::post_task(server_task && task, bool front) {
     id_tasks.insert(task.id);
     states.push_back(task.create_state());
     queue_results.add_waiting_task_id(task.id);
+    ctx_guard_release(); // model reads done; the task owns its data from here
     queue_tasks.post(std::move(task), front);
 }
 
@@ -377,6 +425,7 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     }
     GGML_ASSERT(states.size() == id_tasks.size());
     queue_results.add_waiting_task_ids(id_tasks);
+    ctx_guard_release(); // model reads done; the tasks own their data from here
     queue_tasks.post(std::move(tasks), front);
 }
 
@@ -439,6 +488,7 @@ server_response_reader::batch_response server_response_reader::wait_for_all(cons
 }
 
 void server_response_reader::stop() {
+    ctx_guard_release(); // reader dying without posting (error path / no-task route)
     queue_results.remove_waiting_task_ids(id_tasks);
     if (has_next() && !cancelled) {
         // if tasks is not finished yet, cancel them

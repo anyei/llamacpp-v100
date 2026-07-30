@@ -1725,6 +1725,10 @@ private:
         }
 
         SRV_ERR("%s", "an RPC worker connection was lost - reloading in-process across the reachable workers (--rpc-reload)\n");
+        // block new pre-task work and drain HTTP threads out of the model
+        // (tokenize/template reads) before destroying it - they were
+        // use-after-free crashing (exit 139) when requests raced the reload
+        queue_tasks.ctx_hold_begin(15000);
         handle_sleeping_state(true); // destroy the model; buffers on live workers are freed remotely
 
         for (int attempt = 1;; attempt++) {
@@ -1821,6 +1825,7 @@ private:
             std::this_thread::sleep_for(std::chrono::seconds(10));
         }
         sleeping = false;
+        queue_tasks.ctx_hold_end();
         fleet.reload_active.store(false);
         SRV_INF("%s", "in-process reload complete - resuming serving\n");
     }
@@ -5031,10 +5036,14 @@ struct server_res_generator : server_res_spipe {
     server_response_reader rd;
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
-        // fast path in case sleeping is disabled
-        bypass_sleep |= sleep_idle_seconds < 0;
+        GGML_UNUSED(sleep_idle_seconds);
         if (!bypass_sleep) {
-            queue_tasks.wait_until_no_sleep();
+            // subsumes wait_until_no_sleep(): wakes idle-sleep AND holds off a
+            // concurrent --rpc-reload/sleep teardown for the pre-task window
+            // (the handler reads model/vocab until rd.post_tasks()). Needed
+            // even with idle-sleep disabled - the reload path was segfaulting
+            // HTTP threads mid-tokenize (use-after-free on the vocab).
+            rd.ctx_guard_acquire();
         }
     }
     void ok(const json & response_data) {

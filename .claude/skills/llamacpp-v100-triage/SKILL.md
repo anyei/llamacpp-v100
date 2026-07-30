@@ -12,7 +12,7 @@ description: Failure triage playbook for the llamacpp-v100 fleet - decode -3, re
 | `batched placement: N/N entries missed ... manifest went stale` repeating | model-layout churn LRU-evicted worker cache slices (#8/#72a) | it SELF-HEALS by streaming (watch worker RSS grow); expect +10-20 min. Only intervene if it also drops the connection |
 | `connection lost or worker crashed` during provisioning, but the worker container is `Up` | worker disk-thrash stalls (rpc-timing shows multi-second `SET_TENSOR_HASH` exec max) tripped the coordinator's socket timeout — worker did NOT crash | `docker rm -f` the serve, relaunch immediately — the failed pass warmed page caches; retry loads clean (proven 3×) |
 | tiny alloc refused at end of a long load (e.g. 121 KB on .15) | long-uptime worker RAM bloat on the memory-capped box | immediate retry; if recurrent, ask the user to restart .15's worker |
-| serve exits 139 during `--rpc-reload` recovery | FILED BUG: full-reload fallback segfaults after surgical cache-miss | never trust in-process reload after a worker drop — clean relaunch |
+| serve exits 139 during `--rpc-reload` recovery | FIXED 2026-07-29 (HTTP-thread vocab use-after-free during reload; pre-task ctx guard in server_queue). Pre-fix binaries still crash | on a pre-fix binary: clean relaunch; on current binaries the reload holds requests and completes |
 | decode `ret = -3` every request, serve "healthy" | graph references a failed endpoint (degraded load) OR an unsupported topology | check load log for an earlier endpoint failure; if topology: `n_local > n_owners` (non-owner second GPU) is a FILED CRASH on DSA — use owner groups instead |
 | server up but first request 500s once then works | warmup graph race — retry before diagnosing |
 

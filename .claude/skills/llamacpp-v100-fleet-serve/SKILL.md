@@ -81,8 +81,10 @@ first poll — treat empty status as "not yet", not death).
   bloat). The immediate RETRY loads clean (the failed attempt warmed the caches).
 - The serve exits on load failure; container shows `Exited` — `docker rm -f` and
   relaunch. With `--rpc-reload` a worker loss mid-serve triggers in-process
-  reload; a reload after cache-miss can SEGFAULT (exit 139, bug filed) — treat a
-  dead serve container as relaunch-from-scratch.
+  reload; the reload-window SEGFAULT (exit 139, HTTP threads tokenizing against
+  the destroyed model) is FIXED as of 2026-07-29 (pre-task ctx guard in
+  server_queue) — binaries built before that still crash; treat a dead serve
+  container as relaunch-from-scratch either way.
 
 ## Stopping and etiquette
 
