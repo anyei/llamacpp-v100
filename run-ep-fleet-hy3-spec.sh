@@ -60,6 +60,10 @@ fi
 if [[ "${UNION:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_UNION_STATS=1)
 fi
+# DBGR=1: GGML_META_DEBUG_REDUCE boundary-placement prints (rebuild-time only)
+if [[ "${DBGR:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e GGML_META_DEBUG_REDUCE=1)
+fi
 # LP=1: Layer-Parallel pair fusion (docs/lp-pair-fusion-plan.md) - LOSSY,
 # quality-gate measurement only until the ladder passes. LP_EDGE = sync edge.
 if [[ "${LP:-0}" == "1" ]]; then
