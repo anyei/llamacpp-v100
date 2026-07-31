@@ -991,7 +991,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
@@ -1085,6 +1085,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
+            // the previous block decoded its noise tokens at these very positions and left their K/V
+            // behind. injecting now would add a second cell at each position, and since the decoder
+            // runs non-causal both would be attended. drop the stale draft region first: the cache
+            // must hold exactly one injected target state per token, as in the reference.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1165,7 +1171,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // the previous block left its noise tokens' K/V in the draft region. the decoder runs
+            // non-causal, so those cells are not masked out by position and the new block would
+            // attend to them. only the injected target states (positions < n_past) may persist.
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n, -1);
+
+            int32_t n_draft = params.n_max;
+            if (dp.n_max > 0) {
+                n_draft = std::min(n_draft, dp.n_max);
+            }
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1202,16 +1216,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.conf_min) {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    const llama_token id = common_sampler_sample(smpl, ctx_dft, idx, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1221,8 +1235,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
-
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
@@ -1230,7 +1242,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
-                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                    const llama_token id = common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1239,8 +1251,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
-
-                    const llama_token id = cur_p->data[0].id;
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;

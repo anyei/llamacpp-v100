@@ -291,8 +291,9 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // one extra slot: index n_layer captures the output of the final layer
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -1477,7 +1478,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid < cparams.embeddings_layer_inp.size());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -2773,7 +2774,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_MINIMAX_M3) {
+        model.arch == LLM_ARCH_MINIMAX_M3 ||
+        model.arch == LLM_ARCH_DFLASH) { // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
