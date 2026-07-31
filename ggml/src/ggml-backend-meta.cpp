@@ -3799,7 +3799,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // reduce contribution, a graph output, an in-place write, or the end of
         // the piece. Local members are always delivered - they are the repair
         // sources, and member 0 anchors host reads (get_tensor MIRRORED).
-        if (bcast_fuse >= 2 && n_backends > 1 &&
+        // TASKS #84c: cross-piece consumer safety rests on the repair pass, and
+        // under heavy graph fragmentation (eval-callback sched splits: 1-2
+        // reduce boundaries per piece) that path measurably corrupts decode -
+        // loopback ladder 2026-07-31: FUSE=2 + splits diverges run-to-run
+        // (wire-format-independent) while FUSE=1 + splits is byte-exact
+        // (c80261ff 6/6). Until the exact repair hole is found, withhold
+        // deliveries only in monolithic-class pieces (>= 3 reduce boundaries -
+        // production decode graphs carry ~160); fragmented pieces fall back to
+        // FUSE=1 semantics (deliver everything), which is exact by measurement.
+        size_t n_reduce_sg = 0;
+        for (size_t g = 0; g < n_subgraphs; g++) {
+            n_reduce_sg += backend_ctx->backend_configs[0].cgraphs[g].reduce ? 1 : 0;
+        }
+        if (bcast_fuse >= 2 && n_reduce_sg >= 3 && n_backends > 1 &&
                 !backend_ctx->wire_member.empty() && !backend_ctx->wire_member[0]) {
             const auto & cfg0 = backend_ctx->backend_configs[0].cgraphs;
             std::vector<char> is_cell(cgraph->n_nodes, 0);
