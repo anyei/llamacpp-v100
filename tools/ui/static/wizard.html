@@ -325,6 +325,31 @@ async function loadData() {
       }
     }
   } catch(e) {}
+  await rescanFleet(); // TASKS #87: seed the accumulating worker registry
+}
+
+// TASKS #87: accumulating worker registry - each /wizard/hw discovery poll
+// catches only the beacons that answer inside its ~1.5s window, so the fleet
+// roster is the UNION across rescans, keyed by endpoint.
+const FLEET_WORKERS = {};
+async function rescanFleet() {
+  try {
+    const hr = await fetch("./wizard/hw");
+    if (!hr.ok) return false;
+    const h = await hr.json();
+    (h.discovered||[]).forEach(w => {
+      FLEET_WORKERS[w.endpoint] = Object.assign(FLEET_WORKERS[w.endpoint]||{}, w, {seen:Date.now()});
+    });
+    const list = Object.values(FLEET_WORKERS);
+    if (list.length) {
+      const gb = list.reduce((a,w)=>a+(w.free_mib||0),0)/1024;
+      HW.fleet = { workers:list.length, pooledGB:Math.round(gb), usableGB:Math.round(gb*0.92),
+                   endpoints:list.map(w=>w.endpoint),
+                   names:list.map(w=>w.endpoint+" "+Math.round((w.free_mib||0)/1024)+"G").join(" · "),
+                   list };
+    }
+    return true;
+  } catch(e) { return false; }
 }
 
 const kvEst = (m, ctx, kv) => (m.kvtok ? m.kvtok*ctx/1073741824
@@ -360,6 +385,45 @@ function specOptions(m, modeId) {
     sub:"train-free, no draft model - shines on repetitive/structured output",
     flags:`--spec-type ngram-simple\nGGML_CUDA_DISABLE_GRAPHS=1` });
   return opts;
+}
+
+// TASKS #87: fleet-builder - user-selected worker subset + capacity verdicts.
+// S.fleetSel = null means "all discovered"; otherwise an endpoint whitelist.
+const fleetList  = () => (HW.fleet.list && HW.fleet.list.length) ? HW.fleet.list
+  : (HW.fleet.endpoints||[]).map(e=>({endpoint:e, free_mib:(HW.fleet.pooledGB*1024)/(HW.fleet.workers||1)}));
+const selWorkers   = () => fleetList().filter(w => !S.fleetSel || S.fleetSel.includes(w.endpoint));
+const selUsableGB  = () => selWorkers().reduce((a,w)=>a+(w.free_mib||0),0)/1024*0.92;
+const selEndpoints = () => selWorkers().map(w=>w.endpoint);
+// manual device-weights (UI-only): per-device share -> the -ts ratio list, in
+// the device order the fleet flags use (local GPUs first, then RPC workers)
+const manualDevices = () => [
+  ...HW.gpus.map((g,i)=>({key:"CUDA"+i, name:"CUDA"+i+" · "+g.name, capGB:g.vram, gpu:true})),
+  ...selWorkers().map(w=>({key:w.endpoint, name:w.endpoint, capGB:(w.free_mib||0)/1024*0.92}))];
+function manualPcts() {
+  const devs = manualDevices();
+  const tot  = devs.reduce((a,d)=>a+d.capGB,0)||1;
+  return devs.map(d => ({...d, pct: S.fleetPct[d.key]!==undefined ? S.fleetPct[d.key] : Math.round(d.capGB/tot*100)}));
+}
+const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3; // the swept split assumes the 3-worker record roster
+const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct).join(",")
+  : (S.fleetW==="record" && recordTsOk(md) ? "-ts 21,21,46,50,27" : "--rpc-auto-weight");
+// capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
+// kinds: weights (hard), ctx (hard - weights+KV exceed), manual (hard)
+function fleetIssue(m, ctx, kv) {
+  const cap  = selUsableGB() + totalVram;
+  const kvGB = kvEst(m, ctx, kv) * S.np;
+  if (selWorkers().length===0)
+    return {kind:"weights", msg:"no workers selected - a valid fleet needs at least the workers that hold the model's weights"};
+  if (m.size > cap)
+    return {kind:"weights", msg:`selected fleet holds ${cap.toFixed(0)} GB usable - the ${m.size} GB weights do not fit. Select more workers.`};
+  if (m.size + kvGB > cap)
+    return {kind:"ctx", msg:`weights + KV at this context (~${(m.size+kvGB).toFixed(0)} GB) exceed the selected fleet's ${cap.toFixed(0)} GB - rebuild the fleet (add workers) or lower the context / quantize KV.`};
+  if (S.fleetW==="manual") {
+    const over = manualPcts().filter(d=>!d.gpu && d.pct/100*m.size > d.capGB);
+    if (over.length)
+      return {kind:"manual", msg:`manual split over-fills ${over.map(d=>d.key).join(", ")} (share exceeds free RAM) - lower those percentages.`};
+  }
+  return null;
 }
 
 function modesFor(m, ctx, kv) {
@@ -418,8 +482,6 @@ function modesFor(m, ctx, kv) {
   // attention/FFN op would sync over GbE - EP is tensor mode with only the
   // expert tier segmented, which is the viable form of it.
   if (HW.fleet.workers > 0 && m.size + kvMin <= caps.fleet) {
-    const rpcList = (HW.fleet.endpoints && HW.fleet.endpoints.length)
-      ? HW.fleet.endpoints.join(",") : "127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055";
     const margin = caps.fleet - m.size;
     const border = margin < 25 ? ` CAPACITY-BORDERLINE: ~${margin.toFixed(0)} GB headroom for KV + overheads - keep context modest.` : "";
     if (m.moe) {
@@ -430,13 +492,13 @@ function modesFor(m, ctx, kv) {
             (epMeas ? " Gates preset: boundary fusion, q8 wire, decode-only expert deferral."
                     : " UNSWEPT for this model - run layer split first to collect its expert profile (a profiled first EP layout beats uniform)."),
         hasRecordTs: !!MEASURED[m.file+"|fleet-ep|none"],
-        flags:`--rpc ${rpcList} --rpc-reload\n-sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
+        flags:`--rpc {RPC} --rpc-reload\n-sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
     }
     push({ id:"fleetl", name:"Distributed fleet · layer split",
       speed:s2=>meas("fleet-layer",s2)||"~1.5–2.5", est:s2=>!meas("fleet-layer",s2),
       why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture.${border}`+
           (m.moe ? ` Also the PROFILING vehicle: add LLAMA_EXPERT_PROFILE to collect router histograms for a first ${m.file.split("-")[0]} EP layout.` : ""),
-      flags:`--rpc ${rpcList} --rpc-reload\n-sm layer --rpc-auto-weight -ngl 99 -c {CTX} --no-mmap -fit off`+
+      flags:`--rpc {RPC} --rpc-reload\n-sm layer {TS} -ngl 99 -c {CTX} --no-mmap -fit off`+
             (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
     out.blocked.push({ name:"Distributed · full tensor split",
       why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
@@ -602,7 +664,7 @@ function gatesHTML(seeded){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", adv:{cachereuse:true}, gateOn:{}, gateOff:{}, gateQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, adv:{cachereuse:true}, gateOn:{}, gateOff:{}, gateQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -791,6 +853,7 @@ function render() {
           `<button data-pctx="${c}" class="${S.ctx===c?"on":""} ${c>nctx2?"yarn":""}">${fmtCtx(c)}</button>`).join("")}</div>
       </div>` + ranked.map((md,i)=>{
       const sel = S.mode.id===md.id;
+      const m = S.model; // used by the #87 fleet-builder blocks below
       const opts = specOptions(S.model, md.id);
       const curSpec = sel ? S.spec : "none";
       const spd = md.speed(curSpec), est = md.est(curSpec);
@@ -802,11 +865,32 @@ function render() {
           <span class="speed"><b>${spd}</b> t/s ${est?'<span class="est">est.</span>':"measured"}</span>
         </div>
         <div class="why">${md.why}</div>
-        ${md.id==="fleet"?`<div class="spec"><div class="lbl">Device weights</div>
-          ${md.hasRecordTs?`<label><input type="radio" name="fw-${md.id}" value="record" ${S.fleetW==="record"?"checked":""} ${sel?"":"disabled"}>
+        ${(md.id==="fleet"||md.id==="fleetl")?`<div class="spec"><div class="lbl">Device weights</div>
+          ${md.id==="fleet"&&recordTsOk(md)?`<label><input type="radio" name="fw-${md.id}" value="record" ${S.fleetW==="record"?"checked":""} ${sel?"":"disabled"}>
             measured record split <span class="gain">-ts 21,21,46,50,27 · swept</span></label>`:""}
-          <label><input type="radio" name="fw-${md.id}" value="auto" ${S.fleetW==="auto"||!md.hasRecordTs?"checked":""} ${sel?"":"disabled"}>
+          <label><input type="radio" name="fw-${md.id}" value="auto" ${S.fleetW==="auto"||(S.fleetW==="record"&&!(md.id==="fleet"&&recordTsOk(md)))?"checked":""} ${sel?"":"disabled"}>
             auto-weight <span class="estg">· scored worker benchmarks fill -ts (--rpc-auto-weight)</span></label>
+          <label><input type="radio" name="fw-${md.id}" value="manual" ${S.fleetW==="manual"?"checked":""} ${sel?"":"disabled"}>
+            manual <span class="estg">· you assign each device's share (becomes the -ts ratio list)</span></label>
+          ${sel&&S.fleetW==="manual"?manualPcts().map(d=>{
+            const gb=(d.pct/100*m.size), over=!d.gpu&&gb>d.capGB;
+            return `<label class="mrow" style="padding-left:22px"><input type="number" data-mpct="${d.key}" value="${d.pct}" min="0" max="100"
+              style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+              <span class="estg">% · ${d.name} · ≈${gb.toFixed(0)} GB of ${d.capGB.toFixed(0)} GB usable</span>
+              ${over?'<span class="tag t-bad">over capacity</span>':""}</label>`;}).join("")+
+            `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100</span></div>`:""}
+        </div>
+        <div class="spec"><div class="lbl">Fleet workers</div>
+          ${fleetList().map(w=>{const on=!S.fleetSel||S.fleetSel.includes(w.endpoint); const gb=Math.round((w.free_mib||0)/1024);
+            return `<label><input type="checkbox" data-fwsel="${w.endpoint}" ${on?"checked":""} ${sel?"":"disabled"}>
+              <span style="font-family:var(--mono);font-size:12px">${w.endpoint}</span>
+              <span class="estg">· ${gb} GB free${w.proto_version?` · proto ${w.proto_version}`:""}${w.score?` · score ${Math.round(w.score)}`:""}</span></label>`;}).join("")}
+          <label><button class="btn ghost" data-rescan style="padding:3px 10px;font-size:12px">↻ rescan</button>
+            <span class="estg">beacons answer in ~1.5s windows - rescans accumulate the roster</span></label>
+          ${(()=>{ if(!sel) return "";
+            const iss=fleetIssue(m,S.ctx,S.kv), cap=(selUsableGB()+totalVram).toFixed(0), kvGB=kvEst(m,S.ctx,S.kv)*S.np;
+            return `<div class="memnote"><span>selected ${selWorkers().length}/${fleetList().length} workers · ${cap} GB usable (incl. ${totalVram} GB VRAM) vs weights ${m.size} GB + KV ~${kvGB.toFixed(0)} GB @ ${fmtCtx(S.ctx)}</span></div>`+
+              (iss?`<div style="margin-top:4px"><span class="tag ${iss.kind==="ctx"?"t-warn":"t-bad"}">${iss.msg}</span></div>`:"");})()}
         </div>`:""}
         ${md.ssdGpuOpt?`<div class="spec"><div class="lbl">Expert landing</div>
           <label><input type="checkbox" data-ssdgpu="1" ${sel&&S.ssdGpu?"checked":""} ${sel?"":"disabled"}>
@@ -820,7 +904,7 @@ function render() {
                ${o.name} ${o.gain?`<span class="gain">${o.gain}</span>`:o.est?'<span class="estg">est. gain — sweep it</span>':""}
                ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>`).join("")}
         </div>`:""}
-        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",S.fleetW==="record"&&md.hasRecordTs?"-ts 21,21,46,50,27":"--rpc-auto-weight")}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053")}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
       </div>`;}).join("") +
       `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
       `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
@@ -841,7 +925,22 @@ function render() {
     v.querySelectorAll("[data-pctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.pctx; render(); });
     v.querySelectorAll("[data-ssdgpu]").forEach(cb=>cb.onchange=e=>{ S.ssdGpu=e.target.checked; render(); });
     v.querySelectorAll("[name^=fw-]").forEach(r=>r.onchange=e=>{ S.fleetW=e.target.value; render(); });
-    v.querySelectorAll(".spec input[type=radio]:not([disabled])").forEach(r=>r.onchange=e=>{ S.spec=e.target.value; render(); });
+    // TASKS #87: worker selection, rescan, manual shares
+    v.querySelectorAll("[data-fwsel]").forEach(cb=>cb.onchange=()=>{
+      const ep=cb.dataset.fwsel;
+      let cur = S.fleetSel ? S.fleetSel.slice() : fleetList().map(w=>w.endpoint);
+      cur = cb.checked ? [...new Set([...cur,ep])] : cur.filter(x=>x!==ep);
+      S.fleetSel = cur; render();
+    });
+    v.querySelectorAll("[data-rescan]").forEach(b=>b.onclick=async e=>{
+      e.preventDefault(); b.textContent="scanning…"; await rescanFleet(); render();
+    });
+    v.querySelectorAll("[data-mpct]").forEach(inp=>inp.onchange=()=>{
+      S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); render();
+    });
+    // NOT the fw- (device-weights) radios: they carry fleetW values, and this
+    // generic handler would overwrite their onchange and crash the spec lookup
+    v.querySelectorAll(".spec input[type=radio][name^=spec-]:not([disabled])").forEach(r=>r.onchange=e=>{ S.spec=e.target.value; render(); });
     $("next2").onclick=()=>{ S.step=3; render(); };
     bindCrumb();
   }
@@ -850,8 +949,10 @@ function render() {
     const m=S.model, md=S.mode;
     const opts = specOptions(m, md.id);
     const kvGB = kvEst(m, S.ctx, S.kv) * S.np;
-    const capGB = md.id==="fleet"||md.id==="fleetl" ? HW.fleet.usableGB+totalVram : md.id==="cpu" ? HW.ram
+    const isFleet = md.id==="fleet"||md.id==="fleetl";
+    const capGB = isFleet ? selUsableGB()+totalVram : md.id==="cpu" ? HW.ram
                  : md.id==="ncmoe"||md.id==="ssd" ? totalVram+HW.ram : md.id==="gpu1" ? HW.gpus[0].vram : totalVram;
+    const fIssue = isFleet ? fleetIssue(m, S.ctx, S.kv) : null; // TASKS #87 launch gate
     const usedPct = Math.min(100, m.size/capGB*100), kvPct = Math.min(100-usedPct, kvGB/capGB*100);
     const spec = opts.find(o=>o.id===S.spec);
     const kvFlags = S.kv==="f16" ? "" : `\n-ctk ${S.kv} -ctv ${S.kv} -fa on`;
@@ -869,7 +970,8 @@ function render() {
     const advGroups = advOptions(m, md, S.spec);
     const advFlags = advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).map(it=>"\n"+it.flags).join("");
     const tmpl = md.flags.replace("{CTX}", S.ctx)
-                         .replace("{TS}", S.fleetW==="record"&&md.hasRecordTs ? "-ts 21,21,46,50,27" : "--rpc-auto-weight")
+                         .replace("{TS}", tsForFleet(md))
+                         .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
                  + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+spec.flags : "") + advFlags;
     const ga = applyGates(tmpl);
     const flags = ga.text, seeded = ga.seeded;
@@ -913,8 +1015,11 @@ function render() {
         </div>`).join("")}
         ${gatesHTML(seeded)}
       </details>
+      ${fIssue?`<div class="panel" style="border-color:${fIssue.kind==="ctx"?"var(--warn,#b58900)":"var(--bad,#dc322f)"}">
+        <span class="tag ${fIssue.kind==="ctx"?"t-warn":"t-bad"}">fleet capacity</span>
+        <span class="note" style="margin-left:6px">${fIssue.msg}${fIssue.kind==="ctx"?" Go back to step 2 to rebuild the fleet.":""}</span></div>`:""}
       <div class="actions">
-        <button class="btn" id="go" ${S.launched?"disabled":""}>${S.launched?"Launching":"Launch"}</button>
+        <button class="btn" id="go" ${S.launched||fIssue?"disabled":""} ${fIssue?`title="blocked: ${fIssue.kind} - fix the fleet selection first"`:""}>${S.launched?"Launching":"Launch"}</button>
         <button class="btn ghost" id="copy">Copy flags &amp; env</button>
       </div>
       <div class="lbanner ${S._lst?S._lst.kind:""}" id="lst">${S._lst?S._lst.html:""}</div>`;
@@ -947,7 +1052,7 @@ function render() {
       else S.gateOn[name]=val;
       render();
     });
-    $("go").onclick=()=>{ S.launched=1; render(); realLaunch(flags); };
+    $("go").onclick=()=>{ if (fIssue) return; S.launched=1; render(); realLaunch(flags); };
     $("copy").onclick=async e=>{
       const btn=e.target;
       try { await navigator.clipboard.writeText(flags); }
