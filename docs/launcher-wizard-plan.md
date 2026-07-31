@@ -157,10 +157,31 @@ Landed beyond the original increments:
   beacons; Copy button actually copies; <meta charset>; details drawers
   survive re-render; trunc vehicles annotated.
 
-Later same day: "Running now" panel on the model step (loaded/loading models
-with status chip, open-chat link, Unload/Stop button posting /models/unload
-with an async-shutdown poll; live rows tinted in the list); gates catalog
-v100/upstream badges (from the doc's *(upstream)* markers).
+Later same day (through 078c4b733, all rolled to the live launcher):
+
+- "Running now" panel on the model step: loaded/loading models with status
+  chip, open-chat link, Unload/Stop button (posts /models/unload, polls out
+  the async child shutdown); running rows tinted in the list.
+- LAUNCH REPLACES RUNNING: realLaunch stops every router-managed model first
+  (including a running copy of the picked model, so re-launching applies new
+  flags) and waits for the children to exit before loading - VRAM/RAM is
+  actually free when the new child allocates. Fleet serves live outside the
+  router and are never touched.
+- Launcher compose defaults to --no-models-autoload (user directive): naming
+  an unloaded model in a chat/OpenAI request returns 400 instead of starting
+  a surprise multi-minute load next to a production serve. Re-enable with
+  MODELS_AUTOLOAD_FLAG=--models-autoload.
+- Gates catalog v100/upstream badges (from the doc's *(upstream)* markers) +
+  visual pass (card categories, active pills, row tinting).
+- dflash speculation offered on the ncmoe mode (+-ngld 99): small dense
+  drafts fit VRAM while the target's experts sit in RAM - unblocks
+  Laguna-S-2.1 (68.4GB) with its converted arch=dflash drafter. NOTE:
+  laguna-family drafting on the (Qwen-class) dflash graph is not yet
+  live-tested - first launch is the gate.
+- Fleet fit badges carry a tooltip: capacity = currently-FREE beacon RAM
+  x0.92 + local VRAM (it shrinks while serves run - a 246.7GB MiniMaxM3
+  reads "exceeds fleet" against a busy fleet's ~165GB and that is honest).
+- Hardware chip reads detected/custom/assumed instead of always "assumed".
 
 Remaining polish (none blocking):
 
