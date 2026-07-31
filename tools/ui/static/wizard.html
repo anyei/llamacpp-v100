@@ -874,11 +874,12 @@ function render() {
             manual <span class="estg">· you assign each device's share (becomes the -ts ratio list)</span></label>
           ${sel&&S.fleetW==="manual"?manualPcts().map(d=>{
             const gb=(d.pct/100*m.size), over=!d.gpu&&gb>d.capGB;
+            const lay=md.id==="fleetl"&&m.layers?Math.round(d.pct/100*m.layers):null;
             return `<label class="mrow" style="padding-left:22px"><input type="number" data-mpct="${d.key}" value="${d.pct}" min="0" max="100"
               style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
-              <span class="estg">% · ${d.name} · ≈${gb.toFixed(0)} GB of ${d.capGB.toFixed(0)} GB usable</span>
+              <span class="estg">% · ${d.name} · ${lay!==null?`~${lay} of ${m.layers} layers · `:""}≈${gb.toFixed(0)} GB of ${d.capGB.toFixed(0)} GB usable</span>
               ${over?'<span class="tag t-bad">over capacity</span>':""}</label>`;}).join("")+
-            `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100</span></div>`:""}
+            `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100${md.id==="fleetl"?"; -sm layer assigns whole layers by these ratios":""}</span></div>`:""}
         </div>
         <div class="spec"><div class="lbl">Fleet workers</div>
           ${fleetList().map(w=>{const on=!S.fleetSel||S.fleetSel.includes(w.endpoint); const gb=Math.round((w.free_mib||0)/1024);
