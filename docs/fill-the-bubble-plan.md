@@ -655,6 +655,16 @@ from an offline per-position profiler dump on a single-box V4 -ncmoe prefill.
 Bonus from the discriminator serve: post-merge fleet-spec regate GREEN
 (coherent, 4.01-4.90 t/s cold, acceptance 83-93%).
 
+**V4 production curve (2026-07-31, offline per-position route -
+LLAMA_EXPERT_PROFILE_IDS + scripts/union-curve-from-ids.py, single-box
+IQ2XXS -ncmoe wikitext, PPL 4.08 sane): w2 1.62x / w4 2.65x / w8 4.35x
+(0.54x linear); per-layer w8 spread 3.28-7.09x, deep layers reuse hardest.
+V4 routes top-6/256 (w1 = 6.00). Proxy reads ~8% high vs direct verify
+lanes (stub calibration). The 2.65 sits BELOW the hy3-priced 2.8
+break-even: spec/block economics on V4 flip to plausible - price via the
+#80 DSpark A/B; #85's catch-up ingest pays ~half linear at w8; deep-layer
+reuse is the EcoSpec/layer-budgeting headroom (#84 probes 2-3).**
+
 ## 3. Probe ladder (each gated before the next)
 
 1. Merge expert-placement -> parallel-inference; CPU loopback byte gate:

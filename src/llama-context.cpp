@@ -86,6 +86,16 @@ struct llama_expert_profile {
         fclose(f);
         rename(tmp.c_str(), path.c_str());
     }
+
+    // TASKS #84: optional per-position routed-ids dump (binary int32 records:
+    // il, k, n_tok, ids[k*n_tok] lane-major) for offline union analysis
+    FILE * ids_f = nullptr;
+
+    ~llama_expert_profile() {
+        if (ids_f != nullptr) {
+            fclose(ids_f);
+        }
+    }
 };
 
 // TASKS #71 inc-0 (GGML_META_ZL_STATS): capture each layer's routed ids at
@@ -160,10 +170,23 @@ static bool llama_expert_profile_cb(struct ggml_tensor * t, bool ask, void * use
     }
     auto * prof = (llama_expert_profile *) user_data;
     const int il = atoi(t->name + prefix_len);
-    const int64_t n_ids = ggml_nelements(t);
-    std::vector<int32_t> ids(n_ids);
-    ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
-    prof->accumulate(il, ids.data(), n_ids, t->ne[1]);
+    const int64_t k     = t->ne[0];
+    const int64_t n_tok = t->ne[1];
+    std::vector<int32_t> ids(k*n_tok);
+    // ffn_moe_topk is a top-k VIEW over the argsort ([n_expert, n_tok] base):
+    // lanes are nb[1]-strided, so a linear read returns argsort-permutation
+    // bytes for n_tok > 1 (the #84 poison signature). Read lane by lane.
+    for (int64_t j = 0; j < n_tok; j++) {
+        ggml_backend_tensor_get(t, ids.data() + j*k, (size_t) j*t->nb[1], k*sizeof(int32_t));
+    }
+    prof->accumulate(il, ids.data(), k*n_tok, n_tok);
+    // TASKS #84: per-position dump for the offline union curve
+    if (prof->ids_f != nullptr) {
+        std::lock_guard<std::mutex> lock(prof->mtx);
+        const int32_t hdr[3] = { (int32_t) il, (int32_t) k, (int32_t) n_tok };
+        fwrite(hdr, sizeof(int32_t), 3, prof->ids_f);
+        fwrite(ids.data(), sizeof(int32_t), ids.size(), prof->ids_f);
+    }
     return true;
 }
 
@@ -303,6 +326,17 @@ llama_context::llama_context(
             cparams.cb_eval_user_data = expert_profile.get();
             LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE: recording per-layer expert selections to '%s'\n",
                            __func__, prof_path);
+            // TASKS #84: optional per-position ids dump alongside the counts
+            const char * ids_path = getenv("LLAMA_EXPERT_PROFILE_IDS");
+            if (ids_path != nullptr && ids_path[0] != '\0') {
+                expert_profile->ids_f = fopen(ids_path, "wb");
+                if (expert_profile->ids_f != nullptr) {
+                    LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE_IDS: dumping per-position routed ids to '%s'\n",
+                                   __func__, ids_path);
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PROFILE_IDS: cannot open '%s'\n", __func__, ids_path);
+                }
+            }
         } else if ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
                    (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0)) {
             // TASKS #71 inc-0 / #84: routed-id capture for the meta zero-leg
