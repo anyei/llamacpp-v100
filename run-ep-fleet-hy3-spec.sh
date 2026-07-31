@@ -55,6 +55,11 @@ fi
 if [[ "${STATS:-0}" == "1" ]]; then
     SPEC_ENV+=(-e GGML_META_BOUNDARY_STATS=1)
 fi
+# UNION=1: GGML_META_UNION_STATS expert-union width curve (#84). Installs the
+# routed-id eval callback -> MEASUREMENT ONLY, never a baseline or user serve.
+if [[ "${UNION:-0}" == "1" ]]; then
+    SPEC_ENV+=(-e GGML_META_UNION_STATS=1)
+fi
 # LP=1: Layer-Parallel pair fusion (docs/lp-pair-fusion-plan.md) - LOSSY,
 # quality-gate measurement only until the ladder passes. LP_EDGE = sync edge.
 if [[ "${LP:-0}" == "1" ]]; then

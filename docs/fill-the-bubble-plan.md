@@ -642,6 +642,19 @@ with entry conditions: SBD/Fast-dLLM-v2 (~1B-token finetune, 3-5x fewer
 passes at parity), OEA (2511.02237) batch-aware re-routing as a union
 compressor, judge/relaxed acceptance (ICLR'25) as a zero-read stack-on.
 
+**2026-07-31 MEASURED (probe 1 = the union counter, GGML_META_UNION_STATS,
+c4c0c94b6):** loopback stub verify union multiplier **w4 = 3.06-3.14x** vs
+the w1 floor of 8.00 (w2 1.8-1.9, w3 2.3-2.75, 7-tok prefill 5.1-5.3 vs 7).
+Break-even was f(3) <= 2.8: **measured ~3.1 closes the stage-1 arithmetic -
+ratio ~1.0 is the predicted outcome, no hidden second cost, and Revision 1's
+overlap hope does not rescue spec at 8-of-256 sparsity.** The fleet number is
+pending an instrument redesign: the routed-id eval callback CORRUPTS
+meta-fleet serve quality on fused AND plain stacks (2x reproduced,
+discriminated; full detail TASKS #84c) - the record-roster curve will come
+from an offline per-position profiler dump on a single-box V4 -ncmoe prefill.
+Bonus from the discriminator serve: post-merge fleet-spec regate GREEN
+(coherent, 4.01-4.90 t/s cold, acceptance 83-93%).
+
 ## 3. Probe ladder (each gated before the next)
 
 1. Merge expert-placement -> parallel-inference; CPU loopback byte gate:

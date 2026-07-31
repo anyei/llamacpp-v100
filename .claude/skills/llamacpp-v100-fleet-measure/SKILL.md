@@ -48,7 +48,12 @@ HTTP 200 + plausible t/s is NOT correctness. READ the output:
 - `META_BOUNDARY_STATS` — star/bcast1 counts (boundary structure), gather/deliver
   bytes. Prints every 128 graphs; an 8-chunk PPL run never prints it.
 - Never baseline with `GGML_META_TIMING` (serializes) or `GGML_META_ZL_STATS` /
-  `LLAMA_EXPERT_PROFILE` (eval callbacks force sched splits; ~-1.5 t/s).
+  `GGML_META_UNION_STATS` / `LLAMA_EXPERT_PROFILE` (eval callbacks force sched
+  splits; ~-1.5 t/s). **WORSE (2026-07-31, #84c): eval-callback instruments
+  CORRUPT meta-fleet serve QUALITY outright (repetition spiral, on fused AND
+  plain stacks) — loopback only; any fleet number produced under one is
+  untrusted, and the loopback stub cannot reveal the damage (it babbles by
+  design).**
 
 ## -np 2 aggregate measurement
 
