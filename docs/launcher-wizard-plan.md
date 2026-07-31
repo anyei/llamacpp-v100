@@ -183,10 +183,43 @@ Later same day (through 078c4b733, all rolled to the live launcher):
   reads "exceeds fleet" against a busy fleet's ~165GB and that is honest).
 - Hardware chip reads detected/custom/assumed instead of always "assumed".
 
+## 7. Launch-visibility suite + fleet proxy + mobile (2026-07-30 night,
+## dc22b7dbe..77526d6bc, all rolled)
+
+- Wizard launch states became a real banner (spinner, stage, elapsed timer;
+  sticky across re-renders): stopping -> launching -> loading -> ready link /
+  failure card. On failure it shows the CHILD'S LAST OUTPUT LINES.
+- Server: the router keeps a rolling 12-line tail of each child's output and
+  emits `error_tail` in /models status + the SSE feed when the exit code is
+  non-zero (server-models.{h,cpp}; note the positional server_model_meta
+  initializers gained an /* error_tail */ slot - a merge hotspot).
+- Webui (svelte): ChatScreenModelLoading renders a prominent loading banner
+  (router SSE status + load-progress %) and a dismissible failure card with
+  the error tail + a relaunch-in-wizard link; ChatScreenGreeting shows a
+  "No model is loaded -> Open the launch wizard" empty state in router mode;
+  the sidebar gained a rocket "Launch wizard" item (externalHref field on
+  DesktopIconStripItem escapes the hash router); store merges
+  failed/exit_code/error_tail onto the model row.
+- FLEET VISIBILITY: in router mode /fleet/status and /fleet/worker/log now
+  PROXY to the active child (a loading child wins, else most recently used
+  running) - so the Fleet dashboard and loading.html (the per-worker
+  cached/streamed bars from #56) are live during wizard fleet loads. The
+  loading banners link the detailed view. Empty shape
+  `{"model":null,"devices":[]}` when nothing runs.
+- Mobile: viewport meta (the page was rendering desktop-width on phones),
+  wrap rules for model rows/actions/gate rows, 16px inputs (stops iOS
+  focus-zoom), touch-size buttons; 0 horizontal overflow at 390px on all
+  three steps.
+- Gate evidence: headless-chromium runs against a real router for every
+  piece - forced bad-flag load shows the exact error line on both surfaces;
+  loading banner appears and clears across a real load; fleet proxy verified
+  across the load lifecycle; wizard menu item navigates.
+
 Remaining polish (none blocking):
 
-- wizard link from the main webui; fleet-mode launches now launch through the
-  router like any mode (flags parse-validated) but a real fleet launch from
-  the wizard is still unproven live.
+- a real fleet launch from the wizard is still unproven live (flags
+  parse-validated; the visibility stack for it is now in place).
 - fold #73 (score staleness) + #68 (auto-weight iGPU trust) into the fleet
   card data path.
+- #83: laguna DFlash drafter (gated attention + enc.aux_norm) - filed with
+  tensor-level diagnosis; wizard's ncmoe+dflash mode is wired and waiting.
