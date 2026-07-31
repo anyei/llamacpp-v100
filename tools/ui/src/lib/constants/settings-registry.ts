@@ -198,7 +198,8 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.SHOW_MESSAGE_STATS,
 				label: 'Show message generation statistics',
 				help: 'Display generation statistics (tokens/second, token count, duration) below each assistant message.',
-				defaultValue: false,
+				// default ON for this fork: serving performance is the whole point here
+				defaultValue: true,
 				type: SettingsFieldType.CHECKBOX,
 				section: SETTINGS_SECTION_SLUGS.DISPLAY
 			},
