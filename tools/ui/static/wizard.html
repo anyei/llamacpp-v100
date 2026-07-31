@@ -173,7 +173,22 @@
   .btn[disabled] { opacity:0.6; cursor:default; }
   .btn.ghost { background:none; color:var(--muted); font-weight:500; border:1px solid var(--border); }
   .actions { display:flex; gap:10px; align-items:center; margin-top:4px; }
-  .launchstate { font-family:var(--mono); font-size:12px; margin-left:4px; }
+  .lbanner { display:flex; align-items:center; gap:11px; font-size:13.5px; border-radius:8px;
+             padding:13px 16px; margin-top:12px; border:1px solid var(--border); }
+  .lbanner:empty { display:none; }
+  .lbanner b { font-family:var(--mono); font-size:12.5px; }
+  .lbanner .dim { color:var(--muted); font-size:12px; margin-left:auto; font-variant-numeric:tabular-nums; }
+  .lbanner.busy { background:var(--accent-bg); border-color:var(--accent); }
+  .lbanner.ok { background:var(--ok-bg); border-color:var(--ok); }
+  .lbanner.bad { background:var(--bad-bg); border-color:var(--bad); }
+  .spin { width:15px; height:15px; border:2.5px solid var(--accent); border-top-color:transparent;
+          border-radius:50%; animation:spin 0.8s linear infinite; flex:none; }
+  .lbanner { flex-wrap:wrap; }
+  .etail { flex-basis:100%; font-family:var(--mono); font-size:11px; line-height:1.6; color:var(--fg);
+           background:var(--inset); border-radius:6px; padding:8px 10px; margin-top:8px;
+           overflow-x:auto; white-space:pre; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none; opacity:0.5; } }
 
   .foot { margin-top:28px; border-top:1px solid var(--border); padding-top:12px; color:var(--muted); font-size:11.5px; }
   .foot .cmd { margin-top:8px; }
@@ -877,8 +892,8 @@ function render() {
       <div class="actions">
         <button class="btn" id="go" ${S.launched?"disabled":""}>${S.launched?"Launching":"Launch"}</button>
         <button class="btn ghost" id="copy">Copy flags &amp; env</button>
-        <span class="launchstate" id="lst"></span>
-      </div>`;
+      </div>
+      <div class="lbanner ${S._lst?S._lst.kind:""}" id="lst">${S._lst?S._lst.html:""}</div>`;
     v.querySelectorAll("[data-ctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.ctx; render(); });
     v.querySelectorAll("[data-np]").forEach(b=>b.onclick=()=>{ S.np=+b.dataset.np; render(); });
     v.querySelectorAll("[data-adv]").forEach(cb=>cb.onchange=e=>{ S.adv[cb.dataset.adv]=e.target.checked; render(); });
@@ -922,7 +937,7 @@ function render() {
   }
   restoreD();
 }
-function bindCrumb(){ document.querySelectorAll(".crumb button").forEach(b=>b.onclick=()=>{ S.step=+b.dataset.go; S.launched=0; render(); }); }
+function bindCrumb(){ document.querySelectorAll(".crumb button").forEach(b=>b.onclick=()=>{ S.step=+b.dataset.go; S.launched=0; S._lst=null; if (launchPoll) { clearTimeout(launchPoll); launchPoll=null; } render(); }); }
 let launchPoll=null;
 function splitFlags(text){
   // KEY=VALUE tokens are env; everything else argv; comments stripped
@@ -936,8 +951,17 @@ function splitFlags(text){
   }
   return {args, env};
 }
+let launchT0 = 0;
+function lstate(kind, html){
+  // sticky: survives re-renders (step 3 re-emits it from S._lst)
+  S._lst = kind ? { kind, html } : null;
+  const el = $("lst");
+  if (el) { el.className = "lbanner " + (kind||""); el.innerHTML = html||""; }
+}
+const lElapsed = () => launchT0 ? `<span class="dim">${Math.round((Date.now()-launchT0)/1000)}s</span>` : "";
 async function realLaunch(flagsText){
   const {args, env} = splitFlags(flagsText);
+  launchT0 = Date.now();
   // one model owns the box: stop every router-managed model first (including a
   // running copy of the picked one - relaunching applies the new flags) so the
   // VRAM/RAM is actually free before the new child allocates. Fleet serves and
@@ -947,7 +971,7 @@ async function realLaunch(flagsText){
     const isRun = x => ["loading","loaded","downloading"].includes(x.status.value);
     const running = (j0.data||[]).filter(isRun);
     for (const m of running) {
-      if ($("lst")) $("lst").textContent = "stopping " + m.id + "…";
+      lstate("busy", `<span class="spin"></span> Stopping <b>${m.id}</b> — freeing its memory first ${lElapsed()}`);
       await fetch("./models/unload", { method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({model: m.id}) });
     }
@@ -957,22 +981,26 @@ async function realLaunch(flagsText){
       if (!(jj.data||[]).some(isRun)) break;
     }
   } catch(_) {}
-  if ($("lst")) $("lst").textContent = "requesting launch...";
+  lstate("busy", `<span class="spin"></span> Launching <b>${S.model.id}</b>… ${lElapsed()}`);
   try {
     const r = await fetch("./models/load", { method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ model: S.model.id, extra_args: args, extra_env: env }) });
     const j = await r.json();
-    if (!r.ok || j.error) { if ($("lst")) $("lst").textContent = "launch failed: " + (j.error && j.error.message || r.status); S.launched=0; return; }
-  } catch(e) { if ($("lst")) $("lst").textContent = "launch failed: " + e; S.launched=0; return; }
+    if (!r.ok || j.error) { lstate("bad", `Launch failed: ${j.error && j.error.message || r.status}`); S.launched=0; render(); return; }
+  } catch(e) { lstate("bad", `Launch failed: ${e}`); S.launched=0; render(); return; }
   const poll = async () => {
     try {
       const r = await fetch("./models"); const j = await r.json();
       const me = (j.data||[]).find(x=>x.id===S.model.id);
       const st = me ? me.status.value : "?";
-      if (!$("lst")) return;
-      if (st === "loaded") { $("lst").innerHTML = 'ready — <a href="./">open chat</a>'; return; }
-      if (me && me.status.failed) { $("lst").textContent = "load failed (exit " + me.status.exit_code + ") - check router logs"; S.launched=0; return; }
-      $("lst").textContent = "status: " + st;
+      if (st === "loaded") { S.launched=0; render(); lstate("ok", `<b>${S.model.id}</b> is ready — <a href="./">open the chat</a>`); return; }
+      if (me && me.status.failed) {
+        const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;");
+        const tail = (me.status.error_tail||[]).slice(-5).map(esc).join("<br>");
+        lstate("bad", `Load failed (exit ${me.status.exit_code})${tail?` — the child's last output:<div class="etail">${tail}</div>`:" — check the router logs"}`);
+        S.launched=0; render(); return;
+      }
+      lstate("busy", `<span class="spin"></span> Loading <b>${S.model.id}</b> — ${st}… weights are streaming in, big models take minutes ${lElapsed()}`);
       launchPoll = setTimeout(poll, 2000);
     } catch(e) { launchPoll = setTimeout(poll, 4000); }
   };

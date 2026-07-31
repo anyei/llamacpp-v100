@@ -1,4 +1,4 @@
-import { Network, Search, Settings, SquarePen } from '@lucide/svelte';
+import { Network, Rocket, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -16,6 +16,8 @@ export interface DesktopIconStripItem {
 	icon: Component;
 	tooltip: string;
 	route?: string;
+	/** full-page navigation target outside the SvelteKit hash router (e.g. wizard.html) */
+	externalHref?: string;
 	activeRouteId?: string;
 	activeRoutePrefix?: string;
 	activeUrlIncludes?: string;
@@ -36,6 +38,11 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'Fleet',
 		route: ROUTES.FLEET,
 		activeRouteId: '/fleet'
+	},
+	{
+		icon: Rocket,
+		tooltip: 'Launch wizard',
+		externalHref: './wizard.html'
 	},
 	{
 		icon: Settings,

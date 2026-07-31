@@ -6,7 +6,8 @@
 		ChatScreenDragOverlay,
 		ChatScreenStreamResumeStatus,
 		ServerLoadingSplash,
-		ChatScreenServerError
+		ChatScreenServerError,
+		ChatScreenModelLoading
 	} from '$lib/components/app';
 	import { createAutoScrollController } from '$lib/hooks/use-auto-scroll.svelte';
 	import { useChatScreenActiveModel } from '$lib/hooks/use-chat-screen-active-model.svelte';
@@ -301,6 +302,8 @@
 			style:padding-top={!isEmpty ? 'var(--chat-form-padding-top)' : undefined}
 		>
 			<ChatScreenGreeting {isEmpty} />
+
+			<ChatScreenModelLoading />
 
 			<ChatScreenServerError />
 

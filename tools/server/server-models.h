@@ -82,6 +82,7 @@ struct server_model_meta {
     json loaded_info; // info to be reflected via /v1/models endpoint ; if in DOWNLOADING state, it should contain download progress info
     json progress; // reflect load or download progress info, if any
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
+    std::vector<std::string> error_tail; // last output lines of a failed child, for the UI/wizard error surface
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
     json gguf_meta; // offline gguf header facts (size, arch, moe, mtp, kv/token) for the launch wizard
@@ -255,6 +256,7 @@ public:
         int exit_code = 0; // only valid if status == UNLOADED
         json loaded_info = nullptr;
         json progress = nullptr;
+        std::vector<std::string> log_tail = {}; // last child output lines, kept when the exit was a failure
     };
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint

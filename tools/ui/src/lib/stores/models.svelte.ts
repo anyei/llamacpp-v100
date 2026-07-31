@@ -796,7 +796,19 @@ class ModelsStore {
 
 		const status = data.status;
 
-		this.setRouterModelStatus(model, status);
+		const failed =
+			status === ServerModelStatus.FAILED ||
+			(status === ServerModelStatus.UNLOADED && (data.exit_code ?? 0) !== 0);
+
+		// carry the failure detail onto the row so the chat banner can surface
+		// it; a new load attempt clears it
+		this.setRouterModelStatus(
+			model,
+			status,
+			failed
+				? { failed: true, exit_code: data.exit_code, error_tail: data.error_tail }
+				: { failed: undefined, exit_code: undefined, error_tail: undefined }
+		);
 
 		if (status === ServerModelStatus.LOADING) {
 			if (data.progress) this.loadProgress.set(model, data.progress);
@@ -807,10 +819,6 @@ class ModelsStore {
 		if (status === ServerModelStatus.LOADED) {
 			void this.updateModelModalities(model);
 		}
-
-		const failed =
-			status === ServerModelStatus.FAILED ||
-			(status === ServerModelStatus.UNLOADED && (data.exit_code ?? 0) !== 0);
 
 		if (failed) {
 			this.rejectStatus(model, new Error(`Model failed: ${this.toDisplayName(model)}`));
@@ -834,15 +842,19 @@ class ModelsStore {
 	/**
 	 * Update one model row status in place, reassigning to trigger reactivity.
 	 */
-	private setRouterModelStatus(modelId: string, status: ServerModelStatus): void {
+	private setRouterModelStatus(
+		modelId: string,
+		status: ServerModelStatus,
+		extra?: Partial<ApiModelStatus>
+	): void {
 		const idx = this.routerModels.findIndex((m) => m.id === modelId);
 		if (idx === -1) return;
 
 		const current = this.routerModels[idx];
-		if (current.status.value === status) return;
+		if (current.status.value === status && !extra?.failed && !current.status.failed) return;
 
 		const next = [...this.routerModels];
-		next[idx] = { ...current, status: { ...current.status, value: status } };
+		next[idx] = { ...current, status: { ...current.status, value: status, ...extra } };
 		this.routerModels = next;
 	}
 

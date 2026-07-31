@@ -71,6 +71,12 @@ export interface ApiModelStatus {
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
+	/** Set when the last load attempt failed (status stays "unloaded") */
+	failed?: boolean;
+	/** Child process exit code of the failed load */
+	exit_code?: number;
+	/** Last output lines of the failed child, for the error surface */
+	error_tail?: string[];
 }
 
 /**
@@ -125,6 +131,8 @@ export interface ApiModelsSseData {
 	status: ServerModelStatus;
 	progress?: ApiModelsSseProgress;
 	exit_code?: number;
+	/** last output lines of a failed child (only with a non-zero exit_code) */
+	error_tail?: string[];
 }
 
 /**

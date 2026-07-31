@@ -15,6 +15,7 @@
 #include <optional>
 #include <map>
 #include <set>
+#include <deque>
 
 #include <functional>
 #include <optional>
@@ -600,6 +601,7 @@ void server_models::load_models() {
                 /* loaded_info   */ {},
                 /* progress      */ {},
                 /* exit_code     */ 0,
+                /* error_tail    */ {},
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                 /* multimodal    */ mtmd_caps{false, false},
                 // /* need_download */ false,
@@ -752,6 +754,7 @@ void server_models::load_models() {
             }
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
+            inst.meta.error_tail.clear();
             inst.meta.update_args(ctx_preset, bin_path);
             inst.meta.update_caps();
         }
@@ -773,6 +776,7 @@ void server_models::load_models() {
                     /* loaded_info   */ {},
                     /* progress      */ {},
                     /* exit_code     */ 0,
+                    /* error_tail    */ {},
                     /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                     /* multimodal    */ mtmd_caps{false, false},
                     // /* need_download */ false,
@@ -1002,6 +1006,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
         FILE * stdin_file = child_proc->sproc.stdin_file();
         FILE * stdout_file = child_proc->sproc.stdout_file(); // combined stdout/stderr
 
+        // rolling tail of child output, surfaced in the status when the exit is a failure
+        std::deque<std::string> log_tail;
         std::thread log_thread([&]() {
             // read stdout/stderr and forward to main server log
             // also handle status report from child process
@@ -1013,6 +1019,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
                         this->handle_child_state(name, str);
+                    } else {
+                        while (!str.empty() && (str.back() == '\n' || str.back() == '\r')) str.pop_back();
+                        if (!str.empty()) {
+                            log_tail.push_back(str);
+                            if (log_tail.size() > 12) log_tail.pop_front();
+                        }
                     }
                 }
             } else {
@@ -1080,10 +1092,13 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
             // instance will be cleaned up on next load_models() call
         } else {
-            this->update_status(name, {
-                SERVER_MODEL_STATUS_UNLOADED,
-                exit_code
-            });
+            update_status_args args;
+            args.status    = SERVER_MODEL_STATUS_UNLOADED;
+            args.exit_code = exit_code;
+            if (exit_code != 0) {
+                args.log_tail.assign(log_tail.begin(), log_tail.end());
+            }
+            this->update_status(name, args);
         }
         SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
     });
@@ -1168,6 +1183,7 @@ void server_models::update_status(const std::string & name, const update_status_
         auto & meta = it->second.meta;
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
+        meta.error_tail  = args.log_tail;
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
         }
@@ -1182,6 +1198,9 @@ void server_models::update_status(const std::string & name, const update_status_
         };
         if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
             data["exit_code"] = args.exit_code;
+            if (!args.log_tail.empty()) {
+                data["error_tail"] = args.log_tail;
+            }
         }
         if (!args.loaded_info.is_null()) {
             data["info"] = args.loaded_info;
@@ -2071,6 +2090,9 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+                if (!meta.error_tail.empty()) {
+                    status["error_tail"] = meta.error_tail;
+                }
             }
 
             // pi coding agent multimodal compatibility
