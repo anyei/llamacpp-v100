@@ -1,4 +1,5 @@
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Launch a model</title>
 <style>
   :root {
@@ -197,6 +198,29 @@
   .crumb button { background:none; border:none; color:var(--accent); font-size:11.5px; cursor:pointer;
                   padding:0 2px; text-decoration:underline; text-underline-offset:2px; font-family:var(--sans); }
   @media (prefers-reduced-motion: no-preference) { .mode, .mrow { transition: border-color 120ms ease; } }
+
+  /* mobile */
+  @media (max-width: 640px) {
+    .wrap { padding: 14px 10px 40px; }
+    .search { flex-wrap: wrap; }
+    .search .count { flex-basis: 100%; text-align: right; }
+    .rail button { margin-right: 14px; font-size: 12px; }
+    .mrow { flex-wrap: wrap; gap: 6px 8px; padding: 10px 12px; }
+    .mrow .grow { flex-basis: 100%; }
+    .mhead .speed { margin-left: 0; flex-basis: 100%; }
+    .runrow { flex-wrap: wrap; gap: 8px; }
+    .runrow .mname { flex-basis: 100%; }
+    .actions { flex-wrap: wrap; }
+    .actions .btn { flex: 1 1 auto; text-align: center; }
+    .gcat label { flex-wrap: wrap; row-gap: 3px; }
+    .gcat label .estg { flex-basis: 100%; padding-left: 22px; }
+    .kvrow { row-gap: 8px; }
+    .ctxchips button, .seg button { padding: 8px 12px; }
+    .btn { padding: 12px 18px; }
+    /* 16px inputs stop iOS Safari from zooming the page on focus */
+    .search input, #gateq, #newdir, #mmproj, .gval { font-size: 16px; }
+    .foot .cmd, .cmd, .flags { font-size: 10.5px; }
+  }
 </style>
 
 <div class="wrap">
