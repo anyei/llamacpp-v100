@@ -655,6 +655,16 @@ from an offline per-position profiler dump on a single-box V4 -ncmoe prefill.
 Bonus from the discriminator serve: post-merge fleet-spec regate GREEN
 (coherent, 4.01-4.90 t/s cold, acceptance 83-93%).
 
+**HY3 RECORD CURVE (2026-07-31, trunc-40 single-box route - truncation
+preserves surviving layers' routing exactly): w2 1.70x / w4 2.89x / w8
+4.81x (0.60x linear); per-layer w8 3.95 deep - 6.03 shallow. Calibrated
+true verify mult at w4 ~2.65, BELOW the 2.8 break-even: the stage-1 null
+re-reads as physics-MARGINAL (predicted ratio 1.03-1.08 vs measured 1.00,
+inside fleet noise) - the 5-layer stub's 3.1 overstated it. hy3 and V4
+converge to near-identical curves. Verify-side probes 2-3 (budget replay,
+confidence purity) upgraded to strong-prior on both vehicles; deep-layer
+budgets are the sharpest angle (0.49x linear at w8).**
+
 **V4 production curve (2026-07-31, offline per-position route -
 LLAMA_EXPERT_PROFILE_IDS + scripts/union-curve-from-ids.py, single-box
 IQ2XXS -ncmoe wikitext, PPL 4.08 sane): w2 1.62x / w4 2.65x / w8 4.35x
