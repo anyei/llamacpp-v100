@@ -326,6 +326,17 @@ async function loadData() {
     }
   } catch(e) {}
   await rescanFleet(); // TASKS #87: seed the accumulating worker registry
+  // #87 follow-up: each discovery poll only catches beacons firing inside its
+  // ~1.5s window (the LOCAL worker misses most single polls). Auto-rescan a few
+  // times in the background so the roster fills without the user clicking;
+  // re-render only when the roster actually grew.
+  for (let i = 1; i <= 5; i++) {
+    setTimeout(async () => {
+      const before = Object.keys(FLEET_WORKERS).length;
+      await rescanFleet();
+      if (Object.keys(FLEET_WORKERS).length !== before) render();
+    }, 2500*i);
+  }
 }
 
 // TASKS #87: accumulating worker registry - each /wizard/hw discovery poll
