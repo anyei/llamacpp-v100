@@ -110,9 +110,14 @@ static bool llama_zl_ids_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         return is_base_topk(t->name);
     }
     static const bool zl_debug = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+    // TASKS #84 (GGML_META_UNION_STATS): capture verify/multi-token-shaped
+    // graphs too (all lanes) for the union counters; without the env the
+    // original decode-only gate (ne[1] <= 2) stands bit-for-bit
+    static const bool union_stats = getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0;
+    const int64_t max_w = union_stats ? 16 : 2;
     // decode-shaped graphs only (an MTP head can make them 2-wide; ids are
     // [k, n_tok] so token 0's ids are the first k values either way)
-    if (!is_base_topk(t->name) || t->type != GGML_TYPE_I32 || t->ne[1] > 2 || t->ne[0] > 64) {
+    if (!is_base_topk(t->name) || t->type != GGML_TYPE_I32 || t->ne[1] > max_w || t->ne[0] > 64) {
         if (zl_debug) {
             static int n = 0;
             if (n < 8) {
@@ -123,9 +128,17 @@ static bool llama_zl_ids_cb(struct ggml_tensor * t, bool ask, void * user_data) 
         }
         return true;
     }
-    int32_t ids[64];
-    ggml_backend_tensor_get(t, ids, 0, t->ne[0]*sizeof(int32_t));
-    ggml_backend_meta_note_routed_ids(atoi(t->name + prefix_len), ids, (size_t) t->ne[0]);
+    int32_t ids[64*16];
+    const size_t k     = (size_t) t->ne[0];
+    const size_t n_tok = (size_t) t->ne[1];
+    // ffn_moe_topk is a top-k VIEW over the full argsort ([n_expert, n_tok]
+    // base): lanes are nb[1]-strided, NOT contiguous - a linear read returns
+    // token 0's argsort PERMUTATION (distinct by construction, poisoning the
+    // union counters with exact-disjoint lanes). Read lane by lane.
+    for (size_t j = 0; j < n_tok; j++) {
+        ggml_backend_tensor_get(t, ids + j*k, j*t->nb[1], k*sizeof(int32_t));
+    }
+    ggml_backend_meta_note_routed_ids_batch(atoi(t->name + prefix_len), ids, k, n_tok);
     if (zl_debug) {
         static int n = 0;
         if (n < 8) {
@@ -290,12 +303,14 @@ llama_context::llama_context(
             cparams.cb_eval_user_data = expert_profile.get();
             LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE: recording per-layer expert selections to '%s'\n",
                            __func__, prof_path);
-        } else if (getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) {
-            // TASKS #71 inc-0: routed-id capture for the meta zero-leg counters
-            // (mutually exclusive with the profiler - one eval-callback slot)
+        } else if ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
+                   (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0)) {
+            // TASKS #71 inc-0 / #84: routed-id capture for the meta zero-leg
+            // and expert-union counters (mutually exclusive with the profiler
+            // - one eval-callback slot)
             cparams.cb_eval           = llama_zl_ids_cb;
             cparams.cb_eval_user_data = nullptr;
-            LLAMA_LOG_INFO("%s: GGML_META_ZL_STATS: capturing routed ids for zero-leg counters\n", __func__);
+            LLAMA_LOG_INFO("%s: GGML_META_ZL_STATS/UNION_STATS: capturing routed ids for meta counters\n", __func__);
         }
     }
 

@@ -471,6 +471,13 @@ extern "C" {
     GGML_API void ggml_backend_meta_note_routed_ids(
         int32_t il, const int32_t * ids, size_t k);
 
+    // TASKS #84 (GGML_META_UNION_STATS): batch variant - note ALL lanes of a
+    // verify/multi-token graph's routed ids ([k, n_tok] flattened, lane-major).
+    // Token 0 keeps the single-token semantics above for the ZL counters; the
+    // meta gather consults the full batch for the expert-union counters.
+    GGML_API void ggml_backend_meta_note_routed_ids_batch(
+        int32_t il, const int32_t * ids, size_t k, size_t n_tok);
+
     //
     // Utils
     //

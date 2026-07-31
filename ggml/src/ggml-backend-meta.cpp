@@ -2106,15 +2106,27 @@ static std::map<int32_t, std::vector<int32_t>> g_expert_owner;
 // and ignores the OUTPUT flag)
 static std::map<int32_t, std::vector<int32_t>> g_routed_ids;
 static int32_t                                 g_routed_last_il = -1;
+// TASKS #84 (GGML_META_UNION_STATS): full [k, n_tok] routed ids of the last
+// noted graph per layer - the union counters need every lane, not just token 0
+static std::map<int32_t, std::vector<int32_t>> g_routed_ids_all;
+static std::map<int32_t, size_t>               g_routed_k;
 
-void ggml_backend_meta_note_routed_ids(int32_t il, const int32_t * ids, size_t k) {
+void ggml_backend_meta_note_routed_ids_batch(int32_t il, const int32_t * ids, size_t k, size_t n_tok) {
     std::lock_guard<std::mutex> lock(g_expert_owner_mtx);
-    if (ids == nullptr || k == 0) {
+    if (ids == nullptr || k == 0 || n_tok == 0) {
         g_routed_ids.erase(il);
+        g_routed_ids_all.erase(il);
+        g_routed_k.erase(il);
         return;
     }
-    g_routed_ids[il].assign(ids, ids + k);
+    g_routed_ids[il].assign(ids, ids + k); // token 0 (ZL semantics unchanged)
+    g_routed_ids_all[il].assign(ids, ids + k*n_tok);
+    g_routed_k[il] = k;
     g_routed_last_il = il;
+}
+
+void ggml_backend_meta_note_routed_ids(int32_t il, const int32_t * ids, size_t k) {
+    ggml_backend_meta_note_routed_ids_batch(il, ids, k, 1);
 }
 
 void ggml_backend_meta_set_expert_ownership(int32_t il, const int32_t * member_of, size_t n_expert) {
@@ -2717,6 +2729,18 @@ struct ggml_backend_meta_context {
     int64_t zl_owner_slots   = 0;
     int64_t zl_total_slots   = 0;
     std::array<int64_t, 16> zl_zero {}; // per member: gathers with zero routed experts
+    // GGML_META_UNION_STATS (TASKS #84): expert-union width curve. Per
+    // lane-width bucket: boundaries seen, total routed slots (k*width) and
+    // the distinct-expert UNION across the boundary's lanes - the measured
+    // verify member-read multiplier the #52 law priced as linear-in-width.
+    // Member tier (distinct OWNED experts per member) needs the #75 tables.
+    std::array<int64_t, 17> us_bounds {}; // index = lane width (1..16)
+    std::array<int64_t, 17> us_slots  {};
+    std::array<int64_t, 17> us_uniq   {};
+    std::array<int64_t, 16> us_mem_uniq  {}; // width>1 boundaries
+    std::array<int64_t, 16> us_mem_uniq1 {}; // width==1 floor
+    int64_t us_mem_bounds  = 0;
+    int64_t us_mem_bounds1 = 0;
     int64_t bs_graphs        = 0;
 
     // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
@@ -4407,6 +4431,51 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                 }
+                // TASKS #84 (GGML_META_UNION_STATS=1): expert-union width
+                // curve - distinct experts routed across ALL lanes of this
+                // boundary vs total routed slots, bucketed by lane width.
+                // Needs the widened id capture (llama_zl_ids_cb notes every
+                // lane when the env is set); member tier needs #75 tables.
+                // Pure host counters on already-noted ids - no device reads.
+                static const bool union_stats = getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0;
+                if (union_stats) {
+                    const int64_t w = boundary_node(part[0])->ne[1];
+                    if (w >= 1 && w <= 16) {
+                        std::lock_guard<std::mutex> us_lock(g_expert_owner_mtx);
+                        const auto it_all = g_routed_ids_all.find(g_routed_last_il);
+                        const auto it_k   = g_routed_k.find(g_routed_last_il);
+                        if (it_all != g_routed_ids_all.end() && it_k != g_routed_k.end() && it_k->second > 0 &&
+                                it_all->second.size() == it_k->second * (size_t) w) {
+                            // shape agreement (noted lanes == boundary lanes)
+                            // skips boundaries whose capture was clipped or
+                            // belongs to a different-width graph in flight
+                            const auto &      ids = it_all->second;
+                            std::set<int32_t> uniq;
+                            for (const int32_t e : ids) {
+                                if (e >= 0) {
+                                    uniq.insert(e);
+                                }
+                            }
+                            backend_ctx->us_bounds[w]++;
+                            backend_ctx->us_slots[w] += (int64_t) ids.size();
+                            backend_ctx->us_uniq[w]  += (int64_t) uniq.size();
+                            const auto it_own = g_expert_owner.find(g_routed_last_il);
+                            if (it_own != g_expert_owner.end()) {
+                                const auto & owner_of = it_own->second;
+                                auto & mem_acc = w == 1 ? backend_ctx->us_mem_uniq1 : backend_ctx->us_mem_uniq;
+                                for (const int32_t e : uniq) {
+                                    if ((size_t) e < owner_of.size()) {
+                                        const int32_t jm = owner_of[e];
+                                        if (jm >= 0 && jm < 16) {
+                                            mem_acc[jm]++;
+                                        }
+                                    }
+                                }
+                                (w == 1 ? backend_ctx->us_mem_bounds1 : backend_ctx->us_mem_bounds)++;
+                            }
+                        }
+                    }
+                }
                 const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
                 const size_t n_vals = nbytes/sizeof(float);
                 auto & scratch = backend_ctx->star_scratch;
@@ -4968,6 +5037,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->zl_gathers = backend_ctx->zl_free = 0;
             backend_ctx->zl_owner_slots = backend_ctx->zl_total_slots = 0;
             backend_ctx->zl_zero.fill(0);
+        }
+        {
+            // TASKS #84: META_UNION dump - per width bucket the mean distinct-
+            // expert union per boundary, and its multiplier vs the width-1
+            // floor (the number the #52 law assumed equals the width)
+            int64_t us_total = 0;
+            for (size_t w = 1; w < backend_ctx->us_bounds.size(); w++) {
+                us_total += backend_ctx->us_bounds[w];
+            }
+            if (us_total > 0) {
+                char ubuf[512];
+                int  uo = 0;
+                const double u1 = backend_ctx->us_bounds[1] > 0 ?
+                    (double) backend_ctx->us_uniq[1] / backend_ctx->us_bounds[1] : 0.0;
+                for (size_t w = 1; w < backend_ctx->us_bounds.size() && uo < (int) sizeof(ubuf) - 64; w++) {
+                    if (backend_ctx->us_bounds[w] == 0) {
+                        continue;
+                    }
+                    const double uw = (double) backend_ctx->us_uniq[w] / backend_ctx->us_bounds[w];
+                    uo += snprintf(ubuf + uo, sizeof(ubuf) - uo, " | w%zu g %" PRId64 " uniq/b %.2f slots/b %.2f",
+                                   w, backend_ctx->us_bounds[w], uw,
+                                   (double) backend_ctx->us_slots[w] / backend_ctx->us_bounds[w]);
+                    if (w > 1 && u1 > 0) {
+                        uo += snprintf(ubuf + uo, sizeof(ubuf) - uo, " mult %.2f", uw / u1);
+                    }
+                }
+                fprintf(stderr, "META_UNION:%s\n", ubuf);
+                if (backend_ctx->us_mem_bounds > 0 || backend_ctx->us_mem_bounds1 > 0) {
+                    char mbuf[512];
+                    int  mo = 0;
+                    for (size_t j = 0; j < backend_ctx->wire_member.size() && j < 16 && mo < (int) sizeof(mbuf) - 32; j++) {
+                        if (!backend_ctx->wire_member[j]) {
+                            continue;
+                        }
+                        mo += snprintf(mbuf + mo, sizeof(mbuf) - mo, " m%zu %.2f/%.2f", j,
+                                       backend_ctx->us_mem_bounds  > 0 ? (double) backend_ctx->us_mem_uniq[j]  / backend_ctx->us_mem_bounds  : 0.0,
+                                       backend_ctx->us_mem_bounds1 > 0 ? (double) backend_ctx->us_mem_uniq1[j] / backend_ctx->us_mem_bounds1 : 0.0);
+                    }
+                    fprintf(stderr, "META_UNION_MEM: owned-uniq/boundary multi/floor:%s\n", mbuf);
+                }
+                backend_ctx->us_bounds.fill(0);
+                backend_ctx->us_slots.fill(0);
+                backend_ctx->us_uniq.fill(0);
+                backend_ctx->us_mem_uniq.fill(0);
+                backend_ctx->us_mem_uniq1.fill(0);
+                backend_ctx->us_mem_bounds = backend_ctx->us_mem_bounds1 = 0;
+            }
         }
         backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
         backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;
