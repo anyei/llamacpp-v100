@@ -4,10 +4,112 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
-#include <map>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+
+// expert mask (TASKS #84 probe 2)
+
+ggml_tensor * llama_expert_mask::tensor_for(int il) const {
+    if (il < 0 || (size_t) il >= tensors.size()) {
+        return nullptr;
+    }
+    return tensors[il];
+}
+
+bool llama_expert_mask::init(const llama_model & model, const char * path) {
+    const auto & hparams  = model.hparams;
+    const int64_t n_expert = hparams.n_expert;
+    const size_t  n_layer  = hparams.n_layer();
+
+    GGML_ASSERT(tensors.empty());
+    if (n_expert <= 0) {
+        LLAMA_LOG_ERROR("%s: model has no experts\n", __func__);
+        return false;
+    }
+
+    // parse "il id id id ..." lines; absent layers stay unmasked
+    std::ifstream f(path);
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: cannot read '%s'\n", __func__, path);
+        return false;
+    }
+    std::map<int, std::vector<int32_t>> allowed;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        int il = -1;
+        if (!(ss >> il) || il < 0 || (size_t) il >= n_layer) {
+            continue;
+        }
+        auto & ids = allowed[il];
+        int32_t e;
+        while (ss >> e) {
+            if (e >= 0 && e < n_expert) {
+                ids.push_back(e);
+            }
+        }
+    }
+    if (allowed.empty()) {
+        LLAMA_LOG_ERROR("%s: no valid mask lines in '%s'\n", __func__, path);
+        return false;
+    }
+
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ n_layer*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+            ctx_map[buft] = ctx;
+            ctxs.emplace_back(ctx);
+            return ctx;
+        }
+        return it->second;
+    };
+
+    tensors.assign(n_layer, nullptr);
+    for (const auto & [il, ids] : allowed) {
+        ggml_context * ctx = ctx_for_buft(model.select_buft(il));
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to allocate context\n", __func__);
+            return false;
+        }
+        tensors[il] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+    }
+
+    bufs.reserve(ctx_map.size());
+    for (auto it : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(it.second, it.first);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer\n", __func__);
+            return false;
+        }
+        bufs.emplace_back(buf);
+    }
+
+    std::vector<float> host(n_expert);
+    for (const auto & [il, ids] : allowed) {
+        std::fill(host.begin(), host.end(), -INFINITY);
+        for (const int32_t e : ids) {
+            host[e] = 0.0f;
+        }
+        ggml_backend_tensor_set(tensors[il], host.data(), 0, n_expert*sizeof(float));
+        LLAMA_LOG_INFO("%s: layer %d budget %zu/%lld experts\n", __func__, il, ids.size(), (long long) n_expert);
+    }
+    return true;
+}
 
 // vec
 

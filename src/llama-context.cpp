@@ -337,8 +337,20 @@ llama_context::llama_context(
                     LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PROFILE_IDS: cannot open '%s'\n", __func__, ids_path);
                 }
             }
-        } else if ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
-                   (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0)) {
+        }
+        // TASKS #84 probe 2: per-layer routing-budget mask (measurement only)
+        if (const char * mask_path = getenv("LLAMA_EXPERT_MASK"); mask_path != nullptr && mask_path[0] != '\0') {
+            expert_mask = std::make_unique<llama_expert_mask>();
+            if (expert_mask->init(model, mask_path)) {
+                LLAMA_LOG_INFO("%s: LLAMA_EXPERT_MASK: routing budget loaded from '%s'\n", __func__, mask_path);
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_MASK: failed to load '%s' - unmasked\n", __func__, mask_path);
+                expert_mask.reset();
+            }
+        }
+        if (cparams.cb_eval == nullptr && // profiler owns the one eval-callback slot when set
+                ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
+                 (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0))) {
             // TASKS #71 inc-0 / #84: routed-id capture for the meta zero-leg
             // and expert-union counters (mutually exclusive with the profiler
             // - one eval-callback slot)
@@ -2872,6 +2884,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs     =*/ n_outputs,
         /*.expert_tables =*/ model.expert_tables.get(),
+        /*.expert_mask   =*/ expert_mask.get(),
         /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

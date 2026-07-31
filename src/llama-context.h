@@ -287,6 +287,9 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
+    // TASKS #84 probe 2: per-layer routing-budget mask (LLAMA_EXPERT_MASK)
+    std::unique_ptr<llama_expert_mask> expert_mask;
+
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;

@@ -1361,6 +1361,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     expert_tables    (params.expert_tables),
+    expert_mask      (params.expert_mask),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -1920,6 +1921,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
         selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_masked", il);
+    }
+
+    // TASKS #84 probe 2 (LLAMA_EXPERT_MASK): restrict routing to a per-layer
+    // allowed-expert budget. -INF rides the SELECTION scores only - gating
+    // weights still gather from the unbiased probs of the (allowed) selected
+    // experts, so allowed-expert math is untouched.
+    if (expert_mask != nullptr && il >= 0) {
+        ggml_tensor * m = expert_mask->tensor_for(il);
+        if (m != nullptr) {
+            selection_probs = ggml_add(ctx0, selection_probs, m);
+            cb(selection_probs, "ffn_moe_probs_budget", il);
+        }
     }
 
     // select experts

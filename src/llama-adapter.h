@@ -14,6 +14,22 @@
 // llama_adapter_cvec
 //
 
+// TASKS #84 probe 2 (LLAMA_EXPERT_MASK): per-layer routing budget - an F32
+// [n_expert] bias (0 = allowed, -INF = banned) added to the SELECTION scores
+// only, so allowed experts' gating weights are untouched. File format: one
+// line per masked layer, "il id id id ..." (absent layers stay unmasked).
+struct llama_expert_mask {
+    ggml_tensor * tensor_for(int il) const;
+
+    bool init(const llama_model & model, const char * path);
+
+private:
+    std::vector<ggml_context_ptr> ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+
+    std::vector<ggml_tensor *> tensors; // per layer, nullptr = unmasked
+};
+
 struct llama_adapter_cvec {
     ggml_tensor * tensor_for(int il) const;
 

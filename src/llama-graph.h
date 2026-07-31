@@ -22,6 +22,7 @@ struct llama_layer;
 struct llama_memory_context_i;
 
 struct llama_expert_placement_tables; // TASKS #75
+struct llama_expert_mask;             // TASKS #84 probe 2
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -712,6 +713,9 @@ struct llm_graph_params {
     // TASKS #75: hot-expert placement ownership tables (null = placement off)
     const llama_expert_placement_tables * expert_tables = nullptr;
 
+    // TASKS #84 probe 2: per-layer routing-budget mask (null = unmasked)
+    const llama_expert_mask * expert_mask = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -938,6 +942,7 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     const llama_expert_placement_tables * expert_tables = nullptr;
+    const llama_expert_mask             * expert_mask   = nullptr; // TASKS #84 probe 2
 
     llm_graph_result * res;
 
