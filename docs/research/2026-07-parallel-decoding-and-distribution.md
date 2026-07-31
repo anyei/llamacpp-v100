@@ -252,3 +252,94 @@ is mechanism (b) of the three escapes - FEWER boundaries (Layer Parallelism)
 - plus corroboration for (c) fill-the-bubble (APEX pattern -> Expert
 Deferral). Mechanism (a), cheaper boundaries, lives in the horizontal doc
 (soft-RoCE/UCCL). All three wait on #7's compute/reduce/wire split.
+
+## Addendum 2026-07-30: independent verification sweep - the MoE-speculation
+## and block-decode paper haul (feeds TASKS #84/#85/#86; synthesis lives in
+## fill-the-bubble-plan 2.5)
+
+Four-agent sweep run as an adversarial check on the #71 stage-1/stage-2
+verdicts plus the first enumeration of the block/parallel-decode family
+(Jacobi/Medusa/CLLM/lookahead had zero prior hits in this ledger). Verdict
+summary is in fill-the-bubble-plan 2.5; this addendum is the citation bank.
+
+### MoE x speculation (verify economics - the #52-law literature)
+
+- EcoSpec, arXiv 2607.12696 - expert-reuse-aware draft/lane selection
+  (score candidates by marginal new-expert cost vs a running buffer);
+  1.36x batch-1 vs EAGLE-3 1.22x on Qwen3-235B; states the dense-vs-MoE
+  verify distinction verbatim. = our "tree-verify with expert-reuse-aware
+  selection" reopen key, published.
+- MoE-Spec, arXiv 2602.16052 - budgeted verify: cap per-layer verify union
+  to top-B by tree-aggregated router prob, truncate/substitute the rest;
+  -1.4% acceptance, quality within noise, +10-30% t/s, training-free.
+- EVICT, arXiv 2605.00342 - utility-optimal draft-tree truncation before
+  verify: -74.7% verified tokens, -32.5% activated experts, LOSSLESS,
+  avg 1.21x over EAGLE-3.
+- MoESD, arXiv 2505.19645 - formalizes SD-net-negative in memory-bound MoE
+  (expert-union growth with n); independent reproduction of our ratio 1.00.
+- Cascade / Utility-Driven SD for MoE, arXiv 2506.20675 - measures 2-3x
+  verify-time growth vs dense, 1.5x SLOWDOWNS from naive SD; fix = dynamic
+  spec on/off + K tuning (limits loss to 5%).
+- DraftExpert, arXiv 2607.24434 - trained per-layer resident draft expert
+  lifts tiny-footprint drafts to 84-87% acceptance; naive drafting sits at
+  22-46% (= our 0.59 leg's band).
+- SpecMoE, arXiv 2604.10152 (DAC'26) - restricted-expert self-draft (N=4 of
+  128 pinned) reaches ~85-88% per-token acceptance; skew table: NLLB 0.84
+  -> 4.3x, Mixtral 0.32 -> 2.17x. Our coverage@25.5%=0.913 exceeds their
+  best testbed. Caveat: batch<=4 loses to plain hot-expert caching - the
+  coalescing win is a large-batch effect.
+- SS-MoE (WWW 2026, DOI 10.1145/3774904.3792218) - confidence-gated
+  accept-WITHOUT-verify on a restricted-expert self-draft; 3.72x claimed
+  "nearly lossless". PAYWALLED - unverified beyond abstract.
+- Revisiting Lossy Verification, arXiv 2607.26627 - lossy acceptance damage
+  grows with task hardness (+0.38pp GSM8K -> +6.67pp AIME): the standing
+  risk law for every skip/relaxed scheme; PPL cannot see it.
+- Cross-lane overlap data: Cohere MoE+SD blog (8-of-128: 30-38%
+  adjacent-lane overlap; 4-lane verify ~2.5x unique experts, not 4x);
+  MoE-Infinity 2401.14361 + ST-MoE prefetch 2606.15453 (~2x-over-
+  independence consecutive-token reuse). No published number at 8-of-256 -
+  our #84 counter would be first.
+- OEA, arXiv 2511.02237 - training-free batch-aware RE-ROUTING (tokens
+  piggyback on experts already loaded for the batch): 15-39% latency cut,
+  no significant accuracy loss; candidate union-compressor for any
+  multi-lane pass (lossy-gate discipline applies).
+- Speculative MoE, arXiv 2503.04398 - token->expert route PREDICTION
+  pre-gating (89% / 96.3% static top-k precision) + co-activation-clustered
+  placement; gains grow on slow interconnects (2.34-4.3x PCIe/UPI vs
+  1.49-1.72x NVLink) -> #86 recon.
+- Dead ends confirmed: SpecExec 2406.02532 / Sequoia 2402.12374 tree sizes
+  are DENSE-offload economics (verify lanes reuse the same weights - the
+  amortization that does not exist in sparse MoE); exact residual/delta
+  verify for expert-subset drafts exists nowhere and is structurally
+  unsound (hidden-state divergence from the first restricted layer).
+
+### Block / parallel decode (stage-3 family - first enumeration)
+
+- CLP, arXiv 2606.10935 - verification-free MTP emission: ~5K-param linear
+  gate on backbone state accepts k MTP tokens directly, NO verify batch;
+  1.14-1.29x on dense 7B. The one published shape that fits this fleet
+  (-> #85, with the KV-catch-up caveat: accepted tokens still need an
+  n-lane trunk ingest, so it prices as spec-at-100%-acceptance).
+- Judge Decoding (ICLR 2025) + SelfJudge 2510.02329 - relaxed/judge
+  acceptance via tiny probe: more accepted tokens per verify pass at zero
+  extra reads; cheapest stack-on found. Same lossy-risk law.
+- MARS, arXiv 2604.07023 - multi-token emission via continued training of
+  the SAME model (no heads): 1.5-1.7x, needs a finetune we cannot afford.
+- Set Block Decoding, arXiv 2509.04185 + Fast-dLLM v2, arXiv 2509.26328 -
+  cheapest credible AR->block conversion (~1B-token finetune, 3-5x fewer
+  passes at parity, exact KV). PARKED: finetune budget + no MoE-scale
+  replication.
+- Jacobi family: Lookahead (ICML'24, 56-120x extra FLOPs/step - fatal
+  here), CLLMs 2403.00835, Jacobi Forcing 2512.14681 (best-in-family,
+  3.8-4x, but distillation finetune + compute-for-latency by design).
+  RULED OUT for this fleet.
+- Medusa 2401.10774 / Jakiro 2502.06282 - tree verify = maximal expert
+  union. RULED OUT.
+- Diffusion: LLaDA-MoE 2509.24389, LLaDA2.0 2512.15745, RND1 (AR->diffusion
+  conversion of Qwen3-30B-A3B: 500B tokens, still below AR quality) - no
+  cheap conversion path exists mid-2026; APD 2506.00413 (dLLM + tiny-AR
+  mixture accept rule) is the acceptance primitive to remember IF a
+  block-capable model ever lands.
+- Production MTP serving datum: SGLang MTP (lmsys 2025-07-17) caps draft at
+  2-4 tokens (accept len 2.18-2.44, +60% single-node, +14% at scale); no
+  per-rank expert-read cost model published - the gap our counter fills.

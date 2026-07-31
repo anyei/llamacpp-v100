@@ -566,6 +566,82 @@ reload followed; the clean relaunch on warmed page caches loaded fine and
 the worker peaked at its normal ~46GiB share. Watch worker RSS on the
 FIRST post-churn load.
 
+### 2.5 INDEPENDENT VERIFICATION 2026-07-30 (4-agent literature sweep; no code,
+no fleet legs) — stage-1/2 verdicts CONFIRMED, two premises revised, three
+tasks filed (#84 verify-side economics, #85 block-decode stage 3, #86
+pre-scheduling recon)
+
+Method: two web agents hunted counter-evidence against the stage-1 and
+stage-2 verdicts independently; one agent swept the blockwise/parallel-decode
+SOTA; one re-derived the ledger's own record (the #52 law's provenance:
+TASKS #52 2026-07-18 verify pass 1.17s vs 0.53s plain, worker exec 140ms vs
+71ms floor, the 96%-acceptance run the SLOWEST; ancestor #31 LAW 3 -np 4
+aggregate only +27%).
+
+**Confirmed (the field reproduced us):** every 2025-26 MoE-speculation paper
+prices verify as the UNION of experts across verified lanes — EcoSpec
+(2607.12696) states it verbatim (dense lanes reuse weights, MoE cost = the
+union); MoESD (2505.19645) and Cascade (2506.20675, 2-3x verify-time growth,
+outright slowdowns from naive SD on MoE) and DraftExpert (2607.24434,
+acceptance 22-46% band for naive drafting = our 0.59 leg) all match our
+1.00 / 0.59 / 0.83 ladder in kind. The Cohere MoE+SD study places our regime
+(bs=1, partial expert residency) exactly in the band where "verification adds
+extra expert weight loading, limiting SD gains". No paper composes deferral
+with verification (the DEFER_VERIFY 0.83 experiment appears novel) and no
+paper tests experts sharded across multi-node CPU RAM over Ethernet — the
+topology itself is unpublished territory.
+
+**Revision 1 — the multiplier arithmetic (feeds #84 probe 1).** Measured
+cross-lane routing overlap is substantial: Cohere (8-of-128, K=3 spec)
+measures 30-38% adjacent-lane expert overlap → a 4-lane verify activates
+~20.4 unique experts vs 29.1 uniform, i.e. ~2.5x not 4x; MoE-offload caching
+work corroborates ~2x-over-independence consecutive-token reuse. Our n=3
+member-read multiplier is therefore likely ~2.2-2.6x, not the 3x the
+break-even model assumed. If break-even at ratio 1.00 required the full 3x,
+a second cost is hiding (per-lane boundary fixed cost, lanes verified past
+the acceptance point, router divergence). One counter decides it: distinct
+expert IDs touched per member per verify graph vs the single-token floor.
+No published number exists at 8-of-256 sparsity — our counter would be the
+first.
+
+**Revision 2 — "verify is untouchable" is now contradicted four ways
+(feeds #84 probes 2-3, = spec REOPEN KEY 3):** MoE-Spec (2602.16052)
+budgeted verify (cap the per-layer verify union to top-B by tree-aggregated
+router probability; -1.4% acceptance, +10-30% t/s, training-free); SS-MoE
+(WWW 2026, paywalled — claims unverified) confidence-gated
+accept-WITHOUT-verify (verifies/token < 1 breaks the ratio-1.00 bound
+structurally; 3.72x claimed); EVICT (2605.00342) lossless utility-optimal
+tree truncation (-32.5% activated experts); EcoSpec expert-reuse-aware lane
+selection — our own stated reopen key, now published (1.36x batch-1 vs
+EAGLE-3's 1.22x). Favorable prior: our placement skew coverage@25.5% = 0.913
+exceeds every published testbed (SpecMoE 2604.10152 best case: NLLB 0.84 →
+4.3x). Standing risk law: lossy acceptance damage GROWS with task hardness
+(2607.26627: +0.38pp GSM8K → +6.67pp AIME) — PPL cannot see it; hard-task
+coherence reads are the gate.
+
+**Stage-2 kill-math: right as specified, safe on its subtle point.** No
+restricted-expert draft in the literature exceeds 84-91% acceptance (our
+84-97% MTP is already at/above the published band), so "deeper chains at
+very high acceptance" stays dead. Exact residual/delta-verify (reuse draft
+hot-expert outputs in verify) exists nowhere and is structurally unsound —
+hidden states diverge from the first restricted layer, so draft outputs are
+computed on the wrong state for exact verify; approximate versions collapse
+into lossy verification (probe 3's territory). The shelving stands; only
+the verify-side keys above reopen anything.
+
+**Block-decode sweep (stage 3, first enumeration — filed #85):** the only
+published shape whose economics fit this fleet is CLP-class (2606.10935)
+verification-free MTP emission — a tiny gate accepts k MTP tokens directly,
+no verify batch. Recon caveat found before building: accepted tokens still
+need trunk KV, so the catch-up ingest is an n-lane pass paying the same
+union cost as a verify — CLP ≈ spec at 100% effective acceptance, and #84's
+union counter gates whether that clears the null. Ruled out: Jacobi/
+lookahead (56-120x extra FLOPs/step), Medusa trees (maximal union), raw
+dLLMs and AR→diffusion conversion (RND1: 500B tokens, quality loss). Parked
+with entry conditions: SBD/Fast-dLLM-v2 (~1B-token finetune, 3-5x fewer
+passes at parity), OEA (2511.02237) batch-aware re-routing as a union
+compressor, judge/relaxed acceptance (ICLR'25) as a zero-read stack-on.
+
 ## 3. Probe ladder (each gated before the next)
 
 1. Merge expert-placement -> parallel-inference; CPU loopback byte gate:
