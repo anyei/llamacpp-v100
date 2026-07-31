@@ -1024,7 +1024,8 @@ async function realLaunch(flagsText){
         lstate("bad", `Load failed (exit ${me.status.exit_code})${tail?` — the child's last output:<div class="etail">${tail}</div>`:" — check the router logs"}`);
         S.launched=0; render(); return;
       }
-      lstate("busy", `<span class="spin"></span> Loading <b>${S.model.id}</b> — ${st}… weights are streaming in, big models take minutes ${lElapsed()}`);
+      const isFleet = S.mode && (S.mode.id==="fleet" || S.mode.id==="fleetl");
+      lstate("busy", `<span class="spin"></span> Loading <b>${S.model.id}</b> — ${st}… weights are streaming in, big models take minutes — <a href="./loading.html">${isFleet?"watch per-worker progress":"detailed progress"}</a> ${lElapsed()}`);
       launchPoll = setTimeout(poll, 2000);
     } catch(e) { launchPoll = setTimeout(poll, 4000); }
   };

@@ -1820,6 +1820,44 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // pick the child whose fleet state the UI should see: a loading child wins
+    // (its /fleet/status carries the live per-worker load progress), else the
+    // most recently used running one
+    auto fleet_proxy_target = [this]() -> std::string {
+        std::string target;
+        int64_t best = -1;
+        for (const auto & m : models.get_all_meta()) {
+            if (m.status == SERVER_MODEL_STATUS_LOADING) {
+                return m.name;
+            }
+            if (m.is_running() && m.last_used > best) {
+                best = m.last_used;
+                target = m.name;
+            }
+        }
+        return target;
+    };
+
+    this->get_router_fleet_status = [this, fleet_proxy_target](const server_http_req & req) {
+        const std::string target = fleet_proxy_target();
+        if (target.empty()) {
+            auto res = std::make_unique<server_http_res>();
+            res_ok(res, json{{"model", nullptr}, {"devices", json::array()}});
+            return res;
+        }
+        return models.proxy_request(req, "GET", target, false);
+    };
+
+    this->get_router_fleet_worker_log = [this, fleet_proxy_target](const server_http_req & req) {
+        const std::string target = fleet_proxy_target();
+        if (target.empty()) {
+            auto res = std::make_unique<server_http_res>();
+            res_err(res, format_error_response("no model is running", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return models.proxy_request(req, "GET", target, false);
+    };
+
     this->get_wizard_hw = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json hw;

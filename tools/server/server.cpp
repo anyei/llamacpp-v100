@@ -222,6 +222,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        // fleet UI/loading page against the router: forward to the active child
+        routes.get_fleet_status            = models_routes->get_router_fleet_status;
+        routes.get_fleet_worker_log        = models_routes->get_router_fleet_worker_log;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));

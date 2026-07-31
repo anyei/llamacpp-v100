@@ -348,6 +348,11 @@ struct server_models_routes {
     server_http_context::handler_t get_wizard_sweeps;
     server_http_context::handler_t get_wizard_dirs;
     server_http_context::handler_t post_wizard_dirs;
+    // fleet visibility in router mode: the fleet machinery lives in the CHILD
+    // serving the current model - forward to the loading child first (live
+    // per-worker load progress), else the most recently used running one
+    server_http_context::handler_t get_router_fleet_status;
+    server_http_context::handler_t get_router_fleet_worker_log;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

@@ -39,6 +39,7 @@
 			<Alert.Description>
 				Weights are streaming in — large models can take several minutes. The chat unlocks as soon
 				as the model is ready.
+				<a href="./loading.html" class="ml-1 font-medium underline">Detailed progress view</a>
 			</Alert.Description>
 		</Alert.Root>
 	</div>
