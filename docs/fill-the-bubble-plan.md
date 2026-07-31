@@ -665,6 +665,17 @@ converge to near-identical curves. Verify-side probes 2-3 (budget replay,
 confidence purity) upgraded to strong-prior on both vehicles; deep-layer
 budgets are the sharpest angle (0.49x linear at w8).**
 
+**PROBE 2 MEASURED (2026-07-31 late): the static-budget arm is DEAD -
+LLAMA_EXPERT_MASK hard-budget on hy3 trunc-40, KLD vs unmasked base:
+deep32 = 27.1% top-1 agreement (73% flips, mean KLD 0.64); b64 (the 25%
+budget, aggregate coverage 0.913) = 29.2% agreement (71% flips). The
+>=99% agreement bar misses by ~70 points: per-layer coverage does not
+survive 38 layers of composition. Temporal reuse (the union curve) and
+static reuse (hot sets) are different quantities; only temporal is
+strong. Key 3 narrows to the lossless dynamic arm - EcoSpec-class
+reuse-aware lane selection - with probe 3 (confidence-skip) downgraded
+to weak-prior.**
+
 **V4 production curve (2026-07-31, offline per-position route -
 LLAMA_EXPERT_PROFILE_IDS + scripts/union-curve-from-ids.py, single-box
 IQ2XXS -ncmoe wikitext, PPL 4.08 sane): w2 1.62x / w4 2.65x / w8 4.35x
