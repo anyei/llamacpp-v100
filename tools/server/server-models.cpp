@@ -1820,9 +1820,25 @@ void server_models_routes::init_routes() {
         // launch-wizard overlay (optional): raw argv tokens + KEY=VALUE env
         server_models::load_options opts;
         for (const auto & a : json_value(body, "extra_args", json::array())) {
-            opts.extra_args.push_back(a.get<std::string>());
+            if (!a.is_string()) {
+                res_err(res, format_error_response("extra_args entries must be strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::string tok = a.get<std::string>();
+            // appended argv wins over the preset's rendered flags, and the
+            // router owns the child's binding: an overridden --port leaves
+            // inst.meta.port stale and every proxy hits the wrong socket
+            if (tok == "--port" || tok == "--host") {
+                res_err(res, format_error_response("extra_args must not set --port/--host - the router owns the child's binding", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            opts.extra_args.push_back(tok);
         }
         for (const auto & e : json_value(body, "extra_env", json::array())) {
+            if (!e.is_string()) {
+                res_err(res, format_error_response("extra_env entries must be strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             const std::string kv = e.get<std::string>();
             if (kv.find('=') == std::string::npos || kv.rfind("LLAMA_SERVER_", 0) == 0) {
                 res_err(res, format_error_response("extra_env entries must be KEY=VALUE and must not touch LLAMA_SERVER_*", ERROR_TYPE_INVALID_REQUEST));

@@ -174,7 +174,12 @@ lines 515/613/1059 the same way.
 
 ---
 
-## [ ] 8. `/models/load` `extra_args` unvalidated: `--port` override breaks routing; non-strings → 500
+## [x] 8. `/models/load` `extra_args` unvalidated: `--port` override breaks routing; non-strings → 500
+
+**FIXED 2026-08-01:** extra_args now validated like extra_env: non-string
+entries → 400 (was 500), `--port`/`--host` rejected 400 (router owns the
+child's binding); extra_env also gets the non-string 400. Gated live: all
+three rejections + benign-args acceptance verified over HTTP.
 
 **File:** `tools/server/server-models.cpp:1816` — **CONFIRMED**
 
