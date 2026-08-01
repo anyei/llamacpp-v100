@@ -416,6 +416,7 @@ function manualPcts() {
   return devs.map(d => ({...d, pct: S.fleetPct[d.key]!==undefined ? S.fleetPct[d.key] : Math.round(d.capGB/tot*100)}));
 }
 const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3; // the swept split assumes the 3-worker record roster
+const devsForFleet = () => [...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().map((w,i)=>"RPC"+i)].join(",");
 const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct).join(",")
   : (S.fleetW==="record" && recordTsOk(md) ? "-ts 21,21,46,50,27" : "--rpc-auto-weight");
 // capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
@@ -503,13 +504,13 @@ function modesFor(m, ctx, kv) {
             (epMeas ? " Gates preset: boundary fusion, q8 wire, decode-only expert deferral."
                     : " UNSWEPT for this model - run layer split first to collect its expert profile (a profiled first EP layout beats uniform)."),
         hasRecordTs: !!MEASURED[m.file+"|fleet-ep|none"],
-        flags:`--rpc {RPC} --rpc-reload\n-sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
+        flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
     }
     push({ id:"fleetl", name:"Distributed fleet · layer split",
       speed:s2=>meas("fleet-layer",s2)||"~1.5–2.5", est:s2=>!meas("fleet-layer",s2),
       why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture.${border}`+
           (m.moe ? ` Also the PROFILING vehicle: add LLAMA_EXPERT_PROFILE to collect router histograms for a first ${m.file.split("-")[0]} EP layout.` : ""),
-      flags:`--rpc {RPC} --rpc-reload\n-sm layer {TS} -ngl 99 -c {CTX} --no-mmap -fit off`+
+      flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm layer {TS} -ngl 99 -c {CTX} --no-mmap -fit off`+
             (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
     out.blocked.push({ name:"Distributed · full tensor split",
       why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
@@ -916,7 +917,7 @@ function render() {
                ${o.name} ${o.gain?`<span class="gain">${o.gain}</span>`:o.est?'<span class="estg">est. gain — sweep it</span>':""}
                ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>`).join("")}
         </div>`:""}
-        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053")}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
       </div>`;}).join("") +
       `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
       `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
@@ -984,6 +985,7 @@ function render() {
     const tmpl = md.flags.replace("{CTX}", S.ctx)
                          .replace("{TS}", tsForFleet(md))
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
+                         .replace("{DEVS}", devsForFleet())
                  + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+spec.flags : "") + advFlags;
     const ga = applyGates(tmpl);
     const flags = ga.text, seeded = ga.seeded;
