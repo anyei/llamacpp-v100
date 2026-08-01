@@ -61,6 +61,32 @@ struct server_spec_timing {
 };
 static server_spec_timing g_spec_timing;
 
+// TASKS #89: a split model's on-disk size is the SUM of its shard set -
+// stat'ing only the -00001- member undercounts every sharded model (the
+// fleet loading page showed shard-1-only sizes and bogus percentages)
+static size_t model_size_on_disk(const std::string & path) {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return 0;
+    }
+    uint64_t total = (uint64_t) sz;
+    const size_t sh = path.find("-00001-of-");
+    if (sh != std::string::npos && path.size() >= sh + 15) {
+        const int n_split = atoi(path.substr(sh + 10, 5).c_str());
+        const std::string prefix = path.substr(0, sh);
+        for (int i = 2; i <= n_split; i++) {
+            char tail[64];
+            snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
+            const auto ssz = std::filesystem::file_size(prefix + tail, ec);
+            if (!ec) {
+                total += (uint64_t) ssz;
+            }
+        }
+    }
+    return (size_t) total;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -1487,13 +1513,7 @@ private:
             }
         }
 
-        size_t model_bytes = 0;
-        {
-            std::ifstream f(params_base.model.path, std::ios::binary | std::ios::ate);
-            if (f.good()) {
-                model_bytes = (size_t) f.tellg();
-            }
-        }
+        const size_t model_bytes = model_size_on_disk(params_base.model.path); // TASKS #89: shard-set sum
 
         typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
         typedef bool (*worker_is_cpu_t)(ggml_backend_dev_t);
@@ -5864,10 +5884,7 @@ void server_routes::init_routes() {
         }
         if (ready) {
             // the model's file size never changes for a given load - stat it once
-            static const size_t model_bytes = [&]() -> size_t {
-                std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
-                return f.good() ? (size_t) f.tellg() : 0;
-            }();
+            static const size_t model_bytes = model_size_on_disk(params.model.path); // TASKS #89: shard-set sum
             body["fleet_admin"]  = params.fleet_admin && !params.api_keys.empty();
             body["split_mode"]   = params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer"
                                  : params.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "none";
