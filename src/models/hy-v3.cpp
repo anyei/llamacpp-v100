@@ -238,11 +238,23 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
 
     for (int il = 0; il < n_layer; ) {
         // pair only strictly inside the sync edges; both members of a pair must
-        // be MoE blocks (pairing a leading dense block buys nothing)
-        const bool pair_ok = lp_pairs &&
+        // be MoE blocks (pairing a leading dense block buys nothing). A member
+        // steered by a control vector must stay unpaired: the fused shape has
+        // no per-member residual to add the vector to, and silently dropping
+        // it steered only the edge layers
+        const bool cvec_here = il + 1 < n_layer &&
+            (cvec->tensor_for(il) != nullptr || cvec->tensor_for(il + 1) != nullptr);
+        const bool pair_ok = lp_pairs && !cvec_here &&
             il >= lp_edge && il + 1 < n_layer - lp_edge &&
             model.layers[il].ffn_gate_inp != nullptr &&
             model.layers[il + 1].ffn_gate_inp != nullptr;
+        if (lp_pairs && cvec_here) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("LLAMA_LP_PAIRS: control vector active - steered layers run unpaired\n");
+                warned = true;
+            }
+        }
         if (pair_ok) {
             ggml_tensor * x0 = inpL;
             ggml_tensor * moe_a = nullptr, * mir_a = nullptr;

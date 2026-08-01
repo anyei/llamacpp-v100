@@ -108,7 +108,13 @@ the wrong one.
 
 ---
 
-## [ ] 5. hy-v3 LP pair-fusion early return skips `build_cvec` + `l_out` callback
+## [x] 5. hy-v3 LP pair-fusion early return skips `build_cvec` + `l_out` callback
+
+**FIXED 2026-08-01:** layers steered by an active control vector are excluded
+from pairing (fall back to the exact unpaired path, which applies
+`build_cvec` + `l_out`), with a one-time warning. Unsteered paired graphs are
+untouched (`tensor_for` null → predicate false). Gated: build clean,
+LP_PAIRS=1 serve generates, no spurious warning without cvec.
 
 **File:** `src/models/hy-v3.cpp:222` — **CONFIRMED**
 
