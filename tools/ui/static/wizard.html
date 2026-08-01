@@ -1020,7 +1020,7 @@ function render() {
       </div>`:""}
       <div class="panel"><h3>Resolved launch — flags &amp; env gates</h3><div class="cmd">${flags}</div>
         <div class="memnote" style="margin-top:6px"><span>model path, host and port come from the router preset; these flags overlay it</span></div></div>
-      <details class="panel" data-d="adv" style="margin-top:0"><summary style="font-size:12px;color:var(--muted);cursor:pointer">Advanced — ${advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).length} of ${advGroups.flatMap(g=>g.items).length} options · env gates</summary>
+      <details class="panel" data-d="adv" style="margin-top:0"><summary style="font-size:12px;color:var(--muted);cursor:pointer">Advanced — ${advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).length} of ${advGroups.flatMap(g=>g.items).length} options${(n=>n?` · ${n} env gates active`:" · env gates")(GATES.filter(g=>S.gateOn[g.name]!==undefined||(seeded[g.name]!==undefined&&!S.gateOff[g.name])).length)}</summary>
         ${advGroups.map(g=>`<div class="spec"><div class="lbl">${g.label}</div>
           ${g.items.map(it=>`<label><input type="checkbox" data-adv="${it.id}" ${S.adv[it.id]?"checked":""}>
             <span style="font-family:var(--mono);font-size:12px">${it.name}</span>
