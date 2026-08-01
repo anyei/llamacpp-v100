@@ -116,11 +116,18 @@ void server_queue::wait_until_no_sleep() {
     }
 }
 
-void server_queue::ctx_guard_enter() {
+bool server_queue::ctx_guard_enter(int hold_timeout_ms) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     for (;;) {
         if (ctx_hold) {
-            condition_tasks.wait(lock, [&]{ return !ctx_hold; });
+            if (hold_timeout_ms < 0) {
+                condition_tasks.wait(lock, [&]{ return !ctx_hold; });
+            } else if (!condition_tasks.wait_for(lock, std::chrono::milliseconds(hold_timeout_ms),
+                                                 [&]{ return !ctx_hold; })) {
+                // a teardown (--rpc-reload retry loop) still holds the model;
+                // give up so the HTTP thread can 503 instead of parking forever
+                return false;
+            }
             continue;
         }
         if (sleeping) {
@@ -135,6 +142,7 @@ void server_queue::ctx_guard_enter() {
         break;
     }
     n_ctx_guards++;
+    return true;
 }
 
 void server_queue::ctx_guard_exit() {

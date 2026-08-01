@@ -16,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,13 @@ struct server_grammar_trigger {
 };
 
 json format_error_response(const std::string & message, const enum error_type type);
+
+// thrown when a request cannot enter the pre-task window because a model
+// teardown (--rpc-reload retry loop, sleep) has held the context past the
+// guard timeout; mapped to ERROR_TYPE_UNAVAILABLE (503) by ex_wrapper
+struct server_unavailable_exception : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 //
 // random string / id

@@ -59,7 +59,11 @@ public:
     // pre-task ctx guard: enter blocks while a teardown hold is active (and
     // wakes/waits out the sleeping state, subsuming wait_until_no_sleep);
     // exit releases. Use via server_response_reader::ctx_guard_acquire/release.
-    void ctx_guard_enter();
+    // hold_timeout_ms bounds only the ctx_hold wait (< 0 = wait forever):
+    // a wedged --rpc-reload retry loop holds the ctx indefinitely, and parking
+    // HTTP threads on it untimed exhausts the pool (code review 2026-08-01 #1).
+    // Returns false if the hold outlasted the timeout; the guard is NOT held.
+    bool ctx_guard_enter(int hold_timeout_ms = -1);
     void ctx_guard_exit();
     // teardown side (queue thread): block new guards, then wait for in-flight
     // ones to drain (bounded); end releases the hold
@@ -206,12 +210,17 @@ struct server_response_reader {
 
     // pre-task ctx guard: held from create_response() until the tasks are
     // posted (or the reader dies), covering every model/vocab read on the
-    // HTTP thread; released automatically by post_task/post_tasks/stop
-    void ctx_guard_acquire() {
+    // HTTP thread; released automatically by post_task/post_tasks/stop.
+    // Returns false if a teardown hold outlasted hold_timeout_ms (see
+    // server_queue::ctx_guard_enter).
+    bool ctx_guard_acquire(int hold_timeout_ms = -1) {
         if (!has_ctx_guard) {
-            queue_tasks.ctx_guard_enter();
+            if (!queue_tasks.ctx_guard_enter(hold_timeout_ms)) {
+                return false;
+            }
             has_ctx_guard = true;
         }
+        return true;
     }
     void ctx_guard_release() {
         if (has_ctx_guard) {

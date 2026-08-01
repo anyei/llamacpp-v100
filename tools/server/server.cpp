@@ -61,6 +61,10 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
+        } catch (const server_unavailable_exception & e) {
+            // ctx guard timed out against a teardown hold (--rpc-reload) (503)
+            error = ERROR_TYPE_UNAVAILABLE;
+            message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
             error = ERROR_TYPE_SERVER;

@@ -44,6 +44,11 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// how long an HTTP thread waits out a teardown hold (--rpc-reload/sleep) before
+// giving up with a 503; a healthy reload finishes within one model load, a
+// wedged one (all workers down) holds the ctx forever
+constexpr int CTX_GUARD_HOLD_TIMEOUT_MS = 30000;
+
 // env LLAMA_SPEC_TIMING: coarse per-phase timing of the speculative decode loop
 struct server_spec_timing {
     bool    enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
@@ -5071,7 +5076,15 @@ struct server_res_generator : server_res_spipe {
             // (the handler reads model/vocab until rd.post_tasks()). Needed
             // even with idle-sleep disabled - the reload path was segfaulting
             // HTTP threads mid-tokenize (use-after-free on the vocab).
-            rd.ctx_guard_acquire();
+            // The hold wait is bounded: a wedged reload retry loop (all workers
+            // down) holds the ctx indefinitely, and untimed waits here consumed
+            // the whole HTTP pool - starving even the bypass routes. Throwing
+            // reaches ex_wrapper as a 503 (handlers create the response before
+            // their own try blocks).
+            if (!rd.ctx_guard_acquire(CTX_GUARD_HOLD_TIMEOUT_MS)) {
+                throw server_unavailable_exception(
+                        "model is being reloaded (a worker connection was lost) - retry later");
+            }
         }
     }
     void ok(const json & response_data) {
