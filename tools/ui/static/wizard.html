@@ -761,13 +761,21 @@ function chips() {
   const b = document.getElementById("hwedit");
   if (b) b.onclick = () => {
     const v = prompt("Hardware assumptions (JSON)", JSON.stringify(HW));
-    if (v) { try { HW = JSON.parse(v); totalVram = HW.gpus.reduce((a,g)=>a+g.vram,0);
-                   localStorage.setItem("wizardHW", v); chips();
+    if (v) {
+      // merge over defaults (same as the bootstrap load) and render BEFORE
+      // persisting; on any throw roll the globals back so a partial edit
+      // (e.g. missing fleet/gpus keys) cannot brick the running page
+      const prevHW = HW, prevTV = totalVram;
+      try { HW = Object.assign({}, HW_DEFAULT, JSON.parse(v));
+            totalVram = HW.gpus.reduce((a,g)=>a+g.vram,0);
+            chips();
+            localStorage.setItem("wizardHW", v);
 document.getElementById("view").innerHTML = '<div class="empty">scanning models...</div>';
 loadData().then(()=>render()).catch(e=>{
   document.getElementById("view").innerHTML = '<div class="empty">failed to read ./models - is this page served by llama-server in router mode? ('+e+')</div>';
 }); }
-             catch(e) { alert("invalid JSON"); } }
+      catch(e) { HW = prevHW; totalVram = prevTV; chips(); alert("invalid hardware JSON: " + e); }
+    }
   };
 }
 

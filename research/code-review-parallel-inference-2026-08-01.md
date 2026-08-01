@@ -151,7 +151,12 @@ where previously it logged a warning, kept the default split, and loaded.
 
 ---
 
-## [ ] 7. Wizard hardware-edit assigns `HW` before validating; partial JSON bricks the page
+## [x] 7. Wizard hardware-edit assigns `HW` before validating; partial JSON bricks the page
+
+**FIXED 2026-08-01:** edit now merges over `HW_DEFAULT` (same as bootstrap),
+renders before persisting, and rolls `HW`/`totalVram` back on any throw;
+honest error alert. Gated: node syntax check + 4-shape logic harness
+(partial/garbage/bad-gpus/bad-fleet) all behave.
 
 **File:** `tools/ui/static/wizard.html:764` — **CONFIRMED**
 
