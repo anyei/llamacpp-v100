@@ -246,6 +246,14 @@ static json server_model_read_gguf_meta(const std::string & path) {
         };
         const uint32_t n_layer = get_u32(".block_count", 0);
         meta["block_count"]  = n_layer;
+        if (arch == "dflash") {
+            // TASKS #88: classify the drafter kind - a DSpark drafter is a
+            // dflash-arch gguf carrying the semi-autoregressive markov head;
+            // pairing it as plain dflash would run the wrong spec type with
+            // the head silently ignored
+            meta["drafter_kind"]   = gguf_find_tensor(g, "markov_w1.weight") >= 0 ? "dspark" : "dflash";
+            meta["spec_block_size"] = get_u32(".block_size", 0);
+        }
         meta["n_ctx_train"]  = get_u32(".context_length", 0);
         meta["n_expert"]     = get_u32(".expert_count", 0);
         // MTP head: the nextn KV when present, else any nextn tensor

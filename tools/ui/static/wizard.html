@@ -288,6 +288,9 @@ async function loadData() {
       nctx: md.n_ctx_train || 32768,
       kvtok: md.kv_bytes_per_token_f16 || 0,
       kind: e.kind || "model",
+      arch: md.arch || "",
+      dspark: md.drafter_kind === "dspark",
+      specBlock: md.spec_block_size || 0,
       status: (e.status||{}).value || "unloaded",
       family: familyOf(id),
       note: [md.arch, md.block_count ? md.block_count+" layers" : "",
@@ -370,11 +373,16 @@ const kvEst = (m, ctx, kv) => (m.kvtok ? m.kvtok*ctx/1073741824
 // n_embd mismatch at load
 const mmprojFor = m => m.family ? MMPROJ.find(p=>familyOf(p.id)===m.family) : undefined;
 const visionCapable = m => !!mmprojFor(m) || (m.family && /^qwen3\.[5-9]|^qwen[4-9]/.test(m.family));
-const dflashFor = m => DRAFTS.find(d => {
+const draftMatches = (d, m) => {
   const dl = d.id.toLowerCase();
   return (m.family && familyOf(d.id)===m.family) ||
          (versionTok(m.id) && dl.includes(versionTok(m.id)));
-});
+};
+// TASKS #88: dspark drafters are dflash-arch ggufs with a markov head - they
+// must pair via --spec-type draft-dspark, never as plain dflash. The arch
+// guard also stops RAW-schema exports (unloadable, draft-named) from pairing.
+const dflashFor = m => DRAFTS.find(d => d.arch==="dflash" && !d.dspark && draftMatches(d, m));
+const dsparkFor = m => DRAFTS.find(d => d.arch==="dflash" &&  d.dspark && draftMatches(d, m));
 
 // ---------- mode catalog + fit + speculation logic ----------
 // specs: which speculation routes exist for (model, mode) and what we know about them.
@@ -392,6 +400,16 @@ function specOptions(m, modeId) {
   if (d && (gpuMode || modeId==="ncmoe")) opts.push({ id:"dflash", name:"dflash speculation", est:true,
     sub:`draft found: ${d.file}`,
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
+  // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
+  // type. Honest per-shape notes: single-box measured 0.7-0.8x SLOWER (#80
+  // A/B - verify compute exceeds savings, no boundary term to amortize);
+  // fleet-EP is the unmeasured boundary-amortization case.
+  const ds = dsparkFor(m);
+  if (ds && (gpuMode || modeId==="ncmoe" || modeId==="fleet")) opts.push({ id:"dspark", name:"DSpark speculation", est:true,
+    sub: modeId==="fleet"
+      ? `draft: ${ds.file} · est. gain — pending the #80 fleet A/B`
+      : `draft: ${ds.file} · measured 0.7–0.8x SLOWER single-box (#80) — experimental`,
+    flags:`--spec-type draft-dspark --spec-draft-model ${ds.path} --spec-draft-n-max ${ds.specBlock||5} --spec-draft-conf-min 0.3 -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
     sub:"train-free, no draft model - shines on repetitive/structured output",
     flags:`--spec-type ngram-simple\nGGML_CUDA_DISABLE_GRAPHS=1` });
@@ -814,6 +832,7 @@ function render() {
           ${/trunc/i.test(m.id)?'<span class="tag t-warn" title="truncated debug reproducer: launches need LLAMA_TRUNC_ARR (env gates, danger class) + --override-kv block_count">trunc vehicle</span>':""}
           ${m.mtp?'<span class="tag t-acc">MTP able</span>':""}
           ${dflashFor(m)?'<span class="tag t-acc">dflash able</span>':""}
+          ${dsparkFor(m)?'<span class="tag t-acc">DSpark able</span>':""}
           ${mmprojFor(m)?'<span class="tag t-ok">vision</span>':visionCapable(m)?'<span class="tag t-idle">vision capable</span>':""}
           ${m.moe?'<span class="tag t-idle">MoE</span>':""}
           <span class="tag ${c}"${tip?` title="${tip}"`:""}>${t}</span></button>`;
