@@ -1582,9 +1582,16 @@ static void apply_rpc_auto_weight(common_params & params) {
         share_sum += share[i];
     }
     if (share_sum < 0.999 && w_bytes > 0.0) {
-        LOG_WRN("--rpc-auto-weight: the model (%.1f GiB) does not fit the fleet's free memory "
-                "at 90%% headroom, keeping the default split\n", w_bytes / (1024.0 * 1024.0 * 1024.0));
-        return;
+        // TASKS #90: proceeding with the DEFAULT split here is a guaranteed OOM
+        // on capacity-shaped rosters (a 32GB GPU can draw a 40GB share - hit
+        // live 2026-07-31: 39.7GB on a V100). Fail fast with the verdict as the
+        // final line so the wizard error tail names the actual cause.
+        LOG_ERR("--rpc-auto-weight: the model (%.1f GiB) does not fit the fleet's free memory "
+                "at 90%% headroom (only %.0f%% of the weights are placeable) - refusing the "
+                "default-split fallback. Free worker/GPU memory, shrink the model or context, "
+                "or pass an explicit -ts.\n",
+                w_bytes / (1024.0 * 1024.0 * 1024.0), share_sum * 100.0);
+        exit(1);
     }
 
     // #31 law 1: never distribute a model that fits fast local VRAM. Layer
