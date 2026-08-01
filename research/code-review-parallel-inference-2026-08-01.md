@@ -198,7 +198,14 @@ turning a malformed request into a 500 instead of the 400 the adjacent
 
 ---
 
-## [ ] 9. Wizard `extra_env` appended *after* inherited env — child `getenv` keeps the old value
+## [x] 9. Wizard `extra_env` appended *after* inherited env — child `getenv` keeps the old value
+
+**FIXED 2026-08-01:** confirmed empirically (C execve/getenv repro: duplicate
+envp → child reads FIRST entry). extra_env now erases matching `NAME=` entries
+from the inherited env before appending. Gated end-to-end: router with
+`GATE_TEST_FOO=1`, wizard override `=2` → child `/proc/<pid>/environ` shows
+exactly one entry, value 2 (also exercised extra_args+extra_env overlay
+loading the trunc stub through /models/load).
 
 **File:** `tools/server/server-models.cpp:983` — **PLAUSIBLE**
 

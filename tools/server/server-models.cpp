@@ -984,10 +984,19 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
 
-        // wizard overlay: appended argv wins over the preset's flags; env
-        // entries reach the child through its environment like any gate
+        // wizard overlay: appended argv wins over the preset's flags. env
+        // overrides must REPLACE inherited entries: execve keeps duplicates
+        // in order and glibc getenv returns the first match, so an appended
+        // override of a variable already in the router's environment would
+        // silently lose to it
         child_args.insert(child_args.end(), opts.extra_args.begin(), opts.extra_args.end());
-        child_env.insert(child_env.end(), opts.extra_env.begin(), opts.extra_env.end());
+        for (const auto & kv : opts.extra_env) {
+            const std::string key = kv.substr(0, kv.find('=') + 1); // "NAME=" - validated upstream
+            child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                    [&](const std::string & e) { return e.rfind(key, 0) == 0; }),
+                    child_env.end());
+            child_env.push_back(kv);
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
