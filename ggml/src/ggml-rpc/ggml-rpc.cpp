@@ -631,9 +631,14 @@ struct ggml_backend_rpc_async_state {
     // breaks by design.
     // zero_ok (proto 4.14): this fetch was sent with the zero-short-reply flag,
     // so a 1-byte ZERO marker response is legal (stashed as logical_size zeros)
-    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint8_t zero_ok; uint64_t logical_size; }; // kind 0 = ping, 1 = fetch
+    // owner = the ggml_backend_t that sent the FETCH (nullptr for pings): two
+    // meta members sharing this socket recv out of send order under expert
+    // deferral, so a stashed payload must be claimed by its owner, not by
+    // whoever pops first
+    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint8_t zero_ok; uint64_t logical_size; const void * owner; }; // kind 0 = ping, 1 = fetch
     std::deque<rpc_pending_rsp> rsp_fifo;
-    std::deque<std::vector<uint8_t>> fetch_stash; // early-read FETCH payloads, f32, FIFO
+    struct rpc_fetch_stashed { const void * owner; std::vector<uint8_t> payload; };
+    std::deque<rpc_fetch_stashed> fetch_stash; // early-read FETCH payloads, f32, send order per owner
     uint64_t zero_replies = 0; // proto 4.14 ZERO short replies received (TASKS #71 inc-1)
 };
 
@@ -876,7 +881,7 @@ static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state
         if (!sock->recv_data(&marker, 1) || marker != 0x5A) {
             return false;
         }
-        st.fetch_stash.push_back(std::vector<uint8_t>(e.logical_size)); // zero-filled
+        st.fetch_stash.push_back({e.owner, std::vector<uint8_t>(e.logical_size)}); // zero-filled
         if (st.zero_replies++ == 0) {
             // stderr, not GGML_LOG_INFO: the engagement line must be visible at
             // default serve verbosity (the -lv 1 fleet-load trap)
@@ -901,7 +906,7 @@ static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state
     } else if (!sock->recv_data(payload.data(), e.logical_size)) {
         return false;
     }
-    st.fetch_stash.push_back(std::move(payload));
+    st.fetch_stash.push_back({e.owner, std::move(payload)});
     return true;
 }
 
@@ -1006,7 +1011,7 @@ static uint64_t rpc_ping_async(socket_ptr sock) {
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
     } else {
-        st.rsp_fifo.push_back({0, 0, 0, 0});
+        st.rsp_fifo.push_back({0, 0, 0, 0, nullptr});
     }
     return ++st.pings_sent;
 }
@@ -2349,7 +2354,7 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         return false;
     }
     if (flags & 4) {
-        st.rsp_fifo.push_back({1, fetch_fmt, (uint8_t) ((flags & 128) ? 1 : 0), (uint64_t) fetch_size});
+        st.rsp_fifo.push_back({1, fetch_fmt, (uint8_t) ((flags & 128) ? 1 : 0), (uint64_t) fetch_size, (const void *) backend});
     }
     return true;
 }
@@ -2370,7 +2375,15 @@ static bool ggml_backend_rpc_boundary_fused_ready(ggml_backend_t backend) {
     }
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    while (st.fetch_stash.empty()) {
+    auto stashed_own = [&]() {
+        for (const auto & e : st.fetch_stash) {
+            if (e.owner == (const void *) backend) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (!stashed_own()) {
         if (st.rsp_fifo.empty()) {
             return true; // no fetch outstanding - accounting broke, fail in recv
         }
@@ -2396,23 +2409,34 @@ static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * 
     }
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    // process the FIFO (leading pings, then the fetch) until a fetch payload is
-    // available; a fetch consumed early by another read is already stashed
-    while (st.fetch_stash.empty()) {
+    // process the FIFO (leading pings, then the fetch) until THIS member's
+    // payload is stashed; entries owned by a co-hosted member stay stashed for
+    // their own fused_recv (deferral recvs out of send order across members)
+    auto find_own = [&]() {
+        auto it = st.fetch_stash.begin();
+        for (; it != st.fetch_stash.end(); ++it) {
+            if (it->owner == (const void *) backend) {
+                break;
+            }
+        }
+        return it;
+    };
+    auto it = find_own();
+    while (it == st.fetch_stash.end()) {
         if (!rpc_process_rsp_locked(sock, st)) {
             rpc_mark_failed(rpc_ctx->endpoint, __func__);
             memset(data, 0, size); // deterministic instead of stale garbage
             return false;
         }
+        it = find_own();
     }
-    auto & payload = st.fetch_stash.front();
-    if (payload.size() != size) {
+    if (it->payload.size() != size) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         memset(data, 0, size);
         return false;
     }
-    memcpy(data, payload.data(), size);
-    st.fetch_stash.pop_front();
+    memcpy(data, it->payload.data(), size);
+    st.fetch_stash.erase(it);
     return true;
 }
 

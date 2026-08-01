@@ -225,7 +225,16 @@ gate") asserts the opposite.
 
 ---
 
-## [ ] 10. Fused-FETCH stash is untagged FIFO — co-hosted meta members can swap partials
+## [x] 10. Fused-FETCH stash is untagged FIFO — co-hosted meta members can swap partials
+
+**FIXED 2026-08-01:** trace confirmed the mechanism (deferral skips j1's recv,
+j2 pops the FIFO front; same-shape sizes pass). Latent only — current fleet is
+1 device/endpoint. Stash + rsp_fifo entries now carry the owning backend;
+fused_recv/fused_ready claim only their own payloads (single-owner behavior
+identical by construction). Gated: canonical 3-worker loopback byte-identity
+**6/6 c80261ff** with fused engagement (`bcast1 4.0 star 3.0`, parts fused
+8.8/graph); build-cpu + build-cuda75 clean. Live 2-device-endpoint defer A/B
+needs a fleet window (no local rig).
 
 **File:** `ggml/src/ggml-rpc/ggml-rpc.cpp:2408` — **PLAUSIBLE**
 
