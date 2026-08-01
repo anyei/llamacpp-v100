@@ -131,7 +131,16 @@ vs unpaired runs.
 
 ---
 
-## [ ] 6. `--rpc-auto-weight` low fit estimate is now fatal `exit(1)` at parse time
+## [-] 6. `--rpc-auto-weight` low fit estimate is now fatal `exit(1)` at parse time
+
+**WON'T FIX 2026-08-01 (intended behavior):** the exit(1) is TASKS #90,
+landed after a live 2026-07-31 incident — the warn-and-fallback default split
+drew a 39.7 GB share on a 32 GB V100 (guaranteed OOM on capacity-shaped
+rosters). Fail-fast with an actionable message is the design. Tradeoff
+accepted: a transiently-low estimate (worker restarting / releasing buffers)
+hard-fails the serve; remedy is retry, free memory, or explicit `-ts` — all
+named in the error. Revisit only if transient-estimate failures show up in
+practice.
 
 **File:** `common/arg.cpp:1594` — **CONFIRMED**
 
