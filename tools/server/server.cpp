@@ -235,6 +235,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.get ("/wizard/sweeps",        ex_wrapper(models_routes->get_wizard_sweeps));
         ctx_http.get ("/wizard/dirs",          ex_wrapper(models_routes->get_wizard_dirs));
         ctx_http.post("/wizard/dirs",          ex_wrapper(models_routes->post_wizard_dirs));
+        ctx_http.get ("/wizard/configs",       ex_wrapper(models_routes->get_wizard_configs));
+        ctx_http.post("/wizard/configs",       ex_wrapper(models_routes->post_wizard_configs));
+        ctx_http.del ("/wizard/configs",       ex_wrapper(models_routes->del_wizard_configs));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

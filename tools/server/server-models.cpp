@@ -2090,6 +2090,91 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // TASKS #94: named per-model launch configs. Stored as a JSON array in
+    // <cache>/wizard-configs.json (the same launcher-cache volume as the saved
+    // dirs, so configs survive restarts and image rolls). Entry:
+    // {id, model, title, created_ms, config:{...opaque wizard state blob...}}
+    static std::mutex wizard_configs_mtx;
+    static const auto wizard_configs_path = []() {
+        return std::filesystem::path(fs_get_cache_directory()) / "wizard-configs.json";
+    };
+    static const auto wizard_configs_load = []() -> json {
+        std::ifstream f(wizard_configs_path());
+        if (!f.good()) return json::array();
+        try {
+            json j = json::parse(f);
+            return j.is_array() ? j : json::array();
+        } catch (const std::exception &) { return json::array(); }
+    };
+    static const auto wizard_configs_save = [](const json & arr) {
+        const auto path = wizard_configs_path();
+        const auto tmp  = path.string() + ".tmp";
+        std::ofstream f(tmp);
+        f << arr.dump(2);
+        f.close();
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+    };
+
+    this->get_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string model = req.get_param("model");
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json out = json::array();
+        for (const auto & e : all) {
+            if (model.empty() || json_value(e, "model", std::string()) == model) {
+                out.push_back(e);
+            }
+        }
+        res_ok(res, {{"configs", out}});
+        return res;
+    };
+
+    this->post_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string model = json_value(body, "model", std::string());
+        const std::string title = json_value(body, "title", std::string());
+        if (model.empty() || title.empty() || !body.contains("config")) {
+            res_err(res, format_error_response("model, title and config are required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json entry = {
+            {"id",         std::to_string(ggml_time_us())},
+            {"model",      model},
+            {"title",      title},
+            {"created_ms", ggml_time_ms()},
+            {"config",     body["config"]},
+        };
+        all.push_back(entry);
+        wizard_configs_save(all);
+        res_ok(res, {{"success", true}, {"entry", entry}});
+        return res;
+    };
+
+    this->del_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string id = req.get_param("id");
+        if (id.empty()) {
+            res_err(res, format_error_response("id is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json kept = json::array();
+        bool removed = false;
+        for (const auto & e : all) {
+            if (json_value(e, "id", std::string()) == id) { removed = true; continue; }
+            kept.push_back(e);
+        }
+        if (removed) wizard_configs_save(kept);
+        res_ok(res, {{"success", removed}});
+        return res;
+    };
+
     this->get_wizard_sweeps = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json sweeps = json::object();

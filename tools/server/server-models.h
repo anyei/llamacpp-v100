@@ -348,6 +348,10 @@ struct server_models_routes {
     server_http_context::handler_t get_wizard_sweeps;
     server_http_context::handler_t get_wizard_dirs;
     server_http_context::handler_t post_wizard_dirs;
+    // TASKS #94: named per-model launch configs, persisted in the cache dir
+    server_http_context::handler_t get_wizard_configs;
+    server_http_context::handler_t post_wizard_configs;
+    server_http_context::handler_t del_wizard_configs;
     // fleet visibility in router mode: the fleet machinery lives in the CHILD
     // serving the current model - forward to the loading child first (live
     // per-worker load progress), else the most recently used running one

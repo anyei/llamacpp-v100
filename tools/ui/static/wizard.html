@@ -391,14 +391,20 @@ const dsparkFor = m => DRAFTS.find(d => d.arch==="dflash" &&  d.dspark && draftM
 function specOptions(m, modeId) {
   const opts = [];
   const gpuMode = modeId==="gpu1"||modeId==="ts";
+  // TASKS #93: each option declares its editable parameters; specFlags()
+  // appends them (user override or default) to the option's FIRST flag line
   if (m.mtp) opts.push({ id:"mtp", name:"MTP speculation", gain: gpuMode?"+2.4x measured":null,
     disabled: modeId==="fleet", offwhy:"measured break-even over the fleet boundary — verify lanes pay full wire cost",
-    flags:"--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
+    params:[{key:"nmax", flag:"--spec-draft-n-max", def:3, min:1, max:8, step:1},
+            {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05}],
+    flags:"--spec-type draft-mtp\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
   // dflash drafts are small dense models - they fit VRAM even when the target
   // runs with its experts offloaded to CPU (-ncmoe), so offer it there too
   const d = dflashFor(m);
   if (d && (gpuMode || modeId==="ncmoe")) opts.push({ id:"dflash", name:"dflash speculation", est:true,
     sub:`draft found: ${d.file}`,
+    params:[{key:"nmax", flag:"--spec-draft-n-max", def:(d.specBlock||8)-1, min:1, max:(d.specBlock||8)-1, step:1,
+             note:`trained block: ${(d.specBlock||8)-1} draft tokens max`}],
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
   // type. Honest per-shape notes: single-box measured 0.7-0.8x SLOWER (#80
@@ -409,11 +415,51 @@ function specOptions(m, modeId) {
     sub: modeId==="fleet"
       ? `draft: ${ds.file} · est. gain — pending the #80 fleet A/B`
       : `draft: ${ds.file} · measured 0.7–0.8x SLOWER single-box (#80) — experimental`,
-    flags:`--spec-type draft-dspark --spec-draft-model ${ds.path} --spec-draft-n-max ${ds.specBlock||5} --spec-draft-conf-min 0.3 -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
+    params:[{key:"nmax", flag:"--spec-draft-n-max", def:ds.specBlock||5, min:1, max:ds.specBlock||5, step:1,
+             note:`trained block: ${ds.specBlock||5} tokens`},
+            {key:"confmin", flag:"--spec-draft-conf-min", def:0.3, min:0, max:1, step:0.05,
+             note:"0.3 = measured sweet spot; 0 disables the confidence gate"}],
+    flags:`--spec-type draft-dspark --spec-draft-model ${ds.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
     sub:"train-free, no draft model - shines on repetitive/structured output",
     flags:`--spec-type ngram-simple\nGGML_CUDA_DISABLE_GRAPHS=1` });
   return opts;
+}
+
+// TASKS #94: named per-model launch configs (server-persisted)
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","mmproj"];
+const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+function configBlob() {
+  const c = { v: 1, mode: S.mode ? S.mode.id : null };
+  CONFIG_KEYS.forEach(k => c[k] = S[k]);
+  return c;
+}
+function applyConfig(c) {
+  CONFIG_KEYS.forEach(k => { if (c[k] !== undefined) S[k] = c[k]; });
+  const { ranked } = modesFor(S.model, S.ctx, S.kv);
+  const md = ranked.find(r => r.id === c.mode);
+  if (!md) { S.mode = null; S.step = 2; S._cfgWarn = `saved mode "${c.mode}" is not currently offered for this model — pick a mode manually (fields restored)`; render(); return; }
+  S.mode = md; S._cfgWarn = null; S.step = 3; render();
+}
+async function fetchConfigs() {
+  try {
+    const r = await fetch("./wizard/configs?model=" + encodeURIComponent(S.model.id));
+    S._cfgs = r.ok ? (await r.json()).configs : [];
+  } catch (e) { S._cfgs = []; }
+  render();
+}
+
+// TASKS #93: resolve an option's flags with user parameter overrides applied
+// to the first (CLI) line - env lines stay untouched
+function specFlags(o) {
+  if (!o) return "";
+  const lines = o.flags.split("\n");
+  (o.params||[]).forEach(p => {
+    const v = (S.specParams[o.id]||{})[p.key];
+    const val = (v !== undefined && v !== "") ? v : p.def;
+    lines[0] += ` ${p.flag} ${val}`;
+  });
+  return lines.join("\n");
 }
 
 // TASKS #87: fleet-builder - user-selected worker subset + capacity verdicts.
@@ -694,7 +740,7 @@ function gatesHTML(seeded){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, adv:{cachereuse:true}, gateOn:{}, gateOff:{}, gateQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, gateOn:{}, gateOff:{}, gateQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -861,7 +907,7 @@ function render() {
       S.model=MODELS[+b.dataset.i]; S.mode=null; S.spec="none";
       S.gateOn={}; S.gateOff={};
       const mp = mmprojFor(S.model); S.mmproj = mp ? mp.path : "";
-      S.ctx=Math.min(S.ctx, S.model.nctx||32768); S.step=2; render();
+      S.ctx=Math.min(S.ctx, S.model.nctx||32768); S.step=2; S._cfgs=null; render(); fetchConfigs();
     });
   }
 
@@ -878,7 +924,12 @@ function render() {
     if (!steps2.includes(nctx2)) { steps2.push(nctx2); steps2.sort((a,b)=>a-b); }
     if (!steps2.includes(maxCtx2)) steps2.push(maxCtx2);
     if (!steps2.includes(S.ctx)) S.ctx = steps2.filter(c=>c<=S.ctx).pop() || steps2[0];
-    v.innerHTML = crumb() + `
+    v.innerHTML = crumb() + (S._cfgs&&S._cfgs.length?`<div class="panel"><h3>Load config</h3>
+      ${S._cfgs.map(c=>`<div class="runrow"><span class="mname">${escHtml(c.title)}</span>
+        <span class="estg">${new Date(c.created_ms||0).toLocaleString()}</span>
+        <button class="btn ghost small" data-cfgload="${c.id}">Load</button>
+        <button class="btn ghost small" data-cfgdel="${c.id}">Delete</button></div>`).join("")}
+    </div>`:"") + (S._cfgWarn?`<div class="panel"><span class="tag t-warn">${escHtml(S._cfgWarn)}</span></div>`:"") + `
       <div class="panel" style="padding:10px 14px"><h3>Planned context - changes which modes fit</h3>
         <div class="ctxchips">${steps2.map(c=>
           `<button data-pctx="${c}" class="${S.ctx===c?"on":""} ${c>nctx2?"yarn":""}">${fmtCtx(c)}</button>`).join("")}</div>
@@ -934,9 +985,14 @@ function render() {
             ? `<label class="off"><input type="radio" disabled> ${o.name} <span class="offwhy">— ${o.offwhy}</span></label>`
             : `<label><input type="radio" name="spec-${md.id}" value="${o.id}" ${curSpec===o.id?"checked":""} ${sel?"":"disabled"}>
                ${o.name} ${o.gain?`<span class="gain">${o.gain}</span>`:o.est?'<span class="estg">est. gain — sweep it</span>':""}
-               ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>`).join("")}
+               ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>${sel&&curSpec===o.id&&o.params?o.params.map(p=>{
+                 const v=(S.specParams[o.id]||{})[p.key]; const val=(v!==undefined&&v!=="")?v:p.def;
+                 return `<label class="mrow" style="padding-left:22px"><span class="estg" style="font-family:var(--mono);font-size:11px">${p.flag}</span>
+                   <input type="number" data-spar="${o.id}:${p.key}" value="${val}" min="${p.min}" max="${p.max}" step="${p.step}"
+                   style="width:64px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+                   ${p.note?`<span class="estg">· ${p.note}</span>`:""}</label>`;}).join(""):""}`).join("")}
         </div>`:""}
-        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+opts.find(o=>o.id===S.spec).flags:""}</div></details>
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}</div></details>
       </div>`;}).join("") +
       `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
       `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
@@ -970,10 +1026,24 @@ function render() {
     v.querySelectorAll("[data-mpct]").forEach(inp=>inp.onchange=()=>{
       S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); render();
     });
+    // TASKS #93: per-type speculation parameter overrides
+    v.querySelectorAll("[data-spar]").forEach(inp=>inp.onchange=()=>{
+      const [t,k]=inp.dataset.spar.split(":");
+      if (!S.specParams[t]) S.specParams[t]={};
+      S.specParams[t][k]=inp.value; render();
+    });
     // NOT the fw- (device-weights) radios: they carry fleetW values, and this
     // generic handler would overwrite their onchange and crash the spec lookup
     v.querySelectorAll(".spec input[type=radio][name^=spec-]:not([disabled])").forEach(r=>r.onchange=e=>{ S.spec=e.target.value; render(); });
     $("next2").onclick=()=>{ S.step=3; render(); };
+    v.querySelectorAll("[data-cfgload]").forEach(b=>b.onclick=()=>{
+      const e=(S._cfgs||[]).find(x=>x.id===b.dataset.cfgload);
+      if (e) applyConfig(e.config||{});
+    });
+    v.querySelectorAll("[data-cfgdel]").forEach(b=>b.onclick=async()=>{
+      await fetch("./wizard/configs?id="+encodeURIComponent(b.dataset.cfgdel), {method:"DELETE"});
+      fetchConfigs();
+    });
     bindCrumb();
   }
 
@@ -1005,7 +1075,7 @@ function render() {
                          .replace("{TS}", tsForFleet(md))
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
                          .replace("{DEVS}", devsForFleet())
-                 + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+spec.flags : "") + advFlags;
+                 + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+specFlags(spec) : "") + advFlags;
     const ga = applyGates(tmpl);
     const flags = ga.text, seeded = ga.seeded;
     v.innerHTML = crumb() + `
@@ -1054,6 +1124,7 @@ function render() {
       <div class="actions">
         <button class="btn" id="go" ${S.launched||fIssue?"disabled":""} ${fIssue?`title="blocked: ${fIssue.kind} - fix the fleet selection first"`:""}>${S.launched?"Launching":"Launch"}</button>
         <button class="btn ghost" id="copy">Copy flags &amp; env</button>
+        <button class="btn ghost" id="savecfg">Save config</button>
       </div>
       <div class="lbanner ${S._lst?S._lst.kind:""}" id="lst">${S._lst?S._lst.html:""}</div>`;
     v.querySelectorAll("[data-ctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.ctx; render(); });
@@ -1086,6 +1157,14 @@ function render() {
       render();
     });
     $("go").onclick=()=>{ if (fIssue) return; S.launched=1; render(); realLaunch(flags); };
+    $("savecfg").onclick=async e=>{
+      const title = prompt("Config title (saved on the server for " + m.file + "):");
+      if (!title) return;
+      const r = await fetch("./wizard/configs", { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ model: S.model.id, title, config: configBlob() }) });
+      e.target.textContent = r.ok ? "Saved" : "Save failed";
+      setTimeout(()=>{ e.target.textContent = "Save config"; }, 1500);
+    };
     $("copy").onclick=async e=>{
       const btn=e.target;
       try { await navigator.clipboard.writeText(flags); }
