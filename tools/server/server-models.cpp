@@ -461,18 +461,25 @@ void server_models::set_models_dirs(const std::string & dirs) {
 }
 
 void server_models::load_models() {
-    // Phase 1: load presets from all sources - pure I/O, no lock needed
+    // Phase 1: load presets from all sources - pure I/O, no lock needed,
+    // except models_dir which set_models_dirs() mutates under the lock -
+    // snapshot it first (every caller enters with the lock released)
+    std::string models_dir;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        models_dir = base_params.models_dir;
+    }
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
     SRV_INF("Loaded %zu cached model presets\n", cached_models.size());
     // 2. local models from --models-dir
     common_presets local_models;
-    if (!base_params.models_dir.empty()) {
+    if (!models_dir.empty()) {
         // comma-separated list of dirs; on a name collision the EARLIER dir wins.
         // Overlapping sources (e.g. a dir and its own subdir both listed) reach
         // the same gguf under different names - dedup by model path too.
         std::set<std::string> seen_paths;
-        for (const auto & dir : string_split<std::string>(base_params.models_dir, ',')) {
+        for (const auto & dir : string_split<std::string>(models_dir, ',')) {
             if (dir.empty()) {
                 continue;
             }

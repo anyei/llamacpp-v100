@@ -62,7 +62,11 @@ at `:3126` likewise clobbers a previously supplied `--mlock`.
 
 ---
 
-## [ ] 3. Data race on `base_params.models_dir` (router UB/segfault)
+## [x] 3. Data race on `base_params.models_dir` (router UB/segfault)
+
+**FIXED 2026-08-01:** `load_models()` snapshots `models_dir` under `mutex`
+before the Phase-1 unlocked scan (all callers enter unlocked, so no deadlock).
+Build-gated; runtime TSAN gate skipped as disproportionate.
 
 **File:** `tools/server/server-models.cpp:475` (and `:470`) — **CONFIRMED**
 
