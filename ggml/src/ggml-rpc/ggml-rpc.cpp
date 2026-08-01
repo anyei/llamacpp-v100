@@ -1458,9 +1458,14 @@ static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor
             if (known) {
                 ast.pending_batch.push_back({ rpc_tensor, offset, hash });
                 flush_now = ast.pending_batch.size() >= 512;
-            } else {
-                ast.manifest.insert(hash); // the stream below makes the worker cache it
             }
+            // NOT inserted into the manifest on the stream path: the stream
+            // only reaches the worker's cache when it runs -c, so claiming it
+            // "known" made the next identical upload batch-place against
+            // nothing and hard-fail the endpoint. Multi-device endpoints hit
+            // this on every mirrored tensor (same bytes, one socket, twice) -
+            // those now stream once per device instead; the worker's own
+            // manifest still dedupes across loads.
         }
         if (ast.stat != nullptr) {
             (known ? ast.stat->weights_cached_bytes : ast.stat->weights_streamed_bytes)

@@ -263,19 +263,30 @@ activations, incoherent output, no error logged.
 
 ---
 
-## [ ] 11. NEW (found 2026-08-01 during #10 validation): meta serve over a multi-device endpoint fails at warmup
+## [x] 11. NEW (found 2026-08-01 during #10 validation): meta serve over a multi-device endpoint fails at warmup
 
 Attempting #10's real-topology validation (one `ggml-rpc-server` exposing both
-V100s → `--device CPU,RPC0,RPC1 -sm tensor` meta serve) fails every decode with
-`batched placement: entries missed ... manifest went stale, failing the
-endpoint` (49 misses at warmup) → decode -3. **Pre-existing, not a #10
-regression:** identical failure with the defer gate off AND with the rollback
-(0498a482b) client. The fleet has never run this shape (all workers are
-single-device), so it was never exercised. #10's fix stays gated by the
-3-endpoint byte-identity (6/6 c80261ff); the true multi-device-endpoint defer
-A/B is blocked until this warmup failure is fixed. Repro: cuda75
-`ggml-rpc-server` (2 CUDA devs) + build-cpu coordinator, trunc stub, standard
-meta stack.
+V100s → `--device CPU,RPC0,RPC1 -sm tensor` meta serve) failed every decode with
+`batched placement: entries missed ... manifest went stale` (49 misses) →
+decode -3. Pre-existing (identical with defer off and with the 0498a482b
+rollback client); never exercised — fleet workers are single-device.
+
+**ROOT CAUSE + FIX 2026-08-01:** the client optimistically inserted every
+STREAMED hash into its per-socket manifest ("the stream makes the worker cache
+it") — only true when the worker runs `-c`. A multi-device endpoint uploads
+identical mirrored bytes twice on one socket, so the second copy batch-placed
+against a cache that was never populated. Proven: same topology with `-c`
+worked immediately. Fix: the manifest now only ever contains what the worker
+itself reported; repeat identical uploads stream instead (cost: mirrored
+tensors stream once per device on multi-device endpoints only).
+Gates: (1) cacheless 2-device repro loads + serves, 0 misses; (2) canonical
+3-worker byte-identity 6/6 c80261ff; (3) **#10 topology validation unblocked
+and run**: defer mode 1 (30/30 stable, defers 0 = null for swap path on fast
+loopback) and mode 2 all-defer (defers 3.8/graph rate 100%, injects 3.8,
+**LOST 0.00**, 29/30 stable + 1 in-family variant) — concurrent multi-member
+stash on one socket exercised, owner claims correct. Residual: the mixed
+straggler swap-differential (old-vs-new) needs artificial per-member latency;
+not built.
 
 ## Refuted candidates (for the record)
 
