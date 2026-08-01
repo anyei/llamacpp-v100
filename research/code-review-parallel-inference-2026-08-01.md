@@ -38,7 +38,12 @@ once the threads are consumed. Before the change, with the default
 
 ---
 
-## [ ] 2. Deprecated `-ndio` / `--no-mmap` negations clobber `load_mode` (mmap silently disabled)
+## [x] 2. Deprecated `-ndio` / `--no-mmap` negations clobber `load_mode` (mmap silently disabled)
+
+**FIXED 2026-08-01:** all three shims (`--mlock`, `--mmap/--no-mmap`,
+`-dio/-ndio`) now compose with the current `load_mode` instead of overwriting
+it; `-ndio` restores mmap only from DIRECT_IO. Gated: 7 new composition cases
+in test-arg-parser, all pass.
 
 **File:** `common/arg.cpp:3135` (same pattern at `:3117` `--mlock`, `:3126` `--no-mmap`) — **CONFIRMED**
 

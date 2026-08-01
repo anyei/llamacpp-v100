@@ -3114,7 +3114,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing",
         [](common_params & params) {
             LOG_WRN("DEPRECATED: --mlock is deprecated. use --load-mode mlock instead\n");
-            params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+            // the old flag was an independent boolean on top of mmap (default on);
+            // compose with the current mode instead of dropping its mmap bit
+            switch (params.load_mode) {
+                case LLAMA_LOAD_MODE_MMAP:
+                case LLAMA_LOAD_MODE_MMAP_MLOCK:
+                    params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
+                    break;
+                case LLAMA_LOAD_MODE_DIRECT_IO:
+                    LOG_WRN("--mlock does not compose with dio; using mlock\n");
+                    params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+                    break;
+                default:
+                    params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+                    break;
+            }
         }
     ).set_env("LLAMA_ARG_MLOCK"));
     add_opt(common_arg(
@@ -3123,7 +3137,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)",
         [](common_params & params, bool value) {
             LOG_WRN("DEPRECATED: --mmap and --no-mmap are deprecated. use --load-mode mmap instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+            // set/clear only the mmap bit: keep a requested mlock either way,
+            // keep dio on --no-mmap (dio bypasses mmap already)
+            if (value) {
+                params.load_mode = (params.load_mode == LLAMA_LOAD_MODE_MLOCK ||
+                                    params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK)
+                    ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_MMAP) {
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+                params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+            }
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
@@ -3132,7 +3156,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "DEPRECATED in favor of `--load-mode`: use DirectIO if available",
         [](common_params & params, bool value) {
             LOG_WRN("DEPRECATED: --direct-io and --no-direct-io are deprecated. use --load-mode dio instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
+            // -ndio / LLAMA_ARG_DIO=0 only ever meant "no direct-io"; it must
+            // not disable the default mmap (it was OOM-ing boxes sized for
+            // file-backed weights)
+            if (value) {
+                params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO) {
+                params.load_mode = LLAMA_LOAD_MODE_MMAP;
+            }
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
