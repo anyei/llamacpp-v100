@@ -455,9 +455,20 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         }
     }
 
-    // convert local models to presets
+    // convert local models to presets. The recursive walk can emit the same
+    // name from different files (vendorA/X and vendorB/X both name X): keep
+    // the first and warn, matching the cross-dir policy in the router
+    // (server-models.cpp load_models: earlier source wins) instead of letting
+    // the map silently keep whichever was listed last.
     common_presets out;
+    std::map<std::string, std::string> first_path;
     for (const auto & model : models) {
+        auto [it, inserted] = first_path.emplace(model.name, model.path);
+        if (!inserted) {
+            LOG_WRN("duplicate model name '%s' in %s ('%s' vs '%s') - keeping the first entry\n",
+                    model.name.c_str(), models_dir.c_str(), it->second.c_str(), model.path.c_str());
+            continue;
+        }
         common_preset preset;
         preset.name = model.name;
         preset.set_option(*this, "LLAMA_ARG_MODEL", model.path);

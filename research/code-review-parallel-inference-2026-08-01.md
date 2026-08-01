@@ -85,7 +85,12 @@ model). The launcher dies and all child instances become unreachable.
 
 ---
 
-## [ ] 4. Recursive models-dir scan silently collapses same-named models
+## [x] 4. Recursive models-dir scan silently collapses same-named models
+
+**FIXED 2026-08-01:** collision now warns with both paths and keeps the first
+entry (matches the router's cross-dir "earlier wins" policy) instead of the
+map silently keeping the last. Gated: vendorA/vendorB `Qwen3-30B` scratch
+repro logs the warning, one deterministic entry served.
 
 **File:** `common/preset.cpp:467` — **CONFIRMED**
 
