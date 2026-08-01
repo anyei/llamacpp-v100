@@ -263,6 +263,20 @@ activations, incoherent output, no error logged.
 
 ---
 
+## [ ] 11. NEW (found 2026-08-01 during #10 validation): meta serve over a multi-device endpoint fails at warmup
+
+Attempting #10's real-topology validation (one `ggml-rpc-server` exposing both
+V100s → `--device CPU,RPC0,RPC1 -sm tensor` meta serve) fails every decode with
+`batched placement: entries missed ... manifest went stale, failing the
+endpoint` (49 misses at warmup) → decode -3. **Pre-existing, not a #10
+regression:** identical failure with the defer gate off AND with the rollback
+(0498a482b) client. The fleet has never run this shape (all workers are
+single-device), so it was never exercised. #10's fix stays gated by the
+3-endpoint byte-identity (6/6 c80261ff); the true multi-device-endpoint defer
+A/B is blocked until this warmup failure is fixed. Repro: cuda75
+`ggml-rpc-server` (2 CUDA devs) + build-cpu coordinator, trunc stub, standard
+meta stack.
+
 ## Refuted candidates (for the record)
 
 | File | Claim | Why refuted |
