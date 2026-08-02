@@ -1,5 +1,12 @@
 # Serve-mode process analysis — end-to-end stage comparison (2026-08-02)
 
+> **Status update (33f57748a):** findings 1, 3, 8 and the finding-2 gate
+> removal are FIXED in the wizard templates (gpu1 `-fa on`; KV-asymmetry
+> notes on both fleet cards; `--load-mode none` everywhere;
+> `ALLOW_MULTI_LOCAL` dropped from the EP stack). Still open: 2 (CPU `-t`
+> sweep), 4 (layer-hop wire compression), 6 (ncmoe prefill `GGML_SCHED_DEBUG`
+> run — needs idle GPUs), 7 (single-box restart-on-crash), 9 (observability).
+
 Five modes compared from the process standpoint — every stage from argv to
 streamed tokens — to surface anything **missing or odd** per mode. Flag stacks
 are the wizard's own mode templates (source of truth: `wizard.html` modesFor).
