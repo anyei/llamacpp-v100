@@ -2854,6 +2854,9 @@ public:
     bool set_tensor_hash_batch(const std::vector<uint8_t> & input, rpc_msg_set_tensor_hash_batch_rsp & response);
     bool set_tensor_hash_data(const std::vector<uint8_t> & input);
     void manifest(std::vector<uint64_t> & hashes);
+    // catch-up run of the cache cap once the last client disconnects (eviction
+    // is deferred while any coordinator is connected - see rpc_cache_enforce_limit)
+    void cache_enforce_idle();
     bool set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -3368,12 +3371,28 @@ static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache
     return total;
 }
 
+// active client connections: while a coordinator is connected, cache eviction
+// is DEFERRED. The client trusts the manifest it fetched at handshake for the
+// whole (possibly 30-min) load; evicting reported entries mid-load made its
+// batched placements miss ("manifest went stale") and failed the endpoint.
+// The cap is enforced once the last connection closes - the dir may overshoot
+// by roughly one load's slices in the meantime.
+static std::atomic<int> g_rpc_active_conns{0};
+
 static void rpc_cache_enforce_limit(const char * cache_dir) {
     static const long long limit_mib = []() {
         const char * env = getenv("GGML_RPC_CACHE_LIMIT_MIB");
         return env != nullptr ? atoll(env) : 0LL;
     }();
     if (limit_mib <= 0) {
+        return;
+    }
+    if (g_rpc_active_conns.load(std::memory_order_relaxed) > 0) {
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true)) {
+            GGML_LOG_INFO("[cache] over limit with a client connected - eviction deferred until idle\n");
+        }
         return;
     }
     const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
@@ -3496,6 +3515,12 @@ void rpc_server::cache_store(uint64_t hash, const void * data, size_t size) {
         }
 #endif
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+        rpc_cache_enforce_limit(cache_dir);
+    }
+}
+
+void rpc_server::cache_enforce_idle() {
+    if (cache_dir != nullptr) {
         rpc_cache_enforce_limit(cache_dir);
     }
 }
@@ -5275,9 +5300,14 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         const uint64_t conn_id = next_conn_id++;
         // GGML_LOG so the lines reach the fleet log ring (rpc-server's log callback)
         GGML_LOG_INFO("Accepted client connection %" PRIu64 "\n", conn_id);
+        g_rpc_active_conns.fetch_add(1, std::memory_order_relaxed);
         std::thread([&server, client_socket, conn_id]() {
             rpc_serve_client(server, client_socket, conn_id);
             GGML_LOG_INFO("Client connection %" PRIu64 " closed\n", conn_id);
+            if (g_rpc_active_conns.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                // last client gone: catch up on the deferred cache-cap enforcement
+                server.cache_enforce_idle();
+            }
         }).detach();
     }
     rpc_transport_shutdown();
