@@ -527,7 +527,7 @@ function modesFor(m, ctx, kv) {
   if (fitQ("gpu1")) push({ id:"gpu1", name:"Single GPU",
     speed:s2=>meas("gpu1",s2)||"~"+Math.round(1100/m.size*(m.quant.startsWith("Q8")?0.7:1)), est:s2=>!meas("gpu1",s2),
     why:`${m.size} GB on one ${HW.gpus[0].name} ${HW.gpus[0].vram} GB.${kvNote("gpu1")}`,
-    flags:`-ngl 99 -c {CTX} --no-mmap` });
+    flags:`-ngl 99 -c {CTX} -fa on --load-mode none` });
   else out.blocked.push({ name:"Single GPU", why:`${m.size} GB + ~${kvMin.toFixed(0)} GB KV (q4_0) exceeds one ${HW.gpus[0].vram} GB GPU at ${fmtCtx(ctx)}.` });
 
   // multi-GPU tensor split: valid whenever it fits pooled VRAM, even if one GPU would do -
@@ -535,14 +535,14 @@ function modesFor(m, ctx, kv) {
   if (m.size <= totalVram && fitQ("ts")) push({ id:"ts", name:"Multi-GPU · tensor split",
     speed:s2=>meas("ts",s2)||"~"+Math.round(900/m.size*10)/10, est:s2=>!meas("ts",s2),
     why:`${HW.gpus.length}×${HW.gpus[0].vram} GB pooled = ${totalVram} GB for weights + KV - the long-context route when one GPU is tight.${kvNote("ts")} Gates preset: p2p allreduce, FA on.`,
-    flags:`-sm tensor -ts 0.5,0.5 -ngl 99 -c {CTX} --no-mmap -fa on\nGGML_CUDA_ALLREDUCE=p2p` });
+    flags:`-sm tensor -ts 0.5,0.5 -ngl 99 -c {CTX} --load-mode none -fa on\nGGML_CUDA_ALLREDUCE=p2p` });
   else if (m.size <= totalVram) out.blocked.push({ name:"Multi-GPU · tensor split", why:`Weights fit but KV at ${fmtCtx(ctx)} exceeds ${totalVram} GB even at q4_0.` });
   else out.blocked.push({ name:"Multi-GPU · tensor split", why:`${m.size} GB exceeds ${totalVram} GB pooled VRAM.` });
 
   if (m.size <= totalVram && fitQ("ts")) push({ id:"sml", name:"Multi-GPU · layer split",
     speed:s2=>meas("sml",s2)||"~"+Math.round(700/m.size*10)/10, est:s2=>!meas("sml",s2),
     why:`Whole layers per GPU - one hop per boundary instead of per-op sync. Usually slower than tensor split on NVLink boxes; the fallback when tensor-split gates misbehave.${kvNote("ts")}`,
-    flags:`-sm layer -ngl 99 -c {CTX} --no-mmap -fa on` });
+    flags:`-sm layer -ngl 99 -c {CTX} --load-mode none -fa on` });
 
   // MoE CPU offload. -ncmoe takes a layer COUNT (no "auto"): estimate how many
   // MoE layers' experts must leave VRAM - budget is ONE card's free VRAM (#54)
@@ -554,7 +554,7 @@ function modesFor(m, ctx, kv) {
     push({ id:"ncmoe", name:"GPU + CPU expert offload",
     speed:()=>"~6–9", est:()=>true,
     why:`Attention and shared layers on GPU, routed experts of the first ${ncmoeN} layers in ${HW.ram} GB RAM (-ncmoe, estimated - raise it if the load OOMs).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${kvNote("ncmoe")}`,
-    flags:`-ngl 99 -ncmoe ${ncmoeN} -c {CTX} --no-mmap -fa on` });
+    flags:`-ngl 99 -ncmoe ${ncmoeN} -c {CTX} --load-mode none -fa on` });
   }
   else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GB).` });
   else out.blocked.push({ name:"GPU + CPU expert offload", why:"Dense model - no expert tier to offload." });
@@ -570,17 +570,17 @@ function modesFor(m, ctx, kv) {
       const epMeas = meas("fleet-ep");
       push({ id:"fleet", name:"Distributed fleet · expert parallel",
         speed:s2=>meas("fleet-ep",s2)||"~3–5", est:s2=>!meas("fleet-ep",s2),
-        why:`Experts spread across ${HW.fleet.workers} workers' RAM (${HW.fleet.names}); attention stays on the V100s.${border}`+
+        why:`Experts spread across ${HW.fleet.workers} workers' RAM (${HW.fleet.names}); attention AND the KV cache stay on the V100s - conversations survive a worker drop (the reload restores the experts).${border}`+
             (epMeas ? " Gates preset: boundary fusion, q8 wire, decode-only expert deferral."
                     : " UNSWEPT for this model - run layer split first to collect its expert profile (a profiled first EP layout beats uniform)."),
         hasRecordTs: !!MEASURED[m.file+"|fleet-ep|none"],
-        flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm tensor {TS} -ngl 99 -c {CTX} --no-mmap -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1  LLAMA_META_ALLOW_MULTI_LOCAL=1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
+        flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm tensor {TS} -ngl 99 -c {CTX} --load-mode none -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_ATTN_OWNER=0,1\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
     }
     push({ id:"fleetl", name:"Distributed fleet · layer split",
       speed:s2=>meas("fleet-layer",s2)||"~1.5–2.5", est:s2=>!meas("fleet-layer",s2),
-      why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture.${border}`+
+      why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture. NOTE: each member holds the KV for its own layers, so a worker drop loses every conversation's cache (EP keeps KV on the V100s).${border}`+
           (m.moe ? ` Also the PROFILING vehicle: add LLAMA_EXPERT_PROFILE to collect router histograms for a first ${m.file.split("-")[0]} EP layout.` : ""),
-      flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm layer {TS} -ngl 99 -c {CTX} --no-mmap -fit off`+
+      flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm layer {TS} -ngl 99 -c {CTX} --load-mode none -fit off`+
             (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
     out.blocked.push({ name:"Distributed · full tensor split",
       why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
