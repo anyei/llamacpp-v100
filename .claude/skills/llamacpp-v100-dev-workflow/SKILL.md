@@ -95,6 +95,13 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
    lines need `-v`/`-lv`, but `-lv 1` makes fleet loads unusably slow — prefer
    stderr prints / counters for must-see engagement evidence.
 6. Server readiness = `grep -q "model loaded" <log>`, then still `sleep 1`.
+8. **Wizard static changes don't reach dev builds by themselves**: npm is NOT
+   in llama-devcuda, so the ui-assets provisioning reuses `tools/ui/dist/`
+   as-is. After editing `tools/ui/static/wizard.html`: `cp tools/ui/static/wizard.html
+   tools/ui/dist/wizard.html` (host), rebuild `llama-ui llama-server`, and test
+   WITHOUT `--no-webui` (it 404s every UI asset - burned 30 min as "stale embed").
+   Image builds run vite and need none of this. After flag changes also run
+   `python3 scripts/gen-wizard-flags.py` (and `--check` = the #96 drift gate).
 7. Reading intermediate tensors at execution time returns **ring-recycled bytes**
    (the member arena ignores FLAG_OUTPUT). Capture values at compute time via the
    eval-callback pattern (`llama_expert_profile_cb` / `llama_zl_ids_cb` in
