@@ -288,6 +288,23 @@ stash on one socket exercised, owner claims correct. Residual: the mixed
 straggler swap-differential (old-vs-new) needs artificial per-member latency;
 not built.
 
+## [ ] 12. FILED 2026-08-02 (fleet validation): dspark/dflash draft context cannot couple to a meta-split target
+
+With the target on the EP/meta device, a `--spec-type draft-dspark` draft
+context aborts in `resolve_fused_ops`/`graph_reserve`:
+`pre-allocated tensor (output.weight) in a buffer (Meta(...)) that cannot run
+the operation (NONE)` — the DFlash-family draft graph references TARGET model
+tensors (`ctx_other` coupling, anchor/head reads), which live in the meta
+buffer; the draft's single-device scheduler cannot address them. Note
+`draft-simple` does NOT couple (loopback-gated fine). Fix direction: when
+`ctx_other`'s model is meta-resident, substitute the draft-device MEMBER copy
+of the referenced tensors (under EP_ONLY `output.weight` is mirrored on every
+member, so a zero-copy member-view API in ggml-backend-meta suffices), or
+materialize plain-device copies at draft-context build. Until then:
+**dspark/dflash + EP fleet = unsupported; use the layer fleet for spec.**
+Precedes: spec fixes 0bc0775d4 + b2f8d55b3 (draft split inheritance), which
+this sits behind.
+
 ## Refuted candidates (for the record)
 
 | File | Claim | Why refuted |
