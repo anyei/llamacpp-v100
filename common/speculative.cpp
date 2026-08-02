@@ -2326,6 +2326,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
+
+        // the draft is a small standalone model on its own device list - it
+        // must NOT inherit the target's tensor split: that wrapped a pinned
+        // drafter in a 1-member meta device whose split-state derivation
+        // aborts building the draft KV cache (V4 EP + --spec-draft-device,
+        // ggml-backend-meta.cpp ne_sum assert), and an unpinned drafter would
+        // draft across the whole fleet (13x slower, see LLAMA_META_LOCAL_DRAFT)
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            result.split_mode = params_spec.devices.size() > 1 ? LLAMA_SPLIT_MODE_LAYER
+                                                               : LLAMA_SPLIT_MODE_NONE;
+            // the target's -ts shares must not shape the draft's layer spread
+            std::fill(std::begin(result.tensor_split), std::end(result.tensor_split), 0.0f);
+        }
     }
 
     result.cache_type_k  = params_spec.cache_type_k;
