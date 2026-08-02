@@ -1,0 +1,334 @@
+# #96 Wizard flag matrix — REVIEW DRAFT (2026-08-01)
+
+Source of truth: `llama-server --help` (340 long flags) cross-parsed with `common/arg.cpp` (362 add_opt entries). Server-applicable options captured: 262. Already exposed by the wizard: 40. Missing: 222.
+
+Each missing flag has a **proposed control** (derived from its arg type) and a **proposed tier**.
+Tiers: EXPOSE (visible in a wizard panel) / ADVANCED (collapsible drawer) / EXCLUDE (with documented reason).
+**Nothing is built until this matrix is approved.** After approval: `scripts/gen-wizard-flags.py` generates the
+catalog into wizard.html (like GATES) + a drift check in the e2e harness fails when arg.cpp gains uncataloged flags.
+
+## Decisions needed from you
+
+1. The per-category tier defaults below — veto/adjust any.
+2. Rows marked REVIEW (the `other` bucket) — each needs a call.
+3. Confirm the EXCLUDE list — exclusions are explicit and permanent (with reasons).
+4. Whether sampling defaults belong in the wizard at all.
+
+## Category tier defaults
+
+| Category | Flags | Proposed tier | Rationale |
+|---|---|---|---|
+| speculative | 40 | EXPOSE (spec panel) | direct t/s lever; #93 pattern exists |
+| server-ops | 33 | MIXED | router owns some (see exclusions); rest Advanced |
+| sampling | 32 | ADVANCED (sampling drawer) | server defaults only; per-request API overrides exist |
+| other | 27 | REVIEW | needs a human call |
+| perf-system | 20 | ADVANCED | box-level tuning; sweep-derived defaults are good |
+| model-load | 14 | MIXED | wizard owns the model pick; load-mode/ctx exposed |
+| chat-template | 12 | ADVANCED | model metadata usually right |
+| placement-fleet | 12 | EXPOSE (mode/fleet panel) | core wizard purpose |
+| rope-yarn | 8 | ADVANCED | long-context correctness knobs, rarely touched |
+| multimodal | 7 | EXPOSE (conditional) | mmproj pairing already detected by scan |
+| kv-cache | 6 | EXPOSE (memory panel) | memory/fit levers the wizard sizes around |
+| adapters | 6 | ADVANCED | power users; path-valued |
+| embeddings | 5 | ADVANCED (conditional) | only for embedding/rerank serves |
+
+## Already exposed (40) — no action
+
+`--batch-size`, `--ubatch-size`, `--swa-checkpoints`, `--cache-ram`, `--context-shift`, `--flash-attn`, `--rope-scale`, `--yarn-orig-ctx`, `--cache-type-v`, `--defrag-thold`, `--cont-batching`, `--mmproj`, `--rpc-skip-unavailable`, `--rpc-auto-weight`, `--mlock`, `--mmap`, `--ssd-stream-budget`, `--n-cpu-moe`, `--n-gpu-layers`, `--split-mode`, `--tensor-split`, `--fit`, `--override-kv`, `--host`, `--port`, `--timeout`, `--cache-prompt`, `--cache-reuse`, `--fleet-preflight`, `--slot-save-path`, `--models-dir`, `--reasoning-preserve`, `--prefill-assistant`, `--spec-draft-n-max`, `--draft-p-min`, `--spec-draft-conf-min`, `--device-draft`, `--n-gpu-layers-draft`, `--model-draft`, `--spec-type`
+
+## speculative (40) — default: EXPOSE (spec panel)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--cache-type-k-draft` | string |  | text | EXPOSE | KV cache data type for K for the draft model  allowed values: %s  (default: %s) |
+| `--cache-type-v-draft` | string |  | text | EXPOSE | KV cache data type for V for the draft model  allowed values: %s  (default: %s) |
+| `--cpu-mask-batch-draft` | string |  | text | EXPOSE | Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask) |
+| `--cpu-mask-draft` | string |  | text | EXPOSE | Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask) |
+| `--cpu-moe-draft` | switch |  | checkbox | EXPOSE | keep all Mixture of Experts (MoE) weights in the CPU for the draft model |
+| `--cpu-range-draft` | string |  | text | EXPOSE | lo-hi Ranges of CPUs for affinity. Complements --cpu-mask-draft |
+| `--cpu-strict-batch-draft` | int |  | segmented | EXPOSE | Use strict CPU placement for draft model (default: --cpu-strict-draft) |
+| `--cpu-strict-draft` | int |  | segmented | EXPOSE | Use strict CPU placement for draft model (default: same as --cpu-strict) |
+| `--draft-max` | ? |  | number | EXPOSE | the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max |
+| `--draft-n-min` | ? |  | number | EXPOSE | the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min |
+| `--draft-p-split` | string |  | text | EXPOSE | speculative decoding split probability (default: %.2f) |
+| `--fim-qwen-14b-spec` | switch |  | checkbox | EXPOSE | use Qwen 2.5 Coder 14B + 0.5B draft for speculative decoding (note: can download weights f |
+| `--fim-qwen-7b-spec` | switch |  | checkbox | EXPOSE | use Qwen 2.5 Coder 7B + 0.5B draft for speculative decoding (note: can download weights fr |
+| `--hf-repo-draft` | string |  | text | EXPOSE | <user>/<model>[:quant] Same as --hf-repo, but for the draft model (default: unused) |
+| `--n-cpu-moe-draft` | int |  | number | EXPOSE | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft m |
+| `--override-tensor-draft` | string |  | text | EXPOSE | <tensor name pattern>=<buffer type>,... override tensor buffer type for draft model |
+| `--poll-batch-draft` | int |  | segmented | EXPOSE | Use polling to wait for draft model work (default: --poll-draft) |
+| `--poll-draft` | int |  | segmented | EXPOSE | Use polling to wait for draft model work (default: same as --poll) |
+| `--prio-batch-draft` | int |  | number | EXPOSE | set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d) |
+| `--prio-draft` | int |  | number | EXPOSE | set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d) |
+| `--spec-default` | switch |  | checkbox | EXPOSE | enable default speculative decoding config |
+| `--spec-draft-backend-sampling` | bool-flag |  | checkbox | EXPOSE | offload draft sampling to the backend (default: %s) enabled disabled |
+| `--spec-draft-n-min` | int |  | number | EXPOSE | minimum number of draft tokens to use for speculative decoding (default: %d) |
+| `--spec-ngram-map-k-min-hits` | int |  | number | EXPOSE | minimum hits for ngram-map-k speculative decoding (default: %d) |
+| `--spec-ngram-map-k-size-m` | int |  | number | EXPOSE | ngram size M for ngram-map-k speculative decoding, length of draft m-gram (default: %d) |
+| `--spec-ngram-map-k-size-n` | int |  | number | EXPOSE | ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: %d) |
+| `--spec-ngram-map-k4v-min-hits` | int |  | number | EXPOSE | minimum hits for ngram-map-k4v speculative decoding (default: %d) |
+| `--spec-ngram-map-k4v-size-m` | int |  | number | EXPOSE | ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: %d) |
+| `--spec-ngram-map-k4v-size-n` | int |  | number | EXPOSE | ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: %d) |
+| `--spec-ngram-min-hits` | ? |  | number | EXPOSE | the argument has been removed. use the respective --spec-ngram-*-min-hits |
+| `--spec-ngram-mod-n-match` | int |  | number | EXPOSE | ngram-mod lookup length (default: %d) |
+| `--spec-ngram-mod-n-max` | int |  | number | EXPOSE | maximum number of ngram tokens to use for ngram-based speculative decoding (default: %d) |
+| `--spec-ngram-mod-n-min` | int |  | number | EXPOSE | minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d) |
+| `--spec-ngram-simple-min-hits` | int |  | number | EXPOSE | minimum hits for ngram-simple speculative decoding (default: %d) |
+| `--spec-ngram-simple-size-m` | int |  | number | EXPOSE | ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: %d) |
+| `--spec-ngram-simple-size-n` | int |  | number | EXPOSE | ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d) |
+| `--spec-ngram-size-m` | ? |  | number | EXPOSE | the argument has been removed. use the respective --spec-ngram-*-size-m |
+| `--spec-ngram-size-n` | ? |  | number | EXPOSE | the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mo |
+| `--threads-batch-draft` | int |  | number | EXPOSE | number of threads to use during batch and prompt processing (default: same as --threads-dr |
+| `--threads-draft` | int |  | number | EXPOSE | number of threads to use during generation (default: same as --threads) |
+
+## server-ops (33) — default: MIXED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--agent` | bool-flag |  | checkbox | MIXED | whether to enable CORS proxy and all built-in tools - do not enable in untrusted environme |
+| `--alias` | string |  | text | EXCLUDE | **EXCLUDED: router sets it from the preset name** |
+| `--api-key` | string |  | text | MIXED | API key to use for authentication, multiple keys can be provided as a comma-separated list |
+| `--api-key-file` | string |  | text | MIXED | path to file containing API keys, one per line; lines starting with a hash are treated as  |
+| `--api-prefix` | string |  | text | MIXED | prefix path the server serves from, without the trailing slash (default: %s) |
+| `--check-tensors` | switch |  | checkbox | MIXED | check model tensor data for invalid values (default: %s) true false |
+| `--cors-credentials` | bool-flag |  | checkbox | MIXED | whether to allow credentials for CORS (default: %s)  note: if this is enabled and --cors-o |
+| `--cors-headers` | string |  | text | MIXED | comma-separated list of allowed headers for CORS (default: %s) |
+| `--cors-methods` | string |  | text | MIXED | comma-separated list of allowed methods for CORS (default: %s) |
+| `--cors-origins` | string |  | text | MIXED | comma-separated list of allowed origins for CORS (default: %s)  if set to special value 'l |
+| `--log-colors` | string |  | segmented | MIXED | [on/off/auto] Set colored logging ('on', 'off', or 'auto', default: 'auto')  'auto' enable |
+| `--log-disable` | ? | LLAMA_ARG_LOG_FILE | checkbox | MIXED | Log disable |
+| `--log-file` | string |  | text | MIXED | Log to file |
+| `--log-prefix` | ? | LLAMA_ARG_LOG_TIMESTAMPS | checkbox | MIXED | Enable prefix in log messages |
+| `--log-prompts-dir` | string |  | path input | MIXED | Log prompts to directory (auto-created if not present; only used for debugging, default: d |
+| `--log-timestamps` | ? |  | checkbox | MIXED | Enable timestamps in log messages |
+| `--log-verbose` | switch |  | checkbox | MIXED | Set verbosity level to infinity (i.e. log all messages, useful for debugging) |
+| `--log-verbosity` | int | LLAMA_ARG_LOG_PREFIX | number | MIXED | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:   - |
+| `--mcp-servers-config` | string |  | path input | MIXED | experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - d |
+| `--mcp-servers-json` | string |  | text | MIXED | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not  |
+| `--metrics` | switch |  | checkbox | MIXED | enable prometheus compatible metrics endpoint (default: %s) enabled disabled |
+| `--models-max` | int |  | number | EXCLUDE | **EXCLUDED: router-level** |
+| `--models-preset` | string |  | path input | EXCLUDE | **EXCLUDED: router-level** |
+| `--path` | string |  | path input | MIXED | path to serve static files from (default: %s) |
+| `--sleep-idle-seconds` | int |  | number | MIXED | number of seconds of idleness after which the server will sleep (default: %d; -1 = disable |
+| `--slots` | bool-flag |  | checkbox | MIXED | expose slots monitoring endpoint (default: %s) enabled disabled |
+| `--spm-infill` | switch |  | checkbox | MIXED | use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some mode |
+| `--ssl-cert-file` | string |  | text | MIXED | path to file a PEM-encoded SSL certificate |
+| `--ssl-key-file` | string |  | text | MIXED | path to file a PEM-encoded SSL private key |
+| `--webui` | bool-flag |  | checkbox | MIXED | whether to enable the Web UI (default: %s) enabled disabled |
+| `--webui-config` | string |  | text | MIXED | JSON that provides default UI settings (overrides UI defaults) |
+| `--webui-config-file` | string |  | path input | MIXED | JSON file that provides default UI settings (overrides UI defaults) |
+| `--webui-mcp-proxy` | bool-flag |  | checkbox | MIXED | experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments ( |
+
+## sampling (32) — default: ADVANCED (sampling drawer)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--adaptive-decay` | string |  | number | ADVANCED | adaptive-p: decay rate for target adaptation over time. lower values  are more reactive, h |
+| `--adaptive-target` | string |  | number | ADVANCED | adaptive-p: select tokens near this probability (valid range 0.0  to 1.0; negative = disab |
+| `--backend-sampling` | switch |  | checkbox | ADVANCED | enable backend sampling (experimental) (default: disabled) |
+| `--dry-allowed-length` | int |  | number | ADVANCED | set allowed length for DRY sampling (default: %d) |
+| `--dry-base` | string |  | number | ADVANCED | set DRY sampling base value (default: %.2f) |
+| `--dry-multiplier` | string |  | number | ADVANCED | set DRY sampling multiplier (default: %.2f, 0.0 = disabled) |
+| `--dry-penalty-last-n` | int |  | number | ADVANCED | set DRY penalty for the last n tokens (default: %d, 0 = disable, -1 = context size) |
+| `--dry-sequence-breaker` | string |  | text | ADVANCED | add sequence breaker for DRY sampling, clearing out default breakers (%s) in the process;  |
+| `--frequency-penalty` | string |  | number | ADVANCED | repeat alpha frequency penalty (default: %.2f, 0.0 = disabled) |
+| `--grammar` | string |  | text | ADVANCED | BNF-like grammar to constrain generations (see samples in grammars/ dir) |
+| `--grammar-file` | string |  | text | ADVANCED | file to read grammar from |
+| `--ignore-eos` | switch |  | checkbox | ADVANCED | ignore end of stream token and continue generating (implies --logit-bias EOS-inf) |
+| `--json-schema` | string |  | text | ADVANCED | JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON ob |
+| `--json-schema-file` | string | LLAMA_ARG_BACKEND_SAMPLING | path input | ADVANCED | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{ |
+| `--logit-bias` | string |  | text | ADVANCED | TOKEN_ID(+/-)BIAS modifies the likelihood of token appearing in the completion,  i.e. `--l |
+| `--min-p` | string |  | number | ADVANCED | min-p sampling (default: %.2f, 0.0 = disabled) |
+| `--mirostat` | int |  | number | ADVANCED | use Mirostat sampling. Top K, Nucleus and Locally Typical samplers are ignored if used.  ( |
+| `--mirostat-ent` | string |  | number | ADVANCED | Mirostat target entropy, parameter tau (default: %.2f) |
+| `--mirostat-lr` | string |  | number | ADVANCED | Mirostat learning rate, parameter eta (default: %.2f) |
+| `--presence-penalty` | string |  | number | ADVANCED | repeat alpha presence penalty (default: %.2f, 0.0 = disabled) |
+| `--repeat-last-n` | int |  | number | ADVANCED | last n tokens to consider for penalize (default: %d, 0 = disabled, -1 = ctx_size) |
+| `--repeat-penalty` | string |  | number | ADVANCED | penalize repeat sequence of tokens (default: %.2f, 1.0 = disabled) |
+| `--samplers` | string |  | text | ADVANCED | samplers that will be used for generation in the order, separated by \';\' (default: %s) |
+| `--sampling-seq` | string |  | text | ADVANCED | simplified sequence for samplers that will be used (default: %s) |
+| `--seed` | string |  | text | ADVANCED | RNG seed (default: %d, use random seed for %d) |
+| `--temperature` | string |  | number | ADVANCED | temperature (default: %.2f) |
+| `--top-k` | int |  | number | ADVANCED | top-k sampling (default: %d, 0 = disabled) |
+| `--top-n-sigma` | string |  | number | ADVANCED | top-n-sigma sampling (default: %.2f, -1.0 = disabled) |
+| `--top-p` | string |  | number | ADVANCED | top-p sampling (default: %.2f, 1.0 = disabled) |
+| `--typical-p` | string |  | number | ADVANCED | locally typical sampling, parameter p (default: %.2f, 1.0 = disabled) |
+| `--xtc-probability` | string |  | number | ADVANCED | xtc probability (default: %.2f, 0.0 = disabled) |
+| `--xtc-threshold` | string |  | number | ADVANCED | xtc threshold (default: %.2f, 1.0 = disabled) |
+
+## other (27) — default: REVIEW
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--completion-bash` | switch |  | checkbox | EXCLUDE | **EXCLUDED: CLI-only** |
+| `--dynatemp-exp` | string |  | number | REVIEW | dynamic temperature exponent (default: %.2f) |
+| `--dynatemp-range` | string |  | number | REVIEW | dynamic temperature range (default: %.2f, 0.0 = disabled) |
+| `--fim-qwen-30b-default` | switch |  | checkbox | REVIEW | use default Qwen 3 Coder 30B A3B Instruct (note: can download weights from the internet) |
+| `--fim-qwen-3b-default` | switch |  | checkbox | REVIEW | use default Qwen 2.5 Coder 3B (note: can download weights from the internet) |
+| `--fim-qwen-7b-default` | switch |  | checkbox | REVIEW | use default Qwen 2.5 Coder 7B (note: can download weights from the internet) |
+| `--fit-ctx` | int |  | number | REVIEW | minimum ctx size that can be set by --fit option, default: % |
+| `--fit-target` | string |  | text | REVIEW | MiB0,MiB1,MiB2,... target margin per device for --fit, comma-separated list of values,  si |
+| `--gpt-oss-120b-default` | switch |  | checkbox | REVIEW | use gpt-oss-120b (note: can download weights from the internet) |
+| `--gpt-oss-20b-default` | switch |  | checkbox | REVIEW | use gpt-oss-20b (note: can download weights from the internet) |
+| `--list-devices` | ? |  | checkbox | REVIEW | print list of available devices and exit |
+| `--lookup-cache-dynamic` | string |  | text | REVIEW | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
+| `--lookup-cache-static` | string |  | text | REVIEW | path to static lookup cache to use for lookup decoding (not updated by generation) |
+| `--media-path` | string |  | path input | REVIEW | directory for loading local media files; files can be accessed via file:// URLs using rela |
+| `--no-host` | switch |  | checkbox | REVIEW | bypass host buffer allowing extra buffers to be used |
+| `--op-offload` | bool-flag |  | checkbox | REVIEW | whether to offload host tensor operations to device (default: %s) false true |
+| `--perf` | bool-flag |  | checkbox | REVIEW | whether to enable internal libllama performance timings (default: %s) true false |
+| `--repack` | bool-flag | LLAMA_ARG_NO_HOST | checkbox | REVIEW | whether to enable weight repacking (default: %s) disabled enabled |
+| `--reuse-port` | switch |  | checkbox | REVIEW | allow multiple sockets to bind to the same port (default: %s) enabled disabled |
+| `--reverse-prompt` | string |  | text | REVIEW | halt generation at PROMPT, return control in interactive mode |
+| `--slot-prompt-similarity` | string |  | text | REVIEW | how much the prompt of a request must match the prompt of a slot in order to use that slot |
+| `--sse-ping-interval` | int |  | number | REVIEW | server SSE ping interval in seconds (-1 = disabled, default: %d) |
+| `--tags` | string |  | text | REVIEW | set model tags, comma-separated (informational, not used for routing) |
+| `--tts-use-guide-tokens` | switch |  | checkbox | REVIEW | Use guide tokens to improve TTS word recall |
+| `--usage` | switch |  | checkbox | EXCLUDE | **EXCLUDED: CLI-only** |
+| `--version` | ? |  | checkbox | EXCLUDE | **EXCLUDED: CLI-only** |
+| `--warmup` | bool-flag |  | checkbox | REVIEW | whether to perform warmup with an empty run (default: %s) enabled disabled |
+
+## perf-system (20) — default: ADVANCED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--cpu-mask` | string |  | text | ADVANCED | CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: \"\") |
+| `--cpu-mask-batch` | string |  | text | ADVANCED | CPU affinity mask: arbitrarily long hex. Complements cpu-range-batch (default: same as --c |
+| `--cpu-range` | string |  | text | ADVANCED | lo-hi range of CPUs for affinity. Complements --cpu-mask |
+| `--cpu-range-batch` | string |  | text | ADVANCED | lo-hi ranges of CPUs for affinity. Complements --cpu-mask-batch |
+| `--cpu-strict` | string |  | segmented | ADVANCED | use strict CPU placement (default: %u) |
+| `--cpu-strict-batch` | int |  | segmented | ADVANCED | use strict CPU placement (default: same as --cpu-strict) |
+| `--direct-io` | bool-flag |  | checkbox | ADVANCED | DEPRECATED in favor of `--load-mode`: use DirectIO if available |
+| `--load-mode` | string |  | text | ADVANCED | model loading mode (default: mmap)  - none: no special loading mode  - mmap: memory-map mo |
+| `--mtmd-batch-max-tokens` | int |  | number | ADVANCED | maximum number of image tokens per batch when encoding images (default: %d) |
+| `--n-predict` | int | LLAMA_ARG_BATCH | number | ADVANCED | number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled) number |
+| `--numa` | string |  | text | ADVANCED | attempt optimizations that help on some NUMA systems  - distribute: spread execution evenl |
+| `--parallel` | int |  | number | ADVANCED | number of server slots (default: %d, -1 = auto) |
+| `--parallel` | int |  | number | ADVANCED | number of parallel sequences to decode (default: %d) |
+| `--poll` | string |  | number | ADVANCED | use polling level to wait for work (0 - no polling, default: %u) |
+| `--poll-batch` | int |  | segmented | ADVANCED | use polling to wait for work (default: same as --poll) |
+| `--prio` | int |  | number | ADVANCED | set process/thread priority : low(-1), normal(0), medium(1), high(2), realtime(3) (default |
+| `--prio-batch` | int |  | number | ADVANCED | set process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d) |
+| `--threads` | int |  | number | ADVANCED | number of CPU threads to use during generation (default: %d) |
+| `--threads-batch` | int |  | number | ADVANCED | number of threads to use during batch and prompt processing (default: same as --threads) |
+| `--threads-http` | int |  | number | ADVANCED | number of threads used to process HTTP requests (default: %d) |
+
+## model-load (14) — default: MIXED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--cache-list` | ? |  | checkbox | EXCLUDE | **EXCLUDED: CLI-only** |
+| `--ctx-size` | int |  | number | MIXED | size of the prompt context (default: %d, 0 = loaded from model) |
+| `--docker-repo` | string |  | text | MIXED | [<repo>/]<model>[:quant] Docker Hub model repository. repo is optional, default to ai/. qu |
+| `--hf-file` | string |  | path input | MIXED | Hugging Face model file. If specified, it will override the quant in --hf-repo (default: u |
+| `--hf-file-v` | string |  | path input | MIXED | Hugging Face model file for the vocoder model (default: unused) |
+| `--hf-repo` | string |  | text | MIXED | <user>/<model>[:quant] Hugging Face model repository; quant is optional, case-insensitive, |
+| `--hf-repo-v` | string |  | text | MIXED | <user>/<model>[:quant] Hugging Face model repository for the vocoder model (default: unuse |
+| `--hf-token` | string |  | text | MIXED | Hugging Face access token (default: value from HF_TOKEN environment variable) |
+| `--keep` | int |  | number | MIXED | number of tokens to keep from the initial prompt (default: %d, -1 = all) |
+| `--model` | string |  | text | EXCLUDE | **EXCLUDED: wizard owns the model pick** |
+| `--model-url` | string |  | text | MIXED | model download url (default: unused) |
+| `--model-vocoder` | string |  | text | MIXED | vocoder model for audio generation (default: unused) |
+| `--models-autoload` | bool-flag |  | checkbox | MIXED | for router server, whether to automatically load models (default: %s) enabled disabled |
+| `--offline` | switch |  | checkbox | MIXED | Offline mode: forces use of cache, prevents network access |
+
+## chat-template (12) — default: ADVANCED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--chat-template` | string |  | text | ADVANCED | set custom jinja chat template (default: template taken from model's metadata)  if suffix/ |
+| `--chat-template-file` | string |  | path input | ADVANCED | set custom jinja chat template file (default: template taken from model's metadata)  if su |
+| `--chat-template-kwargs` | string |  | text | ADVANCED | sets additional params for the json template parser, must be a valid json object string, e |
+| `--escape` | bool-flag |  | checkbox | ADVANCED | whether to process escapes sequences (\ , \\r, \\t, \\', \\\", \\\\) (default: %s) true fa |
+| `--jinja` | bool-flag |  | checkbox | ADVANCED | whether to use jinja template engine for chat (default: %s) enabled disabled |
+| `--reasoning` | string |  | segmented | ADVANCED | [on/off/auto] Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto'  |
+| `--reasoning-budget` | int |  | number | ADVANCED | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget  |
+| `--reasoning-budget-message` | string |  | text | ADVANCED | message injected before the end-of-thinking tag when reasoning budget is exhausted (defaul |
+| `--reasoning-format` | string |  | text | ADVANCED | controls whether thought tags are allowed and/or extracted from the response, and in which |
+| `--skip-chat-parsing` | bool-flag |  | checkbox | ADVANCED | force a pure content parser, even if a Jinja template is specified; model will output ever |
+| `--special` | switch |  | checkbox | ADVANCED | special tokens output enabled (default: %s) true false |
+| `--tools` | string |  | text | ADVANCED | TOOL1,TOOL2,... experimental: whether to enable built-in tools for AI agents - do not enab |
+
+## placement-fleet (12) — default: EXPOSE (mode/fleet panel)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--cpu-moe` | switch |  | checkbox | EXPOSE | keep all Mixture of Experts (MoE) weights in the CPU |
+| `--device` | string |  | device-picker | EXPOSE | <dev1,dev2,..> comma-separated list of devices to use for offloading (none = don't offload |
+| `--fleet-admin` | switch |  | checkbox | EXPOSE | allow restarting RPC workers via POST /fleet/worker/restart; requires an --api-key (defaul |
+| `--main-gpu` | int |  | number | EXPOSE | the GPU to use for the model (with split-mode = none), or for intermediate results and KV  |
+| `--override-tensor` | string | LLAMA_ARG_CPU_MOE | text | EXPOSE | <tensor name pattern>=<buffer type>,... override tensor buffer type |
+| `--rpc` | string |  | text | EXPOSE | comma-separated list of RPC servers (host:port) |
+| `--rpc-discover` | switch |  | checkbox | EXPOSE | discover RPC workers announcing themselves on the LAN (rpc-server --announce) and use them |
+| `--rpc-discover-group` | string |  | text | EXPOSE | ADDR:PORT multicast group for --rpc-discover (default: the built-in group; must match the  |
+| `--rpc-reload` | switch |  | checkbox | EXPOSE | on RPC worker loss, fail the in-flight requests and reload the model in-process across the |
+| `--ssd-stream-gpu` | switch |  | checkbox | EXPOSE | compute streamed experts on the GPU via a persistent VRAM slot cache (big win when  the ho |
+| `--ssd-stream-vram-budget` | string |  | text | EXPOSE | MiB total VRAM budget for the --ssd-stream-gpu slot cache (default 4096). sets LLAMA_SSD_S |
+| `--ssd-streaming` | switch |  | checkbox | EXPOSE | stream MoE expert weights from SSD on demand into a bounded RAM cache, so a model  whose e |
+
+## rope-yarn (8) — default: ADVANCED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--props` | switch |  | checkbox | ADVANCED | enable changing global properties via POST /props (default: %s) enabled disabled |
+| `--rope-freq-base` | string |  | number | ADVANCED | RoPE base frequency, used by NTK-aware scaling (default: loaded from model) |
+| `--rope-freq-scale` | string |  | number | ADVANCED | RoPE frequency scaling factor, expands context by a factor of 1/N |
+| `--rope-scaling` | string |  | text | ADVANCED | {none,linear,yarn} RoPE frequency scaling method, defaults to linear unless specified by t |
+| `--yarn-attn-factor` | string |  | number | ADVANCED | YaRN: scale sqrt(t) or attention magnitude (default: %.2f) |
+| `--yarn-beta-fast` | string | LLAMA_ARG_GRP_ATTN_N | number | ADVANCED | YaRN: low correction dim or beta (default: %.2f) |
+| `--yarn-beta-slow` | string |  | number | ADVANCED | YaRN: high correction dim or alpha (default: %.2f) |
+| `--yarn-ext-factor` | string |  | number | ADVANCED | YaRN: extrapolation mix factor (default: %.2f, 0.0 = full interpolation) |
+
+## multimodal (7) — default: EXPOSE (conditional)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--image-max-tokens` | int |  | number | EXPOSE | maximum number of tokens each image can take, only used by vision models with dynamic reso |
+| `--image-min-tokens` | int |  | number | EXPOSE | minimum number of tokens each image can take, only used by vision models with dynamic reso |
+| `--mmproj-auto` | bool-flag |  | checkbox | EXPOSE | whether to use multimodal projector file (if available), useful when using -hf (default: % |
+| `--mmproj-offload` | bool-flag |  | checkbox | EXPOSE | whether to enable GPU offloading for multimodal projector (default: %s) enabled disabled |
+| `--mmproj-url` | string |  | text | EXPOSE | URL to a multimodal projector file. see tools/mtmd/README.md |
+| `--vision-gemma-12b-default` | switch |  | checkbox | EXPOSE | use Gemma 3 12B QAT (note: can download weights from the internet) |
+| `--vision-gemma-4b-default` | switch |  | checkbox | EXPOSE | use Gemma 3 4B QAT (note: can download weights from the internet) |
+
+## kv-cache (6) — default: EXPOSE (memory panel)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--cache-idle-slots` | bool-flag |  | checkbox | EXPOSE | save idle slots to the prompt cache on new task, and clear them when using unified KV (def |
+| `--cache-type-k` | string |  | text | EXPOSE | KV cache data type for K  allowed values: %s  (default: %s) |
+| `--checkpoint-min-step` | int |  | number | EXPOSE | minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum) |
+| `--kv-offload` | bool-flag |  | checkbox | EXPOSE | whether to enable KV cache offloading (default: %s) disabled enabled |
+| `--kv-unified` | bool-flag |  | checkbox | EXPOSE | use single unified KV buffer shared across all sequences (default: enabled if number of sl |
+| `--swa-full` | switch |  | checkbox | EXPOSE | use full-size SWA cache (default: %s)  [(more info)](https://github.com/ggml-org/llama.cpp |
+
+## adapters (6) — default: ADVANCED
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--control-vector` | string |  | text | ADVANCED | add a control vector note: use comma-separated values to add multiple control vectors |
+| `--control-vector-layer-range` | string |  | text | ADVANCED | END layer range to apply the control vector(s) to, start and end inclusive |
+| `--control-vector-scaled` | string |  | text | ADVANCED | FNAME:SCALE,... add a control vector with user defined scaling SCALE  note: use comma-sepa |
+| `--lora` | string |  | text | ADVANCED | path to LoRA adapter (use comma-separated values to load multiple adapters) |
+| `--lora-init-without-apply` | switch |  | checkbox | ADVANCED | load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: % |
+| `--lora-scaled` | string |  | text | ADVANCED | FNAME:SCALE,... path to LoRA adapter with user defined scaling (format: FNAME:SCALE,...)   |
+
+## embeddings (5) — default: ADVANCED (conditional)
+
+| Flag | Type | Env | Control | Tier | Help (truncated) |
+|---|---|---|---|---|---|
+| `--embd-gemma-default` | switch |  | checkbox | ADVANCED | use default EmbeddingGemma model (note: can download weights from the internet) |
+| `--embd-normalize` | int |  | number | ADVANCED | normalisation for embeddings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=eu |
+| `--embeddings` | switch |  | checkbox | ADVANCED | restrict to only support embedding use case; use only with dedicated embedding models (def |
+| `--pooling` | string |  | text | ADVANCED | {none,mean,cls,last,rank} pooling type for embeddings, use model default if unspecified |
+| `--reranking` | switch |  | checkbox | ADVANCED | enable reranking endpoint on server (default: %s) disabled |
+
+## Known stragglers from the task filing (all present in the tables above)
+
+- --spec-draft-device (dspark done; extend to dflash)
+- speculative ngram params
+- sampling family
+- --ctx-checkpoints
+- batch/ubatch beyond the two presets
+- --mlock/--numa (note: --mlock shim semantics fixed in review #2)
+- draft cache-type flags
