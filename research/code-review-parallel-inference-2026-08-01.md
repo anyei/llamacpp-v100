@@ -300,8 +300,20 @@ buffer; the draft's single-device scheduler cannot address them. Note
 `ctx_other`'s model is meta-resident, substitute the draft-device MEMBER copy
 of the referenced tensors (under EP_ONLY `output.weight` is mirrored on every
 member, so a zero-copy member-view API in ggml-backend-meta suffices), or
-materialize plain-device copies at draft-context build. Until then:
-**dspark/dflash + EP fleet = unsupported; use the layer fleet for spec.**
+materialize plain-device copies at draft-context build.
+
+**UPDATE 2026-08-02 late:** NOT meta-specific. On the LAYER fleet the same
+abort fires when the target's `output.weight` lives on a remote worker (layer
+split puts it on the LAST device): `pre-allocated tensor (output.weight) in a
+buffer (RPC0[10.5.5.15:50055]) that cannot run the operation`. The coupling
+constraint is general: **every target tensor the DFlash-family draft graph
+references must live on a device inside the draft's scheduler.** Config
+workaround (validated leg in flight): order the device list so a LOCAL GPU is
+last (`--device RPC0,RPC1,RPC2,CUDA0,CUDA1` + reordered `-ts`) so the output
+head co-resides with the pinned drafter. Real fix unchanged: member-view /
+copy substitution at draft-context build. Also validated this leg: the
+eviction-defer fix (a8472e5bd) held on all three workers - zero manifest
+misses with warm caches (45 GiB served from cache on .11 + local).
 Precedes: spec fixes 0bc0775d4 + b2f8d55b3 (draft split inheritance), which
 this sits behind.
 
