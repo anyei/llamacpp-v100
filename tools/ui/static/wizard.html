@@ -749,16 +749,37 @@ function gatesHTML(seeded){
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
 const flagInText = (t,f) => new RegExp("(^|[\\s\"])"+reEsc(f)+"([\\s=]|$)","m").test(t);
 
-// catalog flags the user enabled, rendered as command-line text; wizard-set
-// flags are never duplicated (later flags win in argv, silently overriding
-// the panel the user actually sees)
-function catalogFlags(tmpl){
-  return Object.entries(S.flagSet).map(([k,v])=>{
+// every spelling of a catalog flag (canonical + aliases + negation)
+const flagNames = f => [f.flag].concat((f.aka||"").split(" ").filter(Boolean)).concat(f.neg?[f.neg]:[]);
+// value-token lookahead: excludes flags (-x/--x) but allows negative numbers (-1, -0.5)
+const FLAG_VAL_TOK = "(?!-[-a-zA-Z])[^\\s]+";
+const flagFindRe = f => f.ctl==="check"
+  ? new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?=\\s|$)", "m")
+  : new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?:[ \\t]+(" + FLAG_VAL_TOK + "))?", "m");
+
+// merge the user's catalog values into the command: a flag the wizard already
+// emits (under ANY of its spellings) is REWRITTEN IN PLACE - appending a
+// duplicate broke launches (-ncmoe 32 ... --n-cpu-moe 36); only genuinely new
+// flags append at the end
+function applyFlagSet(tmplBase){
+  let out = tmplBase;
+  const extra = [];
+  for (const [k,v] of Object.entries(S.flagSet)) {
     const f = FLAG_BY_NAME[k];
-    if (!f || flagInText(tmpl,k) || (f.neg && flagInText(tmpl,f.neg))) return "";
-    if (f.ctl==="check") return "\n"+((f.neg && v==="off") ? f.neg : k);
-    return (v===""||v===undefined) ? "" : "\n"+k+" "+v;
-  }).join("");
+    if (!f) continue;
+    const re = flagFindRe(f);
+    const m  = out.match(re);
+    if (f.ctl === "check") {
+      const want = (f.neg && v === "off") ? f.neg : f.flag;
+      if (m) { if (m[2] !== want) out = out.replace(re, "$1" + want); }
+      else   { extra.push(want); }
+    } else {
+      if (v === "" || v === undefined) continue; // nothing typed yet - wizard value stands
+      if (m) { out = out.replace(re, "$1$2 " + v); }
+      else   { extra.push(k + " " + v); }
+    }
+  }
+  return out + extra.map(t => "\n" + t).join("");
 }
 
 function flagsHTML(tmpl){
@@ -767,7 +788,7 @@ function flagsHTML(tmpl){
   const cats = [];
   FLAGS.forEach(f=>{ if(!cats.includes(f.cat)) cats.push(f.cat); });
   return `<div class="spec gates"><div class="lbl">Serve flags — full catalog${nOn?` <span class="gcount">${nOn} set</span>`:""}</div>
-    <div class="why" style="margin:4px 0 8px">Every llama-server flag, generated from common/arg.cpp (#96). <span class="vbadge">v100</span> = fork-added, <span class="vbadge up">upstream</span> = stock llama.cpp. Rows the wizard already configures are locked — change those in their own panel. Checked flags join the launch command below.</div>
+    <div class="why" style="margin:4px 0 8px">Every llama-server flag, generated from common/arg.cpp (#96). <span class="vbadge">v100</span> = fork-added, <span class="vbadge up">upstream</span> = stock llama.cpp. A <span class="tag t-acc">wizard: value</span> tag shows what the wizard already emits — setting your own value REPLACES it in the command (never a duplicate); other checked flags append.</div>
     <div class="kvrow" style="margin:0 0 8px"><input id="flagq" type="search" placeholder="Search flags (name, env, description)…" value="${S.flagQ.replace(/"/g,"&quot;")}" aria-label="Search flags"
       style="flex:1;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:6px 10px"></div>
     ${cats.map(cat=>{
@@ -776,22 +797,24 @@ function flagsHTML(tmpl){
       const catOn = rows.filter(f=>S.flagSet[f.flag]!==undefined).length;
       return `<details class="gcat" data-d="f:${cat}" ${q?"open":""}><summary>${cat} ${catOn?`<span class="gcount">${catOn} set</span>`:""}<span class="estg">${rows.length} flag${rows.length>1?"s":""}</span></summary>
         ${rows.map(f=>{
-          const wiz = flagInText(tmpl,f.flag) || (f.neg && flagInText(tmpl,f.neg));
+          const wm = tmpl.match(flagFindRe(f));
+          const wizVal = wm ? (f.ctl==="check" ? "on" : (wm[3]!==undefined ? wm[3] : "on")) : null;
           const en = S.flagSet[f.flag]!==undefined;
           const val = en ? S.flagSet[f.flag] : "";
+          const ph = (wizVal!==null && f.ctl!=="check" ? wizVal : (f.hint||"value")).replace(/"/g,"&quot;");
           let ctl = "";
-          if (en && !wiz) {
+          if (en) {
             if (f.ctl==="check" && f.neg) ctl = `<select class="gval" data-flagval="${f.flag}"><option value="">on</option><option value="off"${val==="off"?" selected":""}>off (${f.neg})</option></select>`;
             else if (f.ctl==="select") ctl = `<select class="gval" data-flagval="${f.flag}"><option value="">choose…</option>${(f.vals||[]).map(o=>`<option${val===o?" selected":""}>${o}</option>`).join("")}</select>`;
-            else if (f.ctl==="number") ctl = `<input type="number" class="gval" data-flagval="${f.flag}" value="${(""+val).replace(/"/g,"&quot;")}" placeholder="${(f.hint||"N").replace(/"/g,"&quot;")}">`;
-            else if (f.ctl!=="check") ctl = `<input type="text" class="gval" data-flagval="${f.flag}" value="${(""+val).replace(/"/g,"&quot;")}" placeholder="${(f.hint||"value").replace(/"/g,"&quot;")}">`;
+            else if (f.ctl==="number") ctl = `<input type="number" class="gval" data-flagval="${f.flag}" value="${(""+val).replace(/"/g,"&quot;")}" placeholder="${ph}">`;
+            else if (f.ctl!=="check") ctl = `<input type="text" class="gval" data-flagval="${f.flag}" value="${(""+val).replace(/"/g,"&quot;")}" placeholder="${ph}">`;
           }
-          return `<label class="${en&&!wiz?"gon":""}${wiz?" gwk":""}" title="${f.hint?("value: "+f.hint.replace(/"/g,"&quot;")):"switch"}">
-            <input type="checkbox" data-flag="${f.flag}" ${en&&!wiz?"checked":""} ${wiz?"disabled":""}>
+          return `<label class="${en?"gon":""}" title="${f.hint?("value: "+f.hint.replace(/"/g,"&quot;")):"switch"}">
+            <input type="checkbox" data-flag="${f.flag}" ${en?"checked":""}>
             <span style="font-family:var(--mono);font-size:12px">${f.flag}</span>
             <span class="vbadge${f.fork?"":" up"}">${f.fork?"v100":"upstream"}</span>
             ${ctl}
-            ${wiz?'<span class="tag t-acc">wizard-set</span>':""}
+            ${wizVal!==null?`<span class="tag t-acc">wizard: ${(""+wizVal).replace(/</g,"&lt;")}</span>`:""}
             <span class="estg">· ${f.note}${f.env?` (env: ${f.env})`:""}</span></label>`;
         }).join("")}
       </details>`;
@@ -1145,7 +1168,7 @@ function render() {
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
                          .replace("{DEVS}", devsForFleet())
                  + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+specFlags(spec) : "") + advFlags;
-    const tmpl = tmplBase + catalogFlags(tmplBase);
+    const tmpl = applyFlagSet(tmplBase);
     const ga = applyGates(tmpl);
     const flags = ga.text, seeded = ga.seeded;
     v.innerHTML = crumb() + `
