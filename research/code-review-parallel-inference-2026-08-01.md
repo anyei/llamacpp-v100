@@ -288,7 +288,17 @@ stash on one socket exercised, owner claims correct. Residual: the mixed
 straggler swap-differential (old-vs-new) needs artificial per-member latency;
 not built.
 
-## [ ] 12. FILED 2026-08-02 (fleet validation): dspark/dflash draft context cannot couple to a meta-split target
+## [x] 12. FILED 2026-08-02 (fleet validation): dspark/dflash draft context cannot couple to a meta-split target
+
+**FIXED 2026-08-03 (6b2cfc2dc):** the draft context now mirrors unreachable
+`ctx_other` tensors (lm_head / tok_embd) onto its own device at init;
+builders (dflash ×3 sites, eagle3 ×2) prefer the mirror; single-box keeps
+zero-copy sharing. Fleet gate: V4 EP `-ts 12,6,17,35,30` + DSpark drafter
+pinned CUDA1 — the shape that aborted 3 ways — loads, coherent (90 km/h),
+**85.2% acceptance, 5.06 t/s vs 4.7 target-only baseline** (EP+dspark beats
+baseline where layer+dspark measured below it). Device-order workaround no
+longer required. NOTE: image a8472e5bd predates this fix — launcher-driven
+spec-on-fleet needs the next image roll (cold build; cache was pruned).
 
 With the target on the EP/meta device, a `--spec-type draft-dspark` draft
 context aborts in `resolve_fused_ops`/`graph_reserve`:
