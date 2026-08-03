@@ -28,6 +28,14 @@ export interface ApiFleetDeviceTiming {
 	exec_max_us: number;
 }
 
+/** Per-device buffer composition (#97): what fills the device's memory.
+ * Present only after a successful load. */
+export interface ApiFleetDeviceMemBreakdown {
+	model_mib: number;
+	context_mib: number;
+	compute_mib: number;
+}
+
 /** A device participating in the inference pipeline (local or RPC worker). */
 export interface ApiFleetDevice {
 	name: string;
@@ -43,6 +51,7 @@ export interface ApiFleetDevice {
 	failure_count?: number | null;
 	memory_free_mib: number;
 	memory_total_mib: number;
+	memory_breakdown?: ApiFleetDeviceMemBreakdown | null;
 	/** Share of the model split assigned to this device (0..1). */
 	split_frac?: number | null;
 	/** EP dedicated-attention owner: holds attention/KV/router, takes no expert share. */

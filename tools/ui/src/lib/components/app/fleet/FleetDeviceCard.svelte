@@ -223,6 +223,20 @@
 				style="width: {memoryUsedPercent.toFixed(1)}%"
 			></div>
 		</div>
+
+		{#if device.memory_breakdown}
+			{@const mb = device.memory_breakdown}
+			{@const knownMib = mb.model_mib + mb.context_mib + mb.compute_mib}
+			{@const otherMib = Math.max(0, memoryUsedMib - knownMib)}
+			<div
+				class="text-[10px] text-muted-foreground"
+				title="buffer composition from the server's allocation records; 'other' = occupancy the allocator does not account for (CUDA/runtime overhead, co-resident processes)"
+			>
+				weights {(mb.model_mib / 1024).toFixed(1)} · KV {(mb.context_mib / 1024).toFixed(1)} · compute
+				{(mb.compute_mib / 1024).toFixed(1)}
+				{otherMib > 512 ? ` · other ${(otherMib / 1024).toFixed(1)}` : ''} GiB
+			</div>
+		{/if}
 	</div>
 
 	{#if device.attn_owner || device.n_layers != null || splitPercent !== null}

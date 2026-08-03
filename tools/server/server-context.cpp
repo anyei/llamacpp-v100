@@ -1120,6 +1120,13 @@ public:
             int32_t     n_layers;
         };
         std::vector<dev_layers_t> layer_map; // refreshed on every successful load
+        // TASKS.md #97: per-device buffer composition (bytes), refreshed with layer_map
+        struct dev_mem_t {
+            size_t model   = 0;
+            size_t context = 0;
+            size_t compute = 0;
+        };
+        std::map<std::string, dev_mem_t> mem_breakdown; // device name -> composition
         struct beacon_t {
             std::string payload;
             int64_t     t_last_ms;
@@ -2323,6 +2330,19 @@ private:
                         dev != nullptr ? ggml_backend_dev_name(dev) : "?",
                         llama_model_device_n_layers(model_tgt, i),
                     });
+                }
+            }
+            // TASKS.md #97: per-device composition so the fleet UI can answer
+            // "what fills this device" (weights / KV / compute)
+            fleet.mem_breakdown.clear();
+            if (ctx_tgt != nullptr) {
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                    const char * name = dev != nullptr ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
+                    auto & rec = fleet.mem_breakdown[name];
+                    rec.model   += mb.model;
+                    rec.context += mb.context;
+                    rec.compute += mb.compute;
                 }
             }
         }
@@ -5645,6 +5665,7 @@ void server_routes::init_routes() {
 
         // copy the mutex-guarded state up front
         std::map<std::string, int32_t> layer_map;
+        std::map<std::string, server_context_impl::fleet_state_t::dev_mem_t> mem_breakdown;
         std::map<std::string, server_context_impl::fleet_state_t::beacon_t> beacons;
         std::string load_stage;
         std::string load_model_name;
@@ -5662,6 +5683,7 @@ void server_routes::init_routes() {
             for (const auto & d : fleet.layer_map) {
                 layer_map[d.name] = d.n_layers;
             }
+            mem_breakdown    = fleet.mem_breakdown;
             beacons          = fleet.discovered;
             load_stage       = fleet.load_stage;
             load_model_name  = fleet.load_model_name;
@@ -5772,6 +5794,14 @@ void server_routes::init_routes() {
                 auto lit = layer_map.find(ggml_backend_dev_name(dev));
                 if (lit != layer_map.end()) {
                     d["n_layers"] = lit->second;
+                }
+                auto mit = mem_breakdown.find(ggml_backend_dev_name(dev));
+                if (mit != mem_breakdown.end()) {
+                    d["memory_breakdown"] = {
+                        {"model_mib",   mit->second.model   / (1024 * 1024)},
+                        {"context_mib", mit->second.context / (1024 * 1024)},
+                        {"compute_mib", mit->second.compute / (1024 * 1024)},
+                    };
                 }
                 if (is_rpc) {
                     pipeline_eps.insert(ep);
