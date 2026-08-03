@@ -223,3 +223,31 @@ Remaining polish (none blocking):
   card data path.
 - #83: laguna DFlash drafter (gated attention + enc.aux_norm) - filed with
   tensor-level diagnosis; wizard's ncmoe+dflash mode is wired and waiting.
+
+## 8. #96 serve-flag catalog + template fixes (2026-08-02/03, rolled in aac619b09)
+
+- **Generator**: `scripts/gen-wizard-flags.py` parses every `add_opt` in
+  common/arg.cpp (362), keeps the llama-server-applicable set (338), marks
+  fork-added flags by diffing `upstream/master` (12), embeds `const FLAGS`
+  between FLAGS-CATALOG markers (the gates pattern). `--check` = drift gate
+  (exit 1 when arg.cpp gains uncataloged flags) - run it in regates; not yet
+  wired into an automated harness.
+- **UI**: Advanced gains "Serve flags - full catalog": per-category
+  collapsibles, search over name/alias/env/help, v100/upstream badges (same
+  vocabulary as gates), typed value controls, `wizard: <value>` tags on rows
+  the mode already emits. Enabled values persist in saved configs (flagSet).
+- **In-place merge (user-reported bug)**: catalog values REWRITE the
+  template's flag under ANY alias spelling (`--n-cpu-moe` 36 rewrites
+  `-ncmoe 32`); appending duplicates broke launches. Only new flags append.
+- **Mode-template fixes (serve-modes analysis)**: gpu1 `-fa on`; EP template
+  dropped `LLAMA_META_ALLOW_MULTI_LOCAL` (task-48 re-test gate, redundant
+  under ATTN_OWNER=0,1); `--load-mode none` replaces deprecated `--no-mmap`
+  everywhere; fleet cards state the KV asymmetry (EP KV survives worker
+  drops, layer KV does not).
+- **Dev trap (recorded in dev-workflow skill)**: no npm in llama-devcuda -
+  wizard static edits need host `cp static->dist` before container builds,
+  and UI testing must not use `--no-webui` (404s read as "stale embed").
+- **Open**: EXPOSE-tier panel promotions (await matrix review:
+  research/wizard-flag-matrix.md), #99 honest load bar, #100 spec badge,
+  #101 ncmoe -ts balance, #102 best-defaults audit, #103 per-model worker
+  cache folders.
