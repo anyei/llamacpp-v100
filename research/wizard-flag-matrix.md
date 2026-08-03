@@ -375,3 +375,15 @@ visible panel control; "EXCLUDE" means mark non-serve/hidden with reason.
 | `--tags` | EXPOSE (model card) | catalog UX; informational only, zero risk |
 | `--tts-use-guide-tokens` | EXCLUDE | no TTS vehicles in the zoo |
 | `--warmup` | EXPOSE (serve panel toggle) | skipping warmup speeds test loads; users hit this |
+
+## APPROVED + BUILT (2026-08-03, user adopted all recommendations)
+
+User adopted the full recommendation set. Built same session: 14 EXCLUDE entries added
+to gen-wizard-flags.py (the 11 recommended + 3 stragglers the matrix missed:
+--fim-qwen-1.5b-default, --fim-qwen-7b-spec, --fim-qwen-14b-spec - same download-
+shortcut class), catalog regenerated 338 -> 324 flags, drift --check green;
+--slot-prompt-similarity 0.5 and --no-warmup promoted as step-3 Caching/serve knobs
+(advOptions). Headless smoke: 324 flags served, zero excluded leaks, both knobs render,
+0 JS errors. REMAINING: --tags and --media-path panel promotions need value-input
+controls (next wizard pass, together with the GiB relabel residual); drift check still
+manually invoked (not wired into an automated harness).

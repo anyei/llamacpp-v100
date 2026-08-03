@@ -56,6 +56,21 @@ EXCLUDE = {
     "--api-key-file": "credential file - router deployment concern",
     "--ssl-key-file": "router deployment concern",
     "--ssl-cert-file": "router deployment concern",
+    # user-approved matrix calls 2026-08-03 (research/wizard-flag-matrix.md addendum)
+    "--fim-qwen-30b-default": "internet weight download conflicts with local-models-first wizard",
+    "--fim-qwen-1.5b-default": "internet weight download conflicts with local-models-first wizard",
+    "--fim-qwen-7b-spec": "internet weight download conflicts with local-models-first wizard",
+    "--fim-qwen-14b-spec": "internet weight download conflicts with local-models-first wizard",
+    "--fim-qwen-3b-default": "internet weight download conflicts with local-models-first wizard",
+    "--fim-qwen-7b-default": "internet weight download conflicts with local-models-first wizard",
+    "--gpt-oss-120b-default": "internet weight download conflicts with local-models-first wizard",
+    "--gpt-oss-20b-default": "internet weight download conflicts with local-models-first wizard",
+    "--embd-gemma-default": "internet weight download conflicts with local-models-first wizard",
+    "--lookup-cache-dynamic": "lookup decoding unused on the fork; spec stack owns speculation",
+    "--lookup-cache-static": "lookup decoding unused on the fork; spec stack owns speculation",
+    "--reuse-port": "router owns port lifecycle",
+    "--reverse-prompt": "interactive-mode flag, meaningless under the router",
+    "--tts-use-guide-tokens": "no TTS vehicles in the zoo",
 }
 
 CATS = [
