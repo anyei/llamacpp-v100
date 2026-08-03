@@ -411,6 +411,10 @@ private:
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
+    // draft-device mirrors of ctx_other tensors (see cparams.other_*_mirror)
+    ggml_context_ptr        mirror_other_ctx;
+    ggml_backend_buffer_ptr mirror_other_buf;
+
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 

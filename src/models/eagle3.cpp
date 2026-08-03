@@ -174,7 +174,10 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // 1. Token embeddings (e.g.from eagle3's own tok_embd for Llama 3.3 70B, or target model for Llama 3.1 8B)
     // 2. g_embeddings from encoder
     auto * tok_embd = model.tok_embd;
-    if (model.tok_embd == nullptr) {
+    if (tok_embd == nullptr && cparams.other_tok_embd_mirror != nullptr) {
+        tok_embd = cparams.other_tok_embd_mirror; // draft-device mirror (#12)
+    }
+    if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
@@ -307,6 +310,9 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head
     auto * output = model.output;
+    if (output == nullptr && cparams.other_output_mirror != nullptr) {
+        output = cparams.other_output_mirror; // draft-device mirror (#12)
+    }
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);

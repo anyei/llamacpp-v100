@@ -62,4 +62,11 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // draft-device mirrors of ctx_other tensors the DFlash/EAGLE3 draft graph
+    // reads (lm_head / tok_embd). Created at context init when the target's
+    // copies live in a buffer this context's scheduler cannot address (the
+    // meta tensor-split device, or a device outside this model's list).
+    ggml_tensor * other_output_mirror   = nullptr;
+    ggml_tensor * other_tok_embd_mirror = nullptr;
 };

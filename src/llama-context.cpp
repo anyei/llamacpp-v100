@@ -382,6 +382,76 @@ llama_context::llama_context(
         }
     }
 
+    // #12: the DFlash/EAGLE3 draft graph reads the TARGET's lm_head and token
+    // embeddings through ctx_other. When those live in a buffer this context's
+    // scheduler cannot address - the meta (tensor-split) device, or a device
+    // outside this model's list (a layer-split target parks output.weight on
+    // its last device, possibly a remote worker) - sched_split_graph aborts.
+    // Materialize one-time mirrors on this model's own device instead.
+    if (cparams.ctx_other != nullptr &&
+        (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH)) {
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        auto reachable = [&](const ggml_tensor * t) {
+            ggml_backend_buffer_t buf = t->buffer;
+            if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+                return true;
+            }
+            if (ggml_backend_buffer_is_meta(buf)) {
+                return false;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            if (dev == nullptr) {
+                return true;
+            }
+            for (const auto & d : model.devices) {
+                if (!d.is_meta && d.dev == dev) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::vector<const ggml_tensor *> need;
+        if (model.output   == nullptr && model_other->output   != nullptr && !reachable(model_other->output))   need.push_back(model_other->output);
+        if (model.tok_embd == nullptr && model_other->tok_embd != nullptr && !reachable(model_other->tok_embd)) need.push_back(model_other->tok_embd);
+        if (!need.empty()) {
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (auto it = model.devices.rbegin(); it != model.devices.rend(); ++it) {
+                if (!it->is_meta) {
+                    buft = ggml_backend_dev_buffer_type(it->dev);
+                    break;
+                }
+            }
+            if (buft == nullptr) {
+                buft = ggml_backend_cpu_buffer_type();
+            }
+            ggml_init_params ip = { ggml_tensor_overhead() * need.size(), nullptr, true };
+            mirror_other_ctx.reset(ggml_init(ip));
+            std::vector<ggml_tensor *> dsts;
+            for (const ggml_tensor * src : need) {
+                ggml_tensor * dst = ggml_dup_tensor(mirror_other_ctx.get(), src);
+                ggml_format_name(dst, "%s.other_mirror", src->name);
+                dsts.push_back(dst);
+            }
+            mirror_other_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mirror_other_ctx.get(), buft));
+            if (mirror_other_buf == nullptr) {
+                throw std::runtime_error("failed to allocate draft-side mirrors of the target's shared tensors");
+            }
+            std::vector<uint8_t> tmp;
+            for (size_t i = 0; i < need.size(); ++i) {
+                tmp.resize(ggml_nbytes(need[i]));
+                ggml_backend_tensor_get(need[i], tmp.data(), 0, tmp.size());
+                ggml_backend_tensor_set(dsts[i], tmp.data(), 0, tmp.size());
+                if (need[i] == model_other->output) {
+                    cparams.other_output_mirror = dsts[i];
+                } else {
+                    cparams.other_tok_embd_mirror = dsts[i];
+                }
+                LLAMA_LOG_INFO("%s: mirrored target '%s' (%.1f MiB) onto the draft device for the %s draft graph\n",
+                        __func__, need[i]->name, tmp.size() / 1024.0 / 1024.0, model.arch_name().c_str());
+            }
+        }
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.

@@ -409,8 +409,13 @@ void llama_model_dflash::graph<false>::build_dsv4(const llama_model & model, ggm
 
     res->t_embd = cur;
 
-    // lm_head from the target model (shared via ctx_other)
+    // lm_head from the target model (shared via ctx_other); a draft-device
+    // mirror takes precedence when the target's copy is not schedulable from
+    // this context (meta / remote buffer - #12)
     auto * output = model.output;
+    if (output == nullptr && cparams.other_output_mirror != nullptr) {
+        output = cparams.other_output_mirror;
+    }
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -549,8 +554,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    // tok_embd from the target model (shared via ctx_other)
+    // tok_embd from the target model (shared via ctx_other); draft-device
+    // mirror first when the target's copy is not schedulable here (#12)
     auto * tok_embd = model.tok_embd;
+    if (tok_embd == nullptr && cparams.other_tok_embd_mirror != nullptr) {
+        tok_embd = cparams.other_tok_embd_mirror;
+    }
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -637,8 +646,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     res->t_embd = cur;
 
-    // lm_head from the target model (shared via ctx_other)
+    // lm_head from the target model (shared via ctx_other); a draft-device
+    // mirror takes precedence when the target's copy is not schedulable from
+    // this context (meta / remote buffer - #12)
     auto * output = model.output;
+    if (output == nullptr && cparams.other_output_mirror != nullptr) {
+        output = cparams.other_output_mirror;
+    }
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
