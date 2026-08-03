@@ -342,3 +342,36 @@ catalog into wizard.html (like GATES) + a drift check in the e2e harness fails w
 - batch/ubatch beyond the two presets
 - --mlock/--numa (note: --mlock shim semantics fixed in review #2)
 - draft cache-type flags
+## Recommended calls for the 27 REVIEW rows (2026-08-03 session, awaiting user veto)
+
+Default posture: every flag is already reachable via the shipped full catalog (#96 core,
+1dd91e64f), so "ADVANCED" below means catalog-only stays fine; "EXPOSE" means promote to a
+visible panel control; "EXCLUDE" means mark non-serve/hidden with reason.
+
+| Flag | Recommended | Reason |
+|---|---|---|
+| `--dynatemp-exp` | ADVANCED (sampling drawer) | joins the sampling family default |
+| `--dynatemp-range` | ADVANCED (sampling drawer) | same |
+| `--fim-qwen-30b-default` | EXCLUDE | internet weight download conflicts with local-models-first wizard |
+| `--fim-qwen-3b-default` | EXCLUDE | same |
+| `--fim-qwen-7b-default` | EXCLUDE | same |
+| `--gpt-oss-120b-default` | EXCLUDE | same |
+| `--gpt-oss-20b-default` | EXCLUDE | same |
+| `--embd-gemma-default` | EXCLUDE (revisit embeddings row) | same download concern; embeddings table currently says ADVANCED |
+| `--fit-ctx` | ADVANCED (fit group) | wizard mostly launches -fit off; niche |
+| `--fit-target` | ADVANCED (fit group) | same |
+| `--list-devices` | EXCLUDE | prints and exits - not a serve flag |
+| `--lookup-cache-dynamic` | EXCLUDE | lookup decoding unused on the fork; spec stack owns speculation |
+| `--lookup-cache-static` | EXCLUDE | same |
+| `--media-path` | EXPOSE (conditional, multimodal panel) | pairs with the existing mmproj detection |
+| `--no-host` | ADVANCED (expert perf) | backend buffer semantics; easy to misuse |
+| `--op-offload` | ADVANCED (expert perf) | same |
+| `--perf` | ADVANCED (diag) | diagnostics class |
+| `--repack` | ADVANCED (expert perf) | CPU-side; sweep owns defaults |
+| `--reuse-port` | EXCLUDE | router owns port lifecycle |
+| `--reverse-prompt` | EXCLUDE | interactive-mode flag, meaningless under the router |
+| `--slot-prompt-similarity` | EXPOSE (serve panel, with -np) | real lever for np>1 serving + cache-reuse behavior |
+| `--sse-ping-interval` | ADVANCED (serve) | proxy keepalive niche (pairs with #104 color) |
+| `--tags` | EXPOSE (model card) | catalog UX; informational only, zero risk |
+| `--tts-use-guide-tokens` | EXCLUDE | no TTS vehicles in the zoo |
+| `--warmup` | EXPOSE (serve panel toggle) | skipping warmup speeds test loads; users hit this |
