@@ -58,10 +58,14 @@
 	let loadPercent = $derived(Math.round(modelLoadFraction(loadProgress) * 100));
 	let loadTitle = $derived(modelLoadProgressText(loadProgress));
 
-	// #100: active speculation badge - no badge = target-only serve
+	// #100: active speculation badge - no badge = target-only serve.
+	// the /models list merges the child's loaded_info at top level (meta.speculative);
+	// the SSE status path nests it under info.
 	let specInfo = $derived.by(() => {
 		const model = currentRouterModels.find((m) => m.id === option.model);
-		const spec = model?.info?.meta?.speculative;
+		const spec =
+			(model?.meta as { speculative?: import('$lib/types/api').ApiSpeculativeInfo } | null)
+				?.speculative ?? model?.info?.meta?.speculative;
 		return spec && spec.type && spec.type !== 'none' ? spec : null;
 	});
 	let specLabel = $derived(
