@@ -552,10 +552,28 @@ function modesFor(m, ctx, kv) {
     const perLayer = m.size*0.9/L;
     const vramBudget = Math.max(0, HW.gpus[0].vram - m.size*0.1 - kvNow - 3);
     const ncmoeN = Math.max(0, L - Math.min(L, Math.floor(vramBudget/perLayer)));
+    // #101: -ncmoe guts the FIRST N layers, so a contiguous layer split by COUNT
+    // strands the gutted range on GPU0. Emit a -ts of layer counts that equalizes
+    // post-offload BYTES instead (expert bytes ~0.9 of a routed-MoE layer;
+    // homogeneous GPUs assumed - matches the 2x V100 box).
+    let ncmoeTs = "", ncmoeTsNote = "";
+    if (HW.gpus.length > 1 && ncmoeN > 0) {
+      const wl = 0.1, per = i => (i < ncmoeN ? wl : 1);
+      const total = Array.from({length:L}, (_,i)=>per(i)).reduce((a,b)=>a+b,0);
+      const share = total / HW.gpus.length;
+      const counts = []; let acc = 0, cnt = 0;
+      for (let i = 0; i < L; i++) {
+        acc += per(i); cnt++;
+        if (acc >= share && counts.length < HW.gpus.length - 1) { counts.push(cnt); acc = 0; cnt = 0; }
+      }
+      counts.push(cnt);
+      ncmoeTs = `\n-ts ${counts.join(",")}`;
+      ncmoeTsNote = ` Byte-balanced -ts ${counts.join(",")} across ${HW.gpus.length} GPUs (#101: the gutted early layers are ~10% weight - a plain layer split leaves GPU0 near-empty).`;
+    }
     push({ id:"ncmoe", name:"GPU + CPU expert offload",
     speed:()=>"~6–9", est:()=>true,
-    why:`Attention and shared layers on GPU, routed experts of the first ${ncmoeN} layers in ${HW.ram} GiB RAM (-ncmoe, estimated - raise it if the load OOMs).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${kvNote("ncmoe")}`,
-    flags:`-ngl 99 -ncmoe ${ncmoeN} -c {CTX} --load-mode none -fa on` });
+    why:`Attention and shared layers on GPU, routed experts of the first ${ncmoeN} layers in ${HW.ram} GiB RAM (-ncmoe, estimated - raise it if the load OOMs).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${ncmoeTsNote}${kvNote("ncmoe")}`,
+    flags:`-ngl 99 -ncmoe ${ncmoeN}${ncmoeTs} -c {CTX} --load-mode none -fa on` });
   }
   else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GiB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GiB).` });
   else out.blocked.push({ name:"GPU + CPU expert offload", why:"Dense model - no expert tier to offload." });
