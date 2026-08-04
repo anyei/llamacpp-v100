@@ -221,3 +221,23 @@ NEXT DISCRIMINATOR (build, ~10 lines): a chunk-only eval callback
 but skip the tensor_get read). Reproduces delta = pure graph-chunking bug in
 the meta decode path; exact = the callback READS (meta get_tensor gathers
 mid-graph) mutate member state. Then node-level diff on the NL=3 graph.
+
+## Chunk-only discriminator (LLAMA_CB_CHUNK_ONLY): READS EXONERATED
+
+New diagnostic gate (llama-context.cpp): a callback that answers ask=true on
+every base ffn_moe_topk-* (chunking the sched identically to ZL/union) but
+NEVER reads the tensor. NL=3 pair: per-pass deltas IDENTICAL to the reading
+callback (france 2.86e-2, pipeline 1.97e-2 - same maxima to 3 digits).
+
+VERDICT: the corruption is PURE GRAPH CHUNKING in the meta backend's decode
+path - no tensor_get involved. Cumulative exonerations: placement determinism
+(byte-identical REDUCE traces), split-state classification (identical), build
+ring (fixed, D==E), BCAST_FUSE/skip/repair (FUSE=0 persists), EXPERT_DEFER
+(off-leg identical garbage), CUDA graphs, the callback reads (this run).
+Remaining frame: a decode-shaped (ne1==1) handler in the meta chunk-compose
+path computes a ~5e-2-wrong contribution when >= 2 MoE layers split across
+chunks; prefill-shaped chunks (ne1>1) are bit-exact.
+
+NEXT: node-level diff on the NL=3 decode graph (chunk-only leg vs ctl) -
+grep the ne[1]==1 gates in ggml-backend-meta.cpp first; the wrongness is
+decode-gate-specific by construction.

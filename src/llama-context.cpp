@@ -349,6 +349,27 @@ llama_context::llama_context(
                 expert_mask.reset();
             }
         }
+        // seam-bug discriminator: chunk the sched exactly like the ZL/union
+        // callback (ask=true on every base topk) but never read the tensor -
+        // separates graph-chunking effects from the get_tensor gathers
+        if (cparams.cb_eval == nullptr &&
+                getenv("LLAMA_CB_CHUNK_ONLY") != nullptr && atoi(getenv("LLAMA_CB_CHUNK_ONLY")) != 0) {
+            cparams.cb_eval = [](struct ggml_tensor * t, bool ask, void * ud) {
+                GGML_UNUSED(ud);
+                if (!ask) {
+                    return true;
+                }
+                constexpr const char * prefix = "ffn_moe_topk-";
+                if (strncmp(t->name, prefix, 13) != 0 || t->name[13] == '\0') {
+                    return false;
+                }
+                const char * p = t->name + 13;
+                while (*p >= '0' && *p <= '9') { p++; }
+                return *p == '\0';
+            };
+            cparams.cb_eval_user_data = nullptr;
+            LLAMA_LOG_INFO("%s: LLAMA_CB_CHUNK_ONLY: chunking sched at topk without reads\n", __func__);
+        }
         if (cparams.cb_eval == nullptr && // profiler owns the one eval-callback slot when set
                 ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
                  (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0))) {
