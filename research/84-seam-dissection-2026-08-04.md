@@ -156,3 +156,30 @@ Prime suspects: chunk-end forced boundaries on topk VIEWs, the stale/repair
 registry across 67 pieces, or the wire GET path that replaces fused arrivals.
 Logs: /tmp/hy3-union-coherence{,2,3}.log, /tmp/hy3-ctl-coherence.log,
 /tmp/hy3-union-nodefer.log.
+
+# Loopback trunc ladder (2026-08-04 late): the break is PROMPT-DEPENDENT, present at 5 layers
+
+Host-loopback ladder (84-trunc-ladder.sh, full hy3 + block_count override, CPU +
+3 loopback workers, default stack, 2 prompts x 6 probes per leg):
+
+- NL=10: both legs internally deterministic ACROSS SERVES (ctl d53bb253 /
+  union d5a01673 reproduced run-to-run) but union != ctl (divergent parse
+  outcomes both prompts; ctl-p2 steady 4574313f clean 6/6, union-p2 500s 6/6).
+- NL=5 (full-file override - kills the stub-vs-override vehicle confound):
+  - prompt 1 ("CPU pipeline"): union == ctl == c80261ff 6/6 BOTH - exact,
+    matches the historic stub sha.
+  - prompt 2 ("The capital of France is"): ctl 6a8f1a83 -> e2f6c6ea steady;
+    union e2f6c6ea FIRST (= ctl's steady sha!) -> af6720d6 steady. DIVERGENT.
+
+VERDICT: the chunk-path wrong math is NOT layer-count-gated - it is
+prompt/routing-DEPENDENT and already present at 5 layers; more layers just make
+more prompts hit it (why trunc20/full-33 look worse). Every historical trunc5
+"exact" gate used only prompt 1 - the 5/5 c80261ff verdicts were
+prompt-1-blind. The union-p2 first-probe-matches-ctl-then-flips pattern says
+the wrong value enters via serve STATE built during the first p2 cycle (build
+cache / registry contents), not via the p2 graph itself. ZL/UNION noted-id
+consumers audited: pure counters, no math influence.
+
+REPRO OF RECORD (cheapest yet): NL=5, single France prompt, ~29 GB host
+loopback, deterministic divergence in 2 probes. Tracer pair banked:
+84-n5-tracer.sh (ctl vs union, DEBUG_REDUCE + GGML_META_DEBUG=1 SPLIT_STATE).
