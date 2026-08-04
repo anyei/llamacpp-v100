@@ -191,15 +191,37 @@
 				}
 
 				const lp = d.load_progress || {};
-				document.getElementById('stage').textContent =
-					'Stage: ' + (lp.stage || '…') +
-					(typeof lp.value === 'number' ? '  ·  ' + Math.round(lp.value * 100) + '%' : '') +
-					(typeof lp.elapsed_ms === 'number' ? '  ·  ' + fmtDur(lp.elapsed_ms) + ' elapsed' : '');
-				document.getElementById('bar').style.width =
-					(typeof lp.value === 'number' ? Math.max(2, lp.value * 100) : 2) + '%';
-
 				const now = performance.now();
 				const workers = Array.isArray(d.load_workers) ? d.load_workers.slice() : [];
+
+				// #99: the stage value is the COORDINATOR's read/dispatch fraction - it hits
+				// 100% at file-EOF while slices are still in flight to slow workers. Cap the
+				// display at 99% and say what is actually happening until every sharing
+				// worker's own bar reads ready (same math as the rows below).
+				let wShare = 0, wReady = 0;
+				{
+					const modelMib0 = d.model && d.model.size_bytes ? d.model.size_bytes / MiB : 0;
+					for (const w of workers) {
+						if (!w.split_frac || modelMib0 <= 0) continue;
+						wShare++;
+						const expected = w.split_frac * modelMib0;
+						let doneMib = (w.weights_cached_mib || 0) + (w.weights_streamed_mib || 0);
+						if (!w.endpoint && w.free_start_mib != null && w.free_mib != null) {
+							doneMib = Math.max(doneMib, w.free_start_mib - w.free_mib);
+						}
+						if ((100 * doneMib) / expected >= 97) wReady++;
+					}
+				}
+				const finalizing = typeof lp.value === 'number' && lp.value >= 0.995 && wShare > 0 && wReady < wShare;
+				const shownPct = typeof lp.value === 'number'
+					? Math.min(finalizing ? 99 : 100, Math.round(lp.value * 100)) : null;
+				document.getElementById('stage').textContent =
+					'Stage: ' + (lp.stage || '…') +
+					(shownPct !== null ? '  ·  ' + shownPct + '%' : '') +
+					(finalizing ? '  ·  finalizing workers ' + wReady + '/' + wShare : '') +
+					(typeof lp.elapsed_ms === 'number' ? '  ·  ' + fmtDur(lp.elapsed_ms) + ' elapsed' : '');
+				document.getElementById('bar').style.width =
+					(shownPct !== null ? Math.max(2, shownPct) : 2) + '%';
 				// fastest first, more free memory breaking ties; unscored sink below,
 				// local devices (no endpoint) keep their pipeline position at the end
 				workers.sort((a, b) => {
