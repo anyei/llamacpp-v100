@@ -488,6 +488,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
         }
+        // Seam finding 2026-08-04 (#95 bisect): expert tensors must keep the SAME
+        // member layout on every layer. Rotated remainder-rounding can leave one
+        // layer's expert split single-member and the next multi-member; the
+        // single-member layer's FFN output then propagates owner-degenerate into
+        // a layer that needs mirrored inputs - abort at best (frac repro), wrong
+        // math where a permissive rule exists. Dense weights keep the fairness
+        // rotation; the cost here is <=1 granule of per-member imbalance.
+        if (tensor_name.find("_exps") != std::string::npos) {
+            rotation = 0;
+        }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
