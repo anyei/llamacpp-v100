@@ -839,6 +839,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         apply_rpc_auto_weight(params);
     }
 
+    // TASKS #82: -sm tensor + -ncmoe on multi-GPU silently corrupts decode
+    // (coherent-then-repetition-spiral, damaged arithmetic; A/B 2026-08-04:
+    // identical config under -sm layer is coherent). Warn, don't fail (#90).
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+        !params.tensor_buft_overrides.empty() && getenv("LLAMA_META_EP_ONLY") == nullptr) {
+        LOG_WRN("-sm tensor combined with -ncmoe/--cpu-moe is KNOWN to corrupt decode quality "
+                "(repetition spirals) - use -sm layer for CPU-expert offload (TASKS #82)\n");
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
