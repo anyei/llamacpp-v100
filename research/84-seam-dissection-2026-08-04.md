@@ -183,3 +183,41 @@ consumers audited: pure counters, no math influence.
 REPRO OF RECORD (cheapest yet): NL=5, single France prompt, ~29 GB host
 loopback, deterministic divergence in 2 probes. Tracer pair banked:
 84-n5-tracer.sh (ctl vs union, DEBUG_REDUCE + GGML_META_DEBUG=1 SPLIT_STATE).
+
+## Per-token logit profile (84-n5-logits.sh): CONSTANT PER-DECODE-PASS ERROR
+
+n_probs=20 over 24 tokens, ctl vs union, NL=5, both prompts:
+
+- tok0 (prefill pass): top-20 logprobs BIT-IDENTICAL (max|d| = 0.0) both prompts.
+- every decode pass after: constant max|d| ~4e-2..2e-1, NOT growing, both
+  prompts, chosen tokens mostly unflipped (pipeline 24/24 same -> its sha
+  "exactness" was flip-luck; france flipped at tok23 -> its sha divergence).
+
+REFRAME: the corruption is NOT prompt-dependent and NOT accumulating - EVERY
+DECODE-SHAPED chunked graph carries a fixed ~5e-2-logit wrong contribution
+while prefill-shaped chunked graphs are exact. At 33 layers the per-pass error
+is ~6x larger -> immediate garbage (the fleet observation). Rules out: KV
+corruption (delta would grow), fp reassociation (would be ~1e-5), routing
+dependence (both prompts equally perturbed).
+
+Next discriminator: BCAST_FUSE=0 pair at NL=5 (84-n5-logits-f0.sh) - delta
+gone = fuse/skip/repair machinery under chunking; delta stays = fuse exonerated
+on loopback, shrink repro to NL=2 for node-level dissection.
+
+## Minimal repro ladder result: TWO ADJACENT MoE LAYERS
+
+- FUSE=0 pair at NL=5: per-pass delta PERSISTS (france max 1.11) - the whole
+  BCAST_FUSE/skip/repair subsystem is exonerated on loopback too.
+- NL=2 (1 dense + 1 MoE): BIT-EXACT, 24/24 tokens, both prompts, max|d| 0.0.
+- NL=3 (2 MoE layers): per-pass delta returns (max 2.9e-2).
+
+MINIMAL REPRO: two adjacent MoE layers, decode-shaped graphs only (prefill
+bit-exact at every NL). The defect is a cross-layer interaction: MoE layer L's
+chunk output feeding layer L+1's chunk. Scripts: 84-n{2,3,5}-logits.sh (+
+-f0 variant), ~12-29 GB host loopback, ~10-20 min per pair.
+
+NEXT DISCRIMINATOR (build, ~10 lines): a chunk-only eval callback
+(LLAMA_CB_CHUNK_ONLY=1 in llama-context.cpp: answer ask=true on ffn_moe_topk-*
+but skip the tensor_get read). Reproduces delta = pure graph-chunking bug in
+the meta decode path; exact = the callback READS (meta get_tensor gathers
+mid-graph) mutate member state. Then node-level diff on the NL=3 graph.
