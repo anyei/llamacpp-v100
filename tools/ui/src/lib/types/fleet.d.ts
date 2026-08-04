@@ -128,6 +128,8 @@ export interface ApiFleetStatusResponse {
 	split_mode?: string | null;
 	n_gpu_layers?: number | null;
 	model?: ApiFleetModelInfo | null;
+	/** Active speculation stack (#100); absent/type "none" = target-only. */
+	speculative?: import('./api').ApiSpeculativeInfo | null;
 	devices: ApiFleetDevice[];
 	recent_failures?: number;
 	discovered: ApiFleetDiscoveredWorker[];

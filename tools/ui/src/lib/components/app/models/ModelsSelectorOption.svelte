@@ -57,6 +57,19 @@
 	let loadProgress = $derived(isLoading ? modelsStore.getLoadProgress(option.model) : null);
 	let loadPercent = $derived(Math.round(modelLoadFraction(loadProgress) * 100));
 	let loadTitle = $derived(modelLoadProgressText(loadProgress));
+
+	// #100: active speculation badge - no badge = target-only serve
+	let specInfo = $derived.by(() => {
+		const model = currentRouterModels.find((m) => m.id === option.model);
+		const spec = model?.info?.meta?.speculative;
+		return spec && spec.type && spec.type !== 'none' ? spec : null;
+	});
+	let specLabel = $derived(
+		specInfo
+			? specInfo.type.replace(/^draft-/, '') +
+					(specInfo.draft_device ? ` @ ${specInfo.draft_device}` : '')
+			: ''
+	);
 </script>
 
 <div
@@ -82,6 +95,15 @@
 		tags={option.tags}
 		class="flex-1"
 	/>
+
+	{#if isLoaded && specInfo}
+		<span
+			class="shrink-0 rounded-sm bg-primary/10 px-1 py-0.5 text-[10px] leading-none text-primary"
+			title={`speculation: ${specInfo.type}${specInfo.draft_model ? ` · drafter ${specInfo.draft_model}` : ''}${specInfo.n_max != null ? ` · n_max ${specInfo.n_max}` : ''}${specInfo.conf_min ? ` · conf_min ${specInfo.conf_min}` : ''}`}
+		>
+			{specLabel}
+		</span>
+	{/if}
 
 	<div class="flex shrink-0 items-center gap-1">
 		<!-- svelte-ignore a11y_no_static_element_interactions -->

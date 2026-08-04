@@ -254,6 +254,17 @@
 							{formatFileSize(status.model.size_bytes)}
 						</span>
 					{/if}
+
+					{#if status.speculative && status.speculative.type !== 'none'}
+						<Badge
+							class="text-xs"
+							title={`speculation: ${status.speculative.type}${status.speculative.draft_model ? ` · drafter ${status.speculative.draft_model}` : ''}${status.speculative.n_max != null ? ` · n_max ${status.speculative.n_max}` : ''}`}
+						>
+							{status.speculative.type.replace(/^draft-/, '')}{status.speculative.draft_device
+								? ` @ ${status.speculative.draft_device}`
+								: ''}
+						</Badge>
+					{/if}
 				{/if}
 			{/if}
 		</div>

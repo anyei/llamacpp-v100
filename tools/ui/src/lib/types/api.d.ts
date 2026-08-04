@@ -83,6 +83,15 @@ export interface ApiModelStatus {
  * Model entry from /models endpoint (ROUTER mode)
  * Based on actual API response structure
  */
+/** Active speculation stack of a loaded instance (#100). type "none" = target-only. */
+export interface ApiSpeculativeInfo {
+	type: string;
+	draft_model?: string;
+	n_max?: number;
+	conf_min?: number;
+	draft_device?: string;
+}
+
 export interface ApiModelDataEntry {
 	/** Model identifier (e.g., "ggml-org/Qwen2.5-Omni-7B-GGUF:latest") */
 	id: string;
@@ -106,6 +115,10 @@ export interface ApiModelDataEntry {
 	tags?: string[];
 	/** Legacy meta field (may be present in older responses) */
 	meta?: Record<string, unknown> | null;
+	/** Loaded-instance info (present while loaded); meta.speculative = active spec stack (#100) */
+	info?: {
+		meta?: Record<string, unknown> & { speculative?: ApiSpeculativeInfo };
+	} | null;
 }
 
 /**

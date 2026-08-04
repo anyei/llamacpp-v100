@@ -5935,6 +5935,7 @@ void server_routes::init_routes() {
                                  : params.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "none";
             body["n_gpu_layers"] = params.n_gpu_layers;
             body["model"]        = { {"path", params.model.path}, {"size_bytes", model_bytes} };
+            body["speculative"]  = speculative_info(params);
         } else {
             body["fleet_admin"]  = false;
             // from the load-plan snapshot (model thread), NOT from params - the
