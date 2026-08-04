@@ -498,9 +498,9 @@ function fleetIssue(m, ctx, kv) {
   if (selWorkers().length===0)
     return {kind:"weights", msg:"no workers selected - a valid fleet needs at least the workers that hold the model's weights"};
   if (m.size > cap)
-    return {kind:"weights", msg:`selected fleet holds ${cap.toFixed(0)} GB usable - the ${m.size} GB weights do not fit. Select more workers.`};
+    return {kind:"weights", msg:`selected fleet holds ${cap.toFixed(0)} GiB usable - the ${m.size} GiB weights do not fit. Select more workers.`};
   if (m.size + kvGB > cap)
-    return {kind:"ctx", msg:`weights + KV at this context (~${(m.size+kvGB).toFixed(0)} GB) exceed the selected fleet's ${cap.toFixed(0)} GB - rebuild the fleet (add workers) or lower the context / quantize KV.`};
+    return {kind:"ctx", msg:`weights + KV at this context (~${(m.size+kvGB).toFixed(0)} GiB) exceed the selected fleet's ${cap.toFixed(0)} GiB - rebuild the fleet (add workers) or lower the context / quantize KV.`};
   if (S.fleetW==="manual") {
     const over = manualPcts().filter(d=>d.pct/100*m.size > (d.gpu ? d.capGB-8 : d.capGB));
     if (over.length)
@@ -527,18 +527,18 @@ function modesFor(m, ctx, kv) {
   // single GPU
   if (fitQ("gpu1")) push({ id:"gpu1", name:"Single GPU",
     speed:s2=>meas("gpu1",s2)||"~"+Math.round(1100/m.size*(m.quant.startsWith("Q8")?0.7:1)), est:s2=>!meas("gpu1",s2),
-    why:`${m.size} GB on one ${HW.gpus[0].name} ${HW.gpus[0].vram} GB.${kvNote("gpu1")}`,
+    why:`${m.size} GiB on one ${HW.gpus[0].name} ${HW.gpus[0].vram} GiB.${kvNote("gpu1")}`,
     flags:`-ngl 99 -c {CTX} -fa on --load-mode none` });
-  else out.blocked.push({ name:"Single GPU", why:`${m.size} GB + ~${kvMin.toFixed(0)} GB KV (q4_0) exceeds one ${HW.gpus[0].vram} GB GPU at ${fmtCtx(ctx)}.` });
+  else out.blocked.push({ name:"Single GPU", why:`${m.size} GiB + ~${kvMin.toFixed(0)} GiB KV (q4_0) exceeds one ${HW.gpus[0].vram} GiB GPU at ${fmtCtx(ctx)}.` });
 
   // multi-GPU tensor split: valid whenever it fits pooled VRAM, even if one GPU would do -
   // the pooled KV headroom is exactly why you'd pick it for long contexts
   if (m.size <= totalVram && fitQ("ts")) push({ id:"ts", name:"Multi-GPU · tensor split",
     speed:s2=>meas("ts",s2)||"~"+Math.round(900/m.size*10)/10, est:s2=>!meas("ts",s2),
-    why:`${HW.gpus.length}×${HW.gpus[0].vram} GB pooled = ${totalVram} GB for weights + KV - the long-context route when one GPU is tight.${kvNote("ts")} Gates preset: p2p allreduce, FA on.`,
+    why:`${HW.gpus.length}×${HW.gpus[0].vram} GiB pooled = ${totalVram} GiB for weights + KV - the long-context route when one GPU is tight.${kvNote("ts")} Gates preset: p2p allreduce, FA on.`,
     flags:`-sm tensor -ts 0.5,0.5 -ngl 99 -c {CTX} --load-mode none -fa on\nGGML_CUDA_ALLREDUCE=p2p` });
-  else if (m.size <= totalVram) out.blocked.push({ name:"Multi-GPU · tensor split", why:`Weights fit but KV at ${fmtCtx(ctx)} exceeds ${totalVram} GB even at q4_0.` });
-  else out.blocked.push({ name:"Multi-GPU · tensor split", why:`${m.size} GB exceeds ${totalVram} GB pooled VRAM.` });
+  else if (m.size <= totalVram) out.blocked.push({ name:"Multi-GPU · tensor split", why:`Weights fit but KV at ${fmtCtx(ctx)} exceeds ${totalVram} GiB even at q4_0.` });
+  else out.blocked.push({ name:"Multi-GPU · tensor split", why:`${m.size} GiB exceeds ${totalVram} GiB pooled VRAM.` });
 
   if (m.size <= totalVram && fitQ("ts")) push({ id:"sml", name:"Multi-GPU · layer split",
     speed:s2=>meas("sml",s2)||"~"+Math.round(700/m.size*10)/10, est:s2=>!meas("sml",s2),
@@ -554,10 +554,10 @@ function modesFor(m, ctx, kv) {
     const ncmoeN = Math.max(0, L - Math.min(L, Math.floor(vramBudget/perLayer)));
     push({ id:"ncmoe", name:"GPU + CPU expert offload",
     speed:()=>"~6–9", est:()=>true,
-    why:`Attention and shared layers on GPU, routed experts of the first ${ncmoeN} layers in ${HW.ram} GB RAM (-ncmoe, estimated - raise it if the load OOMs).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${kvNote("ncmoe")}`,
+    why:`Attention and shared layers on GPU, routed experts of the first ${ncmoeN} layers in ${HW.ram} GiB RAM (-ncmoe, estimated - raise it if the load OOMs).${m.size+kvEst(m,ctx,kv)<=totalVram?" Optional here - the model fits VRAM; use it to spare VRAM for KV.":" Best single-box route for MoE this size."}${kvNote("ncmoe")}`,
     flags:`-ngl 99 -ncmoe ${ncmoeN} -c {CTX} --load-mode none -fa on` });
   }
-  else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GB).` });
+  else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GiB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GiB).` });
   else out.blocked.push({ name:"GPU + CPU expert offload", why:"Dense model - no expert tier to offload." });
 
   // fleet: two REAL variants (expert parallel for MoE, layer split for anything
@@ -566,7 +566,7 @@ function modesFor(m, ctx, kv) {
   // expert tier segmented, which is the viable form of it.
   if (HW.fleet.workers > 0 && m.size + kvMin <= caps.fleet) {
     const margin = caps.fleet - m.size;
-    const border = margin < 25 ? ` CAPACITY-BORDERLINE: ~${margin.toFixed(0)} GB headroom for KV + overheads - keep context modest.` : "";
+    const border = margin < 25 ? ` CAPACITY-BORDERLINE: ~${margin.toFixed(0)} GiB headroom for KV + overheads - keep context modest.` : "";
     if (m.moe) {
       const epMeas = meas("fleet-ep");
       push({ id:"fleet", name:"Distributed fleet · expert parallel",
@@ -585,7 +585,7 @@ function modesFor(m, ctx, kv) {
             (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
     out.blocked.push({ name:"Distributed · full tensor split",
       why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
-  } else if (HW.fleet.workers > 0 && m.size + kvMin > caps.fleet) out.blocked.push({ name:"Distributed fleet", why:`${m.size} GB + KV exceeds usable fleet capacity (${caps.fleet} GB).` });
+  } else if (HW.fleet.workers > 0 && m.size + kvMin > caps.fleet) out.blocked.push({ name:"Distributed fleet", why:`${m.size} GiB + KV exceeds usable fleet capacity (${caps.fleet} GiB).` });
 
   // SSD streaming: always offered for MoE - choosing to spare RAM/VRAM is the user's call
   if (m.moe) push({ id:"ssd", name:"SSD streaming",
@@ -597,9 +597,9 @@ function modesFor(m, ctx, kv) {
 
   // CPU only
   if (fitQ("cpu")) push({ id:"cpu", name:"CPU only", speed:()=>"~1–4", est:()=>true,
-    why:`Fits ${HW.ram} GB RAM. No GPU dependency.${kvNote("cpu")}`,
+    why:`Fits ${HW.ram} GiB RAM. No GPU dependency.${kvNote("cpu")}`,
     flags:`-ngl 0 -c {CTX}` });
-  else out.blocked.push({ name:"CPU only", why:`${m.size} GB + KV exceeds ${HW.ram} GB RAM.` });
+  else out.blocked.push({ name:"CPU only", why:`${m.size} GiB + KV exceeds ${HW.ram} GiB RAM.` });
 
   out.ranked.sort((a,b)=>(b.est("none")?0:1)-(a.est("none")?0:1) ||
                         (parseFloat(b.speed("none"))||0)-(parseFloat(a.speed("none"))||0));
@@ -614,7 +614,7 @@ function modesFor(m, ctx, kv) {
 const fmtCtx = c => c>=1048576?(c/1048576)+"M":(c/1024)+"k";
 
 function fitTag(m) {
-  const fleetTip = `fleet capacity = currently-FREE worker RAM from live beacons (${HW.fleet.pooledGB} GB now, x0.92) + ${totalVram} GB local VRAM = ${HW.fleet.usableGB+totalVram} GB - it grows when running serves stop`;
+  const fleetTip = `fleet capacity = currently-FREE worker RAM from live beacons (${HW.fleet.pooledGB} GiB now, x0.92) + ${totalVram} GiB local VRAM = ${HW.fleet.usableGB+totalVram} GiB - it grows when running serves stop`;
   if (m.size + 4 <= HW.gpus[0].vram) return ["fits 1 GPU","t-ok",""];
   if (m.size + 6 <= totalVram) return ["fits "+HW.gpus.length+" GPUs","t-ok",""];
   if (m.size + 8 <= totalVram + HW.ram) return ["needs CPU offload","t-warn",""];
@@ -837,10 +837,10 @@ const $ = id => document.getElementById(id);
 
 function chips() {
   $("hw").innerHTML =
-    HW.gpus.map(g=>`<span class="chip"><b>${g.name}</b> <span class="dim">${g.vram} GB</span></span>`).join("") +
-    `<span class="chip"><b>RAM</b> <span class="dim">${HW.ram} GB</span></span>` +
+    HW.gpus.map(g=>`<span class="chip"><b>${g.name}</b> <span class="dim">${g.vram} GiB</span></span>`).join("") +
+    `<span class="chip"><b>RAM</b> <span class="dim">${HW.ram} GiB</span></span>` +
     `<span class="chip"><b>${HW.ssd}</b></span>` +
-    `<span class="chip"><b>fleet</b> <span class="dim">${HW.fleet.workers} workers · ${HW.fleet.pooledGB} GB RAM</span></span>` +
+    `<span class="chip"><b>fleet</b> <span class="dim">${HW.fleet.workers} workers · ${HW.fleet.pooledGB} GiB RAM</span></span>` +
     `<span class="chip" style="color:var(--muted)" title="${localStorage.getItem("wizardHW")?"values from your manual edit (clear via edit)":HW.detected?"GPUs/RAM from /wizard/hw, fleet from live worker beacons (free memory NOW, not box totals)":"hardware values are assumptions until detection lands"}">${localStorage.getItem("wizardHW")?"custom":HW.detected?"detected":"assumed"}</span>` +
     `<button class="rescan" id="hwedit">edit</button>` +
     `<button class="rescan" id="srcedit">sources</button>`;
@@ -901,7 +901,7 @@ function renderDirs(v) {
           .filter(mt=>!S.dirs.includes(mt.path))
           .sort((a,b)=>(b.gguf_count-a.gguf_count) || (b.total_mib-a.total_mib))
           .map(mt=>`<button data-mnt="${mt.path.replace(/"/g,"&quot;")}"
-            title="${mt.fstype} · ${Math.round(mt.free_mib/1024)} GB free">${mt.path}
+            title="${mt.fstype} · ${Math.round(mt.free_mib/1024)} GiB free">${mt.path}
             ${mt.gguf_count?` <span style="color:var(--ok)">· ${mt.gguf_count} gguf</span>`
                            :` <span style="color:var(--muted)">· ${Math.round(mt.free_mib/1024)}G free</span>`}</button>`).join("")}
         </div></div>` : ""}
@@ -971,7 +971,7 @@ function render() {
         const [t,c,tip]=fitTag(m); const i=MODELS.indexOf(m);
         return `<button class="mrow${m.status!=="unloaded"?" live":""}" data-i="${i}">
           <span class="grow"><span class="mname">${m.file}</span>
-          <div class="mmeta">${m.size} GB · ${m.note}</div></span>
+          <div class="mmeta">${m.size} GiB · ${m.note}</div></span>
           ${m.status!=="unloaded" ? `<span class="tag t-ok">${m.status}</span>`:""}
           ${/trunc/i.test(m.id)?'<span class="tag t-warn" title="truncated debug reproducer: launches need LLAMA_TRUNC_ARR (env gates, danger class) + --override-kv block_count">trunc vehicle</span>':""}
           ${m.mtp?'<span class="tag t-acc">MTP able</span>':""}
@@ -1058,7 +1058,7 @@ function render() {
             const lay=md.id==="fleetl"&&m.layers?Math.round(d.pct/100*m.layers):null;
             return `<label class="mrow" style="padding-left:22px"><input type="number" data-mpct="${d.key}" value="${d.pct}" min="0" max="100"
               style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
-              <span class="estg">% · ${d.name} · ${lay!==null?`~${lay} of ${m.layers} layers · `:""}≈${gb.toFixed(0)} GB of ${(d.gpu?d.capGB-8:d.capGB).toFixed(0)} GB usable${d.gpu?" (KV+compute reserved)":""}</span>
+              <span class="estg">% · ${d.name} · ${lay!==null?`~${lay} of ${m.layers} layers · `:""}≈${gb.toFixed(0)} GiB of ${(d.gpu?d.capGB-8:d.capGB).toFixed(0)} GiB usable${d.gpu?" (KV+compute reserved)":""}</span>
               ${over?'<span class="tag t-bad">over capacity</span>':""}</label>`;}).join("")+
             `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100${md.id==="fleetl"?"; -sm layer assigns whole layers by these ratios":""}</span></div>`:""}
         </div>
@@ -1066,12 +1066,12 @@ function render() {
           ${fleetList().map(w=>{const on=!S.fleetSel||S.fleetSel.includes(w.endpoint); const gb=Math.round((w.free_mib||0)/1024);
             return `<label><input type="checkbox" data-fwsel="${w.endpoint}" ${on?"checked":""} ${sel?"":"disabled"}>
               <span style="font-family:var(--mono);font-size:12px">${w.endpoint}</span>
-              <span class="estg">· ${gb} GB free${w.proto_version?` · proto ${w.proto_version}`:""}${w.score?` · score ${Math.round(w.score)}`:""}</span></label>`;}).join("")}
+              <span class="estg">· ${gb} GiB free${w.proto_version?` · proto ${w.proto_version}`:""}${w.score?` · score ${Math.round(w.score)}`:""}</span></label>`;}).join("")}
           <label><button class="btn ghost" data-rescan style="padding:3px 10px;font-size:12px">↻ rescan</button>
             <span class="estg">beacons answer in ~1.5s windows - rescans accumulate the roster</span></label>
           ${(()=>{ if(!sel) return "";
             const iss=fleetIssue(m,S.ctx,S.kv), cap=(selUsableGB()+totalVram).toFixed(0), kvGB=kvEst(m,S.ctx,S.kv)*S.np;
-            return `<div class="memnote"><span>selected ${selWorkers().length}/${fleetList().length} workers · ${cap} GB usable (incl. ${totalVram} GB VRAM) vs weights ${m.size} GB + KV ~${kvGB.toFixed(0)} GB @ ${fmtCtx(S.ctx)}</span></div>`+
+            return `<div class="memnote"><span>selected ${selWorkers().length}/${fleetList().length} workers · ${cap} GiB usable (incl. ${totalVram} GiB VRAM) vs weights ${m.size} GiB + KV ~${kvGB.toFixed(0)} GiB @ ${fmtCtx(S.ctx)}</span></div>`+
               (iss?`<div style="margin-top:4px"><span class="tag ${iss.kind==="ctx"?"t-warn":"t-bad"}">${iss.msg}</span></div>`:"");})()}
         </div>`:""}
         ${md.ssdGpuOpt?`<div class="spec"><div class="lbl">Expert landing</div>
@@ -1199,8 +1199,8 @@ function render() {
             `<button data-kv="${k}" class="${S.kv===k?"on":""}">${k}</button>`).join("")}</span>
           <span class="note">${KVQ[S.kv].note}${S.kv!=="f16"?" · needs flash attention (-fa on, added)":""}</span></div>
         <div class="membar"><div class="used" style="width:${usedPct}%"></div><div class="kvpart" style="width:${kvPct}%"></div></div>
-        <div class="memnote"><span>weights ${m.size} GB + KV ~${kvGB.toFixed(1)} GB @ ${S.kv}${S.np>1?` ×${S.np} slots`:""}${S.spec!=="none"?" + draft ctx":""}${S.mmproj?" + vision proj":""}</span>
-        <span>${capGB} GB available (${md.name}${specName()})</span></div>
+        <div class="memnote"><span>weights ${m.size} GiB + KV ~${kvGB.toFixed(1)} GiB @ ${S.kv}${S.np>1?` ×${S.np} slots`:""}${S.spec!=="none"?" + draft ctx":""}${S.mmproj?" + vision proj":""}</span>
+        <span>${capGB} GiB available (${md.name}${specName()})</span></div>
       </div>
       ${visionCapable(m)?`<div class="panel"><h3>Vision projector</h3>
         <div class="kvrow" style="margin-top:0"><input id="mmproj" type="text" value="${S.mmproj.replace(/"/g,"&quot;")}"
