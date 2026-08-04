@@ -18,6 +18,11 @@ check `git status` first; uncommitted changes ship.
 
 ## Build (always detached — the ~10-min background cap kills clients)
 
+**MANDATORY pre-build gate (#96):** `python3 scripts/gen-wizard-flags.py --check`
+must pass before any coordinator image build — a stale FLAGS catalog vs arg.cpp
+fails the build here, not silently in the shipped wizard. On drift: run the
+generator, `cp tools/ui/static/wizard.html tools/ui/dist/wizard.html`, commit.
+
 ```bash
 nohup docker build -f .devops/cuda.Dockerfile --target server \
   -t llamacpp-local-v100:$(git rev-parse --short HEAD) . > /tmp/build.log 2>&1 & disown

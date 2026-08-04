@@ -434,7 +434,7 @@ function specOptions(m, modeId) {
 }
 
 // TASKS #94: named per-model launch configs (server-persisted)
-const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","mmproj","flagSet"];
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet"];
 const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 function configBlob() {
   const c = { v: 1, mode: S.mode ? S.mode.id : null };
@@ -638,6 +638,10 @@ function advOptions(m, md, specId) {
     { id:"cacheram", name:"--cache-ram 12288", note:"host-RAM budget (MiB) for cached prompts beyond what stays in slot KV", flags:"--cache-ram 12288" },
     { id:"ctxckpt", name:"--ctx-checkpoints 8", note:"keep N KV checkpoints per slot - fast rollback for regenerate/branching instead of full re-prefill", flags:"--ctx-checkpoints 8" },
   ]});
+  g.push({ label:"Catalog & media", items:[
+    { id:"tags", name:"--tags", input:true, ph:"prod,main", note:"comma-separated informational tags shown on the model row (#96; not used for routing)" },
+    { id:"mediapath", name:"--media-path", input:true, ph:"/mnt/files/media", note:"directory for file:// media URLs in multimodal requests (#96; pairs with mmproj)" },
+  ]});
   if (fleet) {
     const tiny = MODELS.filter(x=>x.size>0 && x.size<3 && x.id!==m.id).sort((a,b)=>a.size-b.size)[0];
     const resil = [
@@ -826,7 +830,7 @@ function flagsHTML(tmpl){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -1165,7 +1169,9 @@ function render() {
                   (md.ssdGpuOpt && S.ssdGpu ? `\nLLAMA_SSD_STREAM_GPU=1 LLAMA_SSD_STREAM_VRAM_BUDGET=6000` : "") +
                   (S.np>1 ? `\n-np ${S.np}` : "");
     const advGroups = advOptions(m, md, S.spec);
-    const advFlags = advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).map(it=>"\n"+it.flags).join("");
+    const advFlags = advGroups.flatMap(g=>g.items)
+      .filter(it=>it.input ? (S.advVal[it.id]||"").trim() : S.adv[it.id])
+      .map(it=>it.input ? "\n"+it.name+" "+(S.advVal[it.id]||"").trim() : "\n"+it.flags).join("");
     const tmplBase = md.flags.replace("{CTX}", S.ctx)
                          .replace("{TS}", tsForFleet(md))
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
@@ -1207,7 +1213,9 @@ function render() {
         <div class="memnote" style="margin-top:6px"><span>model path, host and port come from the router preset; these flags overlay it</span></div></div>
       <details class="panel" data-d="adv" style="margin-top:0"><summary style="font-size:12px;color:var(--muted);cursor:pointer">Advanced — ${advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).length} of ${advGroups.flatMap(g=>g.items).length} options${(n=>n?` · ${n} catalog flags`:" · flag catalog")(Object.keys(S.flagSet).length)}${(n=>n?` · ${n} env gates active`:" · env gates")(GATES.filter(g=>S.gateOn[g.name]!==undefined||(seeded[g.name]!==undefined&&!S.gateOff[g.name])).length)}</summary>
         ${advGroups.map(g=>`<div class="spec"><div class="lbl">${g.label}</div>
-          ${g.items.map(it=>`<label><input type="checkbox" data-adv="${it.id}" ${S.adv[it.id]?"checked":""}>
+          ${g.items.map(it=>it.input?`<label><span style="font-family:var(--mono);font-size:12px">${it.name}</span>
+            <input type="text" data-advval="${it.id}" value="${S.advVal[it.id]||""}" placeholder="${it.ph||""}" style="width:180px">
+            <span class="estg">· ${it.note}</span></label>`:`<label><input type="checkbox" data-adv="${it.id}" ${S.adv[it.id]?"checked":""}>
             <span style="font-family:var(--mono);font-size:12px">${it.name}</span>
             ${it.warn?'<span class="tag t-warn">untested</span>':""}
             <span class="estg">· ${it.note}</span></label>`).join("")}
@@ -1227,6 +1235,7 @@ function render() {
     v.querySelectorAll("[data-ctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.ctx; render(); });
     v.querySelectorAll("[data-np]").forEach(b=>b.onclick=()=>{ S.np=+b.dataset.np; render(); });
     v.querySelectorAll("[data-adv]").forEach(cb=>cb.onchange=e=>{ S.adv[cb.dataset.adv]=e.target.checked; render(); });
+    v.querySelectorAll("[data-advval]").forEach(inp=>inp.onchange=e=>{ S.advVal[inp.dataset.advval]=e.target.value; render(); });
     const mpi=$("mmproj"); if (mpi) mpi.onchange=e=>{ S.mmproj=e.target.value.trim(); render(); };
     v.querySelectorAll("[data-kv]").forEach(b=>b.onclick=()=>{ S.kv=b.dataset.kv; render(); });
     const gq=$("gateq");
