@@ -115,3 +115,44 @@ regime again outruns the cache (residual noted in TASKS #71).
   deterministic on the 20-layer vehicle; the final quality gate for lifting the
   fleet eval-callback caveat remains a coherence read on a real (non-babble)
   model at the next fleet window.
+
+# Fleet coherence window (2026-08-04 evening): CAVEAT STAYS - deterministic WRONG math at scale
+
+Real-model gate on the hy3 record roster (full hy3-1M-MTP, fleet
+CUDA0,CUDA1,RPC0-2, production stack). Four loads, findings in order:
+
+1. **Rotation-pin share-balance regression (NEW, blocks the old record -ts)**:
+   the proven maxed split `-ts 21,21,46,50,27` now OOMs CUDA1 at warmup
+   (cudaFuncGetAttributes OOM, 2/2, with AND without CUDA graphs) - first
+   record-roster load since the 25647fa7c rotation pin. Resized
+   `-ts 21,19,47,51,27` loads but the layout is grossly lopsided: CUDA0 4.7 GB
+   (~zero experts) vs CUDA1 32.2/32.7 GB. Pinning rotation=0 for _exps makes
+   the same member absorb the rounding remainder on EVERY layer instead of
+   rotating it. CORRECTNESS is unaffected (ctl coherence passes on the lopsided
+   layout); it is a balance/capacity regression. Fix direction: keep rotation
+   fixed per tensor KIND (layer-uniform, which is all the degenerate-propagation
+   fix needs) but stagger kinds across members (e.g. gate/up/down at 0/1/2).
+2. **Union-callback VRAM overhead**: on maxed shapes the callback's chunked
+   execution needs headroom the maxed split does not have;
+   GGML_CUDA_DISABLE_GRAPHS=1 alone does NOT save it.
+3. **The caveat STAYS - and is sharpened**: union leg on the resized layout =
+   deterministic GARBAGE (identical bytes across two serves, 3.05-3.27 t/s);
+   ctl same layout = COHERENT (90km/h 60 km correct + planets correct,
+   4.97 t/s). **EXPERT_DEFER exonerated**: union with deferral OFF produces
+   BYTE-IDENTICAL garbage to the deferral leg. So the chunk-path corruption is
+   deterministic wrong math, defer-independent, CUDA-graph-independent.
+4. **Counter signature of the chunk regime**: per-chunk BOUNDARY_STATS show
+   `parts fused 0.0` (vs ctl 112.8/graph - the fused-arrival machinery is
+   entirely bypassed under chunking), `deliveries skipped 0.0` (vs 237), and no
+   META_EXPERT_DEFER line ever prints (deferral never engages on chunk graphs).
+
+**Where that leaves the bug**: trunc5 loopback proves the chunk path CAN be
+exact (union leg == c80261ff, the no-callback sha); full hy3 (32+nextn layers,
+67+ chunks) is deterministically wrong. Scale-dependent correctness break
+between 5 and 33 layers. NEXT DISSECTION (loopback-only, no fleet window
+needed): byte-identity union-vs-ctl at trunc10/15/20 on the CPU loopback rig to
+find the breaking scale, then diff the chunk builds at the first wrong layer.
+Prime suspects: chunk-end forced boundaries on topk VIEWs, the stale/repair
+registry across 67 pieces, or the wire GET path that replaces fused arrivals.
+Logs: /tmp/hy3-union-coherence{,2,3}.log, /tmp/hy3-ctl-coherence.log,
+/tmp/hy3-union-nodefer.log.
