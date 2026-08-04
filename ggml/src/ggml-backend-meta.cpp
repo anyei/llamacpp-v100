@@ -537,6 +537,10 @@ struct ggml_backend_meta_buffer_context {
     std::vector<ggml_backend_meta_simple_tensor_container> stc_compute;
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // slot cleared by the most recent rebuild: the ring only advances on
+    // init_tensor, so consecutive rebuilds re-clear the same slot and only the
+    // first clear after an advance recycles live shadows (see reset_seq)
+    int stc_last_reset         = -1;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // never-recycled buffer generation, mixed into the prepared-build content key:
@@ -2663,8 +2667,8 @@ struct ggml_backend_meta_context {
     // unchanged); an inactive build parks it here.
     struct meta_build {
         uint64_t key       = 0; // content hash of the outer graph
-        uint64_t outer_uid = 0; // outer cgraph->uid at build time (uid fast path)
-        uint64_t built_seq = 0; // rebuild counter at creation (shadow-ring validity)
+        uint64_t outer_uid = 0; // outer cgraph->uid at build time (uid fast path; 0 = chunked piece)
+        uint64_t built_seq = 0; // reset_seq at creation (shadow-ring validity)
         uint64_t used_seq  = 0; // LRU
         size_t   n_subgraphs = 0;
         ggml_context_ptr ctx;   // owns this build's cgraph_main structures
@@ -2693,12 +2697,18 @@ struct ggml_backend_meta_context {
 
     std::vector<std::unique_ptr<meta_build>> builds;
     meta_build * build_active = nullptr;
-    uint64_t     rebuild_seq  = 0;
+    // count of FRESH shadow-ring clears: a rebuild clears each used buffer's
+    // next slot, but the ring index only advances on init_tensor, so repeated
+    // rebuilds between advances re-clear the same (already empty) slot. Aging
+    // builds by rebuild count instead of this clock evicted every chunked-graph
+    // (eval-callback) build before reuse - permanent rebuild churn whose stale
+    // reads corrupted the computation (research/84-seam-dissection-2026-08-04.md).
+    uint64_t     reset_seq    = 0;
     uint64_t     use_seq      = 0;
-    // compute-node shadows of a build live in the stc ring slot that was current
-    // when it was built; every rebuild advances each used buffer's ring by one
-    // slot, so a build older than ring_slots-1 rebuilds may point at reset
-    // shadows and must be discarded. Mirrors the buffer context's ring sizing.
+    // compute-node shadows of a build live in the stc ring slots that were live
+    // when it was built; after ring_slots-1 fresh clears the oldest of those
+    // slots has been recycled, so older builds must be discarded. Mirrors the
+    // buffer context's ring sizing.
     int          ring_slots;
 
     // GGML_META_BOUNDARY_STATS tallies (TASKS #9 follow-up: aim the next
@@ -3330,14 +3340,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // look up a prepared build: by outer uid when the graph carries one, else by
-    // content hash. A build older than ring_slots-1 rebuilds may reference reset
-    // shadow-ring slots and is dropped instead of trusted.
+    // content hash. A build older than ring_slots-1 fresh ring clears may
+    // reference recycled shadow-ring slots and is dropped instead of trusted.
     backend_ctx->use_seq++;
     ggml_backend_meta_context::meta_build * build = nullptr;
     uint64_t outer_key = 0;
     for (size_t k = 0; k < backend_ctx->builds.size(); ) {
         ggml_backend_meta_context::meta_build * b = backend_ctx->builds[k].get();
-        if (backend_ctx->rebuild_seq - b->built_seq >= (uint64_t) (backend_ctx->ring_slots - 1)) {
+        if (backend_ctx->reset_seq - b->built_seq >= (uint64_t) (backend_ctx->ring_slots - 1)) {
             if (b == backend_ctx->build_active) {
                 park_active();
             }
@@ -3381,7 +3391,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->n_subgraphs = build->n_subgraphs;
     } else {
         backend_ctx->tm_build_misses++;
-        backend_ctx->rebuild_seq++;
         park_active();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -3402,9 +3411,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
+        bool fresh_reset = false;
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = (buf_ctx->stc_compute_index + 1) % (int) buf_ctx->stc_compute.size();
+            if (buf_ctx->stc_compute_index_next != buf_ctx->stc_last_reset) {
+                buf_ctx->stc_last_reset = buf_ctx->stc_compute_index_next;
+                fresh_reset = true;
+            }
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
@@ -3412,6 +3426,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             stc.ctxs_retired.clear(); // frees overflow arenas chained by shadow_ctx
             stc.simple_tensors.clear();
             stc.by_data.clear();
+        }
+        if (fresh_reset) {
+            backend_ctx->reset_seq++;
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -4012,20 +4029,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // register the build; its per-member state stays live in backend_configs
         // until another build is activated. Entries past the shadow-ring horizon
-        // were dropped during lookup, cap the rest by LRU.
-        while (backend_ctx->builds.size() >= (size_t) (backend_ctx->ring_slots - 1)) {
-            size_t lru = 0;
-            for (size_t k = 1; k < backend_ctx->builds.size(); k++) {
-                if (backend_ctx->builds[k]->used_seq < backend_ctx->builds[lru]->used_seq) {
-                    lru = k;
+        // were dropped during lookup, cap the rest by LRU - per class: chunked
+        // pieces (uid 0, eval-callback chunking) arrive ~2 per layer per outer
+        // graph, so counting them against the outer cap evicted every one of
+        // them before reuse (permanent rebuild churn, the trunc20 corruption).
+        {
+            const bool  chunk = cgraph->uid == 0;
+            const size_t cap  = chunk ? std::max((size_t) 256, (size_t) (8*backend_ctx->ring_slots))
+                                      : (size_t) (backend_ctx->ring_slots - 1);
+            for (;;) {
+                size_t n_class = 0;
+                size_t lru     = SIZE_MAX;
+                for (size_t k = 0; k < backend_ctx->builds.size(); k++) {
+                    if ((backend_ctx->builds[k]->outer_uid == 0) != chunk) {
+                        continue;
+                    }
+                    n_class++;
+                    if (lru == SIZE_MAX || backend_ctx->builds[k]->used_seq < backend_ctx->builds[lru]->used_seq) {
+                        lru = k;
+                    }
                 }
+                if (n_class < cap) {
+                    break;
+                }
+                backend_ctx->builds.erase(backend_ctx->builds.begin() + lru);
             }
-            backend_ctx->builds.erase(backend_ctx->builds.begin() + lru);
         }
         auto build_new = std::make_unique<ggml_backend_meta_context::meta_build>();
         build_new->key         = outer_key;
         build_new->outer_uid   = cgraph->uid;
-        build_new->built_seq   = backend_ctx->rebuild_seq;
+        build_new->built_seq   = backend_ctx->reset_seq;
         build_new->used_seq    = backend_ctx->use_seq;
         build_new->n_subgraphs = n_subgraphs;
         build_new->ctx         = std::move(build_ctx);
