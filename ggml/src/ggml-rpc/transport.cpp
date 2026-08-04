@@ -612,6 +612,25 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// TASKS #104: stateful firewalls silently drop idle connections (a healthy
+// worker was declared dead mid-prompt after an idle gap). Keepalive probes
+// keep long-lived compute sockets visible: first probe after 60s idle, then
+// every 10s, dead after 3 misses (~90s to detect a truly dead peer - well
+// under the 10-min fence ceiling). Best-effort: failure is logged, not fatal.
+static bool set_keepalive(sockfd_t sockfd) {
+    int flag = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *)&flag, sizeof(int)) != 0) {
+        return false;
+    }
+#ifndef _WIN32
+    int idle = 60, intvl = 10, cnt = 3;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,  (char *)&idle,  sizeof(int));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, (char *)&intvl, sizeof(int));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,   (char *)&cnt,   sizeof(int));
+#endif
+    return true;
+}
+
 // IPv4 resolution via getaddrinfo: gethostbyname returns a pointer into a
 // shared static buffer and is MT-Unsafe - concurrent fleet-status probes on the
 // server's HTTP threads crashed inside its NSS internals (TASKS.md #40)
@@ -644,6 +663,9 @@ socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
+    }
+    if (!set_keepalive(client_socket_fd)) {
+        GGML_LOG_ERROR("Failed to set SO_KEEPALIVE (continuing)\n");
     }
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
@@ -688,6 +710,9 @@ socket_ptr socket_t::connect(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
+    }
+    if (!set_keepalive(sockfd)) {
+        GGML_LOG_ERROR("Failed to set SO_KEEPALIVE (continuing)\n");
     }
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");

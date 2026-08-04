@@ -25,7 +25,7 @@ extern "C" {
 // set_tensor otherwise. No ggml op-enum shift in this merge (fingerprint
 // unchanged). Minor 14 (zero short replies) unchanged.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    15
+#define RPC_PROTO_MINOR_VERSION    16
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
@@ -50,6 +50,9 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 // cache. NULL name clears the hint. Every serve is hash-verified, so a wrong or stale
 // hint degrades to streaming, never to corruption.
 GGML_BACKEND_API void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset);
+// TASKS #103: announce the model identity of the upcoming load; workers scope
+// their tensor cache per model (folder, manifest, eviction preference)
+GGML_BACKEND_API void ggml_backend_rpc_session_model(const char * model_id);
 
 // model_dir (optional, TASKS.md #26): directory of local GGUF files indexed by tensor-content
 // hash at startup; SET_TENSOR_HASH cache misses are then served from local disk instead of

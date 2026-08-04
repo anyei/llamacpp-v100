@@ -1231,6 +1231,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // TASKS #103: announce the model identity to RPC workers so their tensor
+    // caches scope per model (basename, shard suffix stripped so every shard
+    // of one model shares a folder). Resolved via the registry: no hard dep.
+    {
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        if (rpc_reg != nullptr) {
+            auto set_sm = (void (*)(const char *))
+                ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_session_model");
+            if (set_sm != nullptr) {
+                std::string base = params.model.path;
+                const size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    base = base.substr(slash + 1);
+                }
+                base = std::regex_replace(base, std::regex("-\\d{5}-of-\\d{5}"), "");
+                if (string_ends_with(base, ".gguf")) {
+                    base.resize(base.size() - 5);
+                }
+                set_sm(base.c_str());
+            }
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;

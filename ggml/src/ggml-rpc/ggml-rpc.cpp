@@ -163,6 +163,11 @@ enum rpc_cmd {
     // command ids; upstream assigns this a different id and is rejected on
     // the major at HELLO. Client-side gated on server minor >= 15.
     RPC_CMD_MEMSET_TENSOR,
+    // proto 4.16 (TASKS #103): the coordinator announces the model identity of
+    // the load session; the worker scopes its cache dir, manifest and eviction
+    // preference by it (per-model folders - collision/poison isolation).
+    // No response, like SET_TENSOR. Client-gated on server minor >= 16.
+    RPC_CMD_SESSION_MODEL,
     RPC_CMD_COUNT,
 };
 
@@ -1332,6 +1337,15 @@ static thread_local struct {
     bool     valid;
 } g_rpc_src_hint;
 
+// TASKS #103: process-wide model identity, sent once per socket right before
+// the manifest handshake so the worker scopes its cache per model. Set by the
+// loader (common_init_from_params) with the target gguf basename.
+static char g_rpc_session_model[100] = {0};
+
+void ggml_backend_rpc_session_model(const char * model_id) {
+    snprintf(g_rpc_session_model, sizeof(g_rpc_session_model), "%s", model_id ? model_id : "");
+}
+
 void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset) {
     static const bool disabled = getenv("GGML_RPC_NO_SRC_HINT") != nullptr;
     if (disabled || name == nullptr || name[0] == '\0') {
@@ -1412,6 +1426,14 @@ static void rpc_manifest_ensure(socket_ptr sock) {
     st.manifest_fetched = true; // one attempt; on failure the load just streams
     if (!rpc_drain_all_locked(sock, st)) {
         return;
+    }
+    // #103: announce the session model BEFORE the manifest so the response is
+    // scoped to this model's folder (+ flat legacy entries)
+    if (st.server_minor >= 16 && g_rpc_session_model[0] != '\0') {
+        if (!send_rpc_cmd_raw(sock, st, RPC_CMD_SESSION_MODEL,
+                              g_rpc_session_model, strlen(g_rpc_session_model))) {
+            return;
+        }
     }
     if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GET_MANIFEST, nullptr, 0)) {
         return;
@@ -2854,6 +2876,10 @@ public:
     bool set_tensor_hash_batch(const std::vector<uint8_t> & input, rpc_msg_set_tensor_hash_batch_rsp & response);
     bool set_tensor_hash_data(const std::vector<uint8_t> & input);
     void manifest(std::vector<uint64_t> & hashes);
+    // proto 4.16 (TASKS #103): per-connection model identity - scopes the cache
+    // folder, the manifest and the eviction preference. Thread-local: each
+    // connection runs on its own thread.
+    void session_model(const std::string & id);
     // catch-up run of the cache cap once the last client disconnects (eviction
     // is deferred while any coordinator is connected - see rpc_cache_enforce_limit)
     void cache_enforce_idle();
@@ -3351,11 +3377,31 @@ struct rpc_cache_entry {
 };
 
 // walk the cache dir once; returns total bytes, optionally collecting entries
+// TASKS #103: the announced model identity of the CURRENT connection's load
+// session. Sanitized on set; empty = legacy flat-dir behavior. Thread-local
+// because each connection has its own handler thread.
+static thread_local std::string t_rpc_session_model;
+
+void rpc_server::session_model(const std::string & id) {
+    std::string s;
+    for (char c : id.substr(0, 96)) {
+        s += (isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-') ? c : '_';
+    }
+    if (s == "." || s == "..") {
+        s.clear();
+    }
+    t_rpc_session_model = s;
+    if (!s.empty()) {
+        GGML_LOG_INFO("[cache] session model '%s' - cache scoped per model\n", s.c_str());
+    }
+}
+
 static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache_entry> * entries) {
     uint64_t total = 0;
     std::error_code ec;
-    for (auto it = fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+    // recursive: per-model subfolders (#103) count toward the same global cap
+    for (auto it = fs::recursive_directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (!it->is_regular_file(ec)) {
             continue;
         }
@@ -3407,7 +3453,19 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
         return e.path.filename().string().rfind("modelidx-", 0) == 0;
     }), entries.end());
     std::error_code ec;
-    std::sort(entries.begin(), entries.end(), [](const rpc_cache_entry & a, const rpc_cache_entry & b) {
+    // #103 eviction preference: entries OUTSIDE the current session's model
+    // folder go first (oldest-first within each class) - the active model's
+    // folder is the last thing the cap touches
+    const std::string active_dir = t_rpc_session_model.empty()
+        ? std::string() : (fs::path(cache_dir) / t_rpc_session_model).string();
+    auto is_active = [&](const rpc_cache_entry & e) {
+        return !active_dir.empty() && e.path.parent_path().string() == active_dir;
+    };
+    std::sort(entries.begin(), entries.end(), [&](const rpc_cache_entry & a, const rpc_cache_entry & b) {
+        const bool aa = is_active(a), ab = is_active(b);
+        if (aa != ab) {
+            return !aa; // non-active evicts first
+        }
         return a.mtime < b.mtime;
     });
     size_t   n_evicted = 0;
@@ -3480,11 +3538,18 @@ void rpc_server::cache_store(uint64_t hash, const void * data, size_t size) {
     }
     char hash_str[17];
     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-    // save to cache_dir/hash_str via a temp file: a partial write (killed worker,
-    // full disk) must never land under the final name - an unverified truncated
-    // entry used to poison every later load of the tensor
-    fs::path cache_file = fs::path(cache_dir) / hash_str;
-    fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
+    // save via a temp file: a partial write (killed worker, full disk) must
+    // never land under the final name - an unverified truncated entry used to
+    // poison every later load of the tensor. #103: entries live under a
+    // per-model folder when the coordinator announced a session model
+    fs::path dir = fs::path(cache_dir);
+    if (!t_rpc_session_model.empty()) {
+        dir /= t_rpc_session_model;
+        std::error_code ec_mk;
+        fs::create_directories(dir, ec_mk);
+    }
+    fs::path cache_file = dir / hash_str;
+    fs::path tmp_file   = dir / (std::string(hash_str) + ".tmp");
     std::ofstream ofs(tmp_file, std::ios::binary);
     if (!ofs.is_open()) {
         // the cache dir can disappear at runtime (manual cleanup) - without this
@@ -3531,8 +3596,15 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     }
     char hash_str[17];
     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+    // #103: the session's model folder first, then the flat legacy location
     fs::path cache_file = fs::path(cache_dir) / hash_str;
     std::error_code ec;
+    if (!t_rpc_session_model.empty()) {
+        fs::path scoped = fs::path(cache_dir) / t_rpc_session_model / hash_str;
+        if (fs::exists(scoped, ec)) {
+            cache_file = scoped;
+        }
+    }
     if (!fs::exists(cache_file, ec)) {
         return false;
     }
@@ -3835,18 +3907,30 @@ bool rpc_server::set_tensor_hash_data(const std::vector<uint8_t> & input) {
 void rpc_server::manifest(std::vector<uint64_t> & hashes) {
     if (cache_dir != nullptr) {
         std::error_code ec;
-        fs::directory_iterator end;
-        for (fs::directory_iterator it(cache_dir, ec); !ec && it != end; it.increment(ec)) {
-            const std::string name = it->path().filename().string();
-            if (name.size() != 16 || !it->is_regular_file(ec)) {
-                continue; // modelidx-*, *.tmp, foreign files
+        auto scan_flat = [&](const fs::path & dir) {
+            fs::directory_iterator end;
+            for (fs::directory_iterator it(dir, ec); !ec && it != end; it.increment(ec)) {
+                const std::string name = it->path().filename().string();
+                if (name.size() != 16 || !it->is_regular_file(ec)) {
+                    continue; // modelidx-*, *.tmp, subfolders, foreign files
+                }
+                char * endp = nullptr;
+                const uint64_t hash = strtoull(name.c_str(), &endp, 16);
+                if (endp == name.c_str() + 16) {
+                    hashes.push_back(hash);
+                }
             }
-            char * endp = nullptr;
-            const uint64_t hash = strtoull(name.c_str(), &endp, 16);
-            if (endp == name.c_str() + 16) {
-                hashes.push_back(hash);
+        };
+        // #103: with a session model announced, claim only that model's folder
+        // plus the flat legacy entries; other models' folders are NOT claimed
+        // (a cross-model hash collision must never place another model's bytes)
+        if (!t_rpc_session_model.empty()) {
+            fs::path scoped = fs::path(cache_dir) / t_rpc_session_model;
+            if (fs::is_directory(scoped, ec)) {
+                scan_flat(scoped);
             }
         }
+        scan_flat(cache_dir);
     }
     for (const auto & [hash, ref] : local_index) {
         hashes.push_back(hash);
@@ -4557,6 +4641,7 @@ static const char * rpc_cmd_str(int cmd) {
         case RPC_CMD_SET_TENSOR_HASH2:     return "SET_TENSOR_HASH2";
         case RPC_CMD_SET_TENSOR_HASH_BATCH: return "SET_TENSOR_HASH_BATCH";
         case RPC_CMD_SET_TENSOR_HASH_DATA: return "SET_TENSOR_HASH_DATA";
+        case RPC_CMD_SESSION_MODEL:        return "SESSION_MODEL";
         case RPC_CMD_GET_MANIFEST:         return "GET_MANIFEST";
         case RPC_CMD_RESCORE:              return "RESCORE";
         case RPC_CMD_COPY_FROM_REMOTE:     return "COPY_FROM_REMOTE";    // W2W pull (butterfly)
@@ -4962,6 +5047,15 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 if (!server.set_tensor_hash_data(input)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_SESSION_MODEL: {
+                // no response; payload = model identity string (proto 4.16)
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                server.session_model(std::string((const char *) input.data(), input.size()));
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
@@ -6116,6 +6210,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_source_hint") == 0) {
         return (void *)ggml_backend_rpc_source_hint;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_session_model") == 0) {
+        return (void *)ggml_backend_rpc_session_model;
     }
     if (std::strcmp(name, "ggml_backend_rpc_rescore_worker") == 0) {
         return (void *)ggml_backend_rpc_rescore_worker;
