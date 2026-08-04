@@ -4176,8 +4176,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // a fused response is pending, which would desync the stream.
     static const bool no_fused = getenv("GGML_META_NO_FUSED") != nullptr;
     // requires the star reduce: a carried fetch is only ever consumed by the star
-    // gather, so with GGML_META_NO_STAR the pipeline must stay off too
-    const bool fused_enabled = !no_fused && !tm_enabled &&
+    // gather, so with GGML_META_NO_STAR the pipeline must stay off too.
+    // Chunked pieces (uid 0: eval-callback graph views) stay off the pipeline -
+    // its piece-boundary invariant does not hold across chunk-sized calls, and
+    // wire members then compute from desynced state (~5e-2 logits per decode
+    // pass; the whole ladder is in research/84-seam-dissection-2026-08-04.md)
+    const bool fused_enabled = !no_fused && !tm_enabled && cgraph->uid != 0 &&
         getenv("GGML_META_NO_STAR") == nullptr &&
         backend_ctx->fused_send != nullptr && backend_ctx->fused_recv != nullptr;
     std::vector<int>  fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
@@ -4686,12 +4690,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         fused_fetch_pending[j] = 0;
                     }
                 }
+                // GGML_META_DEBUG_BSUM=1: per-boundary value checksums, printed
+                // from the reduce itself so ctl and chunked legs are observable
+                // without an eval callback perturbing the graph (seam dissection)
+                static const bool bsum_debug = getenv("GGML_META_DEBUG_BSUM") != nullptr && atoi(getenv("GGML_META_DEBUG_BSUM")) != 0;
+                if (bsum_debug) {
+                    for (size_t k = 0; k < part.size(); k++) {
+                        const float * p = (const float *) (scratch.data() + k*nbytes);
+                        double s = 0.0;
+                        for (size_t v = 0; v < n_vals; v++) {
+                            s += p[v];
+                        }
+                        fprintf(stderr, "BSUM: %s w%lld m%zu %.9e\n",
+                                boundary_node(part[k])->name, (long long) boundary_node(part[0])->ne[1], part[k], s);
+                    }
+                }
                 float * acc = (float *) scratch.data();
                 for (size_t k = 1; k < part.size(); k++) {
                     const float * p = (const float *) (scratch.data() + k*nbytes);
                     for (size_t v = 0; v < n_vals; v++) {
                         acc[v] += p[v];
                     }
+                }
+                if (bsum_debug) {
+                    double s = 0.0;
+                    for (size_t v = 0; v < n_vals; v++) {
+                        s += acc[v];
+                    }
+                    fprintf(stderr, "BSUM: %s w%lld FINAL %.9e\n",
+                            boundary_node(part[0])->name, (long long) boundary_node(part[0])->ne[1], s);
                 }
                 if (expert_defer) {
                     // inject the previous reduce's deferred wire partials: the
@@ -4758,6 +4785,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t j_src = part[0];
             auto & bcs = backend_ctx->backend_configs[j_src];
             ggml_tensor * node_src = boundary_node(j_src);
+            static const bool bsum_debug_bc = getenv("GGML_META_DEBUG_BSUM") != nullptr && atoi(getenv("GGML_META_DEBUG_BSUM")) != 0;
+            if (bsum_debug_bc && node_src->type == GGML_TYPE_F32 && ggml_is_contiguous(node_src)) {
+                const size_t nb_bc = ggml_nbytes(node_src);
+                std::vector<char> tmp_bc(nb_bc);
+                ggml_backend_synchronize(bcs.backend);
+                ggml_backend_tensor_get(node_src, tmp_bc.data(), 0, nb_bc);
+                double s = 0.0;
+                const float * p = (const float *) tmp_bc.data();
+                for (size_t v = 0; v < nb_bc/sizeof(float); v++) {
+                    s += p[v];
+                }
+                fprintf(stderr, "BSUM: %s w%lld BCAST1 m%zu %.9e\n",
+                        node_src->name, (long long) node_src->ne[1], j_src, s);
+            }
             // local sole computer + fused pipeline: read the value once and push it
             // with each wire member's next subgraph chain in one message (the copy
             // path below pays a bridged copy per member and carries nothing)

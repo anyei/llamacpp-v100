@@ -241,3 +241,38 @@ chunks; prefill-shaped chunks (ne1>1) are bit-exact.
 NEXT: node-level diff on the NL=3 decode graph (chunk-only leg vs ctl) -
 grep the ne[1]==1 gates in ggml-backend-meta.cpp first; the wrongness is
 decode-gate-specific by construction.
+
+## ROOT CAUSE CLOSED: fused wire pipeline desyncs under chunking; fix = chunks take the plain path
+
+Mode table (NL=3, both prompts, 24-token per-token logprob deltas):
+
+| ctl        | chunked    | result |
+|------------|------------|--------|
+| fused ON   | fused ON   | differ ~1e-1 (the bug: BSUM shows wire members hold
+|            |            | different data than local m0 from decode pass 2 on -
+|            |            | genuine wire desync, not reassociation) |
+| fused OFF  | fused OFF  | BIT-EXACT 24/24 |
+| fused ON   | fused OFF  | differ = ctl-ON vs ctl-OFF (fused and plain delivery
+|            |            | are legitimately fp-different, both self-consistent) |
+| fused OFF  | fused ON   | differ |
+
+Method traps burned tonight: (1) divergence starts at DECODE PASS 2 - any
+exactness claim needs n_predict >= 3 (an n_predict=2 "exact" NO_FUSED run
+temporarily mis-convicted the pipeline); (2) BSUM's sync+read is an ordering
+barrier - it did NOT mask this bug but must be considered; (3) byte-identity
+vs a FUSED ctl was the wrong success criterion for chunked legs - fused vs
+plain differ in fp legitimately; like-vs-like is the valid gate.
+
+FIX (landed): fused_enabled &= cgraph->uid != 0 - chunked pieces (uid 0 graph
+views) never enter the fused pipeline, whose piece-boundary invariant ("the
+pipeline never spans meta graph_compute calls") they violate. Chunked legs
+become bit-exact vs the plain baseline (validation pair 24/24 both prompts,
+0.0 delta). Production serves (uid != 0) keep the fused pipeline unchanged.
+
+GATES: validation pair exact; trunc5 seam 5/5 all c80261ff (ctl fused
+unaffected, callback legs auto-plain and still c80261ff at stub scale).
+RESIDUAL: the fused+chunked wire desync itself is now unreachable but not
+root-caused inside the pipeline (worker-side stream state across chunk-sized
+calls is the frame); revisit only if chunked graphs ever need fused speed.
+Final quality gate: fleet coherence read with a callback at the next window -
+expected COHERENT now (self-consistent plain math), not byte-equal to ctl.
