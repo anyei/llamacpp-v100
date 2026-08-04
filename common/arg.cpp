@@ -1577,6 +1577,49 @@ static void apply_rpc_auto_weight(common_params & params) {
             break;
         }
     }
+    // TASKS #95: shares below the segment-rounding floor produce layouts where a
+    // member's slice rounds to ZERO on some tensors and nonzero on others - the
+    // split-state algebra then aborts at warmup (repro: -ts 0,0.924,0.038,0.038
+    // on v4-trunc6; exact-zero members are handled fine). Floor tiny shares to
+    // exact 0 and hand their bytes to the remaining uncapped members.
+    {
+        double min_share = 0.05;
+        if (const char * env = getenv("LLAMA_RPC_AUTO_WEIGHT_MIN_SHARE")) {
+            min_share = atof(env);
+        }
+        double dropped = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (share[i] > 0.0 && share[i] < min_share) {
+                LOG_WRN("--rpc-auto-weight: %s share %.1f%% is below the %.0f%% segment-rounding floor - "
+                        "dropping it from the expert split (TASKS #95; raise via LLAMA_RPC_AUTO_WEIGHT_MIN_SHARE)\n",
+                        ggml_backend_dev_name(devs[i]), 100.0*share[i], 100.0*min_share);
+                dropped += share[i];
+                share[i] = 0.0;
+                capped[i] = true;
+            }
+        }
+        if (dropped > 0.0) {
+            double uncapped_sum = 0.0;
+            int    n_nonzero    = 0;
+            for (size_t i = 0; i < n; ++i) {
+                uncapped_sum += capped[i] ? 0.0 : share[i];
+                n_nonzero    += share[i] > 0.0;
+            }
+            if (n_nonzero < 2) {
+                // a single expert member + dedicated owners is its own aborting
+                // shape (csa_state_kv, same split-state algebra hole) - bail to
+                // the default split rather than emit a known-bad layout
+                LOG_WRN("--rpc-auto-weight: flooring left %d expert member(s) - "
+                        "keeping the default split (TASKS #95)\n", n_nonzero);
+                return;
+            }
+            for (size_t i = 0; i < n && uncapped_sum > 0.0; ++i) {
+                if (!capped[i] && share[i] > 0.0) {
+                    share[i] += dropped * share[i] / uncapped_sum;
+                }
+            }
+        }
+    }
     double share_sum = 0.0;
     for (size_t i = 0; i < n; ++i) {
         share_sum += share[i];
