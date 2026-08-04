@@ -411,13 +411,14 @@ function specOptions(m, modeId) {
              note:`trained block: ${(d.specBlock||8)-1} draft tokens max`}],
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
-  // type. Honest per-shape notes: single-box measured 0.7-0.8x SLOWER (#80
-  // A/B - verify compute exceeds savings, no boundary term to amortize);
-  // fleet-EP is the unmeasured boundary-amortization case.
+  // type. Honest per-shape notes (#80 5-leg A/B 2026-08-03): single-box
+  // 0.7-0.8x SLOWER; fleet-EP 3.37 vs 4.19 no-spec (-20% prose, breaks even
+  // only on >=85%-acceptance content); fleet-layer +40% (2.81 vs 2.01) but
+  // the layer shape itself loses to EP. Default OFF everywhere.
   const ds = dsparkFor(m);
   if (ds && (gpuMode || modeId==="ncmoe" || modeId==="fleet")) opts.push({ id:"dspark", name:"DSpark speculation", est:true,
     sub: modeId==="fleet"
-      ? `draft: ${ds.file} · est. gain — pending the #80 fleet A/B`
+      ? `draft: ${ds.file} · measured -20% vs no-spec on EP prose (#80 A/B) — opt in only for ≥85%-acceptance content`
       : `draft: ${ds.file} · measured 0.7–0.8x SLOWER single-box (#80) — experimental`,
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:ds.specBlock||5, min:1, max:ds.specBlock||5, step:1,
              note:`trained block: ${ds.specBlock||5} tokens`},
