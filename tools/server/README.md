@@ -1181,6 +1181,8 @@ The returned list always has one single element. The `meta` field can be `null` 
 
 By default, model `id` field is the path to model file, specified via `-m`. You can set a custom value for model `id` field via `--alias` argument. For example, `--alias gpt-4o-mini`.
 
+`meta.speculative` describes the active speculation stack: `type` (`none`, `draft-mtp`, `draft-dspark`, `draft-dflash`, ...) plus, when a separate draft model is loaded, `draft_model` (file basename), `n_max`, `conf_min` and `draft_device`. `type: "none"` means a target-only serve. The same object is exposed on `/props`.
+
 Example:
 
 ```json

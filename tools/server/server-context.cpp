@@ -31,6 +31,8 @@
 #include <utility>
 #include <fstream>
 
+static json speculative_info(const common_params & params); // TASKS #100
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -6412,6 +6414,7 @@ void server_routes::init_routes() {
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
+            { "speculative",                 speculative_info(params) },
         };
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
@@ -6925,6 +6928,40 @@ void server_routes::init_routes() {
     };
 }
 
+// TASKS #100: the active speculation stack, shown wherever a loaded model is
+// named (router model rows, /props). type "none" = target-only serve.
+static json speculative_info(const common_params & params) {
+    const auto & spec = params.speculative;
+    std::string type = common_speculative_type_name_str(spec.types);
+    if (type.rfind("none,", 0) == 0) {
+        type = type.substr(5);
+    }
+    json j = {
+        {"type", type},
+    };
+    if (spec.has_dft()) {
+        std::string base = spec.draft.mparams.path;
+        const size_t slash = base.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            base = base.substr(slash + 1);
+        }
+        j["draft_model"] = base;
+        j["n_max"]       = spec.draft.n_max;
+        j["conf_min"]    = spec.draft.conf_min;
+        std::string devs;
+        for (ggml_backend_dev_t d : spec.draft.devices) {
+            if (d == nullptr) {
+                continue;
+            }
+            devs += (devs.empty() ? "" : ",") + std::string(ggml_backend_dev_name(d));
+        }
+        if (!devs.empty()) {
+            j["draft_device"] = devs;
+        }
+    }
+    return j;
+}
+
 json server_routes::get_model_info() const {
     return json {
         {"id",       meta->model_name},
@@ -6942,6 +6979,7 @@ json server_routes::get_model_info() const {
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},
             {"ftype",       meta->model_ftype},
+            {"speculative", speculative_info(params)},
         }},
     };
 }
