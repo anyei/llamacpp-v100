@@ -4818,6 +4818,26 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             server.mark_executed(conn_id);
             continue;
         }
+        if (cmd == RPC_CMD_GET_DEVICE_MEMORY) {
+            // pure device read - kept OFF the execution lock: fleet-status probes
+            // are ephemeral (the client abandons after its poll budget) and
+            // queueing them behind long lock holders piles up half-closed
+            // sockets, threads and fds on the worker until the compute
+            // connection collapses (TASKS #104)
+            rpc_msg_get_device_memory_req request;
+            if (!recv_msg(sock, &request, sizeof(request))) {
+                break;
+            }
+            rpc_msg_get_device_memory_rsp response;
+            if (!server.get_device_memory(request, response)) {
+                break;
+            }
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
         if (cmd == RPC_CMD_RESCORE) {
             if (!recv_msg(sock, nullptr, 0)) {
                 break;
@@ -5189,20 +5209,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 }
                 break;
             }
-            case RPC_CMD_GET_DEVICE_MEMORY: {
-                rpc_msg_get_device_memory_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
-                    return;
-                }
-                rpc_msg_get_device_memory_rsp response;
-                if (!server.get_device_memory(request, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
-                }
-                break;
-            }
+            // RPC_CMD_GET_DEVICE_MEMORY is handled above, without the execution lock
             case RPC_CMD_SET_SPLIT_STATES: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
