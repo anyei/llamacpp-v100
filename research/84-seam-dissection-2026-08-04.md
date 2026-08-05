@@ -292,3 +292,25 @@ OPEN, now with a banked local repro. The eval-callback fleet-quality caveat
 REMAINS until the two-owner path is fixed (fleet serves always run owner
 groups). Next: BSUM diff on the two-owner NL=3 pair - the star reduce with 2
 owner contributors + chunk boundaries is the suspect seam.
+
+## Two-owner dissection (stub vehicle): trigger = NON-ROOT ATTENTION OWNER
+
+- Repro shrunk to the trunc5 STUB (12 GB, ~8 min/pair): ATTN_OWNER=0,1 chunked
+  vs ctl -> france garbage-class (disjoint top-sets, tok 2), pipeline 2.4e-1
+  (tok 1). Script 84-stub-attnowner.sh (+BSUM).
+- BSUM localization: decode pass 1 fully bit-exact INCLUDING m1-owned attn
+  boundaries; the FIRST wrong value of the whole computation is
+  `ffn_inp-1 BCAST1 m1` at decode pass 2 - the non-root owner's OWN computed
+  attn/residual boundary. Its layer input is provably exact (upstream
+  boundaries identical), so its pass-1 KV state is the suspect (pass-2
+  attention is the first read of pass-1's KV write).
+- ATTN_OWNER=1 alone (no alternation): ALSO diverges (7.9e-2/1.7e-1, same
+  onset) -> per-layer owner ALTERNATION exonerated; the trigger is any
+  NON-MEMBER-0 attention owner. ATTN_OWNER=0 chunked = bit-exact (the fixed
+  case). Fleet corrupts with CUDA1 (local non-root) owner -> not wire-specific.
+
+NEXT: instrument KV state - checksum the owner's K/V cache cells for one layer
+after each decode pass, ctl vs chunked (write-lost vs write-misplaced vs
+read-path). The m0-exception points at root-member special-casing in the
+delivery/dispatch machinery (B2 doc: "member 0 local (host reads + repair
+source)") - audit chunk-path assumptions that hard-code member 0.
