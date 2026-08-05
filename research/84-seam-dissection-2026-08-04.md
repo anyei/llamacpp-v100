@@ -330,3 +330,23 @@ alternation, B1/B2 (FUSE=0), src-side sync, fused pipeline (off for chunks).
 NEXT INSTRUMENTS (next session): (1) KV-cell checksum per pass for one
 m1-owned layer (write-lost vs read-path); (2) dst-side ordering trace of
 plain bcast1 deliveries vs chunk dispatches on the same member socket.
+
+## KVSUM verdict (2026-08-05): the non-root owner's KV WRITE is wrong at pass 1
+
+New instrument GGML_META_DEBUG_KVSUM=<substring> (per-member checksums of
+matching cache tensors after every meta compute call; scans node srcs/view_srcs
+because chunk views carry no leafs). Stub two-owner pair, France, n_predict=3,
+cache_k_l1 (owner m1):
+
+- prefill write: ctl == chunked bit-exact.
+- FIRST DECODE pass write: DIVERGED (-2.169467664e+01 vs -2.102627331e+01) -
+  one pass BEFORE the first boundary divergence (BSUM showed all pass-1
+  boundaries bit-exact, including m1's own attn boundary).
+- CONCLUSION: under chunking, the non-root owner's KV-write (k_cpy) consumes a
+  DIFFERENT copy of the hidden state than its attention/boundary compute in
+  the same pass. Pass-2 attention reads the poisoned cell -> the observed
+  boundary divergence and everything downstream.
+
+NEXT: locate the k_cpy node's chunk placement + its src copy on m1 (which
+chunk computes it, what repairs/deliveries it sees) - the write-side src is
+now the single node to trace. All on the stub pair, ~15 min/round.

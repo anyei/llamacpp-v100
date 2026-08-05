@@ -5180,6 +5180,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     // TASKS #75 gate 4: expert ownership audit (no-op unless GGML_META_DEBUG>0)
     ggml_backend_meta_expert_audit(backend, cgraph);
+    // GGML_META_DEBUG_KVSUM=<name-substring>: per-member checksums of matching
+    // cache leafs after every compute call (two-owner seam dissection: does a
+    // non-root owner's KV write go wrong under chunking, or only its read)
+    static const char * kvsum = getenv("GGML_META_DEBUG_KVSUM");
+    if (kvsum != nullptr && kvsum[0] != '\0') {
+        // chunk views carry no leafs - find the cache tensors through node srcs
+        // and their view sources instead
+        std::set<ggml_tensor *> kv_targets;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            for (int s = -1; s < GGML_MAX_SRC; s++) {
+                ggml_tensor * t = s < 0 ? node->view_src : node->src[s];
+                if (t == nullptr) {
+                    continue;
+                }
+                if (t->view_src != nullptr) {
+                    t = t->view_src;
+                }
+                if (strstr(t->name, kvsum) != nullptr) {
+                    kv_targets.insert(t);
+                }
+            }
+        }
+        for (ggml_tensor * leaf : kv_targets) {
+            if (leaf->buffer == nullptr || !ggml_backend_buffer_is_meta(leaf->buffer)) {
+                continue;
+            }
+            if (leaf->type != GGML_TYPE_F32 && leaf->type != GGML_TYPE_F16) {
+                continue;
+            }
+            const size_t nb_kv = ggml_nbytes(leaf);
+            std::vector<char> tmp_kv(nb_kv);
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(leaf, j);
+                if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) == 0) {
+                    continue;
+                }
+                const size_t nb_j = std::min(nb_kv, ggml_nbytes(st));
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                ggml_backend_tensor_get(st, tmp_kv.data(), 0, nb_j);
+                double s = 0.0;
+                if (leaf->type == GGML_TYPE_F32) {
+                    const float * p = (const float *) tmp_kv.data();
+                    for (size_t v = 0; v < nb_j/sizeof(float); v++) s += p[v];
+                } else {
+                    const ggml_fp16_t * p = (const ggml_fp16_t *) tmp_kv.data();
+                    for (size_t v = 0; v < nb_j/sizeof(ggml_fp16_t); v++) s += ggml_fp16_to_fp32(p[v]);
+                }
+                fprintf(stderr, "KVSUM: %s m%zu %.9e\n", leaf->name, j, s);
+            }
+        }
+    }
     return GGML_STATUS_SUCCESS;
 }
 
