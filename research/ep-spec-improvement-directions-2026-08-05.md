@@ -134,3 +134,26 @@ from that leg measures NOTHING about #105 (and is further confounded by the
 .15 worker being recreated mid-run). RULE: a launcher-run A/B of a meta/ggml
 change requires an IMAGE ROLL first; only dev-binary serves (/srcbin mount)
 pick up build-cuda75.
+
+### #105 VALID fleet A/B (image 2f1ca0b85, both legs same binary+roster)
+
+- CTL 3.94 t/s (8 runs, 3.78-4.06) vs LOCAL_COMM=1 4.03 t/s (8 runs, 3.89-4.23)
+  = +2.4%, two-sample t ~1.65, p ~0.12 -> POSITIVE TREND, NOT significant at
+  n=8/leg. Engagement CONFIRMED: 43.0 subgroup pre-reduces/graph, exactly the
+  43 star boundaries/graph the boundary census reports (fires on every
+  eligible boundary).
+- Interpretation matches the #105 filing's own prediction: on a 5-member fleet
+  the WIRE dominates (gather 274 KiB/graph across 3 remote workers), so folding
+  the local GPU pair saves one D2H of a small slice. The lever is real but the
+  fleet is the wrong place to measure it.
+- NOTE the earlier 4.35 t/s reading is NOT a valid baseline for this pair
+  (different worker generation + .15 recreated mid-run); only these two
+  back-to-back legs are comparable.
+- SELECTION FIX after the A/B: the subgroup now takes same-REG local members
+  instead of all non-wire ones - an in-process CPU member (single-box EP
+  CUDA0,CUDA1,CPU) previously vetoed the GPU pair, i.e. the exact shape where
+  the payoff should be largest (EP CPU-member 6.95 vs layer 11.27 t/s).
+  Regated: trunc5 seam 5/5 c80261ff, stub pair still engages 3.0/graph.
+- STATUS: stays OPT-IN (GGML_META_LOCAL_COMM=1). Default-on needs either a
+  significant fleet result (more runs) or the single-box EP A/B, which is now
+  the real next measurement for this feature.

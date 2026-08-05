@@ -2880,12 +2880,23 @@ struct ggml_backend_meta_context {
         // enough to discover a usable subgroup. Opt-in until the fleet A/B lands.
         static const bool sub_enabled = getenv("GGML_META_LOCAL_COMM") != nullptr && atoi(getenv("GGML_META_LOCAL_COMM")) != 0;
         if (comm_ctx == nullptr && sub_enabled && n_devs > 1) {
+            // same-reg local members only: the backend comm init refuses a mixed
+            // list, so an in-process CPU member (single-box EP: CUDA0,CUDA1,CPU)
+            // would otherwise veto the GPU pair that this exists to accelerate
             std::vector<ggml_backend_t> sub_backends;
+            ggml_backend_reg_t reg_sub = nullptr;
             for (size_t i = 0; i < n_devs; i++) {
-                if (!wire_member[i]) {
-                    comm_sub.push_back(i);
-                    sub_backends.push_back(simple_backends[i]);
+                if (wire_member[i]) {
+                    continue;
                 }
+                ggml_backend_reg_t reg_i = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[i]));
+                if (reg_sub == nullptr) {
+                    reg_sub = reg_i;
+                } else if (reg_i != reg_sub) {
+                    continue;
+                }
+                comm_sub.push_back(i);
+                sub_backends.push_back(simple_backends[i]);
             }
             if (sub_backends.size() >= 2 && sub_backends.size() < n_devs) {
                 ggml_backend_comm_init_t comm_init_sub = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
