@@ -2725,6 +2725,7 @@ struct ggml_backend_meta_context {
     int64_t bs_deliver_skip  = 0; // wire deliveries withheld (BCAST_FUSE=2)
     int64_t bs_deliver_bytes = 0; // bytes delivered to wire members
     int64_t bs_repairs       = 0; // stale-value repair copies executed
+    int64_t bs_sub_reduces   = 0; // TASKS #105: boundaries pre-reduced within the local subgroup
     int64_t ed_defers        = 0; // wire partials deferred to the next reduce (GGML_META_EXPERT_DEFER)
     int64_t ed_ready         = 0; // deferral candidates whose response had already arrived (consumed exactly)
     int64_t ed_injects       = 0; // deferred partials injected one reduce late
@@ -2765,6 +2766,13 @@ struct ggml_backend_meta_context {
     int64_t tm_build_misses = 0;
 
     void *                               comm_ctx       = nullptr;
+    // TASKS #105: on a MIXED roster (local CUDA + RPC) the backend comm init
+    // refuses the whole set, so every boundary staged through host RAM and
+    // NVLink sat idle. A second context over just the local subset pre-reduces
+    // those members among themselves (NCCL/p2p), and only their representative
+    // joins the host/wire star - one D2H per boundary instead of one per GPU.
+    void *                               comm_ctx_sub   = nullptr;
+    std::vector<size_t>                  comm_sub;      // member indices in comm_ctx_sub order
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_cpy_tensor_batch_async_t cpy_batch     = nullptr;
     ggml_backend_get_tensor_batch_t       get_batch     = nullptr;
@@ -2866,10 +2874,37 @@ struct ggml_backend_meta_context {
                 }
             }
         }
-        if (comm_ctx != nullptr) {
+        // TASKS #105: local-subset comm for mixed rosters (see comm_ctx_sub).
+        // The backend's comm_init self-selects - it returns null unless every
+        // backend handed to it is its own kind - so trying the local members is
+        // enough to discover a usable subgroup. Opt-in until the fleet A/B lands.
+        static const bool sub_enabled = getenv("GGML_META_LOCAL_COMM") != nullptr && atoi(getenv("GGML_META_LOCAL_COMM")) != 0;
+        if (comm_ctx == nullptr && sub_enabled && n_devs > 1) {
+            std::vector<ggml_backend_t> sub_backends;
+            for (size_t i = 0; i < n_devs; i++) {
+                if (!wire_member[i]) {
+                    comm_sub.push_back(i);
+                    sub_backends.push_back(simple_backends[i]);
+                }
+            }
+            if (sub_backends.size() >= 2 && sub_backends.size() < n_devs) {
+                ggml_backend_comm_init_t comm_init_sub = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(sub_backends[0])), "ggml_backend_comm_init");
+                if (comm_init_sub != nullptr) {
+                    comm_ctx_sub = comm_init_sub(sub_backends.data(), sub_backends.size());
+                }
+            }
+            if (comm_ctx_sub == nullptr) {
+                comm_sub.clear();
+            } else {
+                GGML_LOG_INFO("%s: local-subset allreduce active over %zu members (TASKS #105)\n", __func__, comm_sub.size());
+            }
+        }
+        if (comm_ctx != nullptr || comm_ctx_sub != nullptr) {
+            ggml_backend_t ref = comm_ctx != nullptr ? simple_backends[0] : simple_backends[comm_sub[0]];
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                    ggml_backend_get_device(ref)), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
     }
@@ -4697,10 +4732,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                 }
+                // TASKS #105: pre-reduce the local subgroup among themselves
+                // (NCCL/p2p over NVLink), then contribute ONE representative to
+                // the host sum - the others' partials are already inside it, so
+                // they must be skipped or they would be counted twice.
+                std::vector<char> sub_folded(n_backends, 0);
+                if (backend_ctx->comm_ctx_sub != nullptr) {
+                    bool all_present = true;
+                    for (size_t js : backend_ctx->comm_sub) {
+                        if (std::find(part.begin(), part.end(), js) == part.end()) {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    if (all_present) {
+                        std::vector<ggml_tensor *> sub_nodes;
+                        sub_nodes.reserve(backend_ctx->comm_sub.size());
+                        bool ok_sub = true;
+                        for (size_t js : backend_ctx->comm_sub) {
+                            ggml_tensor * nd = boundary_node(js);
+                            ok_sub = ok_sub && nd->type == GGML_TYPE_F32 && ggml_is_contiguous(nd) && ggml_nbytes(nd) == nbytes;
+                            sub_nodes.push_back(nd);
+                        }
+                        if (ok_sub && backend_ctx->comm_allreduce(backend_ctx->comm_ctx_sub, sub_nodes.data())) {
+                            for (size_t s = 1; s < backend_ctx->comm_sub.size(); s++) {
+                                sub_folded[backend_ctx->comm_sub[s]] = 1;
+                            }
+                            backend_ctx->bs_sub_reduces++;
+                        }
+                    }
+                }
                 size_t n_plain = 0;
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
+                    if (sub_folded[j]) {
+                        // already inside the subgroup representative's value
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
                     if (backend_ctx->wire_member[j] && fused_fetch_pending[j] &&
                             (probe_defer_gather || defer_ok) && defer_now[j]) {
                         // do not wait: defer the fused response to the next reduce;
@@ -5160,6 +5230,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 (double) backend_ctx->bs_deliver_skip  / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_deliver_bytes / 1024.0 / backend_ctx->bs_graphs,
                 (double) backend_ctx->bs_repairs       / backend_ctx->bs_graphs);
+        if (backend_ctx->bs_sub_reduces > 0) {
+            fprintf(stderr, "META_LOCAL_COMM: %.1f subgroup pre-reduces/graph (%zu members)\n",
+                    (double) backend_ctx->bs_sub_reduces / backend_ctx->bs_graphs, backend_ctx->comm_sub.size());
+            backend_ctx->bs_sub_reduces = 0;
+        }
         if (backend_ctx->ed_defers + backend_ctx->ed_ready + backend_ctx->ed_injects + backend_ctx->ed_lost > 0) {
             const double cand = (double) (backend_ctx->ed_defers + backend_ctx->ed_ready);
             fprintf(stderr, "META_EXPERT_DEFER: defers %.1f ready %.1f (rate %.1f%%) injects %.1f LOST %.2f /graph\n",
