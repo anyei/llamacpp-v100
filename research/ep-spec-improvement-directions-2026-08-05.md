@@ -90,3 +90,20 @@ Live 0731 serve, same shares/env both legs, 8x200-token probes, plateau reads:
   accumulation (worker soft limit 1024) -> fd pressure -> compute-connection
   failure ~hourly (the #39 fd-leak class, again). fd-trend poller armed on .11
   (/tmp/fdtrend-11.log) - the accumulation curve decides.
+
+## Post-roll validation audit (2026-08-05 morning)
+
+- #104 fix: deployed worker binary md5-IDENTICAL to the fixed image on local
+  and .11; fd trend on .11 flat at 6 fds / 0 CLOSE_WAIT for ~4h post-roll;
+  ZERO 'failed in ggml_backend_rpc' drops in 90+ min of serving (pre-fix
+  cadence ~1 per 30 min). Coordinator image carries BSUM + CB_CHUNK_ONLY
+  (grep on /app/libggml-base.so.0 + libllama.so.0). NOTE: aggregate
+  /fleet/status probe latency still alternates ~2-3s (uncached) vs ~2ms
+  (60s cache) - consistent with .15 still running the OLD worker image and
+  queueing its probe on the exec lock; TESTABLE PREDICTION: sub-second
+  uncached probes once .15 is recreated on rpc-worker-aea8de1da.
+- Fleet Unload button: headless-verified on the LIVE launcher (puppeteer +
+  chromium): button present via textContent match, click opens the
+  confirmation dialog with the correct model name and copy, Cancel path
+  leaves the serve 'loaded', 0 JS errors. Confirm path intentionally NOT
+  exercised (would stop the user's serve).
