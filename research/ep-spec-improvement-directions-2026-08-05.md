@@ -71,3 +71,22 @@ Sources: [EcoSpec](https://arxiv.org/abs/2607.12696) ·
 [DSpark](https://arxiv.org/html/2607.05147v1) ·
 [MagicDec](https://arxiv.org/pdf/2408.11049) ·
 [HyperDFlash](https://arxiv.org/pdf/2606.26744)
+
+## NMAX=2 A/B RESULT (2026-08-05): NEGATIVE - direction 1 closed
+
+Live 0731 serve, same shares/env both legs, 8x200-token probes, plateau reads:
+- Leg A target-only: 4.35 t/s mean (4.15-4.50, 8/8 clean).
+- Leg B dspark NMAX=2 PMIN=0.8 draft@CUDA0 LOCAL_DRAFT: 3.88 t/s mean over the
+  6 valid runs (3.47-4.52) = -11%. Acceptance 60-65%, mean len 2.2 - the
+  concave-union hypothesis needed >=80% acceptance; real chat sits at ~62%
+  even at p_min 0.8. Chain-length tuning cannot rescue spec on this fleet.
+- VERDICT: #80's EP-target-only keeper STANDS at every n_max. The live spec
+  path is #107 (expert-reuse-aware lane gating) which attacks the union term
+  itself, optionally composed with #108 per-step confidence adaptivity.
+- Bonus capture: a #104 drop struck mid-leg-B with FIN pollers armed - the
+  coordinator's ephemeral probe FINs sit in FIN-WAIT-2 locally while .11 holds
+  the mirror CLOSE-WAITs for 10+ minutes -> the worker does NOT close probed
+  connections on client FIN. Suspect chain: ephemeral-probe CLOSE-WAIT/fd
+  accumulation (worker soft limit 1024) -> fd pressure -> compute-connection
+  failure ~hourly (the #39 fd-leak class, again). fd-trend poller armed on .11
+  (/tmp/fdtrend-11.log) - the accumulation curve decides.
