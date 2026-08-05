@@ -3324,6 +3324,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         cgraph = &cgraph_local;
     }
 
+    // GGML_META_CHUNK_SYNC=1 (diagnostic): drain every member before a chunked
+    // graph piece runs - discriminates cross-piece ORDERING from wrong values
+    static const bool chunk_sync = getenv("GGML_META_CHUNK_SYNC") != nullptr && atoi(getenv("GGML_META_CHUNK_SYNC")) != 0;
+    if (chunk_sync && cgraph->uid == 0) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+    }
+
     // park the active build's per-member state back into its cache entry so a
     // different build can be activated (or a fresh one written) in its place
     auto park_active = [&]() {
@@ -3682,6 +3691,59 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 }
             };
+
+            // GGML_META_DEBUG_KVSUM also traces per-member COMPUTE flags of the
+            // matching cache writes at build time (did the owner's write run?)
+            {
+                static const char * kvw = getenv("GGML_META_DEBUG_KVSUM");
+                if (kvw != nullptr && kvw[0] != '\0') {
+                    for (int i = 0; i < cgraph->n_nodes; i++) {
+                        ggml_tensor * nd = cgraph->nodes[i];
+                        if (nd->op != GGML_OP_SET_ROWS || nd->src[0] == nullptr) {
+                            continue;
+                        }
+                        const ggml_tensor * dstt = nd->view_src != nullptr ? nd->view_src : nd;
+                        if (strstr(dstt->name, kvw) == nullptr && strstr(nd->name, kvw) == nullptr) {
+                            continue;
+                        }
+                        char fbuf[128];
+                        int fo = 0;
+                        for (size_t j = 0; j < n_backends && fo < (int) sizeof(fbuf) - 8; j++) {
+                            fo += snprintf(fbuf + fo, sizeof(fbuf) - fo, " m%zu=%d", j,
+                                           backend_ctx->backend_configs[j].nodes[i] != nullptr &&
+                                           (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0);
+                        }
+                        fprintf(stderr, "KVWRITE: node %d '%s' -> '%s' compute:%s\n", i, nd->name, dstt->name, fbuf);
+                        // the row-index operand is a persistent INPUT (not a
+                        // ring-recycled intermediate), so it is safe to read here
+                        ggml_tensor * idxs = nd->src[1];
+                        const bool ix32 = idxs != nullptr && idxs->type == GGML_TYPE_I32;
+                        const bool ix64 = idxs != nullptr && idxs->type == GGML_TYPE_I64;
+                        if (idxs != nullptr && idxs->buffer != nullptr && ggml_backend_buffer_is_meta(idxs->buffer) &&
+                                (ix32 || ix64) && ggml_nbytes(idxs) <= 8192) {
+                            const size_t nb_ix = ggml_nbytes(idxs);
+                            std::vector<int64_t> ix(nb_ix/(ix64 ? sizeof(int64_t) : sizeof(int32_t)));
+                            for (size_t j = 0; j < n_backends; j++) {
+                                ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(idxs, j);
+                                if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) < nb_ix) {
+                                    continue;
+                                }
+                                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                                std::vector<char> raw(nb_ix);
+                                ggml_backend_tensor_get(st, raw.data(), 0, nb_ix);
+                                for (size_t v = 0; v < ix.size(); v++) {
+                                    ix[v] = ix64 ? ((const int64_t *) raw.data())[v] : (int64_t) ((const int32_t *) raw.data())[v];
+                                }
+                                int64_t s = 0;
+                                for (int64_t v : ix) s += v;
+                                fprintf(stderr, "KVIDX: '%s' m%zu n=%zu sum=%lld first=%lld,%lld\n",
+                                        idxs->name, j, ix.size(), (long long) s,
+                                        (long long)(ix.size() > 0 ? ix[0] : -1), (long long)(ix.size() > 1 ? ix[1] : -1));
+                            }
+                        }
+                    }
+                }
+            }
 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {

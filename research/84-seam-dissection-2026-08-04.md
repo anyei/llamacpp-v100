@@ -331,7 +331,12 @@ NEXT INSTRUMENTS (next session): (1) KV-cell checksum per pass for one
 m1-owned layer (write-lost vs read-path); (2) dst-side ordering trace of
 plain bcast1 deliveries vs chunk dispatches on the same member socket.
 
-## KVSUM verdict (2026-08-05): the non-root owner's KV WRITE is wrong at pass 1
+## KVSUM verdict (2026-08-05) - RETRACTED, see correction below
+
+RETRACTED: the whole-tensor checksum sums UNINITIALIZED cache cells, so the
+observed differences are not necessarily written-cell differences.
+
+## (superseded) KVSUM first reading: the non-root owner's KV WRITE is wrong at pass 1
 
 New instrument GGML_META_DEBUG_KVSUM=<substring> (per-member checksums of
 matching cache tensors after every meta compute call; scans node srcs/view_srcs
@@ -350,3 +355,43 @@ cache_k_l1 (owner m1):
 NEXT: locate the k_cpy node's chunk placement + its src copy on m1 (which
 chunk computes it, what repairs/deliveries it sees) - the write-side src is
 now the single node to trace. All on the stub pair, ~15 min/round.
+
+
+## CORRECTION + state of the two-owner hunt (2026-08-05, end of session)
+
+Instrument audit invalidated the KV-write conclusion:
+
+- The KVSUM checksum sums the WHOLE cache tensor, including cells never
+  written (uninitialized memory). Differing allocation histories (chunked vs
+  ctl builds) give different garbage there.
+- Decisive tell: the divergence appears at compute call 2, then calls 3-4 are
+  BIT-IDENTICAL again, and call 5 differs. A genuinely poisoned cache cell is
+  CUMULATIVE - it cannot heal at call 3. So the call-2 delta is (at least
+  partly) uninitialized-cell noise, not proof of a bad write.
+- A valid version must checksum ONLY the cells named by the SET_ROWS index
+  operand (the KVIDX trace already dumps them: warmup n=2 [0,1], prefill n=5
+  [0..4], decode n=1). NEXT SESSION: bound the KVSUM read to written cells,
+  re-run the stub pair, and only then attribute write-vs-read.
+
+Solid results that survive the audit (do NOT re-derive):
+- Trigger: ANY non-root attention owner (ATTN_OWNER=1 alone reproduces;
+  owner alternation exonerated). ATTN_OWNER=0 + chunking is bit-exact.
+- Exonerated: fused pipeline (fixed separately), B1/B2 fuse machinery
+  (FUSE=0 still diverges), build ring, callback reads, placement determinism,
+  split-state classification, EXPERT_DEFER, CUDA graphs, src-side sync, and
+  CROSS-PIECE ORDERING (GGML_META_CHUNK_SYNC=1 drains every member before each
+  chunked piece and the divergence PERSISTS -> deterministic wrong compute,
+  not a race).
+- The owner's KV-write node is scheduled correctly: KVWRITE trace shows
+  identical per-member COMPUTE flags in both legs (m1=1, others=0), and the
+  KVIDX row indices are identical across legs and members. So the write runs
+  on the right member into the right cells; only its VALUE is unverified.
+- Remaining suspect surface: the value path feeding the owner's attention/KV
+  under chunking (k_cur), which is a ring-recycled intermediate - it needs a
+  compute-time capture (BSUM-style at the node, or a bounded KVSUM), not a
+  post-hoc read.
+
+Instruments available (all env-gated, default off): GGML_META_DEBUG_BSUM,
+GGML_META_DEBUG_KVSUM (+KVWRITE/KVIDX traces), GGML_META_CHUNK_SYNC,
+LLAMA_CB_CHUNK_ONLY. Repro pairs: 84-stub-attnowner.sh / 84-stub-owner1.sh /
+84-stub-kvwrite.sh / 84-stub-chunksync.sh (~15 min each, 12 GB, host loopback).
