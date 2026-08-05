@@ -314,3 +314,19 @@ after each decode pass, ctl vs chunked (write-lost vs write-misplaced vs
 read-path). The m0-exception points at root-member special-casing in the
 delivery/dispatch machinery (B2 doc: "member 0 local (host reads + repair
 source)") - audit chunk-path assumptions that hard-code member 0.
+
+## Two-owner bug: FUSE=0 also diverges - crossing/stale/repair exonerated
+
+Stub ATTN_OWNER=1 pair with BCAST_FUSE=0: france 7.6e-2 (tok 2), pipeline
+1.3e-1 (tok 1) - same signature. The two-owner corruption lives in the BASE
+plain delivery/dispatch path, not the B1/B2 machinery. Note: the 84-sao run
+had DEBUG_BSUM active, whose ggml_backend_synchronize(src) before the bcast1
+read did NOT prevent the divergence -> a source-side unsynced-read race is
+ruled out; remaining suspects = dst-side ordering of the plain bcast copies
+(W2W pulls / set) vs the dst's next chunk compute, and the owner's KV-cell
+state across passes. Exoneration ledger for the two-owner bug so far: owner
+alternation, B1/B2 (FUSE=0), src-side sync, fused pipeline (off for chunks).
+
+NEXT INSTRUMENTS (next session): (1) KV-cell checksum per pass for one
+m1-owned layer (write-lost vs read-path); (2) dst-side ordering trace of
+plain bcast1 deliveries vs chunk dispatches on the same member socket.
