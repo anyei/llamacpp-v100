@@ -276,3 +276,19 @@ root-caused inside the pipeline (worker-side stream state across chunk-sized
 calls is the frame); revisit only if chunked graphs ever need fused speed.
 Final quality gate: fleet coherence read with a callback at the next window -
 expected COHERENT now (self-consistent plain math), not byte-equal to ctl.
+
+## Fleet re-read post-fix: CAVEAT STILL STANDS - residual bug = TWO-OWNER GROUP x CHUNKING
+
+With the uid-gate fix in the serve binary, the hy3 fleet union leg STILL
+produces the same garbage signature (2.37 t/s). The loopback validation was
+single-owner (ATTN_OWNER=0); the fleet runs an owner GROUP (0,1). Discriminator
+on host loopback (84-n3-attnowner.sh: ATTN_OWNER=0,1 + ALLOW_MULTI_LOCAL,
+NL=3, chunk-only vs ctl): france max delta = TOP-SETS DISJOINT (garbage-class),
+pipeline 9.7e-2. THE RESIDUAL FLEET BUG REPRODUCES LOCALLY - two-owner ATTN
+group x chunked graphs, ~15-min repro, no fleet window needed.
+
+Status ledger: single-owner chunking = FIXED (bit-exact); two-owner chunking =
+OPEN, now with a banked local repro. The eval-callback fleet-quality caveat
+REMAINS until the two-owner path is fixed (fleet serves always run owner
+groups). Next: BSUM diff on the two-owner NL=3 pair - the star reduce with 2
+owner contributors + chunk boundaries is the suspect seam.
