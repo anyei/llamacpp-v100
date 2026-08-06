@@ -31,6 +31,12 @@
 #include <utility>
 #include <fstream>
 
+#ifndef _WIN32
+extern char ** environ; // launch-command env capture in get_fleet_status
+#else
+static char ** environ = nullptr; // no env capture on Windows
+#endif
+
 static json speculative_info(const common_params & params); // TASKS #100
 
 // fix problem with std::min and std::max
@@ -5895,6 +5901,36 @@ void server_routes::init_routes() {
             {"devices",    std::move(devices)},
             {"discovered", std::move(discovered)},
         };
+        // the exact launch command of THIS serve: process argv + the LLAMA_*/GGML_*
+        // env gates. Immutable for the process lifetime, so captured once. Behind a
+        // router the /fleet/status proxy hits the child, i.e. this is the real fleet
+        // command including wizard/launcher-injected flags, not the preset alone.
+        {
+            static const json launch = [] {
+                json cmd = json::array();
+#ifdef __linux__
+                std::ifstream f("/proc/self/cmdline", std::ios::binary);
+                std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                for (size_t pos = 0; pos < all.size();) {
+                    const size_t end = all.find('\0', pos);
+                    cmd.push_back(all.substr(pos, end - pos));
+                    pos = (end == std::string::npos ? all.size() : end + 1);
+                }
+#endif
+                json env = json::array();
+                for (char ** e = environ; e != nullptr && *e != nullptr; e++) {
+                    const std::string kv(*e);
+                    // LLAMA_SERVER_* is router->child plumbing, not user config
+                    if (kv.rfind("LLAMA_SERVER_", 0) == 0) continue;
+                    if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
+                        env.push_back(kv);
+                    }
+                }
+                return cmd.empty() && env.empty() ? json(nullptr)
+                     : json({{"cmd", std::move(cmd)}, {"env", std::move(env)}});
+            }();
+            body["launch"] = launch;
+        }
         {
             const fleet_preflight_result pf = fleet_preflight_get();
             body["preflight"] = pf.valid

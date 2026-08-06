@@ -87,12 +87,24 @@
 			.chip.stream { background: #60a5fa33; color: #60a5fa; }
 			.chip.wait { background: #8883; }
 			details.meta > summary { cursor: pointer; font-size: 11px; opacity: 0.6; }
+			details.launch { margin: -0.75rem 0 1.25rem; }
+			details.launch > summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+			details.launch > pre {
+				font-size: 0.7rem; line-height: 1.5; color: var(--fg);
+				background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem;
+				padding: 0.6rem 0.75rem; margin: 0.35rem 0 0;
+				white-space: pre-wrap; word-break: break-all; user-select: all;
+			}
 </style>
 	</head>
 	<body>
 		<main>
 			<h1><span class="dot"></span>Loading model across the fleet</h1>
 			<p class="sub" id="model">The UI will open automatically when the model is ready.</p>
+			<details class="launch" id="launch" hidden>
+				<summary>launch command</summary>
+				<pre id="launch-cmd"></pre>
+			</details>
 
 			<div class="stage" id="stage">Initializing…</div>
 			<div class="track"><div id="bar"></div></div>
@@ -106,6 +118,7 @@
 			const prev = Object.create(null);
 			const MiB = 1024 * 1024;
 			let inFlight = false; // don't stack fetches if the server stalls
+			let renderedLaunch = false;
 
 			function esc(s) {
 				return String(s).replace(/[&<>"]/g, (c) =>
@@ -178,6 +191,21 @@
 				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading') {
 					location.href = './'; // ready/sleeping — the real UI is served now
 					return;
+				}
+
+				// the exact serve command (argv + env gates) - immutable, render once
+				if (d.launch && !renderedLaunch) {
+					renderedLaunch = true;
+					const q = (t) => (/[^A-Za-z0-9_@%+=:,.\/-]/.test(t) ? "'" + t.replace(/'/g, "'\\''") + "'" : t);
+					const lines = (d.launch.env || []).map((e) => {
+						const i = e.indexOf('=');
+						return e.slice(0, i + 1) + q(e.slice(i + 1)) + ' \\';
+					});
+					if (Array.isArray(d.launch.cmd) && d.launch.cmd.length) {
+						lines.push(d.launch.cmd.map(q).join(' '));
+					}
+					document.getElementById('launch-cmd').textContent = lines.join('\n');
+					document.getElementById('launch').hidden = false;
 				}
 
 				// what is being loaded + how it will be split

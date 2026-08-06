@@ -143,6 +143,9 @@ export interface ApiFleetStatusResponse {
 	perf?: ApiFleetPerf | null;
 	/** Duration of the last completed model load, ms (null until one finishes). */
 	load_ms?: number | null;
+	/** Exact serve command of the answering child: process argv + LLAMA_*/GGML_*
+	 * env gates (null when the platform can't provide it). */
+	launch?: { cmd: string[]; env: string[] } | null;
 }
 
 /** Response of `GET ./fleet/worker/log`. */

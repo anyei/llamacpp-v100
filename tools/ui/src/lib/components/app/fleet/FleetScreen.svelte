@@ -57,6 +57,31 @@
 		return path.split('/').pop() || path;
 	});
 
+	// shell-pasteable reconstruction of the serve's exact launch command:
+	// env gates one per line, then the argv (see body["launch"] server-side)
+	let launchText = $derived.by(() => {
+		const launch = status?.launch;
+		if (!launch || (!launch.env?.length && !launch.cmd?.length)) return null;
+		const quote = (t: string) =>
+			/[^A-Za-z0-9_@%+=:,./-]/.test(t) ? `'${t.replace(/'/g, `'\\''`)}'` : t;
+		const lines = (launch.env ?? []).map((e) => {
+			const i = e.indexOf('=');
+			return e.slice(0, i + 1) + quote(e.slice(i + 1)) + ' \\';
+		});
+		if (launch.cmd?.length) lines.push(launch.cmd.map(quote).join(' '));
+		return lines.join('\n');
+	});
+
+	async function copyLaunchCommand() {
+		if (!launchText) return;
+		try {
+			await navigator.clipboard.writeText(launchText);
+			toast.success('Launch command copied');
+		} catch {
+			toast.error('Clipboard unavailable');
+		}
+	}
+
 	// fleet-wide totals across the pipeline devices: worker-CPU devices contribute
 	// RAM + cpu layers, everything else (local GPUs, GPU workers) VRAM + gpu layers
 	let fleetTotals = $derived.by(() => {
@@ -501,6 +526,32 @@
 						</div>
 					{/if}
 				</div>
+			{/if}
+
+			{#if launchText}
+				<details class="rounded-md border bg-card">
+					<summary
+						class="cursor-pointer select-none px-3 py-2 text-xs text-muted-foreground hover:text-foreground"
+					>
+						Launch command — the exact argv + env gates of this serve
+					</summary>
+
+					<div class="border-t px-3 py-2">
+						<div class="mb-2 flex justify-end">
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-6 px-2 text-[10px]"
+								onclick={copyLaunchCommand}
+							>
+								Copy
+							</Button>
+						</div>
+
+						<pre
+							class="overflow-x-auto font-mono text-xs leading-relaxed whitespace-pre-wrap break-all select-all">{launchText}</pre>
+					</div>
+				</details>
 			{/if}
 
 			{#if !status && !fleetStore.error}
