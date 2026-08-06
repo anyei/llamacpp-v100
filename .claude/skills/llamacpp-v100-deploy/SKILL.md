@@ -44,11 +44,23 @@ docker tag <img>:<sha> 127.0.0.1:5000/<img>:<sha>
 docker push 127.0.0.1:5000/<img>:<sha>
 curl -s http://127.0.0.1:5000/v2/<img>/tags/list   # verify
 ```
-- Worker boxes PULL as `10.5.5.1:5000/<img>:<tag>` (their daemons have the
-  insecure-registry config).
+- Worker boxes PULL as `10.5.5.1:5000/<img>:<tag>`. A NEW box needs the
+  insecure-registry config in `/etc/docker/daemon.json` (merge into existing
+  keys, then `systemctl restart docker` — restart KILLS running containers,
+  do it in the same window as the worker recreate):
+  `{"insecure-registries": ["10.5.5.1:5000"]}`
+  The coordinator box itself does NOT need it (loopback push alias).
+- **Moving `:latest` aliases (since 2026-08-06)**: `llamacpp-local-v100:latest`
+  and `llamacpp-cpu:rpc-worker-latest` point at CURRENT, locally AND in the
+  registry; the compose defaults resolve to them (launcher `COORD_IMAGE`
+  default = `llamacpp-local-v100:latest`, worker `WORKER_IMAGE` default =
+  `llamacpp-cpu:rpc-worker-latest`; the bare `rpc-worker` tag is retired).
+  **Every roll MUST re-tag and re-push both aliases** or they silently rot —
+  a stale `:latest` was exactly the footgun that prompted this convention.
 - Tag hygiene: keep exactly CURRENT + one ROLLBACK per image locally (plus their
-  registry aliases); `docker rmi` the rest. Only `llamacpp*`/`ds4` images may ever
-  be deleted — never base/infra/upstream images. Disk target: keep / below ~90%.
+  registry aliases and the `:latest` aliases); `docker rmi` the rest. Only
+  `llamacpp*`/`ds4` images may ever be deleted — never base/infra/upstream
+  images. Disk target: keep / below ~90%.
 
 ## Worker rollout (NEVER while a fleet serve is up — restarts drop the serve)
 
@@ -70,7 +82,10 @@ ssh anyei@10.5.5.11 'cd ~/server/llama/llamacpp-v100 && \
 
 # .15 (:50055): USER-ONLY box - no ssh works from here. Ask the user; workers on
 # older protos interoperate per-connection (wire ladder + zero-reply degrade
-# gracefully), so .15 lagging an image generation is fine.
+# gracefully), so .15 lagging an image generation is fine. One-liner for them:
+#   WORKER_IMAGE=10.5.5.1:5000/llamacpp-cpu:rpc-worker-latest \
+#     docker compose -f docker-compose.rpc-worker-cpu.yml up -d --force-recreate
+# (plus the box's usual port/thread vars)
 ```
 Verify after recreate: `docker inspect llama-rpc-worker-cpu --format '{{.Config.Image}} {{.Config.Cmd}}'`
 (check image tag, `-p`, `-t`). Workers re-benchmark ~15-20 s before listening.
@@ -82,7 +97,13 @@ cache limit) / 16 cores hybrid 6P+8E; .15 64 GB, ~28 GB/s, slowest.
 ```bash
 docker rm -f llama-launcher
 COORD_IMAGE=llamacpp-local-v100:<sha> docker compose -f docker-compose.launcher.yml up -d
+# (bare compose up uses the :latest alias - fine ONLY right after a roll
+#  re-pointed it; pin the sha when rolling to be exact)
 ```
+- The launcher-managed production serve dies with the launcher container —
+  recreating it costs a full model reload (~20-30 min V4); bundle launcher
+  rolls with a serve-restart window and relaunch the serve after (POST
+  /models/load with the exact captured args/env).
 - `llamacpp_launcher-cache` volume persists the user's saved model dirs — never
   delete it. Compose is host-network with a PORT-aware healthcheck (the image's
   baked healthcheck probes :8080 and reads unhealthy otherwise).
