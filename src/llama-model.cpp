@@ -557,7 +557,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // exceeds a 32 GB V100; interleaved across owners it fits). Norms, sinks
         // and the router stay mirrored below - the owner has them locally. Same
         // axis choices as the proven DSA treatment above.
-        if (ep_only && !dsa_arch && attn_owner >= 0 && (size_t) attn_owner < ud->n_devices) {
+        // TASKS #109: gated-delta-net (recurrent) layers must NOT take the dedicated
+        // attention path - attn_qkv doubles as the delta-net input projection, and
+        // splitting it on the owner group while its ssm_* siblings (conv1d, ba,
+        // alpha/beta, r/s caches) fall through to the EP mirror below hands the
+        // delta-net op mixed split states (abort at graph alloc). Mirror the whole
+        // recurrent block instead; hybrid full-attention layers keep the owner path.
+        const auto is_recr_layer = [&]() -> bool {
+            size_t pos = std::string::npos;
+            if (tensor_name.compare(0, 4, "blk.") == 0) {
+                pos = 4;
+            } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+                pos = tensor_name.find("_l", 6);
+                pos = pos == std::string::npos ? pos : pos + 2;
+            }
+            return pos != std::string::npos && hparams.is_recr(std::stoul(tensor_name.substr(pos)));
+        };
+        if (ep_only && !dsa_arch && attn_owner >= 0 && (size_t) attn_owner < ud->n_devices && !is_recr_layer()) {
             if (std::regex_match(tensor_name, pattern_q_weight) ||
                 std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_qkv_weight)) {
