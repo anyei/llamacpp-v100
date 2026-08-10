@@ -421,6 +421,26 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
 }
 
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+    // fault injection: GGML_VBUF_DEBUG_FAIL=N fails every vbuffer (compute-buffer)
+    // alloc from the Nth on, backend-agnostic - reproduces a mid-serve compute
+    // reserve failure (OOM, worker refusal) without needing a real one. Unlike
+    // GGML_RPC_DEBUG_FAIL_ALLOC this also fires for Meta/CPU bufts (meta-EP
+    // compute buffers never reach the plain RPC buft alloc path)
+    {
+        static int fail_from = -2;
+        static int seen = 0;
+        if (fail_from == -2) {
+            const char * env = getenv("GGML_VBUF_DEBUG_FAIL");
+            fail_from = env == NULL ? -1 : atoi(env);
+        }
+        if (fail_from >= 0) {
+            GGML_LOG_ERROR("[vbuf-alloc-debug] call %d buft=%s%s\n", seen,
+                    ggml_backend_buft_name(buft), seen >= fail_from ? " INJECTED-FAIL" : "");
+            if (seen++ >= fail_from) {
+                return NULL;
+            }
+        }
+    }
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -945,6 +965,12 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // invalidate the assignments recorded above: they now name a NULL
+                    // buffer, and a later alloc_graph would pass needs_realloc and
+                    // dereference it (segfault at the next decode instead of a clean
+                    // failure). Zeroed counts force that alloc_graph to re-reserve.
+                    galloc->n_nodes = 0;
+                    galloc->n_leafs = 0;
                     return false;
                 }
             }
