@@ -1866,6 +1866,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (mtp_local && !graph_localize(gf)) {
+            res->reset();
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -1874,6 +1875,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // invalidate the built-but-unallocated graph: it stays in the decode
+            // cache (or gf_res_prev) and a later same-shape decode would pass
+            // can_reuse, skip allocation and abort in set_inputs on tensors the
+            // failed reserve left without buffers
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
