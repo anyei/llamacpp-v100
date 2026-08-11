@@ -481,8 +481,13 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
         ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
 #endif
         if (n < 0) {
-            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                           bytes_sent, size_to_send);
+#ifndef _WIN32
+            if (errno == EINTR) { // see recv_data - interrupted != dead peer
+                continue;
+            }
+#endif
+            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu, errno=%d %s)\n",
+                           bytes_sent, size_to_send, errno, strerror(errno));
             return false;
         }
         bytes_sent += (size_t)n;
@@ -501,8 +506,17 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
-            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                           bytes_recv, size_to_recv);
+#ifndef _WIN32
+            // TASKS #114b: a signal interrupting a blocking recv is NOT a dead
+            // peer - treating EINTR as fatal closed a healthy compute socket
+            // mid-serve (clean FIN to the coordinator -> fence cascade -> full
+            // reload). Retry; only real errors fail, and they name errno now.
+            if (errno == EINTR) {
+                continue;
+            }
+#endif
+            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu, errno=%d %s)\n",
+                           bytes_recv, size_to_recv, errno, strerror(errno));
             return false;
         }
         if (n == 0) {

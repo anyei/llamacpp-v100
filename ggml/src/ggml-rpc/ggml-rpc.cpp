@@ -3001,7 +3001,11 @@ bool rpc_server::wait_fence(uint64_t conn_id, uint64_t seq) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
     while (conn_executed[conn_id] < seq) {
         if (conns_gone.count(conn_id) > 0) {
-            return false; // the gating connection died before reaching the fence
+            // named log: one dead connection cascades through every fence gated
+            // on it - without this line the cascade is invisible (#114b)
+            GGML_LOG_ERROR("[wait_fence] gating conn %llu died before seq %llu - failing this connection too\n",
+                           (unsigned long long) conn_id, (unsigned long long) seq);
+            return false;
         }
         if (fence_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
             GGML_LOG_ERROR("[%s] timed out waiting for conn %" PRIu64 " to reach seq %" PRIu64 "\n",
@@ -4621,7 +4625,12 @@ rpc_server::~rpc_server() {
 // (network RTT + coordinator-side). Answers "is the ~4-5ms boundary turnaround
 // compute, contention, or wire?" (TASKS.md #28 attribution). Off by default.
 static bool rpc_timing_enabled() {
-    static const bool on = getenv("GGML_RPC_TIMING") != nullptr;
+    // value-parsed: compose files pass GGML_RPC_TIMING= (empty) through, and
+    // presence-gating turned the per-connection dump flood on fleet-wide
+    static const bool on = [] {
+        const char * e = getenv("GGML_RPC_TIMING");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return on;
 }
 static std::mutex g_rpc_timing_mutex;
