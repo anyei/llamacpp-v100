@@ -1163,9 +1163,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // Everything else (indexer scores, cache reads) stays on the
                 // owner - a broadcast there is pure boundary overhead.
                 const int owner0 = split_state_owner(src_ss[0]);
+                // TASKS #114: ffn_down is the EP exit the same way attn_output is
+                // the attention-island exit - when a member's expert strips are
+                // zero-width (true-zero owner share), BOTH down operands collapse
+                // to the single populated member and this shortcut used to return
+                // owner-local, skipping the expert-sum AllReduce; the un-mirrored
+                // activation then aborted the next dedicated-attention mul_mat
+                // (the -ts 0,N qr crash). PARTIAL is exact here (absent members
+                // contribute zero) and the existing boundary mirrors it.
                 const bool island_exit = tensor->src[0]->op == GGML_OP_NONE &&
                     (strstr(tensor->src[0]->name, "attn_output_b") != nullptr ||
-                     strstr(tensor->src[0]->name, "attn_output.") != nullptr);
+                     strstr(tensor->src[0]->name, "attn_output.") != nullptr ||
+                     strstr(tensor->src[0]->name, "ffn_down") != nullptr);
                 if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) && !island_exit) {
                     return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner0, tensor->ne[0]);
                 }
