@@ -2248,6 +2248,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
     };
 
+    // #113 diag: GGML_META_DEBUG_UPLOAD=1 - scatter path + per-member tiling decisions for expert tensors
+    static const bool dbg_upload = [] { const char * e = getenv("GGML_META_DEBUG_UPLOAD"); return e != nullptr && atoi(e) != 0; }();
+    if (dbg_upload && strstr(tensor->name, "_exps")) {
+        fprintf(stderr, "[upload-diag] %s axis=%d n_seg=%u nr0=%u path=%s\n",
+                tensor->name, (int) split_state.axis, (unsigned) split_state.n_segments,
+                (unsigned) split_state.nr[0],
+                (split_state.n_segments != 1 || split_state.nr[0] != 1) ? "MULTISEG" : "SWITCH");
+    }
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -2321,6 +2329,31 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
+            // TASKS.md #113: tiled weight uploads. The RPC worker cache is
+            // content-addressed per UPLOAD CALL, so a member's whole segment
+            // hashed as one blob renames on every -ts change and reloads
+            // re-stream unchanged bytes. For RPC weight members, cut the
+            // segment on a FIXED grid anchored in the ROOT tensor's coordinates
+            // (independent of the split): interior tiles keep their hash across
+            // layouts and batch-place from the worker's disk cache; only the
+            // moved boundary tiles stream. AXIS_1 tiles dim-1 (per-expert
+            // column strips of gate/up_exps), AXIS_2 tiles dim-2 (whole-expert
+            // slabs of placed layouts). AXIS_0 cuts inside rows (KB slivers) -
+            // not worth caching, keeps the bulk path. Kill switch:
+            // GGML_META_TILED_UPLOAD=0.
+            static const bool tiled_upload = [] {
+                const char * env = getenv("GGML_META_TILED_UPLOAD");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            const bool tile_axis = split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                                   split_state.axis == GGML_BACKEND_SPLIT_AXIS_2;
+            const size_t tile_unit = tile_axis ? tensor->nb[split_state.axis] : 0;
+            // fixed grid step: geometry-derived only (never from the split), so
+            // every layout sees the same tile boundaries. ~256 KiB: per-expert
+            // member strips of small-ff MoEs are ~1 MB, so the tile must be a
+            // fraction of that or nothing ever spans a tile and the guard below
+            // keeps everything on the bulk path (burned in the first gate run)
+            const size_t tile_units = tile_unit > 0 ? std::max<size_t>(1, (256u << 10) / tile_unit) : 0;
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
@@ -2329,8 +2362,43 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                hint(offset + offset_j);
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                bool tiled = false;
+                if (tiled_upload && tile_axis && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        chunk_size_j > tile_units * tile_unit) {
+                    ggml_backend_buffer_t sb = simple_tensor->buffer;
+                    ggml_backend_dev_t sdev = sb != nullptr ?
+                        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(sb)) : nullptr;
+                    ggml_backend_reg_t sreg = sdev != nullptr ? ggml_backend_dev_backend_reg(sdev) : nullptr;
+                    tiled = sreg != nullptr && strcmp(ggml_backend_reg_name(sreg), "RPC") == 0;
+                }
+                // #113 diag: GGML_META_DEBUG_UPLOAD=1 - scatter path + per-member tiling decisions for expert tensors
+                if (dbg_upload && strstr(tensor->name, "blk.0.ffn_gate_exps") != nullptr) {
+                    fprintf(stderr, "[upload-diag2] %s member=%zu usage=%d chunk_j=%zu tile_bytes=%zu tiled=%d\n",
+                            tensor->name, j, (int) buffer->usage, chunk_size_j, tile_units * tile_unit, (int) tiled);
+                }
+                if (!tiled) {
+                    hint(offset + offset_j);
+                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                } else {
+                    // this member's piece spans [lo, lo + n_u) units of the split
+                    // axis in root coordinates; emit one call per grid tile
+                    const size_t lo  = offset_j / tile_unit;
+                    const size_t n_u = chunk_size_j / tile_unit;
+                    GGML_ASSERT(lo * tile_unit == offset_j && n_u * tile_unit == chunk_size_j);
+                    for (int64_t i = i_start; i < i_stop; i++) {
+                        const char * src_i  = (const char *) data + (i - i_start) * chunk_size_full + offset_j;
+                        const size_t  dst_i = simple_offset + (i - i_start) * chunk_size_j;
+                        size_t a = lo;
+                        while (a < lo + n_u) {
+                            const size_t b = std::min((a / tile_units + 1) * tile_units, lo + n_u);
+                            const size_t blob_off   = (a - lo) * tile_unit;
+                            const size_t blob_bytes = (b - a) * tile_unit;
+                            hint(offset + (i - i_start) * chunk_size_full + offset_j + blob_off);
+                            ggml_backend_tensor_set(simple_tensor, src_i + blob_off, dst_i + blob_off, blob_bytes);
+                            a = b;
+                        }
+                    }
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
