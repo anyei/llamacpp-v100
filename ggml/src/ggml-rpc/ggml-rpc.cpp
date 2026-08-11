@@ -4685,7 +4685,12 @@ static void rpc_timing_record(int cmd, int64_t t_recv, int64_t t_lock, int64_t t
     }
 }
 
-static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
+struct rpc_close_report {
+    int  last_cmd   = -1;    // last command received on this connection
+    bool in_handler = false; // true = the loop exited from inside a handler (silent failure path)
+};
+
+static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id, rpc_close_report & report) {
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -4726,9 +4731,12 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
     while (true) {
         // idle wait for the next command happens without the execution lock so
         // other connections keep making progress
+        report.in_handler = false;
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        report.last_cmd   = cmd;
+        report.in_handler = true;
         const int64_t t_recv = rpc_timing_enabled() ? ggml_time_us() : 0; // GGML_RPC_TIMING
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -5264,6 +5272,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
         }
         // fence progress: in lockstep with the client's sent-command counter
         server.mark_executed(conn_id);
+        report.in_handler = false;
         if (rpc_timing_enabled()) { // GGML_RPC_TIMING: lock-wait + exec+send, per cmd
             rpc_timing_record(cmd, t_recv, t_lock, ggml_time_us());
         }
@@ -5285,7 +5294,15 @@ static void rpc_timing_dump() {
 }
 
 static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
-    rpc_serve_client_loop(server, sock, conn_id);
+    rpc_close_report report;
+    rpc_serve_client_loop(server, sock, conn_id, report);
+    if (report.in_handler) {
+        GGML_LOG_ERROR("Client connection %" PRIu64 " closing: handler for %s FAILED (silent handler exit - #115b)\n",
+                       conn_id, report.last_cmd >= 0 ? rpc_cmd_str(report.last_cmd) : "?");
+    } else if (report.last_cmd >= 0) {
+        GGML_LOG_INFO("Client connection %" PRIu64 " closing after %s (idle recv ended - peer closed or transport error)\n",
+                      conn_id, rpc_cmd_str(report.last_cmd));
+    }
     if (rpc_timing_enabled()) {
         rpc_timing_dump(); // per-connection close: short runs report without the 20k periodic
     }
