@@ -938,6 +938,22 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
+                // TASKS #114: a NONZERO share must never snap down to a
+                // zero-width slice. A small share of a small axis (e.g. 5% of
+                // a 2048-wide expert dim with a 128-granule) rounded to zero,
+                // the member's whole FFN chain then derived owner-degenerate,
+                // and the next dedicated-attention mul_mat aborted
+                // ("unsupported mul_mat split combination", the qr-N crash).
+                // Give such a member one granule when the axis has room for
+                // the members that still follow it; a TRUE zero share (-ts 0)
+                // keeps its intended zero-width slice.
+                high = std::max(high, low); // an earlier bump may sit above this cut
+                const float frac_j = tensor_split_scan[j] - (j > 0 ? tensor_split_scan[j - 1] : 0.0f);
+                const bool nonzero_share = tensor_split_scan.back() == 0.0f || frac_j > 0.0f;
+                if (high == low && nonzero_share &&
+                        low + g_s <= ne_s - g_s * (int64_t) (ud->n_devices - 1 - j)) {
+                    high = low + g_s;
+                }
                 split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
                 low = high;
             }
