@@ -44,6 +44,11 @@ docker tag <img>:<sha> 127.0.0.1:5000/<img>:<sha>
 docker push 127.0.0.1:5000/<img>:<sha>
 curl -s http://127.0.0.1:5000/v2/<img>/tags/list   # verify
 ```
+- X99 (10.5.6.2) pulls over the 10G as `10.5.6.1:5000/<img>:<tag>` (its
+  daemon.json trusts that address; the coordinator wlan/192.168.68.67 path is
+  dead). **TRAP (2026-08-12): docker-29 + compose-5.4 `compose pull` WEDGES
+  against registry:2.8.3** (referrers-API 404 retry loop) - `docker pull` the
+  exact tag directly first, then `compose up`; or upgrade the registry to :3.
 - Worker boxes PULL as `10.5.5.1:5000/<img>:<tag>`. A NEW box needs the
   insecure-registry config in `/etc/docker/daemon.json` (merge into existing
   keys, then `systemctl restart docker` — restart KILLS running containers,
@@ -87,6 +92,12 @@ ssh anyei@10.5.5.11 'cd ~/server/llama/llamacpp-v100 && \
 #     docker compose -f docker-compose.rpc-worker-cpu.yml up -d --force-recreate
 # (plus the box's usual port/thread vars)
 ```
+# X99 (10.5.6.2, quad V100 SXM2 32GB since 2026-08-12): TWO workers -
+#   :50052 CPU (rpc-worker image, -t 28, cache cap 183840 MiB)
+#   :50054 CUDA (the COORDINATOR image llamacpp-local-v100 run as an arch-70
+#     worker, WORKER_GPUS=0,1,2,3; its baked llama-server healthcheck reads
+#     "unhealthy" - cosmetic). Pulls via 10.5.6.1:5000 (see registry TRAP).
+
 Verify after recreate: `docker inspect llama-rpc-worker-cpu --format '{{.Config.Image}} {{.Config.Cmd}}'`
 (check image tag, `-p`, `-t`). Workers re-benchmark ~15-20 s before listening.
 Box facts: local 78 GB RAM / 20 cores; .11 62 GB RAM (its "128G" is the DISK
