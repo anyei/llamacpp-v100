@@ -520,12 +520,16 @@ function fleetIssue(m, ctx, kv) {
   if (m.size + kvGB > cap)
     return {kind:"ctx", msg:`weights + KV at this context (~${(m.size+kvGB).toFixed(0)} GiB) exceed the selected fleet's ${cap.toFixed(0)} GiB - rebuild the fleet (add workers) or lower the context / quantize KV.`};
   if (S.fleetW==="manual") {
-    const over = manualPcts().filter(d=>d.pct/100*m.size > (d.gpu ? d.capGB-8 : d.rgpu ? d.capGB-3 : d.capGB));
+    // GPU margin is share-PROPORTIONAL (layer splits carry KV with their layers)
+    // plus ~1.5G compute - the old flat 8G reserve over-fired on small-share
+    // layer configs. EP owners hold MORE KV than their share suggests, but the
+    // verdict is soft and the allocator is the authority (clean fail, #112)
+    const over = manualPcts().filter(d=>{
+      const margin = (d.gpu||d.rgpu) ? d.pct/100*kvGB + 1.5 : 0;
+      return d.pct/100*m.size + margin > d.capGB;
+    });
     if (over.length)
-      // soft verdict: share x model-size OVERESTIMATES residency for -ncmoe /
-      // EP-offload configs (the expert mass lives elsewhere) - the allocator is
-      // the authority and fails cleanly (#112), so warn but allow the launch
-      return {kind:"manual", soft:true, msg:`manual split MAY over-fill ${over.map(d=>d.key).join(", ")} IF all share bytes land there - true for plain -sm layer/tensor, not for -ncmoe/EP-offload configs. Launch allowed; a real over-fill fails cleanly at alloc.`};
+      return {kind:"manual", soft:true, msg:`manual split MAY over-fill ${over.map(d=>d.key).join(", ")} (weights-share + KV-share + ~1.5G compute vs capacity; overestimates -ncmoe/EP-offload residency). Launch allowed - a real over-fill fails cleanly at alloc.`};
   }
   return null;
 }
