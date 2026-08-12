@@ -174,6 +174,8 @@
 				}
 			}
 
+			let goneTicks = 0;
+
 			async function tick() {
 				if (inFlight) return;
 				inFlight = true;
@@ -188,6 +190,16 @@
 					inFlight = false;
 				}
 
+				if (!d.server_state) {
+					// the load vanished (child exited or was stopped): /fleet/status
+					// drops server_state entirely - do not idle here forever
+					if (++goneTicks >= 3) {
+						document.getElementById('stage').innerHTML =
+							'no load in flight — it finished, failed, or was stopped · <a href="./">back to the dashboard</a>';
+					}
+					return;
+				}
+				goneTicks = 0;
 				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading' &&
 						d.server_state !== 'waiting-capacity') {
 					location.href = './'; // ready/sleeping — the real UI is served now

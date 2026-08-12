@@ -9,6 +9,7 @@
 #include "download.h"
 #include "http.h"
 #include "gguf.h"
+#include "ggml-rpc.h"
 #include "subproc.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
@@ -2012,6 +2013,40 @@ void server_models_routes::init_routes() {
                     e["age_ms"] = now - it->second.second;
                     merged.push_back(std::move(e));
                     ++it;
+                }
+                // #116: per-device inventory (desc/type/memory) for the fleet
+                // selector - ephemeral probes (the #47 pattern), cached 60 s per
+                // endpoint so rescans stay cheap; a failed re-probe keeps the
+                // stale inventory another cycle instead of hammering a dead box
+                if (reg != nullptr) {
+                    typedef int (*probe_devices_t)(const char *, int, ggml_backend_rpc_device_probe_info *, int);
+                    static probe_devices_t probe_fn = (probe_devices_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_probe_devices");
+                    static std::map<std::string, std::pair<json, int64_t>> probe_cache;
+                    if (probe_fn != nullptr) {
+                        for (auto & e : merged) {
+                            const std::string ep = e["endpoint"].get<std::string>();
+                            auto pit = probe_cache.find(ep);
+                            if (pit == probe_cache.end() || now - pit->second.second > 60 * 1000) {
+                                ggml_backend_rpc_device_probe_info infos[16];
+                                const int n = probe_fn(ep.c_str(), 800, infos, 16);
+                                if (n >= 0) {
+                                    json devs = json::array();
+                                    for (int i = 0; i < n; i++) {
+                                        devs.push_back({{"desc",      std::string(infos[i].desc)},
+                                                        {"is_cpu",    infos[i].is_cpu != 0},
+                                                        {"free_mib",  infos[i].free_mem  / (1024ull*1024)},
+                                                        {"total_mib", infos[i].total_mem / (1024ull*1024)}});
+                                    }
+                                    probe_cache[ep] = { devs, now };
+                                } else if (pit != probe_cache.end()) {
+                                    pit->second.second = now;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            e["devices"] = probe_cache[ep].first;
+                        }
+                    }
                 }
                 hw["discovered"] = merged;
             }

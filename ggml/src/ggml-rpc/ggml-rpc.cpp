@@ -5648,6 +5648,54 @@ bool ggml_backend_rpc_dev_memory_ephemeral(ggml_backend_dev_t dev, int timeout_m
     return true;
 }
 
+// one-shot device inventory for the wizard fleet selector (#116) - same ephemeral
+// discipline as above: never the compute socket, no failed-endpoint marking.
+// Memory is queried before desc per device so a worker predating GET_DEVICE_DESC
+// (its serve loop closes on unknown commands) still yields the earlier devices.
+int ggml_backend_rpc_probe_devices(const char * endpoint, int timeout_ms,
+                                   ggml_backend_rpc_device_probe_info * out, int max_devices) {
+    if (endpoint == nullptr || out == nullptr || max_devices <= 0) {
+        return -1;
+    }
+    if (!ggml_backend_rpc_endpoint_reachable(endpoint, timeout_ms)) {
+        return -1;
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return -1;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    rpc_msg_device_count_rsp count_rsp;
+    if (!send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &count_rsp, sizeof(count_rsp))) {
+        return -1;
+    }
+    const int n = std::min((int) count_rsp.device_count, max_devices);
+    for (int i = 0; i < n; i++) {
+        ggml_backend_rpc_device_probe_info & info = out[i];
+        std::memset(&info, 0, sizeof(info));
+        rpc_msg_get_device_memory_req mem_req;
+        mem_req.device = (uint32_t) i;
+        rpc_msg_get_device_memory_rsp mem_rsp;
+        if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &mem_req, sizeof(mem_req), &mem_rsp, sizeof(mem_rsp))) {
+            return i;
+        }
+        info.free_mem  = mem_rsp.free_mem;
+        info.total_mem = mem_rsp.total_mem;
+        rpc_msg_get_device_desc_req desc_req = { (uint32_t) i };
+        rpc_msg_get_device_desc_rsp desc_rsp;
+        if (send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_DESC, &desc_req, sizeof(desc_req), &desc_rsp, sizeof(desc_rsp))) {
+            desc_rsp.desc[sizeof(desc_rsp.desc) - 1] = '\0';
+            const char * d = desc_rsp.desc;
+            if (std::strncmp(d, "CPU|", 4) == 0) {
+                info.is_cpu = 1;
+                d += 4;
+            }
+            snprintf(info.desc, sizeof(info.desc), "%s", d);
+        }
+    }
+    return n;
+}
+
 bool ggml_backend_rpc_shutdown_worker(const char * endpoint) {
     if (endpoint == nullptr) {
         return false;
@@ -6267,6 +6315,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_memory_ephemeral") == 0) {
         return (void *)ggml_backend_rpc_dev_memory_ephemeral;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_probe_devices") == 0) {
+        return (void *)ggml_backend_rpc_probe_devices;
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_failed") == 0) {
         return (void *)ggml_backend_rpc_dev_failed;

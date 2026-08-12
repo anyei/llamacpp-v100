@@ -221,6 +221,10 @@
     .search input, #gateq, #newdir, #mmproj, .gval { font-size: 16px; }
     .foot .cmd, .cmd, .flags { font-size: 10.5px; }
   }
+.devchips{display:inline-flex;gap:4px;margin-left:6px;vertical-align:middle}
+.devchip{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border:1px solid rgba(128,128,128,.35);border-radius:4px;font-size:11px;font-family:var(--mono)}
+.devchip svg{opacity:.75;flex:none}
+.devchip b{font-weight:600}
 </style>
 
 <div class="wrap">
@@ -476,18 +480,32 @@ const fleetList  = () => (HW.fleet.list && HW.fleet.list.length) ? HW.fleet.list
 const selWorkers   = () => fleetList().filter(w => !S.fleetSel || S.fleetSel.includes(w.endpoint));
 const selUsableGB  = () => selWorkers().reduce((a,w)=>a+(w.free_mib||0),0)/1024*0.92;
 const selEndpoints = () => selWorkers().map(w=>w.endpoint);
+// per-device view of a worker (#116): enriched /wizard/hw devices[] when present,
+// else devs-count equal-split of the beacon free_mib (type unknown until probed)
+const workerDevs = w => (w.devices && w.devices.length) ? w.devices
+  : Array.from({length:w.devs||1},()=>({desc:"", is_cpu:undefined, free_mib:(w.free_mib||0)/(w.devs||1)}));
+const ICO_GPU = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="11" rx="1"/><circle cx="9" cy="11.5" r="2.6"/><path d="M15 9.5h4M15 13.5h4M5 17v4M10 17v4"/></svg>';
+const ICO_CPU = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="7" y="7" width="10" height="10" rx="1"/><path d="M10 7V3M14 7V3M10 21v-4M14 21v-4M7 10H3M7 14H3M21 10h-4M21 14h-4"/></svg>';
+const ICO_UNK = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+const devIcon = d => d.is_cpu===false ? ICO_GPU : d.is_cpu===true ? ICO_CPU : ICO_UNK;
 // manual device-weights (UI-only): per-device share -> the -ts ratio list, in
-// the device order the fleet flags use (local GPUs first, then RPC workers)
+// the device order the fleet flags use (local GPUs first, then each worker's
+// devices in endpoint order - one share per DEVICE, matching -ts semantics)
 const manualDevices = () => [
   ...HW.gpus.map((g,i)=>({key:"CUDA"+i, name:"CUDA"+i+" · "+g.name, capGB:g.vram, gpu:true})),
-  ...selWorkers().map(w=>({key:w.endpoint, name:w.endpoint, capGB:(w.free_mib||0)/1024*0.92}))];
+  ...selWorkers().flatMap(w=>{
+    const ds = workerDevs(w), multi = ds.length>1;
+    return ds.map((d,j)=>({key:w.endpoint+(multi?"#"+j:""), name:w.endpoint+(multi?" · "+(d.desc||("dev"+j)):""),
+                           capGB:(d.free_mib||0)/1024*0.92, rgpu:d.is_cpu===false}));})];
 function manualPcts() {
   const devs = manualDevices();
   const tot  = devs.reduce((a,d)=>a+d.capGB,0)||1;
   return devs.map(d => ({...d, pct: S.fleetPct[d.key]!==undefined ? S.fleetPct[d.key] : Math.round(d.capGB/tot*100)}));
 }
-const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3; // the swept split assumes the 3-worker record roster
-const devsForFleet = () => [...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().map((w,i)=>"RPC"+i)].join(",");
+const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3 && selWorkers().every(w=>workerDevs(w).length===1); // the swept split assumes the 3-worker record roster
+// one RPC name per DEVICE, endpoint order (#116) - a multi-GPU worker consumes
+// successive names; must stay aligned with manualDevices() and the coordinator
+const devsForFleet = () => { let n=0; return [...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().flatMap(w=>workerDevs(w).map(()=>"RPC"+(n++)))].join(","); };
 const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct).join(",")
   : (S.fleetW==="record" && recordTsOk(md) ? "-ts 21,21,46,50,27" : "--rpc-auto-weight");
 // capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
@@ -502,7 +520,7 @@ function fleetIssue(m, ctx, kv) {
   if (m.size + kvGB > cap)
     return {kind:"ctx", msg:`weights + KV at this context (~${(m.size+kvGB).toFixed(0)} GiB) exceed the selected fleet's ${cap.toFixed(0)} GiB - rebuild the fleet (add workers) or lower the context / quantize KV.`};
   if (S.fleetW==="manual") {
-    const over = manualPcts().filter(d=>d.pct/100*m.size > (d.gpu ? d.capGB-8 : d.capGB));
+    const over = manualPcts().filter(d=>d.pct/100*m.size > (d.gpu ? d.capGB-8 : d.rgpu ? d.capGB-3 : d.capGB));
     if (over.length)
       return {kind:"manual", msg:`manual split over-fills ${over.map(d=>d.key).join(", ")} (share exceeds free RAM) - lower those percentages.`};
   }
@@ -1081,10 +1099,15 @@ function render() {
             `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100${md.id==="fleetl"?"; -sm layer assigns whole layers by these ratios":""}</span></div>`:""}
         </div>
         <div class="spec"><div class="lbl">Fleet workers</div>
-          ${fleetList().map(w=>{const on=!S.fleetSel||S.fleetSel.includes(w.endpoint); const gb=Math.round((w.free_mib||0)/1024);
+          ${(()=>{const rn={}; let rc=0; selWorkers().forEach(w=>{rn[w.endpoint]=workerDevs(w).map(()=>"RPC"+(rc++));});
+            return fleetList().map(w=>{const on=!S.fleetSel||S.fleetSel.includes(w.endpoint); const gb=Math.round((w.free_mib||0)/1024);
+            const chips=workerDevs(w).map((d,j)=>{const nm=on&&rn[w.endpoint]?rn[w.endpoint][j]:"";
+              const cap=d.free_mib?` ${Math.round(d.free_mib/1024)}G`:"";
+              return `<span class="devchip" title="${(d.desc||"device "+j).replace(/"/g,"&quot;")}">${devIcon(d)}${nm?`<b>${nm}</b>`:""}${cap}</span>`;}).join("");
             return `<label><input type="checkbox" data-fwsel="${w.endpoint}" ${on?"checked":""} ${sel?"":"disabled"}>
               <span style="font-family:var(--mono);font-size:12px">${w.endpoint}</span>
-              <span class="estg">· ${gb} GiB free${w.proto_version?` · proto ${w.proto_version}`:""}${w.score?` · score ${Math.round(w.score)}`:""}</span></label>`;}).join("")}
+              <span class="devchips">${chips}</span>
+              <span class="estg">· ${gb} GiB free${w.proto_version?` · proto ${w.proto_version}`:""}${w.score?` · score ${Math.round(w.score)}`:""}</span></label>`;}).join("");})()}
           <label><button class="btn ghost" data-rescan style="padding:3px 10px;font-size:12px">↻ rescan</button>
             <span class="estg">beacons answer in ~1.5s windows - rescans accumulate the roster</span></label>
           ${(()=>{ if(!sel) return "";

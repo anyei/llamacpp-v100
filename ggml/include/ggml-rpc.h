@@ -108,6 +108,19 @@ GGML_BACKEND_API void ggml_backend_rpc_reset_failed_endpoints(void);
 // probe whether an RPC device's endpoint accepts connections right now
 GGML_BACKEND_API bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev);
 
+// one-shot per-device inventory of a worker over an EPHEMERAL connection (never a
+// compute socket): description, worker-RAM flag (the "CPU|" desc convention, #30)
+// and free/total memory per device. Returns the count written (<= max_devices),
+// -1 when the endpoint is unreachable. Wizard fleet selector (#116).
+struct ggml_backend_rpc_device_probe_info {
+    char     desc[128];
+    int32_t  is_cpu;
+    uint64_t free_mem;
+    uint64_t total_mem;
+};
+GGML_BACKEND_API int ggml_backend_rpc_probe_devices(const char * endpoint, int timeout_ms,
+                                                    struct ggml_backend_rpc_device_probe_info * out, int max_devices);
+
 // surgical re-provision of a restarted worker (TASKS.md #29c refinement)
 GGML_BACKEND_API bool         ggml_backend_rpc_dev_failed(ggml_backend_dev_t dev);
 GGML_BACKEND_API bool         ggml_backend_rpc_endpoint_reprobe(const char * endpoint);
