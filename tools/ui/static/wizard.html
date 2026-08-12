@@ -522,7 +522,10 @@ function fleetIssue(m, ctx, kv) {
   if (S.fleetW==="manual") {
     const over = manualPcts().filter(d=>d.pct/100*m.size > (d.gpu ? d.capGB-8 : d.rgpu ? d.capGB-3 : d.capGB));
     if (over.length)
-      return {kind:"manual", msg:`manual split over-fills ${over.map(d=>d.key).join(", ")} (share exceeds free RAM) - lower those percentages.`};
+      // soft verdict: share x model-size OVERESTIMATES residency for -ncmoe /
+      // EP-offload configs (the expert mass lives elsewhere) - the allocator is
+      // the authority and fails cleanly (#112), so warn but allow the launch
+      return {kind:"manual", soft:true, msg:`manual split MAY over-fill ${over.map(d=>d.key).join(", ")} IF all share bytes land there - true for plain -sm layer/tensor, not for -ncmoe/EP-offload configs. Launch allowed; a real over-fill fails cleanly at alloc.`};
   }
   return null;
 }
@@ -1113,7 +1116,7 @@ function render() {
           ${(()=>{ if(!sel) return "";
             const iss=fleetIssue(m,S.ctx,S.kv), cap=(selUsableGB()+totalVram).toFixed(0), kvGB=kvEst(m,S.ctx,S.kv)*S.np;
             return `<div class="memnote"><span>selected ${selWorkers().length}/${fleetList().length} workers · ${cap} GiB usable (incl. ${totalVram} GiB VRAM) vs weights ${m.size} GiB + KV ~${kvGB.toFixed(0)} GiB @ ${fmtCtx(S.ctx)}</span></div>`+
-              (iss?`<div style="margin-top:4px"><span class="tag ${iss.kind==="ctx"?"t-warn":"t-bad"}">${iss.msg}</span></div>`:"");})()}
+              (iss?`<div style="margin-top:4px"><span class="tag ${(iss.kind==="ctx"||iss.soft)?"t-warn":"t-bad"}">${iss.msg}</span></div>`:"");})()}
         </div>`:""}
         ${md.ssdGpuOpt?`<div class="spec"><div class="lbl">Expert landing</div>
           <label><input type="checkbox" data-ssdgpu="1" ${sel&&S.ssdGpu?"checked":""} ${sel?"":"disabled"}>
@@ -1264,11 +1267,11 @@ function render() {
         ${flagsHTML(tmplBase)}
         ${gatesHTML(seeded)}
       </details>
-      ${fIssue?`<div class="panel" style="border-color:${fIssue.kind==="ctx"?"var(--warn,#b58900)":"var(--bad,#dc322f)"}">
-        <span class="tag ${fIssue.kind==="ctx"?"t-warn":"t-bad"}">fleet capacity</span>
+      ${fIssue?`<div class="panel" style="border-color:${(fIssue.kind==="ctx"||fIssue.soft)?"var(--warn,#b58900)":"var(--bad,#dc322f)"}">
+        <span class="tag ${(fIssue.kind==="ctx"||fIssue.soft)?"t-warn":"t-bad"}">fleet capacity</span>
         <span class="note" style="margin-left:6px">${fIssue.msg}${fIssue.kind==="ctx"?" Go back to step 2 to rebuild the fleet.":""}</span></div>`:""}
       <div class="actions">
-        <button class="btn" id="go" ${S.launched||fIssue?"disabled":""} ${fIssue?`title="blocked: ${fIssue.kind} - fix the fleet selection first"`:""}>${S.launched?"Launching":"Launch"}</button>
+        <button class="btn" id="go" ${S.launched||(fIssue&&!fIssue.soft)?"disabled":""} ${fIssue&&!fIssue.soft?`title="blocked: ${fIssue.kind} - fix the fleet selection first"`:""}>${S.launched?"Launching":"Launch"}</button>
         <button class="btn ghost" id="copy">Copy flags &amp; env</button>
         <button class="btn ghost" id="savecfg">Save config</button>
       </div>
@@ -1315,7 +1318,7 @@ function render() {
       else S.gateOn[name]=val;
       render();
     });
-    $("go").onclick=()=>{ if (fIssue) return; S.launched=1; render(); realLaunch(flags); };
+    $("go").onclick=()=>{ if (fIssue && !fIssue.soft) return; S.launched=1; render(); realLaunch(flags); };
     $("savecfg").onclick=async e=>{
       const title = prompt("Config title (saved on the server for " + m.file + "):");
       if (!title) return;
