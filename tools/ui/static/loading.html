@@ -188,9 +188,18 @@
 					inFlight = false;
 				}
 
-				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading') {
+				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading' &&
+						d.server_state !== 'waiting-capacity') {
 					location.href = './'; // ready/sleeping — the real UI is served now
 					return;
+				}
+				if (d.server_state === 'waiting-capacity' && d.capacity) {
+					// keep the loading page: the serve is alive, waiting for fleet RAM
+					// (a worker is down/restarting) - show what it needs vs has
+					document.getElementById('stage').textContent =
+						'waiting for fleet capacity: ' +
+						Math.round((d.capacity.available_mib || 0) / 1024) + ' GiB pooled of ' +
+						Math.round((d.capacity.required_mib || 0) / 1024) + ' GiB needed — resumes when workers return';
 				}
 
 				// the exact serve command (argv + env gates) - immutable, render once
