@@ -92,11 +92,13 @@ ssh anyei@10.5.5.11 'cd ~/server/llama/llamacpp-v100 && \
 #     docker compose -f docker-compose.rpc-worker-cpu.yml up -d --force-recreate
 # (plus the box's usual port/thread vars)
 ```
-# X99 (10.5.6.2, quad V100 SXM2 32GB since 2026-08-12): TWO workers -
-#   :50052 CPU (rpc-worker image, -t 28, cache cap 183840 MiB)
-#   :50054 CUDA (the COORDINATOR image llamacpp-local-v100 run as an arch-70
-#     worker, WORKER_GPUS=0,1,2,3; its baked llama-server healthcheck reads
-#     "unhealthy" - cosmetic). Pulls via 10.5.6.1:5000 (see registry TRAP).
+# X99 (10.5.6.2, 2x V100 SXM2 32GB + 251GB RAM; verified 2026-08-12): TWO
+#   workers - :50052 CUDA (the COORDINATOR image run as an arch-70 worker,
+#   CUDA_VISIBLE_DEVICES=0,1; baked healthcheck reads "unhealthy" - cosmetic)
+#   and :50054 CPU (rpc-worker image, -t 30). A multi-GPU worker consumes
+#   SUCCESSIVE RPC device names in endpoint order - put the RAM endpoint
+#   first in --rpc if RPC0 must be the 256GB device.
+#   Pulls via 10.5.6.1:5000 (see registry TRAP).
 
 Verify after recreate: `docker inspect llama-rpc-worker-cpu --format '{{.Config.Image}} {{.Config.Cmd}}'`
 (check image tag, `-p`, `-t`). Workers re-benchmark ~15-20 s before listening.
