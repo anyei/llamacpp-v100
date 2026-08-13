@@ -1171,12 +1171,21 @@ function render() {
           ${HW.gpus.map((g,i)=>{const own=epOwnerList().includes(i);
             return `<label><input type="checkbox" data-epown="${i}" ${own?"checked":""} ${sel?"":"disabled"}>
               CUDA${i} attention owner <span class="estg">· ${g.name} ${g.vram} GiB · owners hold attention + KV (head-split); at least one GPU must own</span></label>`;}).join("")}
-          ${[...HW.gpus.map((g,i)=>({key:"CUDA"+i,cap:g.vram+" GiB VRAM"})),{key:"CPU",cap:(HW.ramFree!==undefined?HW.ramFree:HW.ram)+" GiB free RAM"}].map(r=>{
-            const v=S.epPct[r.key];
-            return `<label class="mrow" style="padding-left:22px"><input type="number" data-eppct="${r.key}" value="${v!==undefined?v:""}" placeholder="auto" min="0" max="100" ${sel?"":"disabled"}
-              style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
-              <span class="estg">% experts · ${r.key} · ${r.cap}</span></label>`;}).join("")}
-          <div class="memnote"><span>shares become the -ts list (GPUs then CPU); blank = auto from the VRAM budget</span></div>
+          ${(()=>{const nG=HW.gpus.length, attnGB=m.size*0.1/nG, kvOwn=kvEst(m,S.ctx,S.kv)/nG;
+            const rows=[...HW.gpus.map((g,i)=>({key:"CUDA"+i, cap:Math.max(0,g.vram-attnGB-kvOwn-2.5), capLbl:g.vram+" GiB VRAM",
+                def:Math.max(2,Math.min(16,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100)))})),
+              {key:"CPU", cap:(HW.ramFree!==undefined?HW.ramFree:HW.ram), capLbl:(HW.ramFree!==undefined?HW.ramFree:HW.ram)+" GiB free RAM", def:null}];
+            const gsum=rows.slice(0,nG).reduce((a,r)=>{const v=S.epPct[r.key];return a+((v!==undefined&&v!=="")?+v:r.def);},0);
+            return rows.map(r=>{
+              const v=S.epPct[r.key];
+              const auto_=r.def!==null?r.def:Math.max(5,100-gsum);
+              const eff=(v!==undefined&&v!=="")?+v:auto_;
+              const gb=eff/100*m.size, over=gb>r.cap;
+              return `<label class="mrow" style="padding-left:22px"><input type="number" data-eppct="${r.key}" value="${v!==undefined?v:""}" placeholder="${auto_}" min="0" max="100" ${sel?"":"disabled"}
+                style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+                <span class="estg">% experts · ${r.key} · ≈<b>${gb.toFixed(0)} GiB</b> of ${r.cap.toFixed(0)} GiB expert budget (${r.capLbl}${r.def!==null?", after attn+KV+compute":""})</span>
+                ${over?'<span class="tag t-warn">over budget</span>':""}</label>`;}).join("");})()}
+          <div class="memnote"><span>shares become the -ts list (GPUs then CPU); blank = auto from the VRAM budget; estimates update as you type</span></div>
           ${epPlacePicker(md, sel)}
         </div>`:""}
         ${(md.id==="fleet"||md.id==="fleetl")?`<div class="spec"><div class="lbl">Device weights</div>
