@@ -606,6 +606,23 @@ function modesFor(m, ctx, kv) {
   else if (m.moe) out.blocked.push({ name:"GPU + CPU expert offload", why:`${m.size} GiB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GiB).` });
   else out.blocked.push({ name:"GPU + CPU expert offload", why:"Dense model - no expert tier to offload." });
 
+  // local EP (#118): every layer's experts SLICED across the local GPUs + an
+  // in-process CPU member (no RPC socket) - all engines work on every layer
+  // concurrently, vs ncmoe's whole-layer alternation. Owner shares from free
+  // VRAM minus the attention/KV/compute budget; CPU takes the remainder.
+  if (m.moe && fitQ("ncmoe")) {
+    const nG = HW.gpus.length;
+    const attnGB = m.size*0.1/nG, kvOwn = kvNow/nG;
+    const gShares = HW.gpus.map(g=>Math.max(2, Math.min(16, Math.floor((g.vram - attnGB - kvOwn - 2.5)/m.size*100))));
+    const cpuShare = Math.max(5, 100 - gShares.reduce((a,b)=>a+b,0));
+    const devs = [...HW.gpus.map((g,i)=>"CUDA"+i), "CPU"].join(",");
+    const owners = HW.gpus.map((g,i)=>i).join(",");
+    push({ id:"eplocal", name:"GPU + CPU expert parallel",
+      speed:()=>"~4–8", est:()=>true,
+      why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on the GPU owner${nG>1?"s":""}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
+      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 LLAMA_FLEET_KV_RESERVE_MB=6144 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_META_EXPERT_DEFER=1` });
+  }
+
   // fleet: two REAL variants (expert parallel for MoE, layer split for anything
   // oversized). Full tensor split across the wire is structurally blocked: every
   // attention/FFN op would sync over GbE - EP is tensor mode with only the

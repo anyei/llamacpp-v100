@@ -171,11 +171,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             // CPU RAM + NVMe: 3.54 vs ~2.5 t/s on 2x V100 for DeepSeek-V4-Flash).
             const char * attn_owner_env = getenv("LLAMA_META_ATTN_OWNER");
             if (attn_owner_env != nullptr && atoi(attn_owner_env) >= 0) {
-                size_t n_local = 0;
+                size_t n_local_gpu = 0;
+                size_t n_local_cpu = 0;
                 for (size_t i = 0; i < n_devs; ++i) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(params.devices[i]);
                     if (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC")) {
-                        n_local++;
+                        if (ggml_backend_dev_type(params.devices[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            n_local_cpu++;
+                        } else {
+                            n_local_gpu++;
+                        }
                     }
                 }
                 // an owner GROUP (TASKS #70, comma list e.g. "0,1") legitimately
@@ -184,8 +189,12 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 for (const char * p = attn_owner_env; *p != '\0'; p++) {
                     n_owners += *p == ',';
                 }
-                if (n_local <= n_owners) {
-                    n_local = 1; // within the owner group - pass the guard below
+                // local CPU members are valid NON-owner expert members (#118): the
+                // member math is that of a remote CPU worker minus the socket. Only
+                // a local GPU outside the owner group stays gated (the #48 class).
+                if (n_local_cpu > 0 && n_local_gpu <= n_owners) {
+                    LLAMA_LOG_INFO("%s: %zu local CPU expert member(s) alongside %zu attention owner(s)\n",
+                                   __func__, n_local_cpu, n_owners);
                 }
                 // LLAMA_META_ALLOW_MULTI_LOCAL=1: re-test gate for the #48 corruption
                 // after major merges - outputs MUST pass the coherence gate before
@@ -194,15 +203,15 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     const char * env = getenv("LLAMA_META_ALLOW_MULTI_LOCAL");
                     return env != nullptr && atoi(env) != 0;
                 }();
-                if (n_local > 1 && allow_multi_local) {
-                    LLAMA_LOG_WARN("%s: LLAMA_META_ALLOW_MULTI_LOCAL: running %zu local members with dedicated "
-                                   "attention - this config corrupted output pre-merge (TASKS.md #48), verify coherence\n",
-                                   __func__, n_local);
-                } else if (n_local > 1) {
-                    LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) supports at most "
-                                    "one local GPU (the attention owner), but %zu local members were given. Put experts "
-                                    "on RPC workers, or use both local GPUs via single-box '-sm tensor -ngl 99 -ncmoe N' "
-                                    "(faster when experts fit CPU RAM+NVMe).\n", __func__, n_local);
+                if (n_local_gpu > n_owners && allow_multi_local) {
+                    LLAMA_LOG_WARN("%s: LLAMA_META_ALLOW_MULTI_LOCAL: running %zu local GPU members with %zu dedicated "
+                                   "attention owners - this config corrupted output pre-merge (TASKS.md #48), verify coherence\n",
+                                   __func__, n_local_gpu, n_owners);
+                } else if (n_local_gpu > n_owners) {
+                    LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) requires every local "
+                                    "GPU to be an attention owner, but %zu local GPUs exceed the %zu-owner group. Put those "
+                                    "experts on RPC workers or a local CPU member, or use single-box "
+                                    "'-sm tensor -ngl 99 -ncmoe N'.\n", __func__, n_local_gpu, n_owners);
                     return false;
                 }
             }
