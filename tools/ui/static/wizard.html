@@ -1274,7 +1274,11 @@ function render() {
       </details>`;
     v.querySelectorAll(".mode").forEach((el)=>{
       const pick = e => {
-        if (e.target.closest("details")||e.target.closest(".spec")) return;
+        if (e.target.closest("details")) return;
+        // control areas swallow clicks only on the SELECTED card - clicking a
+        // disabled field of an unselected card must select it (typed values
+        // were silently eaten by disabled inputs otherwise)
+        if (el.classList.contains("sel") && e.target.closest(".spec")) return;
         S.mode=ranked[+el.dataset.i];
         S.gateOn={}; S.gateOff={};
         const so = specOptions(S.model, S.mode.id).filter(o=>!o.disabled);
@@ -1297,8 +1301,13 @@ function render() {
     v.querySelectorAll("[data-rescan]").forEach(b=>b.onclick=async e=>{
       e.preventDefault(); b.textContent="scanning…"; await rescanFleet(); render();
     });
-    v.querySelectorAll("[data-mpct]").forEach(inp=>inp.onchange=()=>{
-      S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); render();
+    // commit share values on EVERY keystroke without re-rendering (a blur-time
+    // render replaces the input the user is moving to and eats the keystrokes;
+    // typed shares silently reverted to the auto placeholders - X99 3-GPU repro
+    // launched 15,15,15,55 instead of the typed 18,18,18,46)
+    v.querySelectorAll("[data-mpct]").forEach(inp=>{
+      inp.oninput=()=>{ S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); };
+      inp.onchange=()=>{ S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); render(); };
     });
     // #122: eplocal owner selection, per-device expert shares, placement picker
     v.querySelectorAll("[data-epown]").forEach(cb=>cb.onchange=()=>{
@@ -1307,11 +1316,12 @@ function render() {
       if (!cur.length) { render(); return; } // at least one GPU owner required
       S.epOwners = cur; render();
     });
-    v.querySelectorAll("[data-eppct]").forEach(inp=>inp.onchange=()=>{
-      const val=inp.value.trim();
-      if (val==="") delete S.epPct[inp.dataset.eppct];
-      else S.epPct[inp.dataset.eppct]=Math.max(0,Math.min(100,Math.round(+val)||0));
-      render();
+    v.querySelectorAll("[data-eppct]").forEach(inp=>{
+      const commit=()=>{ const val=inp.value.trim();
+        if (val==="") delete S.epPct[inp.dataset.eppct];
+        else S.epPct[inp.dataset.eppct]=Math.max(0,Math.min(100,Math.round(+val)||0)); };
+      inp.oninput=commit;
+      inp.onchange=()=>{ commit(); render(); };
     });
     v.querySelectorAll("[data-plcscan]").forEach(b=>b.onclick=async e=>{
       e.preventDefault(); b.textContent="scanning…";
