@@ -2064,6 +2064,7 @@ void server_models_routes::init_routes() {
         json out = json::array();
         std::vector<std::string> roots = string_split<std::string>(models.get_models_dirs(), ',');
         roots.push_back("/root/.cache");
+        std::set<std::string> seen; // nested models dirs reach the same files - dedupe by canonical path
         for (const auto & root : roots) {
             if (root.empty()) {
                 continue;
@@ -2083,6 +2084,10 @@ void server_models_routes::init_routes() {
                 }
                 const std::filesystem::path p = it->path();
                 if (p.extension() != ".json") {
+                    continue;
+                }
+                const std::string canon = std::filesystem::weakly_canonical(p, ec).string();
+                if (!canon.empty() && !seen.insert(canon).second) {
                     continue;
                 }
                 const uint64_t sz = (uint64_t) std::filesystem::file_size(p, ec);
