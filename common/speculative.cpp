@@ -2322,6 +2322,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // --override-kv targets the MAIN model's metadata; a standalone draft
+        // file has its own geometry. Inheriting the override let a trunc-gated
+        // target (block_count=int:N) truncate the drafter too, silently
+        // stripping its MTP/nextn head before the draft graph asserted on it
+        // (the #114(c) gate-vehicle class).
+        result.kv_overrides.clear();
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
