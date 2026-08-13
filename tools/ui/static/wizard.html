@@ -562,7 +562,9 @@ const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct)
 // capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
 // kinds: weights (hard), ctx (hard - weights+KV exceed), manual (hard)
 function fleetIssue(m, ctx, kv) {
-  const cap  = selUsableGB() + totalVram;
+  // fleet-EP includes the local CPU member (#118) - its RAM is real capacity
+  const cpuGB = (S.mode&&S.mode.id==="fleet") ? (HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92 : 0;
+  const cap  = selUsableGB() + totalVram + cpuGB;
   const kvGB = kvEst(m, ctx, kv) * S.np;
   if (selWorkers().length===0)
     return {kind:"weights", msg:"no workers selected - a valid fleet needs at least the workers that hold the model's weights"};
@@ -1251,7 +1253,7 @@ function render() {
           <label><button class="btn ghost" data-rescan style="padding:3px 10px;font-size:12px">↻ rescan</button>
             <span class="estg">beacons answer in ~1.5s windows - rescans accumulate the roster</span></label>
           ${(()=>{ if(!sel) return "";
-            const iss=fleetIssue(m,S.ctx,S.kv), cap=(selUsableGB()+totalVram).toFixed(0), kvGB=kvEst(m,S.ctx,S.kv)*S.np;
+            const iss=fleetIssue(m,S.ctx,S.kv), cap=(selUsableGB()+totalVram+((md.id==="fleet")?(HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92:0)).toFixed(0), kvGB=kvEst(m,S.ctx,S.kv)*S.np;
             return `<div class="memnote"><span>selected ${selWorkers().length}/${fleetList().length} workers · ${cap} GiB usable (incl. ${totalVram} GiB VRAM) vs weights ${m.size} GiB + KV ~${kvGB.toFixed(0)} GiB @ ${fmtCtx(S.ctx)}</span></div>`+
               (iss?`<div style="margin-top:4px"><span class="tag ${(iss.kind==="ctx"||iss.soft)?"t-warn":"t-bad"}">${iss.msg}</span></div>`:"");})()}
         </div>`:""}
