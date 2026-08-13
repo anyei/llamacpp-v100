@@ -519,7 +519,9 @@ function epPlacePicker(md, sel){
     <label class="mrow"><input type="text" id="plcq" placeholder="search placements" value="${escHtml(S.plcQ||"")}" ${sel?"":"disabled"} style="width:190px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
       <button class="btn ghost small" data-plcscan ${sel?"":"disabled"}>${S._plc?"rescan":"scan"}</button>
       ${S.epPlace?`<button class="btn ghost small" data-plcclear>clear</button>`:""}</label>
-    ${S.epPlace?`<div class="memnote"><span>LLAMA_META_EXPERT_PLACEMENT=${escHtml(S.epPlace)}</span>${mism?` <span class="tag t-warn">artifact has ${cur.members} members, this roster needs ${expected} - regenerate</span>`:""}</div>`:""}
+    ${(()=>{if(!S.epPlace) return "";
+      const srcProf = list.find(p=>p.kind==="profile"&&cur&&String(p.model||"")===String(cur.model||"")) || list.find(p=>p.kind==="profile");
+      return `<div class="memnote"><span>LLAMA_META_EXPERT_PLACEMENT=${escHtml(S.epPlace)}</span>${mism?` <span class="tag t-warn">artifact has ${cur.members} members, this roster needs ${expected}</span>${srcProf?` <button class="btn ghost small" data-plcgen="${escHtml(srcProf.path)}">regenerate for this roster (${expected})</button>`:` <span class="estg">- scan to find its profile</span>`}`:""}</div>`;})()}
     ${S._plc===null?`<div class="memnote"><span>hot experts pinned to the fastest members by measured routing frequency - scan finds #75 artifacts in the model dirs</span></div>`
       :(rows.map(p=>`<label class="mrow" style="padding-left:22px"><input type="radio" name="plc-${md.id}" data-plcpick="${escHtml(p.path)}" ${S.epPlace===p.path?"checked":""} ${sel?"":"disabled"}>
         <span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
