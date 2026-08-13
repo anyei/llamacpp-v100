@@ -6,6 +6,15 @@
 > bytes serve <9% of reads in any domain. **#75 v1 landed** (gates 1-4 passed:
 > byte-exact, PPL-neutral, ownership audit) — fleet A/B is the remaining gate.
 > GLM-5.2 remains to be profiled per the policy below.
+>
+> **2026-08-13: V4-Flash profiled** (pre-0731 IQ2XXS keeper serve, 27.6k decode
+> tokens, 12-domain driver): coverage@25.5% = **0.583** vs 0.255 uniform (lift
+> +0.328, GO; softer skew than hy3's 0.913). Artifact
+> `placements/v4flash-eplocal-12-12-76.json` (CUDA0,CUDA1,CPU roster): members
+> 0+1 hold 24% of bytes but **56.9% of reads**. Adopted as the transferable
+> approximation for 0731 (same family, different checkpoint - validate with an
+> 0731 collection on the X99 when free). Side fact: V4-Flash = 43 MoE layers
+> of ~78 total (the len-43 `swiglu_clamp_exp` array counts MoE layers).
 
 How to measure per-layer router expert-selection frequencies on a serving
 model and turn them into a frequency-ranked VRAM placement. General workflow
