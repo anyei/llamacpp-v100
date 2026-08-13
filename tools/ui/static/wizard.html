@@ -620,7 +620,7 @@ function modesFor(m, ctx, kv) {
     push({ id:"eplocal", name:"GPU + CPU expert parallel",
       speed:()=>"~4–8", est:()=>true,
       why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on the GPU owner${nG>1?"s":""}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
-      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 LLAMA_FLEET_KV_RESERVE_MB=6144 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_META_EXPERT_DEFER=1` });
+      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 LLAMA_FLEET_KV_RESERVE_MB=6144 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_EXPERT_DEFER=1` });
   }
 
   // fleet: two REAL variants (expert parallel for MoE, layer split for anything
@@ -825,7 +825,7 @@ const flagNames = f => [f.flag].concat((f.aka||"").split(" ").filter(Boolean)).c
 const FLAG_VAL_TOK = "(?!-[-a-zA-Z])[^\\s]+";
 const flagFindRe = f => f.ctl==="check"
   ? new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?=\\s|$)", "m")
-  : new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?:[ \\t]+(" + FLAG_VAL_TOK + "))?", "m");
+  : new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?=[ \\t]|$)(?:[ \\t]+(" + FLAG_VAL_TOK + "))?", "m");
 
 // strike-to-exclude (#116): the resolved command tokenizes into groups - an argv
 // flag plus its value tokens, or a bare/env token. Clicking a flag in the
@@ -1254,7 +1254,7 @@ function render() {
     const kvGB = kvEst(m, S.ctx, S.kv) * S.np;
     const isFleet = md.id==="fleet"||md.id==="fleetl";
     const capGB = isFleet ? selUsableGB()+totalVram : md.id==="cpu" ? HW.ram
-                 : md.id==="ncmoe"||md.id==="ssd" ? totalVram+HW.ram : md.id==="gpu1" ? HW.gpus[0].vram : totalVram;
+                 : md.id==="ncmoe"||md.id==="ssd"||md.id==="eplocal" ? totalVram+HW.ram : md.id==="gpu1" ? HW.gpus[0].vram : totalVram;
     const fIssue = isFleet ? fleetIssue(m, S.ctx, S.kv) : null; // TASKS #87 launch gate
     const usedPct = Math.min(100, m.size/capGB*100), kvPct = Math.min(100-usedPct, kvGB/capGB*100);
     const spec = opts.find(o=>o.id===S.spec);
