@@ -406,17 +406,19 @@ function specOptions(m, modeId) {
   // TASKS #93: each option declares its editable parameters; specFlags()
   // appends them (user override or default) to the option's FIRST flag line
   if (m.mtp) opts.push({ id:"mtp", name:"MTP speculation", gain: gpuMode?"+2.4x measured":null,
-    disabled: modeId==="fleet", offwhy:"measured break-even over the fleet boundary — verify lanes pay full wire cost",
+    sub: modeId==="fleet" ? "measured break-even over the fleet boundary (verify lanes pay full wire cost) - draft runs inside the target's own placement, no separate device to pin" : null,
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:3, min:1, max:8, step:1},
             {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05}],
     flags:"--spec-type draft-mtp\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
   // dflash drafts are small dense models - they fit VRAM even when the target
   // runs with its experts offloaded to CPU (-ncmoe), so offer it there too
   const d = dflashFor(m);
-  if (d && (gpuMode || modeId==="ncmoe")) opts.push({ id:"dflash", name:"dflash speculation", est:true,
+  if (d && (gpuMode || modeId==="ncmoe" || modeId==="fleet")) opts.push({ id:"dflash", name:"dflash speculation", est:true,
     sub:`draft found: ${d.file}`,
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:(d.specBlock||8)-1, min:1, max:(d.specBlock||8)-1, step:1,
-             note:`trained block: ${(d.specBlock||8)-1} draft tokens max`}],
+             note:`trained block: ${(d.specBlock||8)-1} draft tokens max`},
+            {key:"dev", flag:"--spec-draft-device", def:"CUDA1", text:true,
+             note:"pin the drafter to specific device(s)"}],
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
   // type. Honest per-shape notes (#80 5-leg A/B 2026-08-03): single-box
