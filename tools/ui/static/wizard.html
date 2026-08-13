@@ -510,7 +510,7 @@ function epSharesFor(m){
 }
 const epPlaceEnv = md => (S.epPlace && (md.id==="fleet"||md.id==="eplocal")) ? "\nLLAMA_META_EXPERT_PLACEMENT="+S.epPlace : "";
 function epPlacePicker(md, sel){
-  const expected = md.id==="eplocal" ? HW.gpus.length+1 : devsForFleet().split(",").length;
+  const expected = md.id==="eplocal" ? HW.gpus.length+1 : devsForFleet(md).split(",").length;
   const list = S._plc||[]; const q=(S.plcQ||"").toLowerCase();
   const qhit = p=>!q||p.name.toLowerCase().includes(q)||String(p.model||"").toLowerCase().includes(q);
   let rows = list.filter(p=>p.kind!=="profile").filter(qhit).slice(0,8);
@@ -544,7 +544,10 @@ const manualDevices = () => [
   ...selWorkers().flatMap(w=>{
     const ds = workerDevs(w), multi = ds.length>1;
     return ds.map((d,j)=>({key:w.endpoint+(multi?"#"+j:""), name:w.endpoint+(multi?" · "+(d.desc||("dev"+j)):""),
-                           capGB:(d.free_mib||0)/1024*0.92, rgpu:d.is_cpu===false}));})];
+                           capGB:(d.free_mib||0)/1024*0.92, rgpu:d.is_cpu===false}));}),
+  // fleet-EP only (#118): the local CPU is a legal expert member - list it
+  // LAST to match devsForFleet's device order
+  ...(S.mode&&S.mode.id==="fleet"?[{key:"CPU", name:"CPU · local RAM", capGB:(HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92}]:[])];
 function manualPcts() {
   const devs = manualDevices();
   const tot  = devs.reduce((a,d)=>a+d.capGB,0)||1;
@@ -553,7 +556,7 @@ function manualPcts() {
 const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3 && selWorkers().every(w=>workerDevs(w).length===1); // the swept split assumes the 3-worker record roster
 // one RPC name per DEVICE, endpoint order (#116) - a multi-GPU worker consumes
 // successive names; must stay aligned with manualDevices() and the coordinator
-const devsForFleet = () => { let n=0; return [...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().flatMap(w=>workerDevs(w).map(()=>"RPC"+(n++)))].join(","); };
+const devsForFleet = (md) => { let n=0; const d=[...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().flatMap(w=>workerDevs(w).map(()=>"RPC"+(n++)))]; if (md&&md.id==="fleet") d.push("CPU"); return d.join(","); };
 const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct).join(",")
   : (S.fleetW==="record" && recordTsOk(md) ? "-ts 21,21,46,50,27" : "--rpc-auto-weight");
 // capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
@@ -689,7 +692,7 @@ function modesFor(m, ctx, kv) {
             (epMeas ? " Gates preset: boundary fusion, q8 wire, decode-only expert deferral."
                     : " UNSWEPT for this model - run layer split first to collect its expert profile (a profiled first EP layout beats uniform)."),
         hasRecordTs: !!MEASURED[m.file+"|fleet-ep|none"],
-        flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm tensor {TS} -ngl 99 -c {CTX} --load-mode none -fit off\nLLAMA_META_EP_ONLY=1${HW.gpus.length?"  LLAMA_META_ATTN_OWNER="+HW.gpus.map((g,i)=>i).join(","):""}\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
+        flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm tensor {TS} -ngl 99 -c {CTX} --load-mode none -fit off\nLLAMA_META_EP_ONLY=1  LLAMA_META_LOCAL_DRAFT=0${HW.gpus.length?"  LLAMA_META_ATTN_OWNER="+HW.gpus.map((g,i)=>i).join(","):""}\nLLAMA_FLEET_KV_RESERVE_MB=6144\nGGML_META_BCAST_FUSE=2  GGML_RPC_WIRE_F16=1  GGML_RPC_WIRE_Q8=1\nGGML_META_EXPERT_DEFER=1` });
     }
     push({ id:"fleetl", name:"Distributed fleet · layer split",
       speed:s2=>meas("fleet-layer",s2)||"~1.5–2.5", est:s2=>!meas("fleet-layer",s2),
@@ -1269,7 +1272,7 @@ function render() {
                    style="width:64px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
                    ${p.note?`<span class="estg">· ${p.note}</span>`:""}</label>`;}).join(""):""}`).join("")}
         </div>`:""}
-        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}${sel?epPlaceEnv(md):""}</div></details>
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet(md))}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}${sel?epPlaceEnv(md):""}</div></details>
       </div>`;}).join("") +
       `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
       `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
@@ -1409,7 +1412,7 @@ function render() {
     const tmplBase = md.flags.replace("{CTX}", S.ctx)
                          .replace("{TS}", tsForFleet(md))
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
-                         .replace("{DEVS}", devsForFleet())
+                         .replace("{DEVS}", devsForFleet(md))
                  + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+specFlags(spec) : "") + advFlags + epPlaceEnv(md);
     const tmpl = applyFlagSet(tmplBase);
     const ga = applyGates(tmpl);
