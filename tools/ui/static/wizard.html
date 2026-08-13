@@ -498,7 +498,7 @@ const epOwnerList = () => (S.epOwners && S.epOwners.length ? S.epOwners : HW.gpu
 // current eplocal roster shares (GPUs then CPU): user overrides else VRAM-budget auto
 function epSharesFor(m){
   const nG=HW.gpus.length, kvNow=kvEst(m,S.ctx,S.kv), attnGB=m.size*0.1/nG, kvOwn=kvNow/nG;
-  const def=HW.gpus.map(g=>Math.max(2,Math.min(16,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100))));
+  const def=HW.gpus.map(g=>Math.max(2,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100)));
   const g=HW.gpus.map((x,i)=>{const v=S.epPct["CUDA"+i];return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):def[i];});
   const cpu=(S.epPct.CPU!==undefined&&S.epPct.CPU!=="")?Math.max(1,Math.min(100,+S.epPct.CPU)):Math.max(5,100-g.reduce((a,b)=>a+b,0));
   return [...g,cpu];
@@ -1186,7 +1186,7 @@ function render() {
               CUDA${i} attention owner <span class="estg">· ${g.name} ${g.vram} GiB · owners hold attention + KV (head-split); at least one GPU must own</span></label>`;}).join("")}
           ${(()=>{const nG=HW.gpus.length, attnGB=m.size*0.1/nG, kvOwn=kvEst(m,S.ctx,S.kv)/nG;
             const rows=[...HW.gpus.map((g,i)=>({key:"CUDA"+i, cap:Math.max(0,g.vram-attnGB-kvOwn-2.5), capLbl:g.vram+" GiB VRAM",
-                def:Math.max(2,Math.min(16,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100)))})),
+                def:Math.max(2,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100))})),
               {key:"CPU", cap:(HW.ramFree!==undefined?HW.ramFree:HW.ram), capLbl:(HW.ramFree!==undefined?HW.ramFree:HW.ram)+" GiB free RAM", def:null}];
             const gsum=rows.slice(0,nG).reduce((a,r)=>{const v=S.epPct[r.key];return a+((v!==undefined&&v!=="")?+v:r.def);},0);
             return rows.map(r=>{
