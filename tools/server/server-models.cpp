@@ -21,6 +21,7 @@
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <numeric>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -2091,21 +2092,157 @@ void server_models_routes::init_routes() {
                 std::ifstream f(p);
                 std::string head(4096, '\0');
                 f.read(&head[0], head.size());
-                if (head.find("\"member_shares\"") == std::string::npos) {
+                const bool is_artifact = head.find("\"member_shares\"") != std::string::npos;
+                // a raw #74 profile (roster-agnostic histogram) carries counts+n_expert
+                const bool is_profile  = !is_artifact &&
+                    head.find("\"counts\"") != std::string::npos && head.find("\"n_expert\"") != std::string::npos;
+                if (!is_artifact && !is_profile) {
                     continue;
                 }
-                json e = {{"path", p.string()}, {"name", p.filename().string()}, {"size_bytes", sz}};
+                json e = {{"path", p.string()}, {"name", p.filename().string()}, {"size_bytes", sz},
+                          {"kind", is_artifact ? "artifact" : "profile"}};
                 try {
                     std::ifstream full(p);
                     json j = json::parse(full);
                     e["model"]   = j.value("model", "");
-                    e["members"] = j.value("member_shares", json::array()).size();
                     e["n_layer"] = j.value("n_layer", 0);
+                    if (is_artifact) {
+                        e["members"] = j.value("member_shares", json::array()).size();
+                    } else {
+                        e["tokens"]  = j.value("tokens_profiled", 0);
+                    }
                 } catch (...) {}
                 out.push_back(std::move(e));
             }
         }
         res_ok(res, json{{"placements", out}});
+        return res;
+    };
+
+    // #123: derive a placement artifact from a #74 profile for an arbitrary
+    // roster - the profile is roster-agnostic; only this derivation is not.
+    // Mirrors scripts/expert-placement.py exactly (largest-remainder member
+    // counts, hottest-first permutation with (-count, id) tie-break) so the
+    // two generators are interchangeable.
+    this->post_wizard_placement_generate = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string prof_path = json_value(body, "profile", std::string());
+        std::vector<double> shares;
+        for (const auto & v : json_value(body, "ts", json::array())) {
+            if (v.is_number()) {
+                shares.push_back(v.get<double>());
+            }
+        }
+        double total = 0.0;
+        for (double s : shares) {
+            if (!(s >= 0.0) || !std::isfinite(s)) {
+                res_err(res, format_error_response("ts entries must be finite and non-negative", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            total += s;
+        }
+        if (shares.empty() || total <= 0.0) {
+            res_err(res, format_error_response("ts must contain at least one nonzero share", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json prof;
+        try {
+            std::ifstream f(prof_path);
+            prof = json::parse(f);
+        } catch (...) {
+            res_err(res, format_error_response("cannot read profile json", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!prof.contains("counts") || !prof.contains("n_expert") || !prof.contains("n_layer")) {
+            res_err(res, format_error_response("not a #74 profile (needs counts/n_expert/n_layer)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const int n_layer  = prof["n_layer"].get<int>();
+        const int n_expert = prof["n_expert"].get<int>();
+        std::vector<double> fracs;
+        fracs.reserve(shares.size());
+        for (double s : shares) {
+            fracs.push_back(s / total);
+        }
+        // largest-remainder rounding, ties by member order (stable) - matches the script
+        std::vector<int>    cnt(fracs.size());
+        std::vector<double> frac_part(fracs.size());
+        int rem = n_expert;
+        for (size_t j = 0; j < fracs.size(); j++) {
+            const double b = fracs[j] * n_expert;
+            cnt[j]       = (int) std::floor(b);
+            frac_part[j] = b - cnt[j];
+            rem         -= cnt[j];
+        }
+        std::vector<size_t> order(fracs.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return frac_part[a] > frac_part[b]; });
+        for (int k = 0; k < rem && k < (int) order.size(); k++) {
+            cnt[order[k]]++;
+        }
+        json perms = json::array();
+        json cpl   = json::array();
+        for (int il = 0; il < n_layer; il++) {
+            std::vector<double> c;
+            c.reserve(n_expert);
+            for (const auto & v : prof["counts"][il]) {
+                c.push_back(v.get<double>());
+            }
+            double lsum = 0.0;
+            for (double x : c) {
+                lsum += x;
+            }
+            if (lsum == 0.0) {
+                perms.push_back(nullptr);
+                cpl.push_back(nullptr);
+                continue;
+            }
+            std::vector<int> perm(n_expert);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::sort(perm.begin(), perm.end(), [&](int a, int b) { return c[a] != c[b] ? c[a] > c[b] : a < b; });
+            perms.push_back(perm);
+            cpl.push_back(cnt);
+        }
+        json out = {
+            {"model",          prof.value("model", json())},
+            {"n_layer",        n_layer},
+            {"n_expert",       n_expert},
+            {"source_profile", {{"path", prof_path}, {"sha256_16", ""}, {"tokens", prof.value("tokens_profiled", json())}}},
+            {"member_shares",  fracs},
+            {"counts_per_layer", cpl},
+            {"perm",           perms},
+        };
+        // name from the profile stem + the requested shares; write beside the
+        // profile when its dir is writable, else the launcher cache
+        std::string ts_name;
+        for (size_t j = 0; j < shares.size(); j++) {
+            ts_name += (j ? "-" : "") + std::to_string((int) std::llround(shares[j]));
+        }
+        const std::filesystem::path pp(prof_path);
+        const std::string base = pp.stem().string() + "-place-" + ts_name + ".json";
+        std::vector<std::filesystem::path> candidates = { pp.parent_path() / base };
+        std::error_code ec;
+        std::filesystem::create_directories("/root/.cache/placements", ec);
+        candidates.push_back(std::filesystem::path("/root/.cache/placements") / base);
+        std::string written;
+        for (const auto & cand : candidates) {
+            std::ofstream of(cand);
+            if (!of) {
+                continue;
+            }
+            of << out.dump();
+            if (of.good()) {
+                written = cand.string();
+                break;
+            }
+        }
+        if (written.empty()) {
+            res_err(res, format_error_response("cannot write the artifact (profile dir and /root/.cache both unwritable)", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res_ok(res, json{{"placement", {{"path", written}, {"name", base}, {"model", out["model"]},
+                                        {"members", fracs.size()}, {"n_layer", n_layer}, {"kind", "artifact"}}}});
         return res;
     };
 

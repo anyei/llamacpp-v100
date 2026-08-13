@@ -495,11 +495,21 @@ const devIcon = d => d.is_cpu===false ? ICO_GPU : d.is_cpu===true ? ICO_CPU : IC
 // #122 eplocal controls: owner list (>=1 local GPU enforced by the handler),
 // per-device expert shares, and the #75 placement-artifact picker (fleet-EP too)
 const epOwnerList = () => (S.epOwners && S.epOwners.length ? S.epOwners : HW.gpus.map((g,i)=>i));
+// current eplocal roster shares (GPUs then CPU): user overrides else VRAM-budget auto
+function epSharesFor(m){
+  const nG=HW.gpus.length, kvNow=kvEst(m,S.ctx,S.kv), attnGB=m.size*0.1/nG, kvOwn=kvNow/nG;
+  const def=HW.gpus.map(g=>Math.max(2,Math.min(16,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100))));
+  const g=HW.gpus.map((x,i)=>{const v=S.epPct["CUDA"+i];return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):def[i];});
+  const cpu=(S.epPct.CPU!==undefined&&S.epPct.CPU!=="")?Math.max(1,Math.min(100,+S.epPct.CPU)):Math.max(5,100-g.reduce((a,b)=>a+b,0));
+  return [...g,cpu];
+}
 const epPlaceEnv = md => (S.epPlace && (md.id==="fleet"||md.id==="eplocal")) ? "\nLLAMA_META_EXPERT_PLACEMENT="+S.epPlace : "";
 function epPlacePicker(md, sel){
   const expected = md.id==="eplocal" ? HW.gpus.length+1 : devsForFleet().split(",").length;
   const list = S._plc||[]; const q=(S.plcQ||"").toLowerCase();
-  const rows = list.filter(p=>!q||p.name.toLowerCase().includes(q)||String(p.model||"").toLowerCase().includes(q)).slice(0,8);
+  const qhit = p=>!q||p.name.toLowerCase().includes(q)||String(p.model||"").toLowerCase().includes(q);
+  const rows = list.filter(p=>p.kind!=="profile").filter(qhit).slice(0,8);
+  const profs = list.filter(p=>p.kind==="profile").filter(qhit).slice(0,4);
   const cur = S.epPlace ? list.find(p=>p.path===S.epPlace) : null;
   const mism = cur && cur.members && cur.members!==expected;
   return `<div class="lbl" style="margin-top:8px">Expert placement (#75 artifact)</div>
@@ -508,9 +518,13 @@ function epPlacePicker(md, sel){
       ${S.epPlace?`<button class="btn ghost small" data-plcclear>clear</button>`:""}</label>
     ${S.epPlace?`<div class="memnote"><span>LLAMA_META_EXPERT_PLACEMENT=${escHtml(S.epPlace)}</span>${mism?` <span class="tag t-warn">artifact has ${cur.members} members, this roster needs ${expected} - regenerate</span>`:""}</div>`:""}
     ${S._plc===null?`<div class="memnote"><span>hot experts pinned to the fastest members by measured routing frequency - scan finds #75 artifacts in the model dirs</span></div>`
-      :rows.map(p=>`<label class="mrow" style="padding-left:22px"><input type="radio" name="plc-${md.id}" data-plcpick="${escHtml(p.path)}" ${S.epPlace===p.path?"checked":""} ${sel?"":"disabled"}>
+      :(rows.map(p=>`<label class="mrow" style="padding-left:22px"><input type="radio" name="plc-${md.id}" data-plcpick="${escHtml(p.path)}" ${S.epPlace===p.path?"checked":""} ${sel?"":"disabled"}>
         <span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
-        <span class="estg">· ${escHtml(String(p.model||"?"))} · ${p.members||"?"} members${p.members===expected?"":" (mismatch)"}</span></label>`).join("")||`<div class="memnote"><span>no placement artifacts found in the model dirs</span></div>`}`;
+        <span class="estg">· ${escHtml(String(p.model||"?"))} · ${p.members||"?"} members${p.members===expected?"":" (mismatch)"}</span></label>`).join("")
+      +profs.map(p=>`<label class="mrow" style="padding-left:22px"><span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
+        <span class="estg">· raw profile · ${escHtml(String(p.model||"?"))}${p.tokens?` · ${p.tokens} tokens`:""}</span>
+        <button class="btn ghost small" data-plcgen="${escHtml(p.path)}" ${sel?"":"disabled"}>generate for this roster (${expected})</button></label>`).join("")
+      ||`<div class="memnote"><span>no placement artifacts or profiles found in the model dirs</span></div>`)}`;
 }
 // manual device-weights (UI-only): per-device share -> the -ts ratio list, in
 // the device order the fleet flags use (local GPUs first, then each worker's
@@ -634,9 +648,8 @@ function modesFor(m, ctx, kv) {
   if (m.moe && fitQ("ncmoe")) {
     const nG = HW.gpus.length;
     const attnGB = m.size*0.1/nG, kvOwn = kvNow/nG;
-    const defShares = HW.gpus.map(g=>Math.max(2, Math.min(16, Math.floor((g.vram - attnGB - kvOwn - 2.5)/m.size*100))));
-    const gShares = HW.gpus.map((g,i)=>{const v=S.epPct["CUDA"+i]; return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):defShares[i];});
-    const cpuShare = (S.epPct.CPU!==undefined&&S.epPct.CPU!=="")?Math.max(1,Math.min(100,+S.epPct.CPU)):Math.max(5, 100 - gShares.reduce((a,b)=>a+b,0));
+    const sh = epSharesFor(m);
+    const gShares = sh.slice(0, nG), cpuShare = sh[nG];
     const owners = epOwnerList().join(",");
     const devs = [...HW.gpus.map((g,i)=>"CUDA"+i), "CPU"].join(",");
     push({ id:"eplocal", name:"GPU + CPU expert parallel",
@@ -1294,6 +1307,19 @@ function render() {
       render();
     });
     v.querySelectorAll("[data-plcpick]").forEach(r=>r.onchange=()=>{ S.epPlace=r.dataset.plcpick; render(); });
+    // #123: derive an artifact from a raw profile for the CURRENT roster shares
+    v.querySelectorAll("[data-plcgen]").forEach(b=>b.onclick=async e=>{
+      e.preventDefault(); b.textContent="generating…";
+      const ts = S.mode && S.mode.id==="eplocal" ? epSharesFor(S.model) : manualPcts().map(d=>d.pct);
+      try {
+        const r=await fetch("./wizard/placements/generate",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({profile:b.dataset.plcgen, ts})});
+        const j=await r.json();
+        if (j.placement&&j.placement.path) S.epPlace=j.placement.path;
+        const r2=await fetch("./wizard/placements"); S._plc=(await r2.json()).placements||[];
+      } catch(err) {}
+      render();
+    });
     v.querySelectorAll("[data-plcclear]").forEach(b=>b.onclick=e=>{ e.preventDefault(); S.epPlace=""; render(); });
     const pq=$("plcq");
     if (pq) pq.oninput=e=>{ S.plcQ=e.target.value; render();

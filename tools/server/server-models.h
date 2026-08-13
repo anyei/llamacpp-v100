@@ -348,6 +348,7 @@ struct server_models_routes {
     server_http_context::handler_t get_wizard_sweeps;
     server_http_context::handler_t get_wizard_dirs;
     server_http_context::handler_t get_wizard_placements;
+    server_http_context::handler_t post_wizard_placement_generate;
     server_http_context::handler_t post_wizard_dirs;
     // TASKS #94: named per-model launch configs, persisted in the cache dir
     server_http_context::handler_t get_wizard_configs;
