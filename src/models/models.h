@@ -1264,6 +1264,13 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il) const;
     };
 
+    // LLM_GRAPH_TYPE_DECODER_MTP draft head: the nextn block is a full V4 decoder
+    // block (ratio-0 raw attention + MoE) wrapped in eh_proj/enorm/hnorm, mirroring
+    // the glm_dsa MTP graph.
+    struct graph_mtp : public llm_graph_context_dsv4_mla {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
