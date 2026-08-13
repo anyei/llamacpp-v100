@@ -1577,7 +1577,11 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
-    if (attn_rot_k) {
+    // an empty cache (every layer filtered out, e.g. the unused compress stores
+    // of a ratio-0-only MTP draft context) has n_embd_head_k_all == 0; the
+    // doubling loop below then never terminates (0 % nrot == 0) until nrot
+    // overflows to 0 -> SIGFPE
+    if (attn_rot_k && n_embd_head_k_all > 0) {
         int nrot = 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
