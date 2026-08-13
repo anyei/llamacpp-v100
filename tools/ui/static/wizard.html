@@ -497,12 +497,14 @@ const devIcon = d => d.is_cpu===false ? ICO_GPU : d.is_cpu===true ? ICO_CPU : IC
 const epOwnerList = () => (S.epOwners && S.epOwners.length ? S.epOwners : HW.gpus.map((g,i)=>i));
 // current eplocal roster shares (GPUs then CPU): user overrides else VRAM-budget auto
 function epSharesFor(m){
-  // only INCLUDED GPUs (all of which are owners - the #118 guard demands it)
-  // pay the attention/KV mirror; a single owner carries all of it
-  const act=epOwnerList(), nO=act.length||1;
+  // ALL local GPUs ride the roster. Owners additionally pay the attention/KV
+  // mirror (split across owners); non-owner GPUs are experts-only (their
+  // budget is the whole card minus compute) via the #48 re-test hatch.
+  const own=epOwnerList(), nO=own.length||1;
   const kvNow=kvEst(m,S.ctx,S.kv), attnGB=m.size*0.1/nO, kvOwn=kvNow/nO;
-  const def=act.map(i=>{const g=HW.gpus[i];return Math.max(2,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100));});
-  const g=act.map((gi,k)=>{const v=S.epPct["CUDA"+gi];return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):def[k];});
+  const def=HW.gpus.map((g,i)=>{const bud=own.includes(i)?g.vram-attnGB-kvOwn-2.5:g.vram-2.5;
+    return Math.max(2,Math.floor(Math.max(0,bud)/m.size*100));});
+  const g=HW.gpus.map((x,i)=>{const v=S.epPct["CUDA"+i];return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):def[i];});
   const cpu=(S.epPct.CPU!==undefined&&S.epPct.CPU!=="")?Math.max(1,Math.min(100,+S.epPct.CPU)):Math.max(5,100-g.reduce((a,b)=>a+b,0));
   return [...g,cpu];
 }
@@ -651,17 +653,20 @@ function modesFor(m, ctx, kv) {
   // concurrently, vs ncmoe's whole-layer alternation. Owner shares from free
   // VRAM minus the attention/KV/compute budget; CPU takes the remainder.
   if (m.moe && fitQ("ncmoe")) {
-    // roster = the INCLUDED GPUs (each an owner - #118 forbids local non-owner
-    // GPUs, so exclusion means leaving the device list) + the CPU member
+    // every local GPU rides the roster; ATTN_OWNER = the checked subset. A
+    // non-owner local GPU (experts-only) needs the #48 re-test hatch - the
+    // template seeds it and the why-text carries the coherence duty
     const act = epOwnerList();
+    const nG = HW.gpus.length;
     const sh = epSharesFor(m);
-    const gShares = sh.slice(0, act.length), cpuShare = sh[act.length];
-    const owners = act.map((x,k)=>k).join(",");
-    const devs = [...act.map(i=>"CUDA"+i), "CPU"].join(",");
+    const gShares = sh.slice(0, nG), cpuShare = sh[nG];
+    const owners = act.join(",");
+    const devs = [...HW.gpus.map((g,i)=>"CUDA"+i), "CPU"].join(",");
+    const multiLocal = act.length < nG;
     push({ id:"eplocal", name:"GPU + CPU expert parallel",
       speed:()=>"~4–8", est:()=>true,
-      why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${act.length} GPU${act.length>1?"s":""} (CUDA${act.join(", CUDA")}) + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV head-split across the included GPU${act.length>1?"s":""}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
-      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_BOUNDARY_STATS=1` });
+      why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on owner${act.length>1?"s":""} CUDA${act.join(", CUDA")}${multiLocal?"; the unchecked GPU(s) run EXPERTS-ONLY via the #48 re-test hatch - VERIFY OUTPUT COHERENCE before trusting the serve":""}. In-process CPU member, zero sockets (#118).`,
+      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0${multiLocal?" LLAMA_META_ALLOW_MULTI_LOCAL=1":""} GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_BOUNDARY_STATS=1` });
   }
   else if (m.moe) out.blocked.push({ name:"GPU + CPU expert parallel", why:`${m.size} GiB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GiB) - this box cannot hold the sliced experts resident.` });
   else out.blocked.push({ name:"GPU + CPU expert parallel", why:"Dense model - no expert tier to slice." });
@@ -1189,12 +1194,14 @@ function render() {
           <div class="memnote"><span>CPU RAM: <b>${HW.ramFree!==undefined?HW.ramFree:"?"} GiB free</b> of ${HW.ram} GiB - the CPU member's expert slice lives here</span></div>
           ${HW.gpus.map((g,i)=>{const own=epOwnerList().includes(i);
             return `<label><input type="checkbox" data-epown="${i}" ${own?"checked":""} ${sel?"":"disabled"}>
-              include CUDA${i} (attention owner) <span class="estg">· ${g.name} ${g.vram} GiB · every included GPU owns attention + KV (head-split, #118); unchecking DROPS it from the roster; at least one stays</span></label>`;}).join("")}
+              CUDA${i} attention owner <span class="estg">· ${g.name} ${g.vram} GiB · owners hold attention + KV (head-split); unchecked = EXPERTS-ONLY (#48 re-test hatch, verify coherence); at least one owner</span></label>`;}).join("")}
           ${(()=>{const act=epOwnerList(), nO=act.length||1, attnGB=m.size*0.1/nO, kvOwn=kvEst(m,S.ctx,S.kv)/nO;
-            const rows=[...act.map(i=>{const g=HW.gpus[i];return {key:"CUDA"+i, cap:Math.max(0,g.vram-attnGB-kvOwn-2.5), capLbl:g.vram+" GiB VRAM",
-                def:Math.max(2,Math.floor(Math.max(0,g.vram-attnGB-kvOwn-2.5)/m.size*100))};}),
+            const rows=[...HW.gpus.map((g,i)=>{const own=act.includes(i);
+              const bud=Math.max(0,own?g.vram-attnGB-kvOwn-2.5:g.vram-2.5);
+              return {key:"CUDA"+i, cap:bud, capLbl:g.vram+" GiB VRAM"+(own?", after attn+KV+compute":", experts-only after compute"),
+                def:Math.max(2,Math.floor(bud/m.size*100))};}),
               {key:"CPU", cap:(HW.ramFree!==undefined?HW.ramFree:HW.ram), capLbl:(HW.ramFree!==undefined?HW.ramFree:HW.ram)+" GiB free RAM", def:null}];
-            const gsum=rows.slice(0,act.length).reduce((a,r)=>{const v=S.epPct[r.key];return a+((v!==undefined&&v!=="")?+v:r.def);},0);
+            const gsum=rows.slice(0,HW.gpus.length).reduce((a,r)=>{const v=S.epPct[r.key];return a+((v!==undefined&&v!=="")?+v:r.def);},0);
             return rows.map(r=>{
               const v=S.epPct[r.key];
               const auto_=r.def!==null?r.def:Math.max(5,100-gsum);
@@ -1202,7 +1209,7 @@ function render() {
               const gb=eff/100*m.size, over=gb>r.cap;
               return `<label class="mrow" style="padding-left:22px"><input type="number" data-eppct="${r.key}" value="${v!==undefined?v:""}" placeholder="${auto_}" min="0" max="100" ${sel?"":"disabled"}
                 style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
-                <span class="estg">% experts · ${r.key} · ≈<b>${gb.toFixed(0)} GiB</b> of ${r.cap.toFixed(0)} GiB expert budget (${r.capLbl}${r.def!==null?", after attn+KV+compute":""})</span>
+                <span class="estg">% experts · ${r.key} · ≈<b>${gb.toFixed(0)} GiB</b> of ${r.cap.toFixed(0)} GiB expert budget (${r.capLbl})</span>
                 ${over?'<span class="tag t-warn">over budget</span>':""}</label>`;}).join("");})()}
           <div class="memnote"><span>shares become the -ts list (GPUs then CPU); blank = auto from the VRAM budget; estimates update as you type</span></div>
           ${epPlacePicker(md, sel)}
