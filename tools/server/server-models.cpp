@@ -2055,6 +2055,60 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // #122: enumerate #75 expert-placement artifacts (JSONs carrying
+    // "member_shares") from the models dirs + the launcher cache, for the
+    // wizard's EP placement picker
+    this->get_wizard_placements = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json out = json::array();
+        std::vector<std::string> roots = string_split<std::string>(models.get_models_dirs(), ',');
+        roots.push_back("/root/.cache");
+        for (const auto & root : roots) {
+            if (root.empty()) {
+                continue;
+            }
+            std::error_code ec;
+            for (auto it = std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec);
+                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) {
+                    break;
+                }
+                if (it.depth() > 2) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(ec)) {
+                    continue;
+                }
+                const std::filesystem::path p = it->path();
+                if (p.extension() != ".json") {
+                    continue;
+                }
+                const uint64_t sz = (uint64_t) std::filesystem::file_size(p, ec);
+                if (sz > 64ull*1024*1024) {
+                    continue;
+                }
+                std::ifstream f(p);
+                std::string head(4096, '\0');
+                f.read(&head[0], head.size());
+                if (head.find("\"member_shares\"") == std::string::npos) {
+                    continue;
+                }
+                json e = {{"path", p.string()}, {"name", p.filename().string()}, {"size_bytes", sz}};
+                try {
+                    std::ifstream full(p);
+                    json j = json::parse(full);
+                    e["model"]   = j.value("model", "");
+                    e["members"] = j.value("member_shares", json::array()).size();
+                    e["n_layer"] = j.value("n_layer", 0);
+                } catch (...) {}
+                out.push_back(std::move(e));
+            }
+        }
+        res_ok(res, json{{"placements", out}});
+        return res;
+    };
+
     this->get_wizard_dirs = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json dirs = json::array();

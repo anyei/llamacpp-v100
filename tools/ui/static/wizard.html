@@ -327,6 +327,7 @@ async function loadData() {
           name: g.name.replace(/^(NVIDIA|Tesla)\s+/,"").split("-")[0],
           vram: Math.round(g.total_mib/1024) }));
         if (h.ram_total_mib) det.ram = Math.round(h.ram_total_mib/1024);
+        if (h.ram_avail_mib) det.ramFree = Math.round(h.ram_avail_mib/1024);
         if (h.discovered && h.discovered.length) {
           const gb = h.discovered.reduce((a,w)=>a+(w.free_mib||0),0)/1024;
           det.fleet = { workers: h.discovered.length,
@@ -441,7 +442,7 @@ function specOptions(m, modeId) {
 }
 
 // TASKS #94: named per-model launch configs (server-persisted)
-const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut"];
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut","epOwners","epPct","epPlace"];
 const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 function configBlob() {
   const c = { v: 1, mode: S.mode ? S.mode.id : null };
@@ -491,6 +492,26 @@ const ICO_GPU = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" str
 const ICO_CPU = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="7" y="7" width="10" height="10" rx="1"/><path d="M10 7V3M14 7V3M10 21v-4M14 21v-4M7 10H3M7 14H3M21 10h-4M21 14h-4"/></svg>';
 const ICO_UNK = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
 const devIcon = d => d.is_cpu===false ? ICO_GPU : d.is_cpu===true ? ICO_CPU : ICO_UNK;
+// #122 eplocal controls: owner list (>=1 local GPU enforced by the handler),
+// per-device expert shares, and the #75 placement-artifact picker (fleet-EP too)
+const epOwnerList = () => (S.epOwners && S.epOwners.length ? S.epOwners : HW.gpus.map((g,i)=>i));
+const epPlaceEnv = md => (S.epPlace && (md.id==="fleet"||md.id==="eplocal")) ? "\nLLAMA_META_EXPERT_PLACEMENT="+S.epPlace : "";
+function epPlacePicker(md, sel){
+  const expected = md.id==="eplocal" ? HW.gpus.length+1 : devsForFleet().split(",").length;
+  const list = S._plc||[]; const q=(S.plcQ||"").toLowerCase();
+  const rows = list.filter(p=>!q||p.name.toLowerCase().includes(q)||String(p.model||"").toLowerCase().includes(q)).slice(0,8);
+  const cur = S.epPlace ? list.find(p=>p.path===S.epPlace) : null;
+  const mism = cur && cur.members && cur.members!==expected;
+  return `<div class="lbl" style="margin-top:8px">Expert placement (#75 artifact)</div>
+    <label class="mrow"><input type="text" id="plcq" placeholder="search placements" value="${escHtml(S.plcQ||"")}" ${sel?"":"disabled"} style="width:190px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+      <button class="btn ghost small" data-plcscan ${sel?"":"disabled"}>${S._plc?"rescan":"scan"}</button>
+      ${S.epPlace?`<button class="btn ghost small" data-plcclear>clear</button>`:""}</label>
+    ${S.epPlace?`<div class="memnote"><span>LLAMA_META_EXPERT_PLACEMENT=${escHtml(S.epPlace)}</span>${mism?` <span class="tag t-warn">artifact has ${cur.members} members, this roster needs ${expected} - regenerate</span>`:""}</div>`:""}
+    ${S._plc===null?`<div class="memnote"><span>hot experts pinned to the fastest members by measured routing frequency - scan finds #75 artifacts in the model dirs</span></div>`
+      :rows.map(p=>`<label class="mrow" style="padding-left:22px"><input type="radio" name="plc-${md.id}" data-plcpick="${escHtml(p.path)}" ${S.epPlace===p.path?"checked":""} ${sel?"":"disabled"}>
+        <span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
+        <span class="estg">· ${escHtml(String(p.model||"?"))} · ${p.members||"?"} members${p.members===expected?"":" (mismatch)"}</span></label>`).join("")||`<div class="memnote"><span>no placement artifacts found in the model dirs</span></div>`}`;
+}
 // manual device-weights (UI-only): per-device share -> the -ts ratio list, in
 // the device order the fleet flags use (local GPUs first, then each worker's
 // devices in endpoint order - one share per DEVICE, matching -ts semantics)
@@ -613,14 +634,15 @@ function modesFor(m, ctx, kv) {
   if (m.moe && fitQ("ncmoe")) {
     const nG = HW.gpus.length;
     const attnGB = m.size*0.1/nG, kvOwn = kvNow/nG;
-    const gShares = HW.gpus.map(g=>Math.max(2, Math.min(16, Math.floor((g.vram - attnGB - kvOwn - 2.5)/m.size*100))));
-    const cpuShare = Math.max(5, 100 - gShares.reduce((a,b)=>a+b,0));
+    const defShares = HW.gpus.map(g=>Math.max(2, Math.min(16, Math.floor((g.vram - attnGB - kvOwn - 2.5)/m.size*100))));
+    const gShares = HW.gpus.map((g,i)=>{const v=S.epPct["CUDA"+i]; return (v!==undefined&&v!=="")?Math.max(0,Math.min(100,+v)):defShares[i];});
+    const cpuShare = (S.epPct.CPU!==undefined&&S.epPct.CPU!=="")?Math.max(1,Math.min(100,+S.epPct.CPU)):Math.max(5, 100 - gShares.reduce((a,b)=>a+b,0));
+    const owners = epOwnerList().join(",");
     const devs = [...HW.gpus.map((g,i)=>"CUDA"+i), "CPU"].join(",");
-    const owners = HW.gpus.map((g,i)=>i).join(",");
     push({ id:"eplocal", name:"GPU + CPU expert parallel",
       speed:()=>"~4–8", est:()=>true,
-      why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on the GPU owner${nG>1?"s":""}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
-      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 LLAMA_FLEET_KV_RESERVE_MB=6144 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_EXPERT_DEFER=1` });
+      why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on owner${owners.includes(",")?"s":""} CUDA${owners}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
+      flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_BOUNDARY_STATS=1` });
   }
 
   // fleet: two REAL variants (expert parallel for MoE, layer split for anything
@@ -927,7 +949,7 @@ function flagsHTML(tmpl){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, epOwners:null, epPct:{}, epPlace:"", plcQ:"", _plc:null, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -1142,6 +1164,19 @@ function render() {
           <span class="speed"><b>${spd}</b> t/s ${est?'<span class="est">est.</span>':"measured"}</span>
         </div>
         <div class="why">${md.why}</div>
+        ${md.id==="eplocal"?`<div class="spec"><div class="lbl">Expert parallel setup</div>
+          <div class="memnote"><span>CPU RAM: <b>${HW.ramFree!==undefined?HW.ramFree:"?"} GiB free</b> of ${HW.ram} GiB - the CPU member's expert slice lives here</span></div>
+          ${HW.gpus.map((g,i)=>{const own=epOwnerList().includes(i);
+            return `<label><input type="checkbox" data-epown="${i}" ${own?"checked":""} ${sel?"":"disabled"}>
+              CUDA${i} attention owner <span class="estg">· ${g.name} ${g.vram} GiB · owners hold attention + KV (head-split); at least one GPU must own</span></label>`;}).join("")}
+          ${[...HW.gpus.map((g,i)=>({key:"CUDA"+i,cap:g.vram+" GiB VRAM"})),{key:"CPU",cap:(HW.ramFree!==undefined?HW.ramFree:HW.ram)+" GiB free RAM"}].map(r=>{
+            const v=S.epPct[r.key];
+            return `<label class="mrow" style="padding-left:22px"><input type="number" data-eppct="${r.key}" value="${v!==undefined?v:""}" placeholder="auto" min="0" max="100" ${sel?"":"disabled"}
+              style="width:56px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+              <span class="estg">% experts · ${r.key} · ${r.cap}</span></label>`;}).join("")}
+          <div class="memnote"><span>shares become the -ts list (GPUs then CPU); blank = auto from the VRAM budget</span></div>
+          ${epPlacePicker(md, sel)}
+        </div>`:""}
         ${(md.id==="fleet"||md.id==="fleetl")?`<div class="spec"><div class="lbl">Device weights</div>
           ${md.id==="fleet"&&recordTsOk(md)?`<label><input type="radio" name="fw-${md.id}" value="record" ${S.fleetW==="record"?"checked":""} ${sel?"":"disabled"}>
             measured record split <span class="gain">-ts 21,21,46,50,27 · swept</span></label>`:""}
@@ -1158,6 +1193,7 @@ function render() {
               <span class="estg">% · ${d.name} · ${lay!==null?`~${lay} of ${m.layers} layers · `:""}≈${gb.toFixed(0)} GiB of ${(d.gpu?d.capGB-8:d.capGB).toFixed(0)} GiB usable${d.gpu?" (KV+compute reserved)":""}</span>
               ${over?'<span class="tag t-bad">over capacity</span>':""}</label>`;}).join("")+
             `<div class="memnote"><span>shares are -ts ratios - they need not sum to exactly 100${md.id==="fleetl"?"; -sm layer assigns whole layers by these ratios":""}</span></div>`:""}
+          ${md.id==="fleet"?epPlacePicker(md, sel):""}
         </div>
         <div class="spec"><div class="lbl">Fleet workers</div>
           ${(()=>{const rn={}; let rc=0; selWorkers().forEach(w=>{rn[w.endpoint]=workerDevs(w).map(()=>"RPC"+(rc++));});
@@ -1193,7 +1229,7 @@ function render() {
                    style="width:64px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
                    ${p.note?`<span class="estg">· ${p.note}</span>`:""}</label>`;}).join(""):""}`).join("")}
         </div>`:""}
-        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}</div></details>
+        <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet())}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}${sel?epPlaceEnv(md):""}</div></details>
       </div>`;}).join("") +
       `<div class="actions"><button class="btn" id="next2">Continue</button></div>` +
       `<details class="blocked-list"><summary>${blocked.length} modes not offered for this model</summary>
@@ -1227,6 +1263,30 @@ function render() {
     v.querySelectorAll("[data-mpct]").forEach(inp=>inp.onchange=()=>{
       S.fleetPct[inp.dataset.mpct]=Math.max(0,Math.min(100,Math.round(+inp.value)||0)); render();
     });
+    // #122: eplocal owner selection, per-device expert shares, placement picker
+    v.querySelectorAll("[data-epown]").forEach(cb=>cb.onchange=()=>{
+      const i=+cb.dataset.epown; let cur=epOwnerList().slice();
+      cur = cb.checked ? [...new Set([...cur,i])].sort((a,b)=>a-b) : cur.filter(x=>x!==i);
+      if (!cur.length) { render(); return; } // at least one GPU owner required
+      S.epOwners = cur; render();
+    });
+    v.querySelectorAll("[data-eppct]").forEach(inp=>inp.onchange=()=>{
+      const val=inp.value.trim();
+      if (val==="") delete S.epPct[inp.dataset.eppct];
+      else S.epPct[inp.dataset.eppct]=Math.max(0,Math.min(100,Math.round(+val)||0));
+      render();
+    });
+    v.querySelectorAll("[data-plcscan]").forEach(b=>b.onclick=async e=>{
+      e.preventDefault(); b.textContent="scanning…";
+      try { const r=await fetch("./wizard/placements"); S._plc=(await r.json()).placements||[]; }
+      catch(err) { S._plc=[]; }
+      render();
+    });
+    v.querySelectorAll("[data-plcpick]").forEach(r=>r.onchange=()=>{ S.epPlace=r.dataset.plcpick; render(); });
+    v.querySelectorAll("[data-plcclear]").forEach(b=>b.onclick=e=>{ e.preventDefault(); S.epPlace=""; render(); });
+    const pq=$("plcq");
+    if (pq) pq.oninput=e=>{ S.plcQ=e.target.value; render();
+      const n=$("plcq"); if(n){ n.focus(); n.setSelectionRange(n.value.length,n.value.length); } };
     // TASKS #93: per-type speculation parameter overrides
     v.querySelectorAll("[data-spar]").forEach(inp=>inp.onchange=()=>{
       const [t,k]=inp.dataset.spar.split(":");
@@ -1278,7 +1338,7 @@ function render() {
                          .replace("{TS}", tsForFleet(md))
                          .replace("{RPC}", selEndpoints().join(",")||"127.0.0.1:50053")
                          .replace("{DEVS}", devsForFleet())
-                 + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+specFlags(spec) : "") + advFlags;
+                 + yarnFlags + kvFlags + extra + (spec&&!spec.disabled ? "\n"+specFlags(spec) : "") + advFlags + epPlaceEnv(md);
     const tmpl = applyFlagSet(tmplBase);
     const ga = applyGates(tmpl);
     const flags = ga.text, seeded = ga.seeded;
