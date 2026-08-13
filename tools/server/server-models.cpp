@@ -2105,7 +2105,8 @@ void server_models_routes::init_routes() {
                     continue;
                 }
                 json e = {{"path", p.string()}, {"name", p.filename().string()}, {"size_bytes", sz},
-                          {"kind", is_artifact ? "artifact" : "profile"}};
+                          {"kind", is_artifact ? "artifact" : "profile"},
+                          {"mtime", (int64_t) std::filesystem::last_write_time(p, ec).time_since_epoch().count()}};
                 try {
                     std::ifstream full(p);
                     json j = json::parse(full);
@@ -2120,6 +2121,10 @@ void server_models_routes::init_routes() {
                 out.push_back(std::move(e));
             }
         }
+        // newest first: fresh generations must surface within the picker's row cap
+        std::sort(out.begin(), out.end(), [](const json & a, const json & b) {
+            return a.value("mtime", (int64_t) 0) > b.value("mtime", (int64_t) 0);
+        });
         res_ok(res, json{{"placements", out}});
         return res;
     };

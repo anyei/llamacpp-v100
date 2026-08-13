@@ -513,9 +513,11 @@ function epPlacePicker(md, sel){
   const expected = md.id==="eplocal" ? HW.gpus.length+1 : devsForFleet().split(",").length;
   const list = S._plc||[]; const q=(S.plcQ||"").toLowerCase();
   const qhit = p=>!q||p.name.toLowerCase().includes(q)||String(p.model||"").toLowerCase().includes(q);
-  const rows = list.filter(p=>p.kind!=="profile").filter(qhit).slice(0,8);
+  let rows = list.filter(p=>p.kind!=="profile").filter(qhit).slice(0,8);
   const profs = list.filter(p=>p.kind==="profile").filter(qhit).slice(0,4);
   const cur = S.epPlace ? list.find(p=>p.path===S.epPlace) : null;
+  // the selected artifact must stay visible even past the row cap
+  if (cur && cur.kind!=="profile" && !rows.some(p=>p.path===cur.path)) rows = [cur, ...rows.slice(0,7)];
   const mism = cur && cur.members && cur.members!==expected;
   return `<div class="lbl" style="margin-top:8px">Expert placement (#75 artifact)</div>
     <label class="mrow"><input type="text" id="plcq" placeholder="search placements" value="${escHtml(S.plcQ||"")}" ${sel?"":"disabled"} style="width:190px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
