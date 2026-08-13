@@ -758,6 +758,10 @@ llama_context::llama_context(
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
             }
+            // the meta backend hides its members from the reg lookup above - the
+            // forwarder no-ops on non-meta backends (#118: an in-process CPU
+            // expert member otherwise computes on the ggml default thread count)
+            set_n_threads_fns.emplace_back(backend.get(), ggml_backend_meta_set_n_threads);
         }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);

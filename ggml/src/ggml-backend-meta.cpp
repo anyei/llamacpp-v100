@@ -5483,6 +5483,24 @@ bool ggml_backend_is_meta(ggml_backend_t backend) {
     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;
 }
 
+void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_threads) {
+    if (!ggml_backend_is_meta(backend)) {
+        return;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    for (auto & bc : backend_ctx->backend_configs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bc.backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto set_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_fn != nullptr) {
+            set_fn(bc.backend, n_threads);
+        }
+    }
+}
+
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     ggml_backend_meta_context * backend_ctx = new ggml_backend_meta_context(dev, params);
 

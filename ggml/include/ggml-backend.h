@@ -431,6 +431,11 @@ extern "C" {
     // Returns false when anything cannot be restored (caller should fully reload).
     GGML_API bool ggml_backend_meta_reprovision_endpoint(const char * endpoint);
 
+    // forward the thread count to member backends that accept it (the in-process
+    // CPU expert member, #118): the meta backend hides its members from the
+    // scheduler-facing set_n_threads collection. No-op on non-meta backends.
+    GGML_API void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_threads);
+
     // local-draft support (TASKS #71): enumerate a meta device's member devices,
     // and fetch member j's shadow of a meta-hosted tensor when that member holds a
     // FULL copy (mirrored, or dedicated-on-j). Returns NULL when the tensor is not
