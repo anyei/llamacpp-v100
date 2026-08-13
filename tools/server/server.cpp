@@ -240,6 +240,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.get ("/wizard/dirs",          ex_wrapper(models_routes->get_wizard_dirs));
         ctx_http.get ("/wizard/placements",    ex_wrapper(models_routes->get_wizard_placements));
         ctx_http.post("/wizard/placements/generate", ex_wrapper(models_routes->post_wizard_placement_generate));
+        ctx_http.post("/wizard/placements/remove",   ex_wrapper(models_routes->post_wizard_placement_remove));
         ctx_http.post("/wizard/dirs",          ex_wrapper(models_routes->post_wizard_dirs));
         ctx_http.get ("/wizard/configs",       ex_wrapper(models_routes->get_wizard_configs));
         ctx_http.post("/wizard/configs",       ex_wrapper(models_routes->post_wizard_configs));

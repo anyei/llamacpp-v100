@@ -529,7 +529,8 @@ function epPlacePicker(md, sel){
     ${S._plc===null?`<div class="memnote"><span>hot experts pinned to the fastest members by measured routing frequency - scan finds #75 artifacts in the model dirs</span></div>`
       :(rows.map(p=>`<label class="mrow" style="padding-left:22px"><input type="radio" name="plc-${md.id}" data-plcpick="${escHtml(p.path)}" ${S.epPlace===p.path?"checked":""} ${sel?"":"disabled"}>
         <span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
-        <span class="estg">· ${escHtml(String(p.model||"?"))} · ${p.members||"?"} members${p.members===expected?"":" (mismatch)"}</span></label>`).join("")
+        <span class="estg">· ${escHtml(String(p.model||"?"))} · ${p.members||"?"} members${p.members===expected?"":" (mismatch)"}</span>
+        <button class="btn ghost small" data-plcrm="${escHtml(p.path)}" ${sel?"":"disabled"} title="delete this generated artifact">remove</button></label>`).join("")
       +profs.map(p=>`<label class="mrow" style="padding-left:22px"><span style="font-family:var(--mono);font-size:12px">${escHtml(p.name)}</span>
         <span class="estg">· raw profile · ${escHtml(String(p.model||"?"))}${p.tokens?` · ${p.tokens} tokens`:""}</span>
         <button class="btn ghost small" data-plcgen="${escHtml(p.path)}" ${sel?"":"disabled"}>generate for this roster (${expected})</button></label>`).join("")
@@ -1346,6 +1347,15 @@ function render() {
       render();
     });
     v.querySelectorAll("[data-plcclear]").forEach(b=>b.onclick=e=>{ e.preventDefault(); S.epPlace=""; render(); });
+    v.querySelectorAll("[data-plcrm]").forEach(b=>b.onclick=async e=>{
+      e.preventDefault(); b.textContent="removing…";
+      try {
+        await fetch("./wizard/placements/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:b.dataset.plcrm})});
+        if (S.epPlace===b.dataset.plcrm) S.epPlace="";
+        const r=await fetch("./wizard/placements"); S._plc=(await r.json()).placements||[];
+      } catch(err) {}
+      render();
+    });
     const pq=$("plcq");
     if (pq) pq.oninput=e=>{ S.plcQ=e.target.value; render();
       const n=$("plcq"); if(n){ n.focus(); n.setSelectionRange(n.value.length,n.value.length); } };

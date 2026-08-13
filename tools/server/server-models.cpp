@@ -2256,6 +2256,49 @@ void server_models_routes::init_routes() {
         return res;
     };
 
+    // #123: delete a generated placement artifact. Refuses paths outside the
+    // scanned roots and anything not carrying the artifact schema - raw
+    // profiles (no "member_shares") are structurally undeletable here.
+    this->post_wizard_placement_remove = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string path = json_value(body, "path", std::string());
+        std::error_code ec;
+        const std::string canon = std::filesystem::weakly_canonical(path, ec).string();
+        std::vector<std::string> roots = string_split<std::string>(models.get_models_dirs(), ',');
+        roots.push_back("/root/.cache");
+        bool inside = false;
+        for (const auto & root : roots) {
+            if (root.empty()) {
+                continue;
+            }
+            const std::string rc = std::filesystem::weakly_canonical(root, ec).string();
+            if (!rc.empty() && canon.rfind(rc + "/", 0) == 0) {
+                inside = true;
+                break;
+            }
+        }
+        if (canon.empty() || !inside) {
+            res_err(res, format_error_response("path is outside the scanned roots", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        {
+            std::ifstream f(canon);
+            std::string head(4096, '\0');
+            f.read(&head[0], head.size());
+            if (head.find("\"member_shares\"") == std::string::npos) {
+                res_err(res, format_error_response("not a placement artifact - refusing to delete", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        if (!std::filesystem::remove(canon, ec) || ec) {
+            res_err(res, format_error_response("delete failed", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res_ok(res, json{{"removed", canon}});
+        return res;
+    };
+
     this->get_wizard_dirs = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json dirs = json::array();
