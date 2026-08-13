@@ -644,6 +644,8 @@ function modesFor(m, ctx, kv) {
       why:`Every layer's experts sliced ${gShares.join("%+")}%+${cpuShare}% across ${nG} GPU${nG>1?"s":""} + CPU RAM - all engines compute each layer CONCURRENTLY (ncmoe alternates whole layers). Attention + KV on owner${owners.includes(",")?"s":""} CUDA${owners}, in-process CPU member, zero sockets (#118). Verify output coherence on first use.`,
       flags:`-sm tensor --device ${devs} -ts ${gShares.join(",")},${cpuShare} -ngl 99 -c {CTX} --load-mode none -fit off --cache-reuse 256 -fa on\nLLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=${owners} LLAMA_META_LOCAL_DRAFT=0 GGML_META_BCAST_FUSE=2 GGML_META_LOCAL_COMM=1 GGML_CUDA_ALLREDUCE=p2p GGML_META_BOUNDARY_STATS=1` });
   }
+  else if (m.moe) out.blocked.push({ name:"GPU + CPU expert parallel", why:`${m.size} GiB + KV exceeds VRAM+RAM (${totalVram+HW.ram} GiB) - this box cannot hold the sliced experts resident.` });
+  else out.blocked.push({ name:"GPU + CPU expert parallel", why:"Dense model - no expert tier to slice." });
 
   // fleet: two REAL variants (expert parallel for MoE, layer split for anything
   // oversized). Full tensor split across the wire is structurally blocked: every
