@@ -225,6 +225,9 @@
 .devchip{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border:1px solid rgba(128,128,128,.35);border-radius:4px;font-size:11px;font-family:var(--mono)}
 .devchip svg{opacity:.75;flex:none}
 .devchip b{font-weight:600}
+.fcut{cursor:pointer;border-bottom:1px dotted transparent;border-radius:3px}
+.fcut:hover{border-bottom-color:currentColor;background:rgba(128,128,128,.12)}
+.fcut.cut{text-decoration:line-through;opacity:.4}
 </style>
 
 <div class="wrap">
@@ -438,7 +441,7 @@ function specOptions(m, modeId) {
 }
 
 // TASKS #94: named per-model launch configs (server-persisted)
-const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet"];
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut"];
 const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 function configBlob() {
   const c = { v: 1, mode: S.mode ? S.mode.id : null };
@@ -807,6 +810,40 @@ const flagFindRe = f => f.ctl==="check"
   ? new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?=\\s|$)", "m")
   : new RegExp("(^|[ \\t])(" + flagNames(f).map(reEsc).join("|") + ")(?:[ \\t]+(" + FLAG_VAL_TOK + "))?", "m");
 
+// strike-to-exclude (#116): the resolved command tokenizes into groups - an argv
+// flag plus its value tokens, or a bare/env token. Clicking a flag in the
+// resolved-launch panel toggles S.flagCut[flag]; struck groups render crossed
+// out but are REMOVED from the string actually launched. Env gates are not
+// cuttable here (the gates panel's gateOff owns those).
+function cmdGroups(text){
+  const groups=[];
+  for (const line of String(text).split("\n")){
+    let cur=null;
+    for (const t of line.split(/ +/).filter(t=>t!=="")){
+      if (/^-{1,2}[a-zA-Z]/.test(t)) { cur={flag:t, toks:[t]}; groups.push(cur); }
+      else if (cur) { cur.toks.push(t); }
+      else { groups.push({flag:null, toks:[t]}); }
+    }
+    groups.push({nl:true});
+  }
+  groups.pop();
+  return groups;
+}
+function applyCuts(text){
+  if (!Object.keys(S.flagCut).some(k=>S.flagCut[k])) return text;
+  return cmdGroups(text)
+    .map(g=> g.nl ? "\n" : (g.flag && S.flagCut[g.flag]) ? "" : g.toks.join(" ")+" ")
+    .join("").replace(/ +(\n|$)/g,"$1").replace(/\n{2,}/g,"\n").replace(/^\n+|\n+$/g,"");
+}
+function renderCmd(text){
+  return cmdGroups(text).map(g=>{
+    if (g.nl) return "\n";
+    if (!g.flag) return escHtml(g.toks.join(" "))+" ";
+    const cut = S.flagCut[g.flag];
+    return `<span class="fcut${cut?" cut":""}" data-fcut="${escHtml(g.flag)}" title="click to ${cut?"restore":"exclude"} ${escHtml(g.flag)}">${escHtml(g.toks.join(" "))}</span> `;
+  }).join("");
+}
+
 // merge the user's catalog values into the command: a flag the wizard already
 // emits (under ANY of its spellings) is REWRITTEN IN PLACE - appending a
 // duplicate broke launches (-ncmoe 32 ... --n-cpu-moe 36); only genuinely new
@@ -873,7 +910,7 @@ function flagsHTML(tmpl){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -1257,8 +1294,8 @@ function render() {
         </div>
         <div class="memnote" style="margin-top:6px"><span>${mmprojFor(m)?`auto-detected ${mmprojFor(m).file} - clear the field to serve text-only`:"this family supports vision with a paired --mmproj file"}</span></div>
       </div>`:""}
-      <div class="panel"><h3>Resolved launch — flags &amp; env gates</h3><div class="cmd">${flags}</div>
-        <div class="memnote" style="margin-top:6px"><span>model path, host and port come from the router preset; these flags overlay it</span></div></div>
+      <div class="panel"><h3>Resolved launch — flags &amp; env gates</h3><div class="cmd">${renderCmd(flags)}</div>
+        <div class="memnote" style="margin-top:6px"><span>model path, host and port come from the router preset; these flags overlay it · click a flag to exclude it from the launch (struck = excluded)</span></div></div>
       <details class="panel" data-d="adv" style="margin-top:0"><summary style="font-size:12px;color:var(--muted);cursor:pointer">Advanced — ${advGroups.flatMap(g=>g.items).filter(it=>S.adv[it.id]).length} of ${advGroups.flatMap(g=>g.items).length} options${(n=>n?` · ${n} catalog flags`:" · flag catalog")(Object.keys(S.flagSet).length)}${(n=>n?` · ${n} env gates active`:" · env gates")(GATES.filter(g=>S.gateOn[g.name]!==undefined||(seeded[g.name]!==undefined&&!S.gateOff[g.name])).length)}</summary>
         ${advGroups.map(g=>`<div class="spec"><div class="lbl">${g.label}</div>
           ${g.items.map(it=>it.input?`<label><span style="font-family:var(--mono);font-size:12px">${it.name}</span>
@@ -1286,6 +1323,7 @@ function render() {
     v.querySelectorAll("[data-advval]").forEach(inp=>inp.onchange=e=>{ S.advVal[inp.dataset.advval]=e.target.value; render(); });
     const mpi=$("mmproj"); if (mpi) mpi.onchange=e=>{ S.mmproj=e.target.value.trim(); render(); };
     v.querySelectorAll("[data-kv]").forEach(b=>b.onclick=()=>{ S.kv=b.dataset.kv; render(); });
+    v.querySelectorAll("[data-fcut]").forEach(el=>el.onclick=()=>{ S.flagCut[el.dataset.fcut]=!S.flagCut[el.dataset.fcut]; render(); });
     const gq=$("gateq");
     if (gq) gq.oninput=e=>{ S.gateQ=e.target.value; render();
       const n=$("gateq"); if(n){ n.focus(); n.setSelectionRange(n.value.length,n.value.length); } };
@@ -1322,7 +1360,7 @@ function render() {
       else S.gateOn[name]=val;
       render();
     });
-    $("go").onclick=()=>{ if (fIssue && !fIssue.soft) return; S.launched=1; render(); realLaunch(flags); };
+    $("go").onclick=()=>{ if (fIssue && !fIssue.soft) return; S.launched=1; render(); realLaunch(applyCuts(flags)); };
     $("savecfg").onclick=async e=>{
       const title = prompt("Config title (saved on the server for " + m.file + "):");
       if (!title) return;
