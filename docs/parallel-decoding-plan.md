@@ -183,6 +183,21 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
 - **A5 (zero build)**: -np 2-4 batching curve on the best single-stream shape
   (throughput mode; the old 1.66->4.73 curve steepens as members leave the
   RAM-bound regime).
+  **PREVIEW MEASURED 2026-08-14 (dev box, X99 off; RAM-bound MoE vehicle =
+  Qwen3.6-35B-A3B Q4, GPU attention + --cpu-moe experts):** np1 27.5; np2
+  aggregate FLAT 27.5-27.9 (per-stream 13.8 = time-slicing, hybrid-vehicle
+  scheduling quirk); **np4 aggregate 84.7-85.8 = 3.1x at -22% per-stream**.
+  Sequence-parallel amortization of CPU expert reads is real and large ->
+  the keeper (~10 single-stream) extrapolates to ~30 aggregate at np4:
+  the 20-30 goal in aggregate terms (decision (b)) is plausibly in reach
+  today. V4-arch curve (256-expert union, skewed routing) = first leg when
+  the X99 returns. Harness /work/np-curve.sh.
+  **#108 v2 NOTE (same day): the pre-verify arm is killed by paper-math on
+  memory-bound targets** - a decode pass costs ~one weight sweep regardless
+  of position count, so splitting the (n+1)-pass into 1 + n doubles target
+  reads on accepted rounds; spec levers on this rig are acceptance-side:
+  LLAMA_SPEC_ADAPTIVE=1 (in-tree, default off - zero-build A/B next X99
+  window at higher n-max), span acceptance (#110-gated), better drafters.
 - **A6 (DECIDED 2026-08-14 - the spine A endgame, the 20-30 carrier)**:
   UD-Q4_K_XL 144.5 GiB served in-box on the X99 - eplocal
   CUDA0,CUDA1,CUDA2,CPU, no wire member, native-profile placement. VRAM
