@@ -109,12 +109,48 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
   the in-box leg quantifies exactly what the worker buys. Also: KV q8_0 and
   context trim legs to grow GPU expert shares (coverage is the only V4 lever
   that moves the 88% term).
+  **MEASURED 2026-08-14 (ctx 8192, 8-run legs, coherence PASS on every leg):**
+  ctx-parity 5-member placed EP = 5.83-6.15, mean 6.03 (A1's 5.35 was the
+  ctx-32768 tax, +12.7% recovered; placement speed-null re-confirmed vs the
+  5.76-5.86 old-artifact baseline). **In-box layer+ncmoe (-ncmoe 28,
+  -ts 29,7,7, classic path, zero meta machinery) = 9.43-9.82, mean 9.64 -
+  the shape verdict: +60% over the best EP shape.** In-box eplocal (EP CPU
+  member, placed 15,15,15,55) = 5.49-5.66, mean 5.60. The ncmoe/eplocal
+  ratio 1.72x reproduces the IQ2XXS precedent (11.3/7.0 = 1.61x):
+  **the meta-EP member machinery costs ~1.7x on single-stream decode vs the
+  classic resident-CPU-expert path, even with 65% vs 37% of expert mass on
+  DDR4.** The worker's +32GB coverage only recovers fleet-EP to 6.03.
+  Consequences: A6's serving shape = ncmoe (not eplocal) pending a -np
+  ranking check; A3 rides the ncmoe shape. Dead levers, with mechanism:
+  GPU share raise OOMs (17% shares -> one member gets a ~32GiB buffer,
+  share-asymmetry class), and the placement artifact is speed-null but
+  LOAD-BEARING for fit (no-placement loads at the proven 15% shares also
+  OOM one member at ~32GiB - the rotation-pin remainder). VRAM at
+  -ncmoe 28: 17.1/25.7/23.2 GiB used -> tuning leg -ncmoe 24 -ts 27,8,8
+  (4 more GPU expert layers, GPU0 keeps drafter headroom), est ~10.
 - **A3 (queued)**: MTP drafter stack on the winner (--spec-type draft-mtp,
   #124 head, NMAX=2 first). The 2026-08-05 NMAX=2 NEGATIVE (3.88 vs 4.35,
   62% temp-0 acceptance, dspark, old roster) is NOT a prior for this leg:
   different drafter (native MTP head), placed roster, and real-workload
   acceptance measured far higher (85.2%). Measure TRUE acceptance + temp-0
   byte identity.
+  **MEASURED 2026-08-14 on the tuned ncmoe shape (target-only ref: -ncmoe 24
+  = 9.82-10.00, mean 9.95; VRAM 23.0/29.2/26.7):**
+  (a) **draft-mtp #124 head, n-max 2: NEGATIVE** - acceptance 39% (30/76,
+  deterministic at temp 0), 8.94 mean = -10% vs target-only. The native
+  head is weak at depth 2 on this checkpoint.
+  (b) **draft-dspark Q8, n-max 3, conf-min 0.3 (needs -ncmoe 25 - the
+  10.4 GiB drafter + -ncmoe 24 OOMs GPU0; MTP head 5.7 GiB fits): 9.60-11.35,
+  mean 10.12, probe acceptance 53-70%.** Parity-plus on the temp-0 probe;
+  by the established probe-vs-real pattern (55% -> 85%) real-workload
+  expectation is 11-13. Keeper decision = user's real usage.
+  (c) **Byte-identity spec-vs-nospec FAILS BENIGNLY**: divergence is a
+  mid-sentence near-tie fork ("to efficiency" vs "to the efficiency of a
+  refrigerator", both coherent) - the fp-batch-shape class (verify batches
+  hit different kernels; argmax flips on near-ties). Spec byte gates cannot
+  be like-vs-like across batch shapes on this stack; #110 KL battery is the
+  quality arbiter if suspicion arises. conf-min 0.3 is already a crude #107
+  gate; the entropy-gate build refines exactly this knob.
 - **A4 (build)**: #107 gate, then #108 PEARL loop, A/B'd separately on the A3
   serve. Expected from paper evidence tempered to a memory-bound target:
   +10-25% over the serialized spec loop at >=75% acceptance, plus recovery of
