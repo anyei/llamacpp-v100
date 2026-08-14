@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
+#include <thread>
 #include <deque>
 #include <optional>
 #include <exception>
@@ -239,6 +241,14 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // PEARL post-verify draft-ahead (#108, LLAMA_SPEC_PEARL=1): drafted on a worker
+    // thread during the target's verify decode, assuming full acceptance; token 0
+    // doubles as the pre-verification of the sampled token
+    llama_tokens spec_draft_ahead;
+    llama_tokens spec_ahead_prompt;
+    int32_t      spec_ahead_n_past = -1;
+    bool         spec_ahead_live   = false; // this round's dft restore is owned by the worker
+
     // `spec_draft` currently holds tokens the target already accepted, kept only to be re-evaluated
     // after a checkpoint restore [TAG_SPEC_AVOID_DRAFT_REEVAL]. They are not a draft: they are
     // accepted by construction and must not enter the acceptance statistics.
@@ -386,6 +396,10 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_draft_ahead.clear();
+            spec_ahead_prompt.clear();
+            spec_ahead_n_past = -1;
+            spec_ahead_live   = false;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -1300,6 +1314,13 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // PEARL (#108) draft-ahead worker; joined before any ctx_dft use and on teardown
+    struct spec_ahead_thread {
+        std::thread th;
+        void join() { if (th.joinable()) th.join(); }
+        ~spec_ahead_thread() { join(); }
+    } spec_ahead;
 
     bool add_bos_token = true;
 
@@ -3957,6 +3978,16 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // PEARL post-verify overlap (#108) - opt-in, off by default
+        static const bool spec_pearl = [] {
+            const char * e = std::getenv("LLAMA_SPEC_PEARL");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+
+        // the previous round's draft-ahead worker is normally joined before acceptance;
+        // error paths can skip that - never touch spec/ctx_dft with it live
+        spec_ahead.join();
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3983,7 +4014,36 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
-                    if (!slot.spec_draft.empty()) {
+                    // PEARL (#108): adopt the draft-ahead window when the assumed prefix held -
+                    // the previous round fully accepted and the sampled token matches the
+                    // drafter's continuation (its token 0 doubles as the pre-verification)
+                    bool adopted = false;
+                    if (spec_pearl && slot.spec_draft.empty() && !slot.spec_draft_ahead.empty()) {
+                        if ((int32_t) slot.prompt.n_tokens() == slot.spec_ahead_n_past + 1 &&
+                            slot.sampled == slot.spec_draft_ahead[0] &&
+                            slot.spec_draft_ahead.size() > 1) {
+                            slot.spec_draft.assign(slot.spec_draft_ahead.begin() + 1, slot.spec_draft_ahead.end());
+                            if ((int32_t) slot.spec_draft.size() > n_draft_max) {
+                                slot.spec_draft.resize(n_draft_max);
+                            }
+                            // this is a real draft: the drafting-list stats increment does not see it
+                            slot.n_draft_total += slot.spec_draft.size();
+                            adopted = true;
+
+                            if (trace > 0) {
+                                SLT_INF(slot, "PEARL: adopted %zu draft-ahead tokens\n", slot.spec_draft.size());
+                            }
+                        } else if (trace > 0) {
+                            SLT_INF(slot, "PEARL: discarded draft-ahead (n_tokens=%d vs n_past+1=%d, sampled=%d vs ahead0=%d, n_ahead=%zu)\n",
+                                    (int) slot.prompt.n_tokens(), slot.spec_ahead_n_past + 1,
+                                    slot.sampled, slot.spec_draft_ahead[0], slot.spec_draft_ahead.size());
+                        }
+                        slot.spec_draft_ahead.clear();
+                        slot.spec_ahead_n_past = -1;
+                        slot.spec_ahead_live   = false;
+                    }
+
+                    if (!slot.spec_draft.empty() && !adopted) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
@@ -4002,16 +4062,18 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
+                        if (!adopted) {
+                            common_speculative_get_draft_params(spec.get(), slot.id) = {
+                                /* .drafting = */ true,
+                                /* .n_max    = */ n_draft_max,
+                                /* .n_past   = */ slot.prompt.n_tokens(),
+                                /* .id_last  = */ slot.sampled,
+                                /* .prompt   = */ &slot.spec_prompt,
+                                /* .result   = */ &slot.spec_draft,
+                            };
 
-                        drafting.push_back(&slot);
+                            drafting.push_back(&slot);
+                        }
                     }
                 }
             }
@@ -4022,6 +4084,71 @@ private:
             const int64_t t0 = ggml_time_us();
             common_speculative_draft(spec.get());
             g_spec_timing.t_draft += ggml_time_us() - t0;
+        }
+
+        // PEARL (#108): launch the NEXT window's drafting on a worker thread, overlapped
+        // with the target's verify decode. Launched BEFORE the draft-context restore:
+        // the just-drafted tokens are still in ctx_dft, so the drafter continues
+        // contiguously from draft.back(). The worker performs the dft-side restore
+        // itself; joined in decode() before the process() mirror touches ctx_dft.
+        if (spec_pearl && spec && trace > 0) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                LOG_INF("PEARL: gate - ctx_dft=%s separate=%s dft_rm_type=%d (need %d)\n",
+                        ctx_dft ? "yes" : "no", ctx_dft != ctx_tgt ? "yes" : "no",
+                        (int) ctx_dft_seq_rm_type, (int) COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            }
+        }
+        if (spec_pearl && spec && ctx_dft && ctx_dft != ctx_tgt &&
+            ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            std::vector<server_slot *> ahead;
+            iterate(drafting, [&](server_slot & slot) {
+                if (slot.spec_draft.empty()) {
+                    return;
+                }
+                slot.spec_draft_ahead.clear();
+                slot.spec_ahead_prompt = slot.spec_prompt;
+                slot.spec_ahead_prompt.push_back(slot.sampled);
+                slot.spec_ahead_prompt.insert(slot.spec_ahead_prompt.end(), slot.spec_draft.begin(), slot.spec_draft.end() - 1);
+                slot.spec_ahead_n_past = (int32_t) slot.spec_ahead_prompt.size();
+                slot.spec_ahead_live   = true;
+
+                common_speculative_get_draft_params(spec.get(), slot.id) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ slot.get_n_draft_max(),
+                    /* .n_past   = */ slot.spec_ahead_n_past,
+                    /* .id_last  = */ slot.spec_draft.back(),
+                    /* .prompt   = */ &slot.spec_ahead_prompt,
+                    /* .result   = */ &slot.spec_draft_ahead,
+                };
+
+                ahead.push_back(&slot);
+            });
+
+            if (!ahead.empty()) {
+                auto * spec_ptr  = spec.get();
+                auto * ctx_dft_l = ctx_dft;
+                const int trace_l = trace;
+
+                spec_ahead.join();
+                spec_ahead.th = std::thread([spec_ptr, ahead, ctx_dft_l, trace_l]() {
+                    common_speculative_draft(spec_ptr);
+
+                    for (auto * s : ahead) {
+                        if (trace_l > 0) {
+                            LOG_INF("PEARL: ahead drafted %zu tokens for slot %d (n_past=%d)\n",
+                                    s->spec_draft_ahead.size(), s->id, s->spec_ahead_n_past);
+                        }
+                        common_speculative_get_draft_params(spec_ptr, s->id).drafting = false;
+
+                        // the per-round dft restore, taken over from the checkpoint iterate below
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), s->id, s->spec_ckpt.pos_max + 1, -1)) {
+                            GGML_ABORT("failed to remove sequence %d\n", s->id);
+                        }
+                    }
+                });
+            }
         }
 
         const int64_t t_ckpt_0 = ggml_time_us();
@@ -4036,7 +4163,8 @@ private:
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-            if (ctx_dft) {
+            // PEARL: the ahead worker owns this round's dft restore for its slots
+            if (ctx_dft && !slot.spec_ahead_live) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -4075,6 +4203,7 @@ private:
         });
 
         g_spec_timing.t_ckpt += ggml_time_us() - t_ckpt_0;
+
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -4727,6 +4856,9 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        // PEARL: the ahead worker must be done with ctx_dft before the mirror below
+        spec_ahead.join();
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -4878,6 +5010,9 @@ private:
 
             slot.print_timings_tg();
         });
+
+        // PEARL: the draft-ahead worker must finish before acceptance may touch ctx_dft
+        spec_ahead.join();
 
         // speculative decoding - main model sample and accept
         const int64_t t_accept_0 = ggml_time_us();
