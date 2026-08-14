@@ -157,7 +157,24 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
   keep their trained confidence head; inert under pad_drafts (same contract
   as p_min). Gates green: canonical off-leg c80261ff stable, engagement
   draft_n 63->0 @ 0.05 / unchanged @ 30 on the trunc-mtp stub (no-pad).
-  Threshold sweep on a real serve pending. Original A4 text follows:
+  **REAL-SERVE RESULTS 2026-08-14 (image 4e19f362d rolled to the X99
+  launcher; keeper baseline on it = 9.98 mean, reproduces 10.12-class):**
+  (a) **#107 entropy gate on draft-mtp (n2, no-pad, entropy-max 2.5):
+  8.94 -> 9.28 mean, acceptance 39% -> 44%, drafts/100tok 76 -> 63** - the
+  gate works exactly as designed (trims wasted drafts, recovers speed),
+  but draft-mtp stays below the 9.95 target-only: DSpark (10.12) keeps
+  the crown; entropy gate = the tool for rescuing weak drafters, not for
+  beating a strong one. (b) **#108 PEARL post-verify is STRUCTURALLY
+  limited to independent drafters (draft-simple)**: on the DSpark serve
+  it produced "Invalid input batch" 500s - feature-conditioned drafters
+  (dspark/dflash/eagle3/mtp) consume the target's hidden states, which do
+  not exist yet for the next window; draft-ahead is impossible in
+  principle for them. Type-gate added (PEARL requires draft-simple in the
+  spec types). The PEARL piece that fits feature drafters is the
+  PRE-verify arm (overlap the target's next forward with drafting) = the
+  #108 v2 direction. Production impact today: none (opt-in env, default
+  off); the fork's spec stack keeps DSpark + conf-min as the production
+  configuration. Original A4 text follows:
   #107 gate, then #108 PEARL loop, A/B'd separately on the A3
   serve. Expected from paper evidence tempered to a memory-bound target:
   +10-25% over the serialized spec loop at >=75% acceptance, plus recovery of

@@ -4100,7 +4100,15 @@ private:
                         (int) ctx_dft_seq_rm_type, (int) COMMON_CONTEXT_SEQ_RM_TYPE_PART);
             }
         }
-        if (spec_pearl && spec && ctx_dft && ctx_dft != ctx_tgt &&
+        // draft-ahead requires an INDEPENDENT drafter: feature-conditioned drafters
+        // (dspark/dflash/eagle3/mtp) consume the target's hidden states, which do not
+        // exist yet for the next window - measured "Invalid input batch" 500s on the
+        // dspark serve. The pre-verify arm is the PEARL piece that fits those (v2).
+        const bool spec_pearl_capable =
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != params_base.speculative.types.end();
+
+        if (spec_pearl && spec_pearl_capable && spec && ctx_dft && ctx_dft != ctx_tgt &&
             ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
             std::vector<server_slot *> ahead;
             iterate(drafting, [&](server_slot & slot) {
