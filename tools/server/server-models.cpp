@@ -258,10 +258,13 @@ static json server_model_read_gguf_meta(const std::string & path) {
         }
         meta["n_ctx_train"]  = get_u32(".context_length", 0);
         meta["n_expert"]     = get_u32(".expert_count", 0);
-        // MTP head: the nextn KV when present, else any nextn tensor
-        bool has_nextn = get_u32(".nextn_predict_layers", 0) > 0;
+        // MTP head: the nextn KV alone can lie - stripped-head exports keep it
+        // (the IQ2XXS chat-v2 keeper) and the wizard then offers speculation the
+        // model cannot serve. The head is real only if its defining tensor
+        // (nextn.eh_proj) actually shipped.
+        bool has_nextn = false;
         for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !has_nextn; i++) {
-            has_nextn = strstr(gguf_get_tensor_name(g, i), "nextn.") != nullptr;
+            has_nextn = strstr(gguf_get_tensor_name(g, i), "nextn.eh_proj") != nullptr;
         }
         meta["has_mtp"] = has_nextn;
         // KV bytes per context token at f16, the wizard's sizing input

@@ -32,6 +32,25 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_all");
 
+    // Some exports carry the nextn KV with the head tensors stripped AND
+    // block_count counting only trunk blocks (the IQ2XXS chat-v2 keeper).
+    // Honoring the KV there would shrink n_layer() and silently amputate the
+    // last trunk layer. The nextn claim is real only if the claimed nextn
+    // block is not a plain trunk block: a trunk-shaped last block (attn_norm
+    // present, no nextn.eh_proj) means the metadata is bogus - clamp it.
+    if (hparams.n_layer_nextn > 0) {
+        const std::string last = std::to_string(hparams.n_layer_all - 1);
+        const bool last_is_trunk =
+            ml.get_weight(("blk." + last + ".attn_norm.weight").c_str()) != nullptr &&
+            ml.get_weight(("blk." + last + ".nextn.eh_proj.weight").c_str()) == nullptr;
+        if (last_is_trunk) {
+            LLAMA_LOG_WARN("%s: nextn_predict_layers=%u declared but block %s is a plain trunk block "
+                           "(head tensors stripped at export) - ignoring the NextN metadata\n",
+                           __func__, hparams.n_layer_nextn, last.c_str());
+            hparams.n_layer_nextn = 0;
+        }
+    }
+
     ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp,   hparams.n_layer_all);
     if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,   hparams.swiglu_clamp_shexp, hparams.n_layer_all, 0)) {
         hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
