@@ -231,3 +231,31 @@ Status legend: ✅ done · 🔄 in progress · ⬜ pending
 - **Two shared-path bugs fixed on the way**: (1) a standalone draft file inherited the target's `--override-kv` — a trunc-gated target truncated the drafter's metadata and silently stripped its head (the #114(c) gate-vehicle class); drafts no longer inherit overrides. (2) `llama_kv_cache::build_input_k_rot` on an empty cache (`n_embd_head_k_all == 0`, e.g. the unused compress stores of an MTP draft ctx): `0 % nrot == 0` looped until `nrot` overflowed to 0 → silent SIGFPE at draft-ctx creation; guarded.
 - **Gates**: trunc-6 V4 target + drafter loads and serves; drafts generated + verified across requests (0/32 acceptance = expected on the babble stub — head trained on real hidden states; Content-only 500s = documented stub artifact); canonical byte gate `c80261ff` 6/6 stable post-edits. Spec-vs-nospec byte leg + real acceptance move to the real X99 serve after the image roll.
 - Wiring: `--spec-type draft-mtp --spec-draft-model <head>.gguf --spec-draft-device CUDAx -ngld 99`; profile collection must finish first (relaunch resets `LLAMA_EXPERT_PROFILE` output).
+
+---
+
+## #125 — Wizard: MTP speculation across all serve modes (FILED 2026-08-13, open)
+
+User ask: offer MTP drafting in **GPU+CPU expert offload (ncmoe)**, **GPU+CPU
+expert parallel (eplocal)**, **distributed fleet — layer split**, and
+**distributed fleet — expert parallel** (today only fleet-EP has an MTP option,
+#122, and it targets embedded-head mains only).
+
+- **Two MTP sources to support** (post-#124): (a) embedded head — main model
+  `has_mtp:true` (GLM-5.2, hy3, the MTP-v2 V4 quants): `--spec-type draft-mtp`
+  alone; (b) **external head file** — main without head + a head-only draft
+  GGUF (e.g. `DeepSeek-V4-Flash-MTP-drafter-Q8.gguf`): `--spec-type draft-mtp
+  --spec-draft-model <head> --spec-draft-device <pin> -ngld 99`.
+- **Classifier**: a head-only GGUF (nextn tensors present, no trunk blk.0) must
+  classify as a DRAFT artifact (drafter_kind "mtp-head"), not a loadable main
+  model (standalone launch of an mtp_only model builds the default graph on
+  null trunk tensors); surface it in the spec drafter picker next to
+  DSpark/dflash, matched to the main model by n_embd + vocab.
+- **Per-mode wiring**: ncmoe/eplocal = plain args (single process); fleet
+  layer + fleet-EP = drafter device pins (#122 UI) + the draft must stay off
+  the fleet split (protected since #114 fix chain; LOCAL_DRAFT=0 seeding on
+  EP templates). Capacity math: the pinned device's budget must count the
+  head's bytes (~5.7GB for the V4 Q8 head).
+- Templates seed `--spec-draft-n-max`/`conf-min` defaults per the spec serve
+  keeper findings (#80: target-only won at n_max sweep — MTP defaults may
+  differ; measure on the real serve first).
