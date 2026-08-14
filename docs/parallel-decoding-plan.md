@@ -87,6 +87,22 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
 - **A1 (queued, zero build)**: measure the placed NATIVE serve. Gate the 9-11
   projection. This is the plan's calibration point - it fixes the real CPU
   read share and the residual per-stage budget.
+  **MEASURED 2026-08-14: 5.3-5.5 t/s - projection MISS, placement null #3.**
+  Two 8-run legs (fresh 5.25-5.38 mean 5.34; plateau at ~35 min 5.31-5.49
+  mean 5.35 - no warm-up drift, load was cache-warm in 4.5 min), 100-tok
+  greedy, cache_prompt false, config = the user's roster (-ts 15,15,15,18,37,
+  -c 32768) + full EP env + v4-0731-native-place-15-15-15-18-37.json.
+  Coherence PASS (74.63 km/h reasoning probe exact; prose clean). Engagement
+  PROVEN: all 12 env vars read off the child process, and placement load is
+  throw-on-mismatch (llama.cpp:443ff) - a decoding serve means the artifact
+  was validated + installed. vs the 5.76-5.86 baseline (ctx 8192): parity
+  minus the ctx delta. CONSEQUENCE: native placement joins hy3's two nulls -
+  routing skew on V4-0731 (proxy Cov@25.5% 0.583) is too soft for placement
+  to move the CPU term; levers are now A2 coverage, A3 spec, A6 Q4-in-box.
+  INSTRUMENT GAP: launcher-spawned serves swallow child stderr at default
+  verbosity (LOG() forward filtered) - DEFER/BOUNDARY counter gates need a
+  script-launched serve or a launcher verbosity bump; A1 ran on coherence +
+  legs only.
 - **A2 (zero build)**: roster A/B - in-box only (drop RPC0: CUDA0-2 + CPU
   eplocal) vs A1's 5-member shape. Decomposition says the wire is cheap
   (0.33 ms/reduce), so the worker's +32 GB coverage may WIN despite the wire;
@@ -179,6 +195,43 @@ Ladder:
 - Worker-box RAM size (GLM Q4 note).
 - c (target/draft speed ratio) per spine on the real serves - sets PEARL's
   initial gamma.
+
+### R0 results (2026-08-14, first pass)
+
+- **DDR4 effective bandwidth (X99, 56T/251GiB)**: OpenMP bench, flat from 8
+  to 56 threads: copy (STREAM convention) 35.1-35.4 GB/s, **pure-read 60.3
+  GB/s**. Use 60 for expert-read terms, 35 for mixed r/w. (The plan's old
+  33 GB/s plug was ~1.8x pessimistic on reads.)
+- **Spine artifacts pinned**: spine A serve vehicle = DeepSeek-V4-Flash-0731
+  **UD-Q8_K_XL, 150.8 GiB weights (161,869,615,520 bytes, 5 shards; the
+  models dir shows 181G with extras)**, launcher metadata: deepseek4, 43
+  blocks, 256 experts, has_mtp=false (head stripped from this export - the
+  #124 drafter file carries it, which is exactly A3's config). So the A6
+  endgame build (UD-Q4_K_XL 144.5 GiB) is a different checkpoint AND quant:
+  A6 needs its own profile+placement (trap confirmed, not hypothetical). GLM-5.2:
+  UD-Q4_K_XL 436 GiB (X99 + /mnt/files local); Q2_K_XL 6 shards at
+  /mnt/full-models on the local box - must be copied to the X99 for B1.
+  IQ2XXS keeper 81 GiB on X99.
+- **GLM-5.2 arch (B0, gguf header)**: glm-dsa, block_count 79 = 3 leading
+  dense + 76 MoE trunk (nextn/MTP head is extra, hy3 pattern;
+  nextn_predict_layers=1 -> spec stack applies). 256 experts, **top-8 + 1
+  SHARED always-active** (pin shared experts in VRAM: ~0.8 GiB at Q2).
+  expert_ffn 2048 x embd 6144 = 37.75M params/expert (~21 MiB at Q4,
+  ~10.6 MiB at Q2). **E_tok ~= 76 x 9 x per-expert ~= 7.2 GiB/token at Q2**
+  - GLM's active expert mass is ~2.2x V4's. Group routing off.
+- **B2 band refresh with measured numbers**: Q2 in-box (VRAM ~75 GiB of
+  ~202 GiB expert mass = ~37% coverage; uniform routing -> miss ~63%): RAM
+  term ~4.6 GiB/token @ 60 GB/s ~= 77-82 ms -> **~9-11 t/s pre-spec, 10-14
+  with the spec stack**. GLM 20-30 single-stream is NOT paper-supported
+  in-box on this rig - spine B's 20-30 needs the aggregate metric (decision
+  (b)), worker VRAM behind a dieted wire, or W2W/RoCE. Spine A (A6) remains
+  the 20-30 carrier.
+- **A1 blocker status (2026-08-14)**: the placed serve was killed by the
+  launcher recreate at 12:48Z (VRAM free, all endpoints healthy, catalog
+  says unloaded; the earlier "loaded" reading was manifest optimism). The
+  roster-matched artifact v4-0731-native-place-15-15-15-18-37.json IS in
+  the X99 launcher cache (Aug 14 04:13). Relaunch is the user's call per
+  the standing serve rule; measurement resumes the moment it is up.
 
 ## 6. Non-goals (reasons on record)
 
