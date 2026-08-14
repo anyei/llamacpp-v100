@@ -259,3 +259,17 @@ expert parallel (eplocal)**, **distributed fleet — layer split**, and
 - Templates seed `--spec-draft-n-max`/`conf-min` defaults per the spec serve
   keeper findings (#80: target-only won at n_max sweep — MTP defaults may
   differ; measure on the real serve first).
+
+---
+
+## #126 — Wizard: optional local CPU member on both fleet modes (SHIPPED 2026-08-14)
+
+- The local CPU roster membership is now a checkbox in the Device-weights panel
+  of BOTH fleet modes. Defaults preserve prior shapes: fleet-EP **checked**
+  (the #118 shape it shipped with), layer split **unchecked** (it never had
+  one). Unchecking removes CPU from `--device`/`-ts`/manual-weight rows and the
+  capacity verdict; checking it on layer split adds the member and seeds
+  `LLAMA_META_LOCAL_DRAFT=0` (the `--device CPU` arg gate). State persists in
+  saved configs (`fleetCpu`).
+- Gates: JS syntax pass, FLAGS drift check clean, served-asset check on the dev
+  build (checkbox + handler present).

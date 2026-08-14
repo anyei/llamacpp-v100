@@ -444,7 +444,7 @@ function specOptions(m, modeId) {
 }
 
 // TASKS #94: named per-model launch configs (server-persisted)
-const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut","epOwners","epPct","epPlace"];
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","fleetCpu","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut","epOwners","epPct","epPlace"];
 const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 function configBlob() {
   const c = { v: 1, mode: S.mode ? S.mode.id : null };
@@ -547,9 +547,9 @@ const manualDevices = () => [
     const ds = workerDevs(w), multi = ds.length>1;
     return ds.map((d,j)=>({key:w.endpoint+(multi?"#"+j:""), name:w.endpoint+(multi?" · "+(d.desc||("dev"+j)):""),
                            capGB:(d.free_mib||0)/1024*0.92, rgpu:d.is_cpu===false}));}),
-  // fleet-EP only (#118): the local CPU is a legal expert member - list it
-  // LAST to match devsForFleet's device order
-  ...(S.mode&&S.mode.id==="fleet"?[{key:"CPU", name:"CPU · local RAM", capGB:(HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92}]:[])];
+  // the local CPU is an optional fleet member (#118 EP shape, #126 checkbox for
+  // both fleet modes) - list it LAST to match devsForFleet's device order
+  ...(fleetCpuOn(S.mode)?[{key:"CPU", name:"CPU · local RAM", capGB:(HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92}]:[])];
 function manualPcts() {
   const devs = manualDevices();
   const tot  = devs.reduce((a,d)=>a+d.capGB,0)||1;
@@ -558,14 +558,19 @@ function manualPcts() {
 const recordTsOk = md => !!md.hasRecordTs && selWorkers().length===3 && selWorkers().every(w=>workerDevs(w).length===1); // the swept split assumes the 3-worker record roster
 // one RPC name per DEVICE, endpoint order (#116) - a multi-GPU worker consumes
 // successive names; must stay aligned with manualDevices() and the coordinator
-const devsForFleet = (md) => { let n=0; const d=[...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().flatMap(w=>workerDevs(w).map(()=>"RPC"+(n++)))]; if (md&&md.id==="fleet") d.push("CPU"); return d.join(","); };
+// #126: the local CPU member is optional on both fleet modes - default ON for
+// fleet-EP (the #118 shape it shipped with), OFF for layer split (never had it);
+// the Device-weights checkbox overrides either way
+const fleetCpuOn = md => !!md && (md.id==="fleet"||md.id==="fleetl") &&
+  (S.fleetCpu!==null && S.fleetCpu!==undefined ? S.fleetCpu : md.id==="fleet");
+const devsForFleet = (md) => { let n=0; const d=[...HW.gpus.map((g,i)=>"CUDA"+i), ...selWorkers().flatMap(w=>workerDevs(w).map(()=>"RPC"+(n++)))]; if (fleetCpuOn(md)) d.push("CPU"); return d.join(","); };
 const tsForFleet = md => S.fleetW==="manual" ? "-ts "+manualPcts().map(d=>d.pct).join(",")
   : (S.fleetW==="record" && recordTsOk(md) ? "-ts 21,21,46,50,27" : "--rpc-auto-weight");
 // capacity verdict for the CURRENT selection: null = ok, else {kind, msg}.
 // kinds: weights (hard), ctx (hard - weights+KV exceed), manual (hard)
 function fleetIssue(m, ctx, kv) {
-  // fleet-EP includes the local CPU member (#118) - its RAM is real capacity
-  const cpuGB = (S.mode&&S.mode.id==="fleet") ? (HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92 : 0;
+  // an included local CPU member (#118/#126) contributes its RAM as capacity
+  const cpuGB = fleetCpuOn(S.mode) ? (HW.ramFree!==undefined?HW.ramFree:HW.ram)*0.92 : 0;
   const cap  = selUsableGB() + totalVram + cpuGB;
   const kvGB = kvEst(m, ctx, kv) * S.np;
   if (selWorkers().length===0)
@@ -703,6 +708,7 @@ function modesFor(m, ctx, kv) {
       why:`Whole layers per member - the simplest, most robust fleet shape; works for ANY architecture. NOTE: each member holds the KV for its own layers, so a worker drop loses every conversation's cache (EP keeps KV on the V100s).${border}`+
           (m.moe ? ` Also the PROFILING vehicle: add LLAMA_EXPERT_PROFILE to collect router histograms for a first ${m.file.split("-")[0]} EP layout.` : ""),
       flags:`--rpc {RPC} --rpc-reload\n--device {DEVS} -sm layer {TS} -ngl 99 -c {CTX} --load-mode none -fit off`+
+            (fleetCpuOn({id:"fleetl"}) ? `\nLLAMA_META_LOCAL_DRAFT=0  # unlocks --device CPU for the local RAM member` : "")+
             (m.moe ? `\nLLAMA_EXPERT_PROFILE=/models/profiles/${m.file}.json  # optional histogram collection` : "") });
     out.blocked.push({ name:"Distributed · full tensor split",
       why:"Every attention/FFN op would sync over GbE per token. Expert parallel IS tensor mode with only the expert tier segmented - pick that." });
@@ -985,7 +991,7 @@ function flagsHTML(tmpl){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, epOwners:null, epPct:{}, epPlace:"", plcQ:"", _plc:null, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, fleetCpu:null, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, epOwners:null, epPct:{}, epPlace:"", plcQ:"", _plc:null, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -1225,6 +1231,8 @@ function render() {
           ${epPlacePicker(md, sel)}
         </div>`:""}
         ${(md.id==="fleet"||md.id==="fleetl")?`<div class="spec"><div class="lbl">Device weights</div>
+          <label><input type="checkbox" data-fcpu="1" ${fleetCpuOn(md)?"checked":""} ${sel?"":"disabled"}>
+            local CPU member <span class="estg">· this box's RAM joins the roster as the last device (${md.id==="fleetl"?"whole layers in local RAM":"expert shares in local RAM, #118"})</span></label>
           ${md.id==="fleet"&&recordTsOk(md)?`<label><input type="radio" name="fw-${md.id}" value="record" ${S.fleetW==="record"?"checked":""} ${sel?"":"disabled"}>
             measured record split <span class="gain">-ts 21,21,46,50,27 · swept</span></label>`:""}
           <label><input type="radio" name="fw-${md.id}" value="auto" ${S.fleetW==="auto"||(S.fleetW==="record"&&!(md.id==="fleet"&&recordTsOk(md)))?"checked":""} ${sel?"":"disabled"}>
@@ -1301,6 +1309,8 @@ function render() {
     v.querySelectorAll("[data-pctx]").forEach(b=>b.onclick=()=>{ S.ctx=+b.dataset.pctx; render(); });
     v.querySelectorAll("[data-ssdgpu]").forEach(cb=>cb.onchange=e=>{ S.ssdGpu=e.target.checked; render(); });
     v.querySelectorAll("[name^=fw-]").forEach(r=>r.onchange=e=>{ S.fleetW=e.target.value; render(); });
+    // #126: local CPU fleet member toggle (both fleet modes)
+    v.querySelectorAll("[data-fcpu]").forEach(cb=>cb.onchange=e=>{ S.fleetCpu=e.target.checked; render(); });
     // TASKS #87: worker selection, rescan, manual shares
     v.querySelectorAll("[data-fwsel]").forEach(cb=>cb.onchange=()=>{
       const ep=cb.dataset.fwsel;
