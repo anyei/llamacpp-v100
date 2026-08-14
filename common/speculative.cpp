@@ -30,6 +30,18 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+// entropy in bits over the sampler's candidate distribution
+static float common_spec_draft_entropy(const llama_token_data_array * cur_p) {
+    float h = 0.0f;
+    for (size_t k = 0; k < cur_p->size; ++k) {
+        const float p = cur_p->data[k].p;
+        if (p > 0.0f) {
+            h -= p * log2f(p);
+        }
+    }
+    return h;
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -215,7 +227,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, entropy_max=%f\n", this->params.n_max, this->params.n_min, this->params.p_min, this->params.entropy_max);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -355,6 +367,14 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // a flat draft distribution predicts rejection - stop drafting early
+                if (params.entropy_max > 0.0f && common_spec_draft_entropy(cur_p) > params.entropy_max) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -821,6 +841,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
                 if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // a flat draft distribution predicts rejection - stop drafting early
+                if (params.entropy_max > 0.0f && common_spec_draft_entropy(cur_p) > params.entropy_max) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1641,6 +1669,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min && !pad_drafts) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                // a flat draft distribution predicts rejection - stop drafting early
+                if (params.entropy_max > 0.0f && !pad_drafts && common_spec_draft_entropy(cur_p) > params.entropy_max) {
                     drafting[seq_id] = false;
                     n_drafting--;
 

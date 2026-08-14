@@ -213,6 +213,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("DSpark: minimum confidence-head acceptance to keep a drafted token (0 = disabled)"));
 
+    add((new field_num("speculative.entropy_max", params.speculative.draft.entropy_max))
+        ->set_hard_limits(0.0f, 32.0f)
+        ->set_desc("Stop drafting when the draft distribution entropy exceeds this many bits (0 = disabled)"));
+
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

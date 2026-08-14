@@ -6985,6 +6985,7 @@ static json speculative_info(const common_params & params) {
         j["draft_model"] = base;
         j["n_max"]       = spec.draft.n_max;
         j["conf_min"]    = spec.draft.conf_min;
+        j["entropy_max"] = spec.draft.entropy_max;
         std::string devs;
         for (ggml_backend_dev_t d : spec.draft.devices) {
             if (d == nullptr) {

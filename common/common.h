@@ -330,6 +330,8 @@ struct common_params_speculative_draft {
 
     float conf_min = 0.0f; // DSpark: min predicted acceptance from the confidence head (0 = disabled)
 
+    float entropy_max = 0.0f; // stop drafting when the draft candidate distribution entropy exceeds this many bits (0 = disabled)
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

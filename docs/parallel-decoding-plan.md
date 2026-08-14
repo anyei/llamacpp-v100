@@ -151,7 +151,14 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
   be like-vs-like across batch shapes on this stack; #110 KL battery is the
   quality arbiter if suspicion arises. conf-min 0.3 is already a crude #107
   gate; the entropy-gate build refines exactly this knob.
-- **A4 (build)**: #107 gate, then #108 PEARL loop, A/B'd separately on the A3
+- **A4 (build)**: **#107 increment 1 LANDED 2026-08-14**: `--spec-draft-entropy-max`
+  (Cerberus-class confidence gate; entropy in bits over the draft candidate
+  distribution, 0 = off). Sites: draft-simple/eagle3/mtp loops; dflash/dspark
+  keep their trained confidence head; inert under pad_drafts (same contract
+  as p_min). Gates green: canonical off-leg c80261ff stable, engagement
+  draft_n 63->0 @ 0.05 / unchanged @ 30 on the trunc-mtp stub (no-pad).
+  Threshold sweep on a real serve pending. Original A4 text follows:
+  #107 gate, then #108 PEARL loop, A/B'd separately on the A3
   serve. Expected from paper evidence tempered to a memory-bound target:
   +10-25% over the serialized spec loop at >=75% acceptance, plus recovery of
   most zero-accept step waste at low acceptance. Anything beyond that is
