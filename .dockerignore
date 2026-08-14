@@ -24,3 +24,7 @@ models/*
 arm_neon.h
 compile_commands.json
 Dockerfile
+cache-rpc/
+research/
+*.pdf
+pi-session-*.html
