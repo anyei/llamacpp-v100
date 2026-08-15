@@ -68,6 +68,7 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 |---|---|---|---|
 | `LLAMA_SPEC_DRAFT_NO_PAD` | bool | off | Kill-switch: disable MTP draft-length padding to fixed `n_max`. Padding keeps the batch shape stable for graph reuse and is the default win (33.6 -> 62-65 t/s); only set this to A-B the effect. |
 | `LLAMA_SPEC_ADAPTIVE` | bool | off | Cap each draft round by an acceptance EMA. Measured tg-neutral; kept off. |
+| `LLAMA_SPEC_PEARL` | bool | off | (#108) PEARL post-verify draft-ahead: draft the NEXT window on a worker thread during the target's verify decode; adopted next round when the assumed prefix held. Requires an INDEPENDENT drafter (draft-simple) with a PART-type draft context - feature drafters (dspark/dflash/eagle3/mtp) need target hiddens and are excluded by the type gate. Tiny vehicles run slower by construction (nothing to hide the draft under). |
 | `LLAMA_SPEC_TIMING` | bool | off | Log server speculation phase timings (draft/verify/accept). |
 
 ## 4. Tensor-parallel AllReduce over NVLink (task 4)
