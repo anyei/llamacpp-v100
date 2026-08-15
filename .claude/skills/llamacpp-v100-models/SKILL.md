@@ -36,6 +36,13 @@ description: Model-zoo facts for the llamacpp-v100 fleet - paths, sizes, arch qu
 
 ## Arch quirk cheat-sheet
 
+- Qwen3.8-27B Q4_K_XL single-V100 MAX-T/S KNOBS (swept 2026-08-15, temp-0
+  6x128tok legs): `-ngl 99 -fa on -c 8192 --spec-type draft-mtp
+  --spec-draft-n-max 2` = **44.7 t/s stable** (target-only 33.7; n1 43.7@81%,
+  n3 40.7@54%, n4/n5 negative; NO_PAD/adaptive/entropy all LOSE to padded
+  fixed-n graph reuse; ctx 32768 costs ~-30%; KV q8_0 on V100 FA costs ~-30%
+  - avoid both for speed). Padding makes p-min/entropy flags INERT on mtp -
+  don't cargo them.
 - Qwen3.8-27B (arch qwen35, native MTP): the chat template defaults
   reasoning_effort to XHIGH and force-opens `<think>` - real prompts think for
   thousands of tokens and exhaust max_tokens inside the think block ("never
