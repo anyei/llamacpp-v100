@@ -276,6 +276,13 @@ expert parallel (eplocal)**, **distributed fleet — layer split**, and
 
 ---
 
+## #128 — Wizard: reasoning-budget control for thinking models (SHIPPED 2026-08-15, f5cfdc3d9)
+
+- Trigger: Qwen3.8-27B "never stops thinking" - its chat template DEFAULTS reasoning_effort to xhigh and force-opens `<think>`; real prompts exhaust max_tokens inside the think block (probes: default 181 completion tokens on a trivial q, effort=low 86, enable_thinking=false 13). Knobs ledgered in the models skill cheat-sheet.
+- Feature: the launcher's gguf scan detects reasoning support from the chat template (`<think>`/`</think>`/`enable_thinking`/`reasoning_effort` markers) -> `has_reasoning` in /models metadata; the wizard model card gains a "reasoning" chip and step 3 gains a **Reasoning budget** input for such models (empty = unlimited, 0 = thinking off, N = `--reasoning-budget N` in the command), persisted via CONFIG_KEYS (reasonBudget) in saved configs; onchange-commit binding (input-eater-safe).
+- Gates: build clean; positive = Qwen3.8 Q4+Q8 has_reasoning=true (also Darwin-28B, Qwen3.5-27B); negative = nomic embeds (no chat template) -> key absent -> UI false; served wizard.html carries the control (router-mode dev serve). Ships in the image AFTER b8ac38ef9.
+- Also this session: launcher model-list triage (the "qwen 3.8 missing" report): `?download=true` suffix files are invisible (renamed), and a parent scan root treats a multi-gguf subdir as ONE directory-model whose path claim shadows the per-file entries ("models"/"draft" bogus ids; dirs list fixed = parent root swapped for /Downloads; loose root gguf moved into models/). OPEN residual: the collection-dir-as-model heuristic itself (should require a single shard set) - candidate #129.
+
 ## #127 — Parallel decoding plan: 20-30 t/s on the over-VRAM spines (FILED 2026-08-14, open)
 
 - **2026-08-15 - np2 FLATLINE RESOLVED WITH MECHANISM + NEXT IMAGE READY**: the A5-preview np2 time-slicing = the hybrid-memory `split_equal(sequential=true)` path (llama-memory-hybrid.cpp:89 via llama-batch.cpp:538) which only lets CONSECUTIVE seq-ids share a ubatch when attention KV is non-unified - last night's pair drew non-consecutive slots (slot-history luck); fresh-serve rerun: np2 = 25.6+25.6 = **51.3 aggregate (1.86x)**, np3 = 58.4 (under image-build contention, qualitative only). Hybrid-vehicle-specific: --kv-unified is the fix there; **production V4 memory is non-hybrid and never takes this path** - the ~30-aggregate extrapolation stands. Image **llamacpp-local-v100:b8ac38ef9** (PEARL type-gate + all of 2026-08-14) built, feature-verified, pushed, :latest re-pointed - X99 roll = pull + recreate (COORD_IMAGE + MODELS_DIR both pinned!).
