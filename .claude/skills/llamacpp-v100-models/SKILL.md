@@ -36,6 +36,14 @@ description: Model-zoo facts for the llamacpp-v100 fleet - paths, sizes, arch qu
 
 ## Arch quirk cheat-sheet
 
+- Qwen3.8-27B (arch qwen35, native MTP): the chat template defaults
+  reasoning_effort to XHIGH and force-opens `<think>` - real prompts think for
+  thousands of tokens and exhaust max_tokens inside the think block ("never
+  stops thinking"). Knobs: `--chat-template-kwargs '{"reasoning_effort":"medium"}'`
+  (low/medium/xhigh only; "high" silently maps to xhigh), `--reasoning-budget N`
+  hard cap (+ optional --reasoning-budget-message), per-request
+  chat_template_kwargs {"enable_thinking": false}.
+
 - hy3 MTP: decode graphs can be 2-wide (nextn) — `ne[1]==1` gates miss them;
   spec/draft-mtp per-request overrides are silently ignored (server flags only).
 - V4/DSA: attention owner takes 0 expert share ONLY as a default — dual-role
