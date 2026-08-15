@@ -302,11 +302,13 @@ async function loadData() {
       arch: md.arch || "",
       dspark: md.drafter_kind === "dspark",
       specBlock: md.spec_block_size || 0,
+      reason: !!md.has_reasoning,
       status: (e.status||{}).value || "unloaded",
       family: familyOf(id),
       note: [md.arch, md.block_count ? md.block_count+" layers" : "",
              (md.n_expert||0)>0 ? "MoE "+md.n_expert+" experts" : (md.arch?"dense":""),
-             md.has_mtp ? "MTP head" : ""].filter(Boolean).join(" · ") || "no metadata",
+             md.has_mtp ? "MTP head" : "",
+             md.has_reasoning ? "reasoning" : ""].filter(Boolean).join(" · ") || "no metadata",
     };
   });
   MMPROJ = SCAN.filter(x => x.kind==="mmproj");
@@ -444,7 +446,7 @@ function specOptions(m, modeId) {
 }
 
 // TASKS #94: named per-model launch configs (server-persisted)
-const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","ssdGpu","fleetW","fleetSel","fleetPct","fleetCpu","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut","epOwners","epPct","epPlace"];
+const CONFIG_KEYS = ["spec","specParams","ctx","kv","np","reasonBudget","ssdGpu","fleetW","fleetSel","fleetPct","fleetCpu","gateOn","gateOff","adv","advVal","mmproj","flagSet","flagCut","epOwners","epPct","epPlace"];
 const escHtml = t => String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 function configBlob() {
   const c = { v: 1, mode: S.mode ? S.mode.id : null };
@@ -991,7 +993,7 @@ function flagsHTML(tmpl){
 }
 
 // ---------- state + render ----------
-const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, fleetCpu:null, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, epOwners:null, epPct:{}, epPlace:"", plcQ:"", _plc:null, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
+const S = { step:1, q:"", model:null, mode:null, spec:"none", ctx:8192, kv:"f16", np:1, reasonBudget:"", ssdGpu:false, fleetW:"record", fleetSel:null, fleetPct:{}, fleetCpu:null, specParams:{}, adv:{cachereuse:true}, advVal:{}, gateOn:{}, gateOff:{}, gateQ:"", flagSet:{}, flagQ:"", flagCut:{}, epOwners:null, epPct:{}, epPlace:"", plcQ:"", _plc:null, mmproj:"", dirs:[], mounts:[], dirsReport:null, showDirs:false, launched:0 };
 const KVQ = { f16:{mult:1, note:"exact"}, q8_0:{mult:0.53, note:"~half the KV bytes; Hadamard-rotated quant auto-enables"},
               q4_0:{mult:0.28, note:"quarter-size KV for long contexts; rotated quant auto-enables — check quality on your workload"} };
 const $ = id => document.getElementById(id);
@@ -1418,7 +1420,9 @@ function render() {
     const yarnFlags = yarnOn ? `\n--rope-scaling yarn --rope-scale ${(S.ctx/nctx).toFixed(4)} --yarn-orig-ctx ${nctx}` : "";
     const extra = (S.mmproj ? `\n--mmproj ${S.mmproj}` : "") +
                   (md.ssdGpuOpt && S.ssdGpu ? `\nLLAMA_SSD_STREAM_GPU=1 LLAMA_SSD_STREAM_VRAM_BUDGET=6000` : "") +
-                  (S.np>1 ? `\n-np ${S.np}` : "");
+                  (S.np>1 ? `\n-np ${S.np}` : "") +
+                  (m.reason && String(S.reasonBudget).trim()!=="" && !isNaN(parseInt(S.reasonBudget,10))
+                    ? `\n--reasoning-budget ${parseInt(S.reasonBudget,10)}` : "");
     const advGroups = advOptions(m, md, S.spec);
     const advFlags = advGroups.flatMap(g=>g.items)
       .filter(it=>it.input ? (S.advVal[it.id]||"").trim() : S.adv[it.id])
@@ -1449,6 +1453,10 @@ function render() {
           <span class="seg">${["f16","q8_0","q4_0"].map(k=>
             `<button data-kv="${k}" class="${S.kv===k?"on":""}">${k}</button>`).join("")}</span>
           <span class="note">${KVQ[S.kv].note}${S.kv!=="f16"?" · needs flash attention (-fa on, added)":""}</span></div>
+        ${m.reason?`<div class="kvrow"><span class="klbl">Reasoning budget</span>
+          <input id="reasonbudget" type="text" inputmode="numeric" value="${String(S.reasonBudget??"").replace(/"/g,"&quot;")}" placeholder="unlimited"
+            style="width:90px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:5px 8px">
+          <span class="note">${String(S.reasonBudget).trim()==="0"?"thinking disabled (empty think block injected)":String(S.reasonBudget).trim()!==""?`force-closes the think block after ${parseInt(S.reasonBudget,10)} tokens`:"this model thinks (template-detected) — empty = unlimited · 0 = off · N = cap think tokens"}</span></div>`:""}
         <div class="membar"><div class="used" style="width:${usedPct}%"></div><div class="kvpart" style="width:${kvPct}%"></div></div>
         <div class="memnote"><span>weights ${m.size} GiB + KV ~${kvGB.toFixed(1)} GiB @ ${S.kv}${S.np>1?` ×${S.np} slots`:""}${S.spec!=="none"?" + draft ctx":""}${S.mmproj?" + vision proj":""}</span>
         <span>${capGB} GiB available (${md.name}${specName()})</span></div>
@@ -1488,6 +1496,7 @@ function render() {
     v.querySelectorAll("[data-adv]").forEach(cb=>cb.onchange=e=>{ S.adv[cb.dataset.adv]=e.target.checked; render(); });
     v.querySelectorAll("[data-advval]").forEach(inp=>inp.onchange=e=>{ S.advVal[inp.dataset.advval]=e.target.value; render(); });
     const mpi=$("mmproj"); if (mpi) mpi.onchange=e=>{ S.mmproj=e.target.value.trim(); render(); };
+    const rbi=$("reasonbudget"); if (rbi) rbi.onchange=e=>{ S.reasonBudget=e.target.value.replace(/[^0-9-]/g,"").trim(); render(); };
     v.querySelectorAll("[data-kv]").forEach(b=>b.onclick=()=>{ S.kv=b.dataset.kv; render(); });
     v.querySelectorAll("[data-fcut]").forEach(el=>el.onclick=()=>{ S.flagCut[el.dataset.fcut]=!S.flagCut[el.dataset.fcut]; render(); });
     const gq=$("gateq");

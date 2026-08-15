@@ -238,6 +238,17 @@ static json server_model_read_gguf_meta(const std::string & path) {
         }
         meta["size_bytes"] = total;
     }
+    // reasoning support: templates that open/mention think blocks respond to
+    // --reasoning-budget and the effort/enable_thinking kwargs (some default
+    // to maximum-effort thinking and eat token budgets uncontrolled)
+    const int64_t k_tmpl = gguf_find_key(g, "tokenizer.chat_template");
+    if (k_tmpl >= 0 && gguf_get_kv_type(g, k_tmpl) == GGUF_TYPE_STRING) {
+        const std::string tmpl = gguf_get_val_str(g, k_tmpl);
+        meta["has_reasoning"] = tmpl.find("<think>")          != std::string::npos ||
+                                tmpl.find("</think>")         != std::string::npos ||
+                                tmpl.find("enable_thinking")  != std::string::npos ||
+                                tmpl.find("reasoning_effort") != std::string::npos;
+    }
     const int64_t k_arch = gguf_find_key(g, "general.architecture");
     if (k_arch >= 0) {
         const std::string arch = gguf_get_val_str(g, k_arch);
