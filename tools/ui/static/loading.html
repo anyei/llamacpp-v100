@@ -332,7 +332,10 @@
 					const badges = [];
 					if (w.attn_owner && w.split_frac) badges.push('<span class="badge score">attention owner + ' + Math.round(w.split_frac * 100) + '% experts</span>');
 					else if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
-					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
+					// #131a: the CPU expert-offload holder has no -ts fraction; and GPU -ts
+					// fractions are a VRAM plan, not where the whole model lives
+					else if (w.name === 'CPU' && !w.split_frac) badges.push('<span class="badge">expert offload (RAM)</span>');
+					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% VRAM share</span>');
 					if (cachedMib > 0) badges.push('<span class="badge score">' + (cachedMib / 1024).toFixed(1) + ' GiB cached</span>');
 					if (streamedMib > 0) badges.push('<span class="badge">' + (streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
 					// #63: coordinator-measured init time (load start -> share placed)

@@ -1210,6 +1210,13 @@ public:
             size_t compute = 0;
         };
         std::map<std::string, dev_mem_t> mem_breakdown; // device name -> composition
+        // #133: drafter contexts' buffer composition (primary + secondary), so devices
+        // that only host a drafter still get a truthful card
+        std::map<std::string, dev_mem_t> mem_breakdown_draft;
+        std::vector<std::string>         drafter_dev_names; // devices any drafter context computes on
+        // #131b: measured local-device speed (same bench the workers publish);
+        // cached per device name across loads - the bench costs seconds
+        std::map<std::string, std::pair<float,float>> local_scores; // name -> {bw_gbps, mm_gflops}
         struct beacon_t {
             std::string payload;
             int64_t     t_last_ms;
@@ -1666,6 +1673,20 @@ private:
                 ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
                 std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end(),
                 (int64_t) (free_mem / (1024 * 1024)),
+            });
+        }
+
+        // #131a: CPU expert-offload holder (ncmoe/--cpu-moe buft overrides) - a plan
+        // row so the loading page never presents the -ts fractions as the whole
+        // story; the exact byte shares replace the plan once the model is ready
+        if (!params_base.tensor_buft_overrides.empty()) {
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            size_t cpu_free = 0, cpu_total = 0;
+            if (cpu != nullptr) {
+                ggml_backend_dev_memory(cpu, &cpu_free, &cpu_total);
+            }
+            fleet.load_plan.push_back({
+                "CPU", "", 0.0, -1, false, false, (int64_t) (cpu_free / (1024 * 1024)),
             });
         }
     }
@@ -2520,14 +2541,70 @@ private:
             // TASKS.md #97: per-device composition so the fleet UI can answer
             // "what fills this device" (weights / KV / compute)
             fleet.mem_breakdown.clear();
+            // #131a: host-pinned buffer types report their GPU as the device while the
+            // bytes live in system RAM (ncmoe/--cpu-moe expert offload) - attribute
+            // host buffers to "CPU" so the roster tells the truth about residency
+            auto breakdown_holder = [](ggml_backend_buffer_type_t buft) -> std::string {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (ggml_backend_buft_is_host(buft) ||
+                    dev == nullptr ||
+                    ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    return "CPU";
+                }
+                return ggml_backend_dev_name(dev);
+            };
             if (ctx_tgt != nullptr) {
                 for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
-                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-                    const char * name = dev != nullptr ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(buft);
-                    auto & rec = fleet.mem_breakdown[name];
+                    auto & rec = fleet.mem_breakdown[breakdown_holder(buft)];
                     rec.model   += mb.model;
                     rec.context += mb.context;
                     rec.compute += mb.compute;
+                }
+            }
+
+            // #133: drafter contexts' composition + the devices they compute on, so a
+            // worker hosting only drafters still appears (and truthfully) in the roster
+            fleet.mem_breakdown_draft.clear();
+            fleet.drafter_dev_names.clear();
+            for (llama_context * cd : { ctx_dft, spec_init2 ? spec_init2->context() : nullptr }) {
+                if (cd == nullptr) {
+                    continue;
+                }
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(cd)) {
+                    const std::string name = breakdown_holder(buft);
+                    auto & rec = fleet.mem_breakdown_draft[name];
+                    rec.model   += mb.model;
+                    rec.context += mb.context;
+                    rec.compute += mb.compute;
+                    if (mb.model > 0 &&
+                        std::find(fleet.drafter_dev_names.begin(), fleet.drafter_dev_names.end(), name) == fleet.drafter_dev_names.end()) {
+                        fleet.drafter_dev_names.push_back(name);
+                    }
+                }
+            }
+
+            // #131b: measured speed for LOCAL devices (workers publish theirs already).
+            // Same bench the workers run; cached per device name - reloads skip it.
+            if (model_tgt != nullptr) {
+                std::vector<ggml_backend_dev_t> bench_devs;
+                for (int32_t i = 0, n_dev = llama_model_n_devices(model_tgt); i < n_dev; ++i) {
+                    bench_devs.push_back(llama_model_get_device(model_tgt, i));
+                }
+                bench_devs.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+                for (ggml_backend_dev_t dev : bench_devs) {
+                    if (dev == nullptr) {
+                        continue;
+                    }
+                    const char * name = ggml_backend_dev_name(dev);
+                    // RPC devices report their own worker-side score
+                    if (strncmp(name, "RPC", 3) == 0 || fleet.local_scores.count(name) > 0) {
+                        continue;
+                    }
+                    float bw = 0.0f, fl = 0.0f;
+                    if (ggml_backend_rpc_benchmark_device(dev, &bw, &fl)) {
+                        fleet.local_scores[name] = { bw, fl };
+                        SRV_INF("local device score: %s = %.1f GB/s, %.1f GFLOPS\n", name, bw, fl);
+                    }
                 }
             }
         }
@@ -6129,12 +6206,18 @@ void server_routes::init_routes() {
         size_t  perf_window_n = 0;
         int64_t perf_n_tokens = 0;
         double  perf_t_gen_ms = 0.0;
+        std::map<std::string, server_context_impl::fleet_state_t::dev_mem_t> mem_breakdown_draft;
+        std::vector<std::string> drafter_dev_names;
+        std::map<std::string, std::pair<float,float>> local_scores;
         {
             std::lock_guard<std::mutex> lock(fleet.mutex);
             for (const auto & d : fleet.layer_map) {
                 layer_map[d.name] = d.n_layers;
             }
-            mem_breakdown    = fleet.mem_breakdown;
+            mem_breakdown       = fleet.mem_breakdown;
+            mem_breakdown_draft = fleet.mem_breakdown_draft;
+            drafter_dev_names   = fleet.drafter_dev_names;
+            local_scores        = fleet.local_scores;
             beacons          = fleet.discovered;
             load_stage       = fleet.load_stage;
             load_model_name  = fleet.load_model_name;
@@ -6166,6 +6249,20 @@ void server_routes::init_routes() {
         std::set<std::string> pipeline_eps;
         json devices = json::array();
         if (ready) {
+            // #131a: truthful shares - total model bytes across ALL holders (incl CPU bufts)
+            size_t model_bytes_total = 0;
+            for (const auto & mb : mem_breakdown) {
+                model_bytes_total += mb.second.model;
+            }
+            auto model_frac_of = [&](const std::string & name) -> json {
+                auto it = mem_breakdown.find(name);
+                return (model_bytes_total > 0 && it != mem_breakdown.end())
+                    ? json((double) it->second.model / (double) model_bytes_total) : json(nullptr);
+            };
+            auto is_drafter_dev = [&](const std::string & name) {
+                return std::find(drafter_dev_names.begin(), drafter_dev_names.end(), name) != drafter_dev_names.end();
+            };
+            std::set<std::string> emitted;
             const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params);
             double ts_sum = 0.0;
             for (size_t i = 0; i < devs.size() && i < llama_max_devices(); ++i) {
@@ -6235,6 +6332,8 @@ void server_routes::init_routes() {
                     {"memory_free_mib",  free_mem  / (1024 * 1024)},
                     {"memory_total_mib", total_mem / (1024 * 1024)},
                     {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
+                    {"model_frac",       model_frac_of(ggml_backend_dev_name(dev))},
+                    {"role",             is_drafter_dev(ggml_backend_dev_name(dev)) ? "target+drafter" : "target"},
                     {"attn_owner",       std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end()},
                     {"n_layers",         nullptr},
                     {"stats",            nullptr},
@@ -6242,6 +6341,13 @@ void server_routes::init_routes() {
                     {"timing",           nullptr},
                     {"init_ms",          init_ms_of(is_rpc ? ep : ggml_backend_dev_name(dev))},
                 };
+                emitted.insert(ggml_backend_dev_name(dev));
+                if (!is_rpc) {
+                    auto sit = local_scores.find(ggml_backend_dev_name(dev));
+                    if (sit != local_scores.end()) {
+                        d["score"] = { {"bw_gbps", sit->second.first}, {"mm_gflops", sit->second.second} };
+                    }
+                }
                 auto lit = layer_map.find(ggml_backend_dev_name(dev));
                 if (lit != layer_map.end()) {
                     d["n_layers"] = lit->second;
@@ -6253,6 +6359,10 @@ void server_routes::init_routes() {
                         {"context_mib", mit->second.context / (1024 * 1024)},
                         {"compute_mib", mit->second.compute / (1024 * 1024)},
                     };
+                }
+                auto dmit = mem_breakdown_draft.find(ggml_backend_dev_name(dev));
+                if (dmit != mem_breakdown_draft.end()) {
+                    d["drafter_model_mib"] = dmit->second.model / (1024 * 1024);
                 }
                 if (is_rpc) {
                     pipeline_eps.insert(ep);
@@ -6292,6 +6402,86 @@ void server_routes::init_routes() {
                     }
                 }
                 devices.push_back(std::move(d));
+            }
+
+            // #131a: CPU-offload holder row - under ncmoe/eplocal the CPU holds real model
+            // bytes (mem_breakdown catches every buffer type) but is absent from the
+            // target's device list; give it a truthful card
+            // #133: devices that host ONLY a drafter (e.g. a remote worker pinned via
+            // --spec-draft-device) get a role="drafter" card
+            {
+                std::vector<std::string> extra;
+                for (const auto & mb : mem_breakdown) {
+                    if (mb.second.model > 0 && emitted.count(mb.first) == 0) {
+                        extra.push_back(mb.first);
+                    }
+                }
+                for (const auto & name : drafter_dev_names) {
+                    if (emitted.count(name) == 0 &&
+                        std::find(extra.begin(), extra.end(), name) == extra.end()) {
+                        extra.push_back(name);
+                    }
+                }
+                for (const auto & name : extra) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+                    const char * ep     = dev != nullptr && procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
+                    const bool   is_rpc = ep != nullptr;
+                    size_t free_mem = 0, total_mem = 0;
+                    if (dev != nullptr) {
+                        fleet_dev_memory_cached(dev, is_rpc, &free_mem, &total_mem);
+                    }
+                    const bool holds_target = mem_breakdown.count(name) > 0 && mem_breakdown.at(name).model > 0;
+                    json d = {
+                        {"name",             name},
+                        {"description",      dev != nullptr ? ggml_backend_dev_description(dev) : "buffer host"},
+                        {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
+                        {"is_rpc",           is_rpc},
+                        {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && dev != nullptr && procs.dev_worker_is_cpu(dev)},
+                        {"reachable",        true},
+                        {"failed",           false},
+                        {"health",           "healthy"},
+                        {"failure_count",    nullptr},
+                        {"memory_free_mib",  free_mem  / (1024 * 1024)},
+                        {"memory_total_mib", total_mem / (1024 * 1024)},
+                        {"split_frac",       nullptr},
+                        {"model_frac",       model_frac_of(name)},
+                        {"role",             holds_target ? (is_drafter_dev(name) ? "target+drafter" : "target")
+                                                          : "drafter"},
+                        {"attn_owner",       false},
+                        {"n_layers",         nullptr},
+                        {"stats",            nullptr},
+                        {"score",            nullptr},
+                        {"timing",           nullptr},
+                        {"init_ms",          nullptr},
+                    };
+                    if (is_rpc) {
+                        std::string payload;
+                        for (const auto & [bep, b] : beacons) {
+                            if (bep == ep) { payload = b.payload; break; }
+                        }
+                        if (auto score = fleet_worker_score(ep, payload, false)) {
+                            d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                        }
+                    } else {
+                        auto sit = local_scores.find(name);
+                        if (sit != local_scores.end()) {
+                            d["score"] = { {"bw_gbps", sit->second.first}, {"mm_gflops", sit->second.second} };
+                        }
+                    }
+                    auto mit = mem_breakdown.find(name);
+                    if (mit != mem_breakdown.end()) {
+                        d["memory_breakdown"] = {
+                            {"model_mib",   mit->second.model   / (1024 * 1024)},
+                            {"context_mib", mit->second.context / (1024 * 1024)},
+                            {"compute_mib", mit->second.compute / (1024 * 1024)},
+                        };
+                    }
+                    auto dmit = mem_breakdown_draft.find(name);
+                    if (dmit != mem_breakdown_draft.end()) {
+                        d["drafter_model_mib"] = dmit->second.model / (1024 * 1024);
+                    }
+                    devices.push_back(std::move(d));
+                }
             }
         }
 

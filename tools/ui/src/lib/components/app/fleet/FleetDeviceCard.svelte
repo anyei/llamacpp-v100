@@ -67,9 +67,17 @@
 		device.memory_total_mib > 0 ? (memoryUsedMib / device.memory_total_mib) * 100 : 0
 	);
 
+	// #131a roster truth: prefer the MEASURED model-bytes share (covers CPU-offload
+	// modes where -ts fractions lie about where the model actually lives); fall back
+	// to the planned split fraction when the measurement is absent
 	let splitPercent = $derived(
-		typeof device.split_frac === 'number' ? Math.round(device.split_frac * 100) : null
+		typeof device.model_frac === 'number'
+			? Math.round(device.model_frac * 100)
+			: typeof device.split_frac === 'number'
+				? Math.round(device.split_frac * 100)
+				: null
 	);
+	let shareIsMeasured = $derived(typeof device.model_frac === 'number');
 
 	let latencyMs = $derived(device.stats ? (device.stats.ewma_latency_us / 1000).toFixed(1) : null);
 
@@ -175,8 +183,20 @@
 			{/if}
 
 			{#if device.score}
-				<Badge variant="outline" class="text-[10px]" title="measured memory bandwidth (worker --score)">
+				<Badge variant="outline" class="text-[10px]" title="measured memory bandwidth (worker --score / local bench)">
 					{device.score.bw_gbps.toFixed(1)} GB/s
+				</Badge>
+			{/if}
+
+			{#if device.role && device.role !== 'target'}
+				<Badge
+					variant="outline"
+					class="text-[10px]"
+					title={device.role === 'drafter'
+						? 'hosts a speculative drafter only - no target layers'
+						: 'hosts target layers AND a speculative drafter'}
+				>
+					{device.role}
 				</Badge>
 			{/if}
 
@@ -234,7 +254,12 @@
 			>
 				weights {(mb.model_mib / 1024).toFixed(1)} · KV {(mb.context_mib / 1024).toFixed(1)} · compute
 				{(mb.compute_mib / 1024).toFixed(1)}
+				{device.drafter_model_mib ? ` · drafter ${(device.drafter_model_mib / 1024).toFixed(1)}` : ''}
 				{otherMib > 512 ? ` · other ${(otherMib / 1024).toFixed(1)}` : ''} GiB
+			</div>
+		{:else if device.drafter_model_mib}
+			<div class="text-[10px] text-muted-foreground" title="speculative drafter weights hosted on this device">
+				drafter {(device.drafter_model_mib / 1024).toFixed(1)} GiB
 			</div>
 		{/if}
 	</div>
@@ -248,7 +273,9 @@
 						? 'attention owner'
 						: null,
 				device.n_layers != null ? `${device.n_layers} layers` : null,
-				!device.attn_owner && splitPercent !== null ? `${splitPercent}%` : null
+				!device.attn_owner && splitPercent !== null
+					? `${splitPercent}%${shareIsMeasured ? ' of weights' : ' planned'}`
+					: null
 			]
 				.filter(Boolean)
 				.join(' · ')}

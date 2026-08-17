@@ -54,6 +54,13 @@ export interface ApiFleetDevice {
 	memory_breakdown?: ApiFleetDeviceMemBreakdown | null;
 	/** Share of the model split assigned to this device (0..1). */
 	split_frac?: number | null;
+	/** MEASURED share of the model's bytes resident on this device (0..1) - the
+	 * truthful number under CPU-offload modes where split_frac lies (#131). */
+	model_frac?: number | null;
+	/** What the device hosts: target layers, a speculative drafter, or both (#133). */
+	role?: 'target' | 'drafter' | 'target+drafter';
+	/** Speculative drafter weights resident on this device, MiB (#133). */
+	drafter_model_mib?: number | null;
 	/** EP dedicated-attention owner: holds attention/KV/router, takes no expert share. */
 	attn_owner?: boolean;
 	n_layers?: number | null;

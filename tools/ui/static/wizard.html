@@ -397,6 +397,10 @@ const draftMatches = (d, m) => {
 // guard also stops RAW-schema exports (unloadable, draft-named) from pairing.
 const dflashFor = m => DRAFTS.find(d => d.arch==="dflash" && !d.dspark && draftMatches(d, m));
 const dsparkFor = m => DRAFTS.find(d => d.arch==="dflash" &&  d.dspark && draftMatches(d, m));
+// TASKS #125: a HEAD-FILE MTP drafter - a draft-kind gguf that carries a real
+// nextn head (has_mtp) for a target whose own gguf shipped without one (the
+// V4-0731 production case, head extracted per #124)
+const mtpHeadFor = m => DRAFTS.find(d => d.mtp && d.arch!=="dflash" && draftMatches(d, m));
 
 // ---------- mode catalog + fit + speculation logic ----------
 // specs: which speculation routes exist for (model, mode) and what we know about them.
@@ -412,6 +416,19 @@ function specOptions(m, modeId) {
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:3, min:1, max:8, step:1},
             {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05}],
     flags:"--spec-type draft-mtp\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
+  // TASKS #125: head-FILE MTP - the target gguf shipped without its nextn head but a
+  // matching extracted-head draft file exists in the catalog (#124 export)
+  const mh = !m.mtp ? mtpHeadFor(m) : null;
+  if (mh) opts.push({ id:"mtph", name:"MTP speculation (head file)", est:true,
+    sub:`head: ${mh.file} - extracted nextn head driven by the target trunk (#124)`,
+    params:[{key:"nmax", flag:"--spec-draft-n-max", def:3, min:1, max:8, step:1},
+            {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05},
+            {key:"dev", flag:"--spec-draft-device", def:"CUDA0", text:true,
+             note:"pin the head; auto RPC0 when a remote worker is set"},
+            {key:"rpcep", flag:"(remote worker)", def:"", text:true,
+             note:"host:port of an RPC worker to host the head off-box (#132) - empty = local"}],
+    inbox: modeId!=="fleet" && modeId!=="fleetl",
+    flags:`--spec-type draft-mtp --model-draft ${mh.path} --n-gpu-layers-draft 99\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1` });
   // dflash drafts are small dense models - they fit VRAM even when the target
   // runs with its experts offloaded to CPU (-ncmoe), so offer it there too
   const d = dflashFor(m);
