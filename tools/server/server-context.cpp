@@ -5047,6 +5047,13 @@ private:
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                // LLAMA_SPEC_ALT_STATS (#132): on a rejection, score the drafter's runner-up
+                // choices at the rejected position. Replay rounds re-verify already-accepted
+                // tokens and carry no fresh draft, so they must not be scored.
+                if (n_rollback > 0 && !slot.spec_replay) {
+                    common_speculative_alt_stats_verify(slot.id, accepted.size() - 1, accepted.back());
+                }
+
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));

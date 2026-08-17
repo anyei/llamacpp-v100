@@ -14,11 +14,82 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <cinttypes>
+
+// LLAMA_SPEC_ALT_STATS=1 (#132): bound the upside of multi-candidate/tree speculation
+// before building it. The drafter sampling loops capture each drafted position's
+// runner-up candidates; the server's verify site reports every rejection through
+// common_speculative_alt_stats_verify(), which scores whether the drafter's 2nd or
+// 3rd choice was the target's actual pick. Value-parsed gate: =0 is off.
+static bool spec_alt_enabled() {
+    static const bool en = [] {
+        const char * v = getenv("LLAMA_SPEC_ALT_STATS");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
+struct spec_alt_registry {
+    std::mutex mu;
+    std::map<llama_seq_id, std::vector<std::array<llama_token, 2>>> alts;
+    std::atomic<uint64_t> n_reject{0};
+    std::atomic<uint64_t> n_alt1{0};
+    std::atomic<uint64_t> n_alt2{0};
+};
+static spec_alt_registry g_spec_alt;
+
+static void spec_alt_begin(llama_seq_id seq_id) {
+    if (!spec_alt_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_spec_alt.mu);
+    g_spec_alt.alts[seq_id].clear();
+}
+
+static void spec_alt_push(llama_seq_id seq_id, const llama_token_data_array * cur_p) {
+    if (!spec_alt_enabled()) {
+        return;
+    }
+    std::array<llama_token, 2> alt = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    if (cur_p->size > 1) { alt[0] = cur_p->data[1].id; }
+    if (cur_p->size > 2) { alt[1] = cur_p->data[2].id; }
+    std::lock_guard<std::mutex> lock(g_spec_alt.mu);
+    g_spec_alt.alts[seq_id].push_back(alt);
+}
+
+void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok) {
+    if (!spec_alt_enabled()) {
+        return;
+    }
+    std::array<llama_token, 2> alt = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    {
+        std::lock_guard<std::mutex> lock(g_spec_alt.mu);
+        auto it = g_spec_alt.alts.find(seq_id);
+        if (it == g_spec_alt.alts.end() || i_rej >= it->second.size()) {
+            return; // draft did not come from an instrumented loop (or was reshaped) - skip
+        }
+        alt = it->second[i_rej];
+    }
+    const uint64_t nr = g_spec_alt.n_reject.fetch_add(1) + 1;
+    if (tgt_tok != LLAMA_TOKEN_NULL && tgt_tok == alt[0]) {
+        g_spec_alt.n_alt1.fetch_add(1);
+    } else if (tgt_tok != LLAMA_TOKEN_NULL && tgt_tok == alt[1]) {
+        g_spec_alt.n_alt2.fetch_add(1);
+    }
+    if (nr == 1 || nr % 16 == 0) {
+        const uint64_t a1 = g_spec_alt.n_alt1.load();
+        const uint64_t a2 = g_spec_alt.n_alt2.load();
+        LOG_INF("SPEC_ALT: rejects %" PRIu64 ", alt1 %" PRIu64 " (%.3f), alt2 %" PRIu64 " (%.3f), alt1+2 %.3f\n",
+                nr, a1, (double) a1 / nr, a2, (double) a2 / nr, (double) (a1 + a2) / nr);
+    }
+}
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -327,6 +398,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            spec_alt_begin(seq_id);
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
         }
@@ -386,6 +458,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
+                spec_alt_push(seq_id, cur_p);
                 result.push_back(id);
 
                 if ((adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) ||
@@ -860,6 +933,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
+                spec_alt_push(seq_id, cur_p);
                 result.push_back(id);
 
                 if (adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) {
@@ -1196,6 +1270,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             common_sampler_reset(smpls[seq_id].get());
+            spec_alt_begin(seq_id);
 
             const int32_t n = (int32_t) dp.n_past;
 
@@ -1265,6 +1340,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     common_sampler_accept(smpl, id, true);
 
+                    spec_alt_push(seq_id, cur_p);
                     result.push_back(id);
                 }
             } else {
@@ -1286,6 +1362,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     common_sampler_accept(smpl, id, true);
 
+                    spec_alt_push(seq_id, cur_p);
                     result.push_back(id);
                 }
             }
@@ -1605,6 +1682,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            spec_alt_begin(seq_id);
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1688,6 +1766,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
+                spec_alt_push(seq_id, cur_p);
                 result.push_back(id);
 
                 if (adaptive_n_max(params.n_min, params.n_max) <= (int) result.size()) {

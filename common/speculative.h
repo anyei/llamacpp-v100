@@ -70,6 +70,11 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// LLAMA_SPEC_ALT_STATS=1 instrument (#132): score the drafter's runner-up candidates at a
+// rejected draft position. i_rej indexes the draft, tgt_tok is the target's actual pick there.
+// No-op unless the env gate is set; capture happens inside the drafter sampling loops.
+void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
