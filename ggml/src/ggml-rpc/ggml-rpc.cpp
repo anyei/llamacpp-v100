@@ -2678,8 +2678,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_UID, input.data(), input.size());
             if (status) {
                 // client tracking cap must stay below the server cache cap so a
-                // remembered uid is never a server-side miss
-                constexpr size_t max_sent_uids = RPC_GRAPH_UID_CACHE_CAP/2;
+                // remembered uid is never a server-side miss. The server cache is
+                // shared by EVERY local context computing on that device (#132: dual
+                // drafters put two draft contexts on one worker), so the per-context
+                // cap must leave room for peers: /8 keeps the sum under the server
+                // cap for up to 8 sharing contexts. An evicted client uid merely
+                // re-uploads; a server-side miss kills the connection.
+                constexpr size_t max_sent_uids = RPC_GRAPH_UID_CACHE_CAP/8;
                 rpc_dev_ctx->sent_graph_uids.insert(cgraph->uid);
                 rpc_dev_ctx->sent_graph_uids_order.push_back(cgraph->uid);
                 if (rpc_dev_ctx->sent_graph_uids_order.size() > max_sent_uids) {
