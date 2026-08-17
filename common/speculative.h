@@ -80,6 +80,14 @@ void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llam
 // spare sequence, rescuing first-position rejections. Value-parsed gate, off by default.
 bool common_speculative_tree_enabled();
 
+// #132 inc 2: re-process specific rows of the just-decoded target batch as seq_id's rows.
+// Spec-tree branch rows carry a foreign sequence tag, so the normal process() pass skips
+// them; after a branch acceptance the drafter's mirrored/injected state for those positions
+// is rebuilt from these rows. `rows` are ascending batch indices into batch_in, which must
+// be the batch of the MOST RECENT target decode (feature-conditioned drafters read the
+// target's per-row extraction buffers).
+bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows);
+
 // the drafter's runner-up candidate for draft position i of seq_id's most recent draft, or
 // LLAMA_TOKEN_NULL when unavailable / the capture is misaligned (n_draft must match the
 // captured draft length).

@@ -2169,17 +2169,20 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // spec tree (#132): reserve one spare branch sequence per slot. v1 requires a
-        // stateless drafter (draft-simple only) - feature-conditioned drafters keep
-        // per-verify-row target state that branch rows would corrupt - and no PEARL.
+        // spec tree (#132): reserve one spare branch sequence per slot. Supported rosters:
+        // draft-simple (mirror heal = token re-decode) and dspark/dflash (heal = the
+        // encode+inject path over the branch rows, whose accept() carries no state).
+        // mtp/eagle3 keep accepted-count-indexed deferred state and stay excluded. No PEARL.
         spec_tree_active = false;
         if (common_speculative_tree_enabled()) {
-            bool only_simple = false;
+            bool roster_ok = false;
             for (const auto t : params_base.speculative.types) {
-                if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) {
-                    only_simple = true;
+                if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                    roster_ok = true;
                 } else if (t != COMMON_SPECULATIVE_TYPE_NONE) {
-                    only_simple = false;
+                    roster_ok = false;
                     break;
                 }
             }
@@ -2187,12 +2190,12 @@ private:
             if (!params_base.kv_unified) {
                 // branch prefix sharing needs ranged seq_cp, which split KV buffers do not support
                 SRV_WRN("%s", "LLAMA_SPEC_TREE requires --kv-unified - tree disabled\n");
-            } else if (only_simple && !pearl_on) {
+            } else if (roster_ok && !pearl_on) {
                 spec_tree_active = true;
                 params_base.n_seq_extra = params_base.n_parallel;
-                SRV_INF("spec tree enabled: %d branch seq(s) reserved (draft-simple roster)\n", params_base.n_seq_extra);
+                SRV_INF("spec tree enabled: %d branch seq(s) reserved\n", params_base.n_seq_extra);
             } else {
-                SRV_WRN("%s", "LLAMA_SPEC_TREE set but roster is not draft-simple-only (or PEARL is on) - tree disabled\n");
+                SRV_WRN("%s", "LLAMA_SPEC_TREE set but roster is not simple/dspark/dflash-only (or PEARL is on) - tree disabled\n");
             }
         }
 
@@ -5216,17 +5219,16 @@ private:
                         llama_memory_seq_cp(mem_tgt, slot.seq_branch, slot.id,
                                             slot.spec_tree_pos0 + 1, slot.spec_tree_pos0 + 1 + (llama_pos) n_keep);
 
-                        // heal the drafter mirror: it ingested the (rejected) main draft tokens at
-                        // these positions; feed it the accepted branch tokens instead
+                        // heal the drafter: its mirror/injection covered the (rejected) main
+                        // draft rows at these positions; rebuild from the accepted branch rows.
+                        // note: row indices assume the round decoded in a single batch view -
+                        // the same assumption the spec sampling path itself makes.
                         if (slot.ctx_dft && n_keep > 0) {
-                            llama_batch heal = llama_batch_init((int32_t) n_keep, 0, 1);
-                            for (size_t k = 0; k < n_keep; ++k) {
-                                common_batch_add(heal, br[k], slot.spec_tree_pos0 + 1 + (llama_pos) k, { slot.id }, false);
+                            const std::vector<int32_t> rows(slot.spec_tree_i_batch.begin(),
+                                                            slot.spec_tree_i_batch.begin() + n_keep);
+                            if (!common_speculative_process_rows(spec.get(), batch.batch, slot.id, rows)) {
+                                SLT_WRN(slot, "%s", "spec tree: drafter heal failed - drafter state may drift\n");
                             }
-                            if (!common_speculative_process(spec.get(), heal)) {
-                                SLT_WRN(slot, "%s", "spec tree: drafter heal decode failed - drafter state may drift\n");
-                            }
-                            llama_batch_free(heal);
                         }
 
                         spec_tree_stats.taken++;

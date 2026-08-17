@@ -289,6 +289,22 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // #132: re-process specific batch_in rows as seq_id's rows (spec-tree branch heal).
+    // Default: re-decode the rows' tokens through process() - correct for stateless
+    // drafters whose mirror is a plain token decode. Feature-conditioned impls override.
+    virtual bool process_rows(const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows) {
+        if (rows.empty()) {
+            return true;
+        }
+        llama_batch sub = llama_batch_init((int32_t) rows.size(), 0, 1);
+        for (const int32_t r : rows) {
+            common_batch_add(sub, batch_in.token[r], batch_in.pos[r], { seq_id }, false);
+        }
+        const bool ok = process(sub);
+        llama_batch_free(sub);
+        return ok;
+    }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1268,6 +1284,86 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+            }
+        }
+
+        return true;
+    }
+
+    // #132 inc 2: spec-tree branch heal - same encode+inject flow as process(), but over an
+    // explicit row list (branch rows carry a foreign seq tag and were skipped by process()).
+    // The target's per-row extraction buffers still hold the verify decode's rows.
+    bool process_rows(const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows) override {
+        if (rows.empty()) {
+            return true;
+        }
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return true;
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_rows   = (int32_t) rows.size();
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        // drop stale decoder cells from the first healed position on (process()'s rule:
+        // the decoder must hold exactly one injected target state per token)
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, batch_in.pos[rows[0]], -1);
+
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+            features_buf.resize((size_t) n_chunk * n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) rows[offset + i] * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: heal llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                batch_inject.pos[i]       = batch_in.pos[rows[offset + i]];
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_id;
+                batch_inject.logits[i]    = false;
+            }
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: heal llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
             }
         }
 
@@ -2768,6 +2864,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_rows(batch_in, seq_id, rows);
     }
 
     return result;
