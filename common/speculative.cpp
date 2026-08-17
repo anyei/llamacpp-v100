@@ -28,12 +28,21 @@
 // runner-up candidates; the server's verify site reports every rejection through
 // common_speculative_alt_stats_verify(), which scores whether the drafter's 2nd or
 // 3rd choice was the target's actual pick. Value-parsed gate: =0 is off.
+bool common_speculative_tree_enabled() {
+    static const bool en = [] {
+        const char * v = getenv("LLAMA_SPEC_TREE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return en;
+}
+
 static bool spec_alt_enabled() {
     static const bool en = [] {
         const char * v = getenv("LLAMA_SPEC_ALT_STATS");
         return v != nullptr && atoi(v) != 0;
     }();
-    return en;
+    // the tree feature consumes the same runner-up capture
+    return en || common_speculative_tree_enabled();
 }
 
 struct spec_alt_registry {
@@ -62,6 +71,18 @@ static void spec_alt_push(llama_seq_id seq_id, const llama_token_data_array * cu
     if (cur_p->size > 2) { alt[1] = cur_p->data[2].id; }
     std::lock_guard<std::mutex> lock(g_spec_alt.mu);
     g_spec_alt.alts[seq_id].push_back(alt);
+}
+
+llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_draft) {
+    if (!spec_alt_enabled()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    std::lock_guard<std::mutex> lock(g_spec_alt.mu);
+    auto it = g_spec_alt.alts.find(seq_id);
+    if (it == g_spec_alt.alts.end() || it->second.size() != n_draft || i >= it->second.size()) {
+        return LLAMA_TOKEN_NULL; // no capture, or the served draft was reshaped after capture
+    }
+    return it->second[i][0];
 }
 
 void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok) {
@@ -2471,6 +2492,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
+    result.n_seq_extra   = 0; // spec-tree branch seqs (#132) are target-only
 
     return result;
 }
@@ -2506,6 +2528,8 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+    // spec-tree branch seqs (#132) live only in the target context
+    cparams.n_seq_max = params.n_parallel;
 
     std::string model_path;
     if (has_draft) {

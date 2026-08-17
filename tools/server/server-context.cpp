@@ -21,6 +21,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <cinttypes>
@@ -40,6 +41,14 @@ static char ** environ = nullptr; // no env capture on Windows
 #endif
 
 static json speculative_info(const common_params & params); // TASKS #100
+
+// spec tree (#132) counters: armed rounds, branches taken, tokens banked beyond
+// what a plain rejection would have banked
+static struct {
+    std::atomic<uint64_t> rounds_armed{0};
+    std::atomic<uint64_t> taken{0};
+    std::atomic<uint64_t> tok_extra{0};
+} spec_tree_stats;
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -110,7 +119,11 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    if (common_speculative_tree_enabled()) {
+        // spec tree (#132): the branch rows add up to n_max more output rows per slot
+        n_outputs_per_seq += common_speculative_n_max(&params.speculative);
+    }
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
@@ -253,6 +266,16 @@ struct server_slot {
     // after a checkpoint restore [TAG_SPEC_AVOID_DRAFT_REEVAL]. They are not a draft: they are
     // accepted by construction and must not enter the acceptance statistics.
     bool spec_replay = false;
+
+    // spec tree (#132, LLAMA_SPEC_TREE=1): one alt branch per verify round - the drafter's
+    // runner-up at draft position 0 plus the shared continuation, on a spare sequence.
+    // Continuation reuse is exact for anchor-conditioned block drafters and merely
+    // conservative otherwise; verification remains the arbiter either way.
+    bool                 spec_tree_on   = false;            // gate resolved at init (env + drafter type)
+    llama_seq_id         seq_branch     = -1;               // this slot's spare branch sequence
+    llama_token          spec_tree_alt  = LLAMA_TOKEN_NULL; // armed branch root, NULL = not armed
+    llama_pos            spec_tree_pos0 = -1;               // position of this round's anchor (sampled) token
+    std::vector<int32_t> spec_tree_i_batch;                 // logits rows: [alt, cont..., last=bonus source]
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -557,6 +580,42 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true);
+            }
+
+            // spec tree (#132): arm one alt branch on the spare sequence - a duplicated
+            // anchor row plus [alt, continuation...] rows parallel to the main draft
+            // positions. The prefix is exposed to the branch seq via seq_cp; main draft
+            // rows stay on the slot seq only, so the branches cannot contaminate each
+            // other. Replay rounds carry no fresh draft and are never armed.
+            spec_tree_alt = LLAMA_TOKEN_NULL;
+            spec_tree_i_batch.clear();
+            if (spec_tree_on && seq_branch >= 0 && !spec_replay && !spec_draft.empty()) {
+                const llama_token alt = common_speculative_get_alt1(id, 0, spec_draft.size());
+                if (alt != LLAMA_TOKEN_NULL && alt != spec_draft[0]) {
+                    const llama_pos pos_a = prompt.tokens.pos_next(); // anchor (sampled) position
+                    auto * mem_tgt = llama_get_memory(ctx_tgt);
+                    llama_memory_seq_rm(mem_tgt, seq_branch, -1, -1);       // stale-cell safety
+                    llama_memory_seq_cp(mem_tgt, id, seq_branch, 0, pos_a); // expose the prefix
+
+                    bool br_ok = true;
+                    br_ok &= batch.add(seq_branch, sampled, pos_a, false);  // duplicated anchor row
+                    llama_pos pos_b = pos_a + 1;
+                    spec_tree_i_batch.push_back(batch.size());
+                    br_ok &= batch.add(seq_branch, alt, pos_b++, true);
+                    for (size_t i = 1; i < spec_draft.size(); i++) {
+                        spec_tree_i_batch.push_back(batch.size());
+                        br_ok &= batch.add(seq_branch, spec_draft[i], pos_b++, true);
+                    }
+
+                    if (br_ok) {
+                        spec_tree_alt  = alt;
+                        spec_tree_pos0 = pos_a;
+                    } else {
+                        // batch full - disarm cleanly; nothing consumes the partial rows
+                        spec_tree_i_batch.clear();
+                        llama_memory_seq_rm(mem_tgt, seq_branch, -1, -1);
+                    }
+                }
             }
         }
 
@@ -1297,6 +1356,9 @@ private:
     // use server_context methods instead
 
     common_params params_base;
+
+    // spec tree (#132): resolved at load (env + draft-simple-only roster + no PEARL)
+    bool spec_tree_active = false;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -2107,6 +2169,33 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // spec tree (#132): reserve one spare branch sequence per slot. v1 requires a
+        // stateless drafter (draft-simple only) - feature-conditioned drafters keep
+        // per-verify-row target state that branch rows would corrupt - and no PEARL.
+        spec_tree_active = false;
+        if (common_speculative_tree_enabled()) {
+            bool only_simple = false;
+            for (const auto t : params_base.speculative.types) {
+                if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) {
+                    only_simple = true;
+                } else if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+                    only_simple = false;
+                    break;
+                }
+            }
+            const bool pearl_on = getenv("LLAMA_SPEC_PEARL") != nullptr && atoi(getenv("LLAMA_SPEC_PEARL")) != 0;
+            if (!params_base.kv_unified) {
+                // branch prefix sharing needs ranged seq_cp, which split KV buffers do not support
+                SRV_WRN("%s", "LLAMA_SPEC_TREE requires --kv-unified - tree disabled\n");
+            } else if (only_simple && !pearl_on) {
+                spec_tree_active = true;
+                params_base.n_seq_extra = params_base.n_parallel;
+                SRV_INF("spec tree enabled: %d branch seq(s) reserved (draft-simple roster)\n", params_base.n_seq_extra);
+            } else {
+                SRV_WRN("%s", "LLAMA_SPEC_TREE set but roster is not draft-simple-only (or PEARL is on) - tree disabled\n");
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -2276,6 +2365,9 @@ private:
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+            slot.spec_tree_on = spec_tree_active;
+            slot.seq_branch   = spec_tree_active ? (llama_seq_id) (params_base.n_parallel + i) : -1;
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -4867,10 +4959,45 @@ private:
         // PEARL: the ahead worker must be done with ctx_dft before the mirror below
         spec_ahead.join();
 
+        // spec tree (#132): strip branch-seq rows before the drafter mirror - the draft
+        // context's sequence space does not include the branch ids, and the branch rows
+        // are target-verify-only by design
+        std::vector<llama_token>    mtok;
+        std::vector<llama_pos>      mpos;
+        std::vector<int32_t>        mnseq;
+        std::vector<llama_seq_id *> mseqp;
+        std::vector<llama_seq_id>   mseq;
+        std::vector<int8_t>         mlog;
+        llama_batch batch_mirror = batch_view;
+        if (spec_tree_active) {
+            const int32_t n = batch_view.n_tokens;
+            mtok.reserve(n); mpos.reserve(n); mnseq.reserve(n); mseq.reserve(n); mlog.reserve(n);
+            for (int32_t i = 0; i < n; ++i) {
+                if (batch_view.seq_id[i][0] >= (llama_seq_id) params_base.n_parallel) {
+                    continue;
+                }
+                mtok.push_back(batch_view.token[i]);
+                mpos.push_back(batch_view.pos[i]);
+                mnseq.push_back(1);
+                mseq.push_back(batch_view.seq_id[i][0]);
+                mlog.push_back(batch_view.logits ? batch_view.logits[i] : 0);
+            }
+            mseqp.resize(mseq.size());
+            for (size_t i = 0; i < mseq.size(); ++i) {
+                mseqp[i] = &mseq[i];
+            }
+            batch_mirror.n_tokens = (int32_t) mtok.size();
+            batch_mirror.token    = mtok.data();
+            batch_mirror.pos      = mpos.data();
+            batch_mirror.n_seq_id = mnseq.data();
+            batch_mirror.seq_id   = mseqp.data();
+            batch_mirror.logits   = mlog.data();
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!common_speculative_process(spec.get(), batch_mirror)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -5058,8 +5185,82 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
+                // spec tree (#132): a first-position rejection whose target sample equals the
+                // armed alt continues along the branch rows instead of ending the round. The
+                // sampler chain is already in the correct state (prefix + alt accepted by the
+                // main walk); the branch rows supply the logits for the continuation samples.
+                if (slot.spec_tree_alt != LLAMA_TOKEN_NULL) {
+                    spec_tree_stats.rounds_armed++;
+                    if (!use_ckpt_tgt && accepted.size() == 1 && accepted.back() == slot.spec_tree_alt) {
+                        const size_t n = slot.spec_draft.size();
+                        GGML_ASSERT(slot.spec_tree_i_batch.size() == n);
+
+                        std::vector<llama_token> br = { accepted.back() };
+                        size_t n_keep = 1; // branch cells to graft: alt + matched continuations
+                        size_t j = 1;
+                        while (true) {
+                            const llama_token tok = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_tree_i_batch[j - 1], false);
+                            common_sampler_accept(slot.smpl.get(), tok, true);
+                            br.push_back(tok);
+                            if (j >= n || tok != slot.spec_draft[j]) {
+                                break; // final token: continuation mismatch, or the bonus after a full match
+                            }
+                            n_keep++;
+                            j++;
+                        }
+
+                        // KV surgery: drop the rejected main draft cells (target + drafter via the
+                        // wrapper), graft the accepted branch cells into the slot sequence
+                        auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                        slot.mem.seq_rm(slot.id, slot.spec_tree_pos0 + 1, -1);
+                        llama_memory_seq_cp(mem_tgt, slot.seq_branch, slot.id,
+                                            slot.spec_tree_pos0 + 1, slot.spec_tree_pos0 + 1 + (llama_pos) n_keep);
+
+                        // heal the drafter mirror: it ingested the (rejected) main draft tokens at
+                        // these positions; feed it the accepted branch tokens instead
+                        if (slot.ctx_dft && n_keep > 0) {
+                            llama_batch heal = llama_batch_init((int32_t) n_keep, 0, 1);
+                            for (size_t k = 0; k < n_keep; ++k) {
+                                common_batch_add(heal, br[k], slot.spec_tree_pos0 + 1 + (llama_pos) k, { slot.id }, false);
+                            }
+                            if (!common_speculative_process(spec.get(), heal)) {
+                                SLT_WRN(slot, "%s", "spec tree: drafter heal decode failed - drafter state may drift\n");
+                            }
+                            llama_batch_free(heal);
+                        }
+
+                        spec_tree_stats.taken++;
+                        spec_tree_stats.tok_extra += (uint64_t) (br.size() - 1); // vs the 1 token a plain rejection banks
+
+                        if (trace > 0) {
+                            SLT_INF(slot, "spec tree: branch taken, %zu token(s) banked (alt + %zu continuation + final)\n",
+                                    br.size(), n_keep - 1);
+                        }
+
+                        accepted = std::move(br);
+                    }
+
+                    if ((spec_tree_stats.rounds_armed & 63) == 0) {
+                        SRV_INF("SPEC_TREE: armed %" PRIu64 ", taken %" PRIu64 " (%.3f), extra tokens %" PRIu64 "\n",
+                                (uint64_t) spec_tree_stats.rounds_armed, (uint64_t) spec_tree_stats.taken,
+                                spec_tree_stats.rounds_armed ? (double) spec_tree_stats.taken / spec_tree_stats.rounds_armed : 0.0,
+                                (uint64_t) spec_tree_stats.tok_extra);
+                    }
+                }
+
+                // the branch sequence is single-round scratch: clear it whether or not it was taken
+                if (slot.spec_tree_alt != LLAMA_TOKEN_NULL) {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.seq_branch, -1, -1);
+                    slot.spec_tree_alt = LLAMA_TOKEN_NULL;
+                    slot.spec_tree_i_batch.clear();
+                }
+
+                // recompute: a taken branch supersedes the main-chain rollback accounting
+                const uint32_t n_rollback_eff = slot.spec_draft.size() + 1 >= accepted.size()
+                    ? (uint32_t) (slot.spec_draft.size() + 1 - accepted.size()) : 0;
+
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
+                if (n_rollback_eff > 0 && n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());

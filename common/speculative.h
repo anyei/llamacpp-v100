@@ -75,6 +75,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // No-op unless the env gate is set; capture happens inside the drafter sampling loops.
 void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok);
 
+// LLAMA_SPEC_TREE=1 (#132): multi-candidate verification - the server adds a branch row set
+// (drafter's runner-up at draft position 0 + shared continuation) to the verify batch on a
+// spare sequence, rescuing first-position rejections. Value-parsed gate, off by default.
+bool common_speculative_tree_enabled();
+
+// the drafter's runner-up candidate for draft position i of seq_id's most recent draft, or
+// LLAMA_TOKEN_NULL when unavailable / the capture is misaligned (n_draft must match the
+// captured draft length).
+llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_draft);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
