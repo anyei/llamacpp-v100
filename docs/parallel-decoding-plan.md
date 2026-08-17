@@ -355,10 +355,13 @@ Ladder:
 - **(a) DECIDED 2026-08-14: UD-Q4_K_XL in-box variant** is the spine A
   endgame - formalized as rung A6 above. A1-A5 on the current fleet
   checkpoint remain the calibration ladder.
-- **(b) OPEN - Metric definition**: does 20-30 t/s mean single-stream
-  strictly, or does -np aggregate served throughput count? Decision (a)
-  lowers the stakes (A6's band covers 20-30 single-stream on paper), but
-  A5/B5 become primary rungs if aggregate counts.
+- **(b) DECIDED 2026-08-17 (user): the 20-30 goal is SINGLE-STREAM,
+  strictly.** The measured np4 target-only ~19.6 aggregate (A5-on-V4) is a
+  capability, not the goal; honest single-stream band on the current
+  checkpoint stays 12-15 and the lane still needs single-stream levers.
+  Consequence: batching headroom (4x positions ~= 2x cost, measured) should
+  be spent INSIDE one stream -> tree/multi-candidate speculation and the
+  #132 RPC-drafter architecture become the primary levers.
 - **(c) APPROVED 2026-08-14: #108 PEARL build green-lit.** Engineering order
   unchanged: #107 gate first (small, independent), #108 on its evidence.
   Both carry the temp-0 spec-vs-nospec byte leg as the landing gate.
