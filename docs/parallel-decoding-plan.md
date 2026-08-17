@@ -192,6 +192,21 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
   the 20-30 goal in aggregate terms (decision (b)) is plausibly in reach
   today. V4-arch curve (256-expert union, skewed routing) = first leg when
   the X99 returns. Harness /work/np-curve.sh.
+  **A5-ON-V4 MEASURED 2026-08-16 (X99, keeper shape -ncmoe 25 -ts 27,8,8
+  -c 8192 --parallel 4, image 5091efd76-era): TARGET-ONLY np1 10.11 (4 runs,
+  10.02-10.15) / np2 ~14.6 aggregate (1.44x) / np4 19.3-19.9 aggregate mean
+  ~19.6 = 1.94x at -52% per-stream, zero failures, coherence PASS** — the
+  20-goal minimum is effectively reached in aggregate terms on the 162GB
+  production checkpoint, single box. **SPEC×BATCHING INTERACTION (the
+  headline mechanism): with DSpark ON the same np4 collapses to ~12.4
+  aggregate (= np2-class) AND 1-2 rounds per 5 die with 500s** — CUDA0
+  compute-graph OOM (~1.1GiB gallocr reserve at 4-wide prefill; drafter's
+  10.4GiB + zero headroom; `[spec] failed to measure draft model memory`
+  at load = the reserve shortfall; -ub 512 is default = no-op, fragmentation
+  keeps it intermittent even at 1271MiB free). Speculation is a single-stream
+  lever, batching an aggregate lever - they do not compose on this shape.
+  Production menu: np1+DSpark 11.56 single / np4 target-only ~19.6 aggregate;
+  ADAPTIVE-under-load A/B = the candidate bridge.
   **#108 v2 NOTE (same day): the pre-verify arm is killed by paper-math on
   memory-bound targets** - a decode pass costs ~one weight sweep regardless
   of position count, so splitting the (n+1)-pass into 1 + n doubles target
