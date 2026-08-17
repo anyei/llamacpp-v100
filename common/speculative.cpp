@@ -233,6 +233,40 @@ static bool common_speculative_are_compatible(
     return true;
 }
 
+// #132: mirror hygiene for drafter process() paths - drop any draft-ctx cells at/after
+// each seq's first batch position before the mirror re-decodes/re-injects there. The
+// server's memory wrapper only rolls back the PRIMARY drafter's context; secondaries
+// (common_speculative_add_drafter) see no external rollback, and this also re-syncs a
+// mirror after target-side checkpoint restores and across request boundaries.
+static void spec_mirror_trim(llama_context * ctx_dft, const llama_batch & batch) {
+    if (batch.n_tokens <= 0 || batch.token == nullptr) {
+        return;
+    }
+    std::map<llama_seq_id, llama_pos> first;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const llama_seq_id s = batch.seq_id[i][0];
+        auto it = first.find(s);
+        if (it == first.end() || batch.pos[i] < it->second) {
+            first[s] = batch.pos[i];
+        }
+    }
+    for (const auto & sp : first) {
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), sp.first, sp.second, -1)) {
+            // cache classes without partial removal (e.g. dsv4-backed heads): full-clear
+            // the sequence instead. The mirror re-fills only from this batch onward, so
+            // the drafter's quality degrades until the next request - correctness is
+            // unaffected (verification remains the arbiter).
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), sp.first, -1, -1);
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WRN("%s: drafter mirror cannot partial-trim (cache class) - full-clearing; "
+                        "this drafter degrades after target rollbacks until the next request\n", __func__);
+            }
+        }
+    }
+}
+
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
 // state of an implementation of speculative decoding
@@ -407,19 +441,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // rolls back the PRIMARY drafter's context - a secondary drafter registered via
         // common_speculative_add_drafter (#132) sees no external rollback, and this
         // trim also re-syncs the mirror after target-side checkpoint restores.
-        if (batch.n_tokens > 0 && batch.token != nullptr) {
-            std::map<llama_seq_id, llama_pos> first;
-            for (int32_t i = 0; i < batch.n_tokens; ++i) {
-                const llama_seq_id s = batch.seq_id[i][0];
-                auto it = first.find(s);
-                if (it == first.end() || batch.pos[i] < it->second) {
-                    first[s] = batch.pos[i];
-                }
-            }
-            for (const auto & sp : first) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), sp.first, sp.second, -1);
-            }
-        }
+        spec_mirror_trim(ctx_dft, batch);
 
         llama_batch batch_dft = batch;
         batch_dft.logits = nullptr;
@@ -750,6 +772,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
+
+        // #132: secondary-drafter / restore hygiene - see spec_mirror_trim
+        spec_mirror_trim(params.ctx_dft, batch_in);
 
         const int32_t n_tokens = batch_in.n_tokens;
 
@@ -1688,6 +1713,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
             return true;
         }
+
+        // #132: secondary-drafter / restore hygiene - see spec_mirror_trim
+        spec_mirror_trim(params.ctx_dft, batch_in);
 
         const int32_t n_tokens = batch_in.n_tokens;
 
