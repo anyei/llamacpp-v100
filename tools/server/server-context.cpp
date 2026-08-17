@@ -595,7 +595,9 @@ struct server_slot {
                     const llama_pos pos_a = prompt.tokens.pos_next(); // anchor (sampled) position
                     auto * mem_tgt = llama_get_memory(ctx_tgt);
                     llama_memory_seq_rm(mem_tgt, seq_branch, -1, -1);       // stale-cell safety
-                    llama_memory_seq_cp(mem_tgt, id, seq_branch, 0, pos_a); // expose the prefix
+                    // full-sequence copy: at arm time (pre-decode) the slot seq holds exactly
+                    // the prefix, and full copies are the only form dsv4 (V4/DSA) supports
+                    llama_memory_seq_cp(mem_tgt, id, seq_branch, -1, -1);
 
                     bool br_ok = true;
                     br_ok &= batch.add(seq_branch, sampled, pos_a, false);  // duplicated anchor row
@@ -5192,14 +5194,22 @@ private:
                 // armed alt continues along the branch rows instead of ending the round. The
                 // sampler chain is already in the correct state (prefix + alt accepted by the
                 // main walk); the branch rows supply the logits for the continuation samples.
+                //
+                // Two acceptance mechanics, matching the context's rollback class:
+                //  - direct targets: KV surgery grafts the branch cells + process_rows heals
+                //    the drafter's mirrored/injected state;
+                //  - checkpoint targets (dsv4/V4, SWA, recurrent): the existing restore+replay
+                //    path re-decodes the extended `accepted` next round, rebuilding target KV
+                //    and drafter state by construction - the replay was paid anyway, so the
+                //    branch tokens ride it for free.
                 if (slot.spec_tree_alt != LLAMA_TOKEN_NULL) {
                     spec_tree_stats.rounds_armed++;
-                    if (!use_ckpt_tgt && accepted.size() == 1 && accepted.back() == slot.spec_tree_alt) {
+                    if (accepted.size() == 1 && accepted.back() == slot.spec_tree_alt) {
                         const size_t n = slot.spec_draft.size();
                         GGML_ASSERT(slot.spec_tree_i_batch.size() == n);
 
                         std::vector<llama_token> br = { accepted.back() };
-                        size_t n_keep = 1; // branch cells to graft: alt + matched continuations
+                        size_t n_keep = 1; // branch cells accepted: alt + matched continuations
                         size_t j = 1;
                         while (true) {
                             const llama_token tok = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_tree_i_batch[j - 1], false);
@@ -5212,22 +5222,24 @@ private:
                             j++;
                         }
 
-                        // KV surgery: drop the rejected main draft cells (target + drafter via the
-                        // wrapper), graft the accepted branch cells into the slot sequence
-                        auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
-                        slot.mem.seq_rm(slot.id, slot.spec_tree_pos0 + 1, -1);
-                        llama_memory_seq_cp(mem_tgt, slot.seq_branch, slot.id,
-                                            slot.spec_tree_pos0 + 1, slot.spec_tree_pos0 + 1 + (llama_pos) n_keep);
+                        if (!use_ckpt_tgt) {
+                            // KV surgery: drop the rejected main draft cells (target + drafter via
+                            // the wrapper), graft the accepted branch cells into the slot sequence
+                            auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                            slot.mem.seq_rm(slot.id, slot.spec_tree_pos0 + 1, -1);
+                            llama_memory_seq_cp(mem_tgt, slot.seq_branch, slot.id,
+                                                slot.spec_tree_pos0 + 1, slot.spec_tree_pos0 + 1 + (llama_pos) n_keep);
 
-                        // heal the drafter: its mirror/injection covered the (rejected) main
-                        // draft rows at these positions; rebuild from the accepted branch rows.
-                        // note: row indices assume the round decoded in a single batch view -
-                        // the same assumption the spec sampling path itself makes.
-                        if (slot.ctx_dft && n_keep > 0) {
-                            const std::vector<int32_t> rows(slot.spec_tree_i_batch.begin(),
-                                                            slot.spec_tree_i_batch.begin() + n_keep);
-                            if (!common_speculative_process_rows(spec.get(), batch.batch, slot.id, rows)) {
-                                SLT_WRN(slot, "%s", "spec tree: drafter heal failed - drafter state may drift\n");
+                            // heal the drafter: its mirror/injection covered the (rejected) main
+                            // draft rows at these positions; rebuild from the accepted branch rows.
+                            // note: row indices assume the round decoded in a single batch view -
+                            // the same assumption the spec sampling path itself makes.
+                            if (slot.ctx_dft && n_keep > 0) {
+                                const std::vector<int32_t> rows(slot.spec_tree_i_batch.begin(),
+                                                                slot.spec_tree_i_batch.begin() + n_keep);
+                                if (!common_speculative_process_rows(spec.get(), batch.batch, slot.id, rows)) {
+                                    SLT_WRN(slot, "%s", "spec tree: drafter heal failed - drafter state may drift\n");
+                                }
                             }
                         }
 
@@ -5235,8 +5247,8 @@ private:
                         spec_tree_stats.tok_extra += (uint64_t) (br.size() - 1); // vs the 1 token a plain rejection banks
 
                         if (trace > 0) {
-                            SLT_INF(slot, "spec tree: branch taken, %zu token(s) banked (alt + %zu continuation + final)\n",
-                                    br.size(), n_keep - 1);
+                            SLT_INF(slot, "spec tree: branch taken (%s), %zu token(s) banked (alt + %zu continuation + final)\n",
+                                    use_ckpt_tgt ? "replay" : "graft", br.size(), n_keep - 1);
                         }
 
                         accepted = std::move(br);
@@ -5248,21 +5260,16 @@ private:
                                 spec_tree_stats.rounds_armed ? (double) spec_tree_stats.taken / spec_tree_stats.rounds_armed : 0.0,
                                 (uint64_t) spec_tree_stats.tok_extra);
                     }
-                }
 
-                // the branch sequence is single-round scratch: clear it whether or not it was taken
-                if (slot.spec_tree_alt != LLAMA_TOKEN_NULL) {
+                    // the branch sequence is single-round scratch: clear it before the
+                    // checkpoint path's early return can skip this cleanup
                     llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.seq_branch, -1, -1);
                     slot.spec_tree_alt = LLAMA_TOKEN_NULL;
                     slot.spec_tree_i_batch.clear();
                 }
 
-                // recompute: a taken branch supersedes the main-chain rollback accounting
-                const uint32_t n_rollback_eff = slot.spec_draft.size() + 1 >= accepted.size()
-                    ? (uint32_t) (slot.spec_draft.size() + 1 - accepted.size()) : 0;
-
                 // check for partial draft acceptance
-                if (n_rollback_eff > 0 && n_rollback > 0) {
+                if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
