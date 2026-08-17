@@ -5186,6 +5186,30 @@ private:
                     common_speculative_alt_stats_verify(slot.id, accepted.size() - 1, accepted.back());
                 }
 
+                // LLAMA_SPEC_DUMP=<path> (#132): append one record per fresh verify round
+                // (anchor_pos;draft_tokens;accepted_tokens). Temp-0 streams from the same
+                // target align position-wise across serves, so two drafters' predictions can
+                // be joined offline without dual-draft-model plumbing.
+                if (!slot.spec_replay) {
+                    static FILE * spec_dump_f = [] {
+                        const char * p = getenv("LLAMA_SPEC_DUMP");
+                        return p ? fopen(p, "a") : (FILE *) nullptr;
+                    }();
+                    if (spec_dump_f) {
+                        const llama_pos pos0 = slot.prompt.tokens.pos_next() - (llama_pos) n_draft - 1;
+                        fprintf(spec_dump_f, "%d;", (int) pos0);
+                        for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                            fprintf(spec_dump_f, i ? ",%d" : "%d", slot.spec_draft[i]);
+                        }
+                        fprintf(spec_dump_f, ";");
+                        for (size_t i = 0; i < accepted.size(); ++i) {
+                            fprintf(spec_dump_f, i ? ",%d" : "%d", accepted[i]);
+                        }
+                        fprintf(spec_dump_f, "\n");
+                        fflush(spec_dump_f);
+                    }
+                }
+
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
