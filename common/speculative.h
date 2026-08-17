@@ -80,6 +80,12 @@ void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llam
 // spare sequence, rescuing first-position rejections. Value-parsed gate, off by default.
 bool common_speculative_tree_enabled();
 
+// #132 (experimental, env-gated at the server): register an ADDITIONAL drafter with its own
+// draft context behind the existing priority-fallback dispatch - impls draft in registration
+// order and later impls only draft sequences the earlier ones left empty. params must carry
+// the second drafter's ctx_tgt/ctx_dft. Supported types: draft-simple/eagle3/mtp/dflash/dspark.
+bool common_speculative_add_drafter(common_speculative * spec, const common_params_speculative & params, enum common_speculative_type type, uint32_t n_seq);
+
 // #132 inc 2: re-process specific rows of the just-decoded target batch as seq_id's rows.
 // Spec-tree branch rows carry a foreign sequence tag, so the normal process() pass skips
 // them; after a branch acceptance the drafter's mirrored/injected state for those positions

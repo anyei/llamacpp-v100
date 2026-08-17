@@ -402,6 +402,25 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     bool process(const llama_batch & batch) override {
         auto * ctx_dft = params.ctx_dft;
 
+        // own the mirror hygiene (dflash pattern): drop any cells at/after each seq's
+        // first batch position before re-decoding. The server's memory wrapper only
+        // rolls back the PRIMARY drafter's context - a secondary drafter registered via
+        // common_speculative_add_drafter (#132) sees no external rollback, and this
+        // trim also re-syncs the mirror after target-side checkpoint restores.
+        if (batch.n_tokens > 0 && batch.token != nullptr) {
+            std::map<llama_seq_id, llama_pos> first;
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                const llama_seq_id s = batch.seq_id[i][0];
+                auto it = first.find(s);
+                if (it == first.end() || batch.pos[i] < it->second) {
+                    first[s] = batch.pos[i];
+                }
+            }
+            for (const auto & sp : first) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), sp.first, sp.second, -1);
+            }
+        }
+
         llama_batch batch_dft = batch;
         batch_dft.logits = nullptr;
 
@@ -2867,6 +2886,34 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     return result;
+}
+
+bool common_speculative_add_drafter(common_speculative * spec, const common_params_speculative & params, enum common_speculative_type type, uint32_t n_seq) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+            spec->impls.push_back(std::make_unique<common_speculative_impl_draft_simple>(params, n_seq));
+            break;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            spec->impls.push_back(std::make_unique<common_speculative_impl_draft_eagle3>(params, n_seq));
+            break;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            spec->impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(params, n_seq));
+            break;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            spec->impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(params, n_seq));
+            break;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            spec->impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+            break;
+        default:
+            return false;
+    }
+
+    return true;
 }
 
 bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows) {

@@ -420,7 +420,10 @@ function specOptions(m, modeId) {
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:(d.specBlock||8)-1, min:1, max:(d.specBlock||8)-1, step:1,
              note:`trained block: ${(d.specBlock||8)-1} draft tokens max`},
             {key:"dev", flag:"--spec-draft-device", def:"CUDA1", text:true,
-             note:"pin the drafter to specific device(s)"}],
+             note:"pin the drafter to specific device(s); auto RPC0 when a remote worker is set"},
+            {key:"rpcep", flag:"(remote worker)", def:"", text:true,
+             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees drafter VRAM here) - empty = local"}],
+    inbox: modeId!=="fleet" && modeId!=="fleetl",
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
   // type. Honest per-shape notes (#80 5-leg A/B 2026-08-03): single-box
@@ -437,7 +440,10 @@ function specOptions(m, modeId) {
             {key:"confmin", flag:"--spec-draft-conf-min", def:0.3, min:0, max:1, step:0.05,
              note:"0.3 = measured sweet spot; 0 disables the confidence gate"},
             {key:"dev", flag:"--spec-draft-device", def:"CUDA1", text:true,
-             note:"pin the drafter to specific device(s) - budget that card's share for ~11GB drafter"}],
+             note:"pin the drafter to specific device(s) - budget that card's share for ~11GB drafter; auto RPC0 when a remote worker is set"},
+            {key:"rpcep", flag:"(remote worker)", def:"", text:true,
+             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees ~11GB VRAM here) - empty = local"}],
+    inbox: modeId!=="fleet" && modeId!=="fleetl",
     flags:`--spec-type draft-dspark --spec-draft-model ${ds.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
     sub:"train-free, no draft model - shines on repetitive/structured output",
@@ -473,11 +479,23 @@ async function fetchConfigs() {
 function specFlags(o) {
   if (!o) return "";
   const lines = o.flags.split("\n");
+  const sp = S.specParams[o.id]||{};
+  // #132 remote drafter: a worker endpoint moves the drafter off-box (measured
+  // -5.7% vs local, frees the drafter's VRAM on the target GPUs)
+  const rpcep = (sp.rpcep !== undefined && sp.rpcep !== "") ? sp.rpcep : "";
   (o.params||[]).forEach(p => {
-    const v = (S.specParams[o.id]||{})[p.key];
-    const val = (v !== undefined && v !== "") ? v : p.def;
+    if (p.key === "rpcep") return; // emitted below as --rpc, not as a flag value
+    const v = sp[p.key];
+    let val = (v !== undefined && v !== "") ? v : p.def;
+    if (p.key === "dev" && rpcep && (v === undefined || v === "")) val = "RPC0"; // remote worker's first device
     lines[0] += ` ${p.flag} ${val}`;
   });
+  if (rpcep) {
+    lines[0] += ` --rpc ${rpcep}`;
+    // in-box modes: keep the TARGET on the local GPUs - without the pin the new
+    // RPC device would join the target's split
+    if (o.inbox) lines[0] += ` --device ${HW.gpus.map((g,i)=>"CUDA"+i).join(",")}`;
+  }
   return lines.join("\n");
 }
 
@@ -1283,7 +1301,7 @@ function render() {
                  const v=(S.specParams[o.id]||{})[p.key]; const val=(v!==undefined&&v!=="")?v:p.def;
                  return `<label class="mrow" style="padding-left:22px"><span class="estg" style="font-family:var(--mono);font-size:11px">${p.flag}</span>
                    <input type="${p.text?"text":"number"}" data-spar="${o.id}:${p.key}" value="${val}"${p.text?"":` min="${p.min}" max="${p.max}" step="${p.step}"`}
-                   style="width:64px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+                   style="width:${p.text?140:64}px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
                    ${p.note?`<span class="estg">· ${p.note}</span>`:""}</label>`;}).join(""):""}`).join("")}
         </div>`:""}
         <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet(md))}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}${sel?epPlaceEnv(md):""}</div></details>

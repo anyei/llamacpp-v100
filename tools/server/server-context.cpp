@@ -1373,6 +1373,7 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+    common_speculative_init_result_ptr spec_init2; // #132 second drafter (LLAMA_SPEC_DRAFT2), env-gated
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1420,6 +1421,7 @@ private:
 
     void destroy() {
         spec.reset();
+        spec_init2.reset();
         spec_init.reset();
 
         ctx_dft   = nullptr;
@@ -2343,6 +2345,63 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+            }
+        }
+
+        // #132 (experimental, env-gated): SECOND drafter with its own model + context,
+        // registered behind the primary in the priority-fallback dispatch (later impls
+        // only draft sequences the earlier ones left empty).
+        //   LLAMA_SPEC_DRAFT2=<gguf path>       - the second drafter's model file
+        //   LLAMA_SPEC_DRAFT2_TYPE=<type name>  - e.g. draft-mtp, draft-simple (default draft-simple)
+        //   LLAMA_SPEC_DRAFT2_DEVICE=<dev,...>  - optional pin, e.g. RPC0 for a remote worker
+        if (spec) {
+            const char * d2_path = getenv("LLAMA_SPEC_DRAFT2");
+            if (d2_path && *d2_path) {
+                const char * d2_type_s = getenv("LLAMA_SPEC_DRAFT2_TYPE");
+                const auto d2_types = common_speculative_types_from_names({ std::string(d2_type_s && *d2_type_s ? d2_type_s : "draft-simple") });
+                if (d2_types.empty() || d2_types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+                    SRV_WRN("LLAMA_SPEC_DRAFT2_TYPE '%s' not recognized - second drafter disabled\n", d2_type_s ? d2_type_s : "");
+                } else {
+                    try {
+                        common_params params_base2 = params_base;
+                        params_base2.speculative.types            = d2_types;
+                        params_base2.speculative.draft.mparams.path = d2_path;
+                        const char * d2_dev = getenv("LLAMA_SPEC_DRAFT2_DEVICE");
+                        if (d2_dev && *d2_dev) {
+                            params_base2.speculative.draft.devices.clear();
+                            for (const auto & name : string_split<std::string>(std::string(d2_dev), ',')) {
+                                auto * dev = ggml_backend_dev_by_name(name.c_str());
+                                if (dev) {
+                                    params_base2.speculative.draft.devices.push_back(dev);
+                                } else {
+                                    SRV_WRN("drafter2: unknown device '%s' - skipped\n", name.c_str());
+                                }
+                            }
+                        }
+
+                        common_params params_dft2 = common_base_params_to_speculative(params_base2);
+                        spec_init2 = common_speculative_init_from_params(params_dft2, model_tgt, ctx_tgt);
+                        if (spec_init2 == nullptr || spec_init2->model() == nullptr || spec_init2->context() == nullptr) {
+                            SRV_WRN("drafter2: failed to load '%s' - second drafter disabled\n", d2_path);
+                            spec_init2.reset();
+                        } else {
+                            common_params_speculative sp2 = params_base2.speculative;
+                            sp2.draft.ctx_tgt = ctx_tgt;
+                            sp2.draft.ctx_dft = spec_init2->context();
+                            if (common_speculative_add_drafter(spec.get(), sp2, d2_types[0], params_base.n_parallel)) {
+                                SRV_INF("drafter2: '%s' (%s) registered behind the primary%s%s\n",
+                                        d2_path, d2_type_s ? d2_type_s : "draft-simple",
+                                        d2_dev && *d2_dev ? " on " : "", d2_dev && *d2_dev ? d2_dev : "");
+                            } else {
+                                SRV_WRN("%s", "drafter2: type not supported by add_drafter - second drafter disabled\n");
+                                spec_init2.reset();
+                            }
+                        }
+                    } catch (const std::exception & e) {
+                        SRV_WRN("drafter2: init failed: %s - second drafter disabled\n", e.what());
+                        spec_init2.reset();
+                    }
+                }
             }
         }
 
