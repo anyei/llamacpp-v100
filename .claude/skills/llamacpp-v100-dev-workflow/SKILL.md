@@ -113,3 +113,14 @@ Every feature lands with: off-gate byte-identity leg, engagement leg (counters),
 and a note in the relevant `docs/*-plan.md` + `TASKS.md` entry with measured
 numbers. Reference shas and counter signatures go in the plan doc so the next
 session can regate without re-deriving.
+
+## RPC graph-uid churn gate (#132 lesson)
+
+Anything touching the RPC graph-uid cache (ggml-rpc graph_compute_uid /
+recompute paths, or configs putting MULTIPLE contexts on one worker, e.g.
+dual drafters) must pass a CHURN gate, not just correctness probes: ~120
+requests with monotonically growing prompt lengths (forces >512 distinct
+graph shapes -> server-side LRU eviction). The failure mode is a soak-scale
+split-brain (client remembers a uid the server evicted -> recompute miss ->
+worker closes the connection); minutes-scale gates cannot see it. Script
+pattern: /home/anyei/churn-gate.sh on the X99.
