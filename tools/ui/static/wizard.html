@@ -401,6 +401,23 @@ const dsparkFor = m => DRAFTS.find(d => d.arch==="dflash" &&  d.dspark && draftM
 // nextn head (has_mtp) for a target whose own gguf shipped without one (the
 // V4-0731 production case, head extracted per #124)
 const mtpHeadFor = m => DRAFTS.find(d => d.mtp && d.arch!=="dflash" && draftMatches(d, m));
+// TASKS #134: secondary-drafter row on the drafter-based spec options. Emits the
+// #132 env gate (LLAMA_SPEC_DRAFT2/_TYPE/_DEVICE) - fallback-chain semantics:
+// the secondary drafts only sequences the primary left empty. Capability, not
+// speed (V4 dual DSpark+MTP measured ~9.6-10.4 t/s vs 11.56 single fixed-n3).
+const d2TypeOf = d => !d ? "draft-simple" : d.dspark ? "draft-dspark" : d.arch==="dflash" ? "draft-dflash" : d.mtp ? "draft-mtp" : "draft-simple";
+function d2Params(m, primary) {
+  const cands = DRAFTS.filter(d => draftMatches(d, m) && (!primary || d.path !== primary.path));
+  if (!cands.length) return [];
+  return [
+    {key:"d2", flag:"LLAMA_SPEC_DRAFT2", def:"", sel:[{v:"",t:"none"}, ...cands.map(d=>({v:d.path,t:d.file}))],
+     note:"secondary drafter (#132): drafts only when the primary yields nothing - capability, not speed (V4 dual ~9.6-10.4 vs 11.56 single)"},
+    {key:"d2type", flag:"LLAMA_SPEC_DRAFT2_TYPE", def:"auto",
+     sel:["auto","draft-simple","draft-eagle3","draft-mtp","draft-dflash","draft-dspark"].map(t=>({v:t,t})),
+     note:"auto = classified from the picked file"},
+    {key:"d2dev", flag:"LLAMA_SPEC_DRAFT2_DEVICE", def:"", text:true,
+     note:"pin the secondary; empty = RPC0 when a remote worker is set, else the drafter default"}];
+}
 
 // ---------- mode catalog + fit + speculation logic ----------
 // specs: which speculation routes exist for (model, mode) and what we know about them.
@@ -414,7 +431,8 @@ function specOptions(m, modeId) {
   if (m.mtp) opts.push({ id:"mtp", name:"MTP speculation", gain: gpuMode?"+2.4x measured":null,
     sub: modeId==="fleet" ? "measured break-even over the fleet boundary (verify lanes pay full wire cost) - draft runs inside the target's own placement, no separate device to pin" : null,
     params:[{key:"nmax", flag:"--spec-draft-n-max", def:3, min:1, max:8, step:1},
-            {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05}],
+            {key:"pmin", flag:"--spec-draft-p-min", def:0.75, min:0, max:1, step:0.05},
+            ...d2Params(m, null)],
     flags:"--spec-type draft-mtp\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1" });
   // TASKS #125: head-FILE MTP - the target gguf shipped without its nextn head but a
   // matching extracted-head draft file exists in the catalog (#124 export)
@@ -426,7 +444,8 @@ function specOptions(m, modeId) {
             {key:"dev", flag:"--spec-draft-device", def:"CUDA0", text:true,
              note:"pin the head; auto RPC0 when a remote worker is set"},
             {key:"rpcep", flag:"(remote worker)", def:"", text:true,
-             note:"host:port of an RPC worker to host the head off-box (#132) - empty = local"}],
+             note:"host:port of an RPC worker to host the head off-box (#132) - empty = local"},
+            ...d2Params(m, mh)],
     inbox: modeId!=="fleet" && modeId!=="fleetl",
     flags:`--spec-type draft-mtp --model-draft ${mh.path} --n-gpu-layers-draft 99\nLLAMA_SPEC_DRAFT_NO_PAD=1  GGML_CUDA_DISABLE_GRAPHS=1` });
   // dflash drafts are small dense models - they fit VRAM even when the target
@@ -439,7 +458,8 @@ function specOptions(m, modeId) {
             {key:"dev", flag:"--spec-draft-device", def:"CUDA1", text:true,
              note:"pin the drafter to specific device(s); auto RPC0 when a remote worker is set"},
             {key:"rpcep", flag:"(remote worker)", def:"", text:true,
-             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees drafter VRAM here) - empty = local"}],
+             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees drafter VRAM here) - empty = local"},
+            ...d2Params(m, d)],
     inbox: modeId!=="fleet" && modeId!=="fleetl",
     flags:`--spec-type draft-dflash --spec-draft-model ${d.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   // TASKS #88: DSpark = dflash backbone + markov/confidence heads, own spec
@@ -459,7 +479,8 @@ function specOptions(m, modeId) {
             {key:"dev", flag:"--spec-draft-device", def:"CUDA1", text:true,
              note:"pin the drafter to specific device(s) - budget that card's share for ~11GB drafter; auto RPC0 when a remote worker is set"},
             {key:"rpcep", flag:"(remote worker)", def:"", text:true,
-             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees ~11GB VRAM here) - empty = local"}],
+             note:"host:port of an RPC worker to host the drafter off-box (#132: -5.7% vs local, frees ~11GB VRAM here) - empty = local"},
+            ...d2Params(m, ds)],
     inbox: modeId!=="fleet" && modeId!=="fleetl",
     flags:`--spec-type draft-dspark --spec-draft-model ${ds.path} -ngld 99\nGGML_CUDA_DISABLE_GRAPHS=1` });
   if (gpuMode || modeId==="ncmoe") opts.push({ id:"ngram", name:"ngram speculation", est:true,
@@ -501,7 +522,7 @@ function specFlags(o) {
   // -5.7% vs local, frees the drafter's VRAM on the target GPUs)
   const rpcep = (sp.rpcep !== undefined && sp.rpcep !== "") ? sp.rpcep : "";
   (o.params||[]).forEach(p => {
-    if (p.key === "rpcep") return; // emitted below as --rpc, not as a flag value
+    if (p.key === "rpcep" || p.key.startsWith("d2")) return; // emitted below as --rpc / #134 envs, not as flag values
     const v = sp[p.key];
     let val = (v !== undefined && v !== "") ? v : p.def;
     if (p.key === "dev" && rpcep && (v === undefined || v === "")) val = "RPC0"; // remote worker's first device
@@ -512,6 +533,13 @@ function specFlags(o) {
     // in-box modes: keep the TARGET on the local GPUs - without the pin the new
     // RPC device would join the target's split
     if (o.inbox) lines[0] += ` --device ${HW.gpus.map((g,i)=>"CUDA"+i).join(",")}`;
+  }
+  // #134 secondary drafter: the three #132 envs on the env line
+  const d2 = sp.d2 || "";
+  if (d2) {
+    const t   = (sp.d2type && sp.d2type !== "auto") ? sp.d2type : d2TypeOf(DRAFTS.find(x => x.path === d2));
+    const dev = sp.d2dev || (rpcep ? "RPC0" : "");
+    lines[lines.length-1] += ` LLAMA_SPEC_DRAFT2=${d2} LLAMA_SPEC_DRAFT2_TYPE=${t}${dev ? ` LLAMA_SPEC_DRAFT2_DEVICE=${dev}` : ""}`;
   }
   return lines.join("\n");
 }
@@ -760,9 +788,13 @@ function modesFor(m, ctx, kv) {
   else out.blocked.push({ name:"SSD streaming", why:"Streams the expert tier - dense models have none." });
 
   // CPU only
+  // TASKS #121: -ngl 0 alone still spawns a ~350MB CUDA context on GPU0 and
+  // op-offloads prefill matmuls there; --device none stops the offload but the
+  // init-time device probes still create a ~280MB context - only hiding the
+  // GPUs from the runtime gives measured-zero VRAM use
   if (fitQ("cpu")) push({ id:"cpu", name:"CPU only", speed:()=>"~1–4", est:()=>true,
-    why:`Fits ${HW.ram} GiB RAM. No GPU dependency.${kvNote("cpu")}`,
-    flags:`-ngl 0 -c {CTX}` });
+    why:`Fits ${HW.ram} GiB RAM. No GPU dependency - GPUs fully excluded (-ngl 0 alone is not device exclusion, #121).${kvNote("cpu")}`,
+    flags:`-ngl 0 --device none -c {CTX}\nCUDA_VISIBLE_DEVICES=-1` });
   else out.blocked.push({ name:"CPU only", why:`${m.size} GiB + KV exceeds ${HW.ram} GiB RAM.` });
 
   out.ranked.sort((a,b)=>(b.est("none")?0:1)-(a.est("none")?0:1) ||
@@ -1316,9 +1348,11 @@ function render() {
                ${o.name} ${o.gain?`<span class="gain">${o.gain}</span>`:o.est?'<span class="estg">est. gain — sweep it</span>':""}
                ${o.sub?`<span class="estg">· ${o.sub}</span>`:""}</label>${sel&&curSpec===o.id&&o.params?o.params.map(p=>{
                  const v=(S.specParams[o.id]||{})[p.key]; const val=(v!==undefined&&v!=="")?v:p.def;
+                 const cst="font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px";
                  return `<label class="mrow" style="padding-left:22px"><span class="estg" style="font-family:var(--mono);font-size:11px">${p.flag}</span>
-                   <input type="${p.text?"text":"number"}" data-spar="${o.id}:${p.key}" value="${val}"${p.text?"":` min="${p.min}" max="${p.max}" step="${p.step}"`}
-                   style="width:${p.text?140:64}px;font:inherit;font-family:var(--mono);font-size:12px;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:3px 6px">
+                   ${p.sel?`<select data-spar="${o.id}:${p.key}" style="max-width:340px;${cst}">${p.sel.map(s=>`<option value="${escHtml(s.v)}"${String(val)===String(s.v)?" selected":""}>${escHtml(s.t)}</option>`).join("")}</select>`
+                         :`<input type="${p.text?"text":"number"}" data-spar="${o.id}:${p.key}" value="${val}"${p.text?"":` min="${p.min}" max="${p.max}" step="${p.step}"`}
+                   style="width:${p.text?140:64}px;${cst}">`}
                    ${p.note?`<span class="estg">· ${p.note}</span>`:""}</label>`;}).join(""):""}`).join("")}
         </div>`:""}
         <details><summary>flags &amp; gates</summary><div class="flags">${md.flags.replace("{CTX}",S.ctx).replace("{TS}",tsForFleet(md)).replace("{RPC}",selEndpoints().join(",")||"127.0.0.1:50053").replace("{DEVS}",devsForFleet(md))}${sel&&S.spec!=="none"?"\n"+specFlags(opts.find(o=>o.id===S.spec)):""}${sel?epPlaceEnv(md):""}</div></details>
