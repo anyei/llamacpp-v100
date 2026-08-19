@@ -97,6 +97,22 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+// Scoped error containment (TASKS.md #136): bounded, optional computes (the
+// load-time device bench) arm this around their graph so a CUDA failure throws
+// to their boundary instead of aborting a whole model load. Exposed through the
+// backend reg proc address table as ggml_backend_error_contain_push/_pop.
+static thread_local int g_cuda_error_contain_scope = 0;
+
+static void ggml_backend_cuda_error_contain_push(void) {
+    g_cuda_error_contain_scope++;
+}
+
+static void ggml_backend_cuda_error_contain_pop(void) {
+    if (g_cuda_error_contain_scope > 0) {
+        g_cuda_error_contain_scope--;
+    }
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -113,7 +129,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
         const char * env = getenv("GGML_CUDA_ERROR_CONTAIN");
         return env != nullptr && atoi(env) != 0;
     }();
-    if (contain) {
+    if (contain || g_cuda_error_contain_scope > 0) {
         (void) cudaGetLastError(); // clear the sticky error state where possible
         throw std::runtime_error(std::string(GGML_CUDA_NAME " error: ") + msg + " (" + stmt + ")");
     }
@@ -5474,6 +5490,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_error_contain_push") == 0) {
+        return (void *)ggml_backend_cuda_error_contain_push;
+    }
+    if (strcmp(name, "ggml_backend_error_contain_pop") == 0) {
+        return (void *)ggml_backend_cuda_error_contain_pop;
     }
     return nullptr;
 }

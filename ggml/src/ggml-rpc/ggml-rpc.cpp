@@ -5790,11 +5790,22 @@ bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, 
         return false;
     }
     // CPU-class devices: bench with all cores, like real serving
+    // #136: fetch the backend's scoped error containment (CUDA implements it) so a
+    // faulted/poisoned device costs only its score row, never the whole process.
+    typedef void (*error_contain_t)(void);
+    error_contain_t contain_push = nullptr;
+    error_contain_t contain_pop  = nullptr;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg != nullptr) {
         auto set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (set_n_threads_fn != nullptr) {
             set_n_threads_fn(backend, std::max(1u, std::thread::hardware_concurrency()));
+        }
+        contain_push = (error_contain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_error_contain_push");
+        contain_pop  = (error_contain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_error_contain_pop");
+        if (contain_push == nullptr || contain_pop == nullptr) {
+            contain_push = nullptr;
+            contain_pop  = nullptr;
         }
     }
 
@@ -5821,21 +5832,36 @@ bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, 
         ggml_backend_free(backend);
         return false;
     }
-    // fill with 0x3c bytes: 0x3c3c3c3c is a small normal f32 (~0.011), avoiding
-    // both denormal stalls and all-zero fast paths
-    ggml_backend_buffer_clear(buf, 0x3c);
-
-    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS; // warmup
-    int  reps = 0;
-    const auto t0 = std::chrono::steady_clock::now();
+    bool   ok        = false;
+    int    reps      = 0;
     double elapsed_s = 0.0;
-    while (ok && reps < 64) {
-        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        reps++;
-        elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (elapsed_s > 0.25) {
-            break;
+    if (contain_push) {
+        contain_push();
+    }
+    try {
+        // fill with 0x3c bytes: 0x3c3c3c3c is a small normal f32 (~0.011), avoiding
+        // both denormal stalls and all-zero fast paths
+        ggml_backend_buffer_clear(buf, 0x3c);
+
+        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS; // warmup
+        const auto t0 = std::chrono::steady_clock::now();
+        while (ok && reps < 64) {
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            reps++;
+            elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (elapsed_s > 0.25) {
+                break;
+            }
         }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: bench failed on device %s: %s\n", __func__, ggml_backend_dev_name(dev), e.what());
+        ok = false;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: bench failed on device %s\n", __func__, ggml_backend_dev_name(dev));
+        ok = false;
+    }
+    if (contain_pop) {
+        contain_pop();
     }
     if (ok && reps > 0 && elapsed_s > 0.0) {
         const double bytes = (double) n * n * sizeof(float) * chain * reps;

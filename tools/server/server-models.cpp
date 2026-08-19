@@ -1048,9 +1048,21 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
         // rolling tail of child output, surfaced in the status when the exit is a failure
         std::deque<std::string> log_tail;
+        // #136c: the FIRST fatal-error lines (e.g. "CUDA error: ...") scroll out of the
+        // 12-line tail under a long abort stack trace - capture them separately so the
+        // error surface names the actual failure, not just the trailing frames.
+        std::vector<std::string> log_head;
+        size_t head_room        = 0; // lines still to capture after the trigger
+        size_t lines_since_head = 0; // lines seen from the trigger line on (incl. it)
         std::thread log_thread([&]() {
             // read stdout/stderr and forward to main server log
             // also handle status report from child process
+            auto is_fatal_line = [](const std::string & s) {
+                return s.find("CUDA error")       != std::string::npos ||
+                       s.find("ggml_abort")       != std::string::npos ||
+                       s.find("GGML_ASSERT")      != std::string::npos ||
+                       s.find("terminate called") != std::string::npos;
+            };
             std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
             char * buffer = vec_buf.data();
             if (stdout_file) {
@@ -1064,6 +1076,16 @@ void server_models::load(const std::string & name, const load_options & opts) {
                         if (!str.empty()) {
                             log_tail.push_back(str);
                             if (log_tail.size() > 12) log_tail.pop_front();
+                            if (log_head.empty() && is_fatal_line(str)) {
+                                head_room = 6;
+                            }
+                            if (head_room > 0) {
+                                log_head.push_back(str);
+                                head_room--;
+                            }
+                            if (!log_head.empty()) {
+                                lines_since_head++;
+                            }
                         }
                     }
                 }
@@ -1136,7 +1158,15 @@ void server_models::load(const std::string & name, const load_options & opts) {
             args.status    = SERVER_MODEL_STATUS_UNLOADED;
             args.exit_code = exit_code;
             if (exit_code != 0) {
-                args.log_tail.assign(log_tail.begin(), log_tail.end());
+                // #136c: prepend the head lines that already scrolled out of the tail
+                if (!log_head.empty() && lines_since_head > log_tail.size()) {
+                    const size_t n_keep = std::min(log_head.size(), lines_since_head - log_tail.size());
+                    args.log_tail.assign(log_head.begin(), log_head.begin() + n_keep);
+                    if (lines_since_head - log_tail.size() > log_head.size()) {
+                        args.log_tail.push_back("[...]");
+                    }
+                }
+                args.log_tail.insert(args.log_tail.end(), log_tail.begin(), log_tail.end());
             }
             this->update_status(name, args);
         }

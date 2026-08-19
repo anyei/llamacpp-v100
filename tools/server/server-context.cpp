@@ -2585,7 +2585,13 @@ private:
 
             // #131b: measured speed for LOCAL devices (workers publish theirs already).
             // Same bench the workers run; cached per device name - reloads skip it.
-            if (model_tgt != nullptr) {
+            // #136: kill switch LLAMA_FLEET_LOCAL_BENCH=0 (unset = on) + auto-skip of
+            // pressured devices - a missing score row must never cost a load.
+            const bool local_bench = [] {
+                const char * env = getenv("LLAMA_FLEET_LOCAL_BENCH");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            if (model_tgt != nullptr && local_bench) {
                 std::vector<ggml_backend_dev_t> bench_devs;
                 for (int32_t i = 0, n_dev = llama_model_n_devices(model_tgt); i < n_dev; ++i) {
                     bench_devs.push_back(llama_model_get_device(model_tgt, i));
@@ -2600,10 +2606,26 @@ private:
                     if (strncmp(name, "RPC", 3) == 0 || fleet.local_scores.count(name) > 0) {
                         continue;
                     }
+                    // meta devices are composite (members carry the scores); benching one
+                    // segfaults in the bench's raw-tensor alloc (#136, pre-existing #131b bug)
+                    if (strncmp(name, "Meta(", 5) == 0) {
+                        continue;
+                    }
+                    // bench working set: 64 MiB f32 matrix + compute buf; skip devices
+                    // another serve holds near-full instead of risking their state (#136)
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                    if (free_mem > 0 && free_mem < 192u * 1024 * 1024) {
+                        SRV_WRN("skipping local bench for %s: %zu MiB free < 192 MiB working set\n",
+                                name, free_mem / (1024 * 1024));
+                        continue;
+                    }
                     float bw = 0.0f, fl = 0.0f;
                     if (ggml_backend_rpc_benchmark_device(dev, &bw, &fl)) {
                         fleet.local_scores[name] = { bw, fl };
                         SRV_INF("local device score: %s = %.1f GB/s, %.1f GFLOPS\n", name, bw, fl);
+                    } else {
+                        SRV_WRN("local bench failed for %s - no score row (see log above)\n", name);
                     }
                 }
             }
