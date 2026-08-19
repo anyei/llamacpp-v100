@@ -2591,7 +2591,16 @@ private:
                 const char * env = getenv("LLAMA_FLEET_LOCAL_BENCH");
                 return env == nullptr || atoi(env) != 0;
             }();
-            if (model_tgt != nullptr && local_bench) {
+            // resolve via proc address like every other RPC hook here - a direct call
+            // fails to link under GGML_BACKEND_DL (the cpu.Dockerfile worker build)
+            typedef bool (*benchmark_t)(ggml_backend_dev_t, float *, float *);
+            static const benchmark_t benchmark_fn = [] {
+                ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+                return reg != nullptr
+                    ? (benchmark_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_benchmark_device")
+                    : (benchmark_t) nullptr;
+            }();
+            if (model_tgt != nullptr && local_bench && benchmark_fn != nullptr) {
                 std::vector<ggml_backend_dev_t> bench_devs;
                 for (int32_t i = 0, n_dev = llama_model_n_devices(model_tgt); i < n_dev; ++i) {
                     bench_devs.push_back(llama_model_get_device(model_tgt, i));
@@ -2621,7 +2630,7 @@ private:
                         continue;
                     }
                     float bw = 0.0f, fl = 0.0f;
-                    if (ggml_backend_rpc_benchmark_device(dev, &bw, &fl)) {
+                    if (benchmark_fn(dev, &bw, &fl)) {
                         fleet.local_scores[name] = { bw, fl };
                         SRV_INF("local device score: %s = %.1f GB/s, %.1f GFLOPS\n", name, bw, fl);
                     } else {
