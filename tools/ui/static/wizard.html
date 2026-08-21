@@ -1648,13 +1648,41 @@ function render() {
 function bindCrumb(){ document.querySelectorAll(".crumb button").forEach(b=>b.onclick=()=>{ S.step=+b.dataset.go; S.launched=0; S._lst=null; if (launchPoll) { clearTimeout(launchPoll); launchPoll=null; } render(); }); }
 let launchPoll=null;
 function splitFlags(text){
-  // KEY=VALUE tokens are env; everything else argv; comments stripped
+  // KEY=VALUE tokens are env; everything else argv; comments stripped.
+  // QUOTED values stay ONE token. #139's --reasoning-budget-warn-message is the first
+  // flag whose value contains spaces; the old bare /\s+/ split turned
+  //   --reasoning-budget-warn-message "I am running low..."
+  // into separate argv entries and the child died with `invalid argument: am`.
+  // Quoted segments are parsed with JSON.parse so they round-trip exactly with the
+  // JSON.stringify the command builder emits (handles \" \\ \n and \uXXXX).
   const args=[], env=[];
-  for (let line of text.split("\n")) {
-    line = line.replace(/#.*$/,"").trim();
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
     if (!line) continue;
-    for (const tok of line.split(/\s+/)) {
-      if (/^[A-Z][A-Z0-9_]*=/.test(tok)) env.push(tok); else args.push(tok);
+    const out = [];
+    let tok = "", held = false, i = 0;
+    const flush = () => { if (tok !== "" || held) { out.push(tok); } tok = ""; held = false; };
+    while (i < line.length) {
+      const c = line[i];
+      if (c === '"') {
+        let j = i + 1, esc = false;
+        while (j < line.length) {
+          if (esc) { esc = false; j++; continue; }
+          if (line[j] === "\\") { esc = true; j++; continue; }
+          if (line[j] === '"') break;
+          j++;
+        }
+        const raw = line.slice(i, Math.min(j + 1, line.length));
+        try { tok += JSON.parse(raw); } catch (_) { tok += raw.replace(/^"|"$/g, ""); }
+        held = true; i = j + 1; continue;
+      }
+      if (c === "#" && tok === "" && !held) { i = line.length; break; }
+      if (/\s/.test(c)) { flush(); i++; continue; }
+      tok += c; i++;
+    }
+    flush();
+    for (const t of out) {
+      if (/^[A-Z][A-Z0-9_]*=/.test(t)) env.push(t); else args.push(t);
     }
   }
   return {args, env};
