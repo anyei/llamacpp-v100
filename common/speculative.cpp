@@ -1825,6 +1825,113 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // #137 step 0: spec-tree branch heal for MTP.
+    //
+    // On a branch take the accepted continuation runs along BRANCH rows, but process()
+    // already ran this round over the MAIN rows - ctx_dft holds the main-path decode and
+    // verify_h/pending_h hold main-path hidden states. accept() then indexes
+    // verify_h[n_accepted] and would carry the WRONG h forward. Rebuild from the branch
+    // rows here; the server calls this before accept() in the same round.
+    //
+    // rows[] are FULL-batch indices (same contract as the dflash override) and begin at
+    // the ALT token - the duplicated anchor row is deliberately not in that list. MTP
+    // pairs token k with the hidden produced at row k-1, so:
+    //   embd[0] = the anchor's hidden = verify_h[seq_id][0], captured by process() above
+    //   embd[i] = the nextn row of rows[i-1]
+    bool process_rows(const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows) override {
+        if (rows.empty()) {
+            return true;
+        }
+        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            return true;
+        }
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return true;
+        }
+        // the anchor row must already be captured - process() runs before the heal
+        if (verify_h_rows[seq_id] <= 0) {
+            SPC_ERR("MTP branch heal: no verify_h for seq %d\n", (int) seq_id);
+            return false;
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+        const int32_t n_rows    = (int32_t) rows.size();
+
+        // if the KV is shared with the target (gemma4) there is no catch-up decode to redo
+        if (!is_mem_shared) {
+            common_batch_clear(batch);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const int32_t r = rows[i];
+                common_batch_add(batch, batch_in.token[r], batch_in.pos[r], { seq_id }, 0);
+
+                const float * h = i == 0
+                    ? verify_h[seq_id].data()
+                    : llama_get_embeddings_nextn_ith(ctx_tgt, rows[i - 1]);
+                if (h == nullptr) {
+                    SPC_ERR("MTP branch heal: no nextn row for batch idx %d\n", (int) rows[i - 1]);
+                    return false;
+                }
+                std::memcpy(batch.embd + (size_t) i * n_embd, h, row_bytes);
+            }
+
+            auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // drop the main-path cells this round already wrote, from the divergence on
+            llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[rows[0]], -1);
+
+            bool ok = true;
+            for (int head = 0; head < n_mtp_layers; ++head) {
+                if (chain_heads) {
+                    llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[rows[0]], -1);
+                    llama_set_nextn_layer_offset(ctx_dft, head);
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR("MTP branch heal: llama_decode(ctx_dft) head=%d rc=%d\n", head, (int) rc);
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (chain_heads) {
+                llama_set_nextn_layer_offset(ctx_dft, 0);
+            }
+            if (!ok) {
+                return false;
+            }
+        }
+
+        // rebuild the accepted-count-indexed capture: row 0 = anchor, row i+1 = rows[i],
+        // matching process()'s contract so accept()'s verify_h[n_accepted] stays correct
+        std::vector<float> h_new((size_t) (n_rows + 1) * n_embd);
+        std::memcpy(h_new.data(), verify_h[seq_id].data(), row_bytes);
+
+        for (int32_t i = 0; i < n_rows; ++i) {
+            const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, rows[i]);
+            if (h == nullptr) {
+                SPC_ERR("MTP branch heal: no nextn row for batch idx %d\n", (int) rows[i]);
+                return false;
+            }
+            std::memcpy(h_new.data() + (size_t) (i + 1) * n_embd, h, row_bytes);
+        }
+
+        verify_h[seq_id]      = std::move(h_new);
+        verify_h_rows[seq_id] = n_rows + 1;
+
+        std::memcpy(pending_h[seq_id].data(),
+                verify_h[seq_id].data() + (size_t) n_rows * n_embd, row_bytes);
+
+        SPC_DBG("MTP branch heal: seq %d, %d branch row(s), verify_h -> %d rows\n",
+                (int) seq_id, (int) n_rows, (int) verify_h_rows[seq_id]);
+
+        return true;
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 

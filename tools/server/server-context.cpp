@@ -85,6 +85,28 @@ struct server_spec_timing {
 };
 static server_spec_timing g_spec_timing;
 
+// #137 / code-review finding #13: the spec-tree roster gate must see the SECONDARY
+// drafter too. LLAMA_SPEC_DRAFT2* is registered AFTER spec_tree_active is resolved and
+// its type lives in a separate params copy, so a gate reading only
+// params_base.speculative.types let an unsupported drafter2 (eagle3) silently arm the
+// tree and then corrupt its unhealed deferred state on the first branch take.
+// An unknown type name maps to _COUNT, which the gate treats as unsupported (it also
+// avoids common_speculative_types_from_names, which THROWS on an unknown name).
+static std::vector<common_speculative_type> spec_tree_roster_types(const common_params & params_base) {
+    std::vector<common_speculative_type> types = params_base.speculative.types;
+
+    const char * d2_path = getenv("LLAMA_SPEC_DRAFT2");
+    if (d2_path == nullptr || *d2_path == '\0') {
+        return types;
+    }
+
+    const char * d2_type_s = getenv("LLAMA_SPEC_DRAFT2_TYPE");
+    types.push_back(common_speculative_type_from_name(
+                d2_type_s != nullptr && *d2_type_s != '\0' ? d2_type_s : "draft-simple"));
+
+    return types;
+}
+
 // TASKS #89: a split model's on-disk size is the SUM of its shard set -
 // stat'ing only the -00001- member undercounts every sharded model (the
 // fleet loading page showed shard-1-only sizes and bogus percentages)
@@ -2195,16 +2217,19 @@ private:
         }
 
         // spec tree (#132): reserve one spare branch sequence per slot. Supported rosters:
-        // draft-simple (mirror heal = token re-decode) and dspark/dflash (heal = the
-        // encode+inject path over the branch rows, whose accept() carries no state).
-        // mtp/eagle3 keep accepted-count-indexed deferred state and stay excluded. No PEARL.
+        // draft-simple (mirror heal = token re-decode), dspark/dflash (heal = the
+        // encode+inject path over the branch rows, whose accept() carries no state), and
+        // since #137 draft-mtp, whose process_rows override rebuilds the accepted-count-
+        // indexed verify_h/pending_h from the branch rows before accept() reads them.
+        // eagle3 still keeps unhealed deferred state and stays excluded. No PEARL.
         spec_tree_active = false;
         if (common_speculative_tree_enabled()) {
             bool roster_ok = false;
-            for (const auto t : params_base.speculative.types) {
+            for (const auto t : spec_tree_roster_types(params_base)) {
                 if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
                     t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
-                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
                     roster_ok = true;
                 } else if (t != COMMON_SPECULATIVE_TYPE_NONE) {
                     roster_ok = false;
