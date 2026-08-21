@@ -4273,6 +4273,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-budget-warn-at"}, "N",
+        "soft warning (#139): when N thinking tokens remain, inject --reasoning-budget-warn-message\n"
+        "into the reasoning stream WITHOUT an end tag and keep counting, so the model can wind down\n"
+        "and close the block itself; the hard budget cut still applies at 0 (default: -1 = disabled)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_warn_at = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_WARN_AT"));
+    add_opt(common_arg(
+        {"--reasoning-budget-warn-message"}, "MESSAGE",
+        "message injected into the reasoning stream when --reasoning-budget-warn-at fires (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_budget_warn_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_WARN_MESSAGE"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"

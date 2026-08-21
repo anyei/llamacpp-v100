@@ -434,6 +434,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_num("reasoning_budget_warn_at", params.sampling.reasoning_budget_warn_at))
+        ->set_desc("Soft warning (#139): inject the warning message into the reasoning stream when this many "
+                   "thinking tokens remain, WITHOUT an end tag, then keep counting so the model can close the "
+                   "block itself. -1 disables. The hard reasoning_budget_tokens cut still applies."));
+
+    add((new field_str("reasoning_budget_warn_message"))
+        ->set_desc("Text injected into the reasoning stream when reasoning_budget_warn_at fires")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            const std::string message = json_value(data, "reasoning_budget_warn_message", std::string());
+            ctx.params.sampling.reasoning_budget_warn_message = message;
+            ctx.params.sampling.reasoning_budget_warn =
+                message.empty() ? llama_tokens{} : common_tokenize(ctx.vocab, message, false, true);
+        }));
+
     add((new field_json("logit_bias"))
         ->set_desc("Modify the likelihood of specific tokens. Accepts an array of [token, bias] pairs or an object mapping token to bias. Use false as bias to ban a token")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

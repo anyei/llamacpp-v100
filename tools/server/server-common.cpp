@@ -1136,6 +1136,8 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+            llama_params["reasoning_budget_warn_at"] = json_value(body, "reasoning_budget_warn_at", opt.reasoning_budget_warn_at);
+            llama_params["reasoning_budget_warn_message"] = json_value(body, "reasoning_budget_warn_message", opt.reasoning_budget_warn_message);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
     }

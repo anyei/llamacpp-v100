@@ -290,6 +290,9 @@ struct common_params_sampling {
     std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+    llama_tokens              reasoning_budget_warn;           // #139 soft-warning sequence (no end tag); empty = disabled
+    int32_t                   reasoning_budget_warn_at   = -1; // fire the warning when this many budget tokens remain; -1 = disabled
+    std::string               reasoning_budget_warn_message;   // text of the soft warning
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;

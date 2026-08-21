@@ -313,6 +313,8 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    int  reasoning_budget_warn_at = -1;
+    std::string reasoning_budget_warn_message;
     std::string media_path;
     bool force_pure_content = false;
 };

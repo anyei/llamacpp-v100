@@ -65,7 +65,18 @@ struct common_reasoning_budget_ctx {
     size_t force_pos;         // next position in forced_tokens to force
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
+
+    // #139 soft warning: injected while still COUNTING, then counting resumes
+    llama_tokens warn_tokens; // sequence forced as the warning (empty = disabled)
+    int32_t warn_at;          // fire when remaining <= warn_at (< 0 = disabled)
+    size_t  warn_pos;         // next position in warn_tokens to force
+    bool    warn_fired;       // already warned in this reasoning block
 };
+
+// the warning is armed only when it can still precede the hard cut
+static bool common_reasoning_budget_warn_armed(const common_reasoning_budget_ctx * ctx) {
+    return !ctx->warn_fired && ctx->warn_at >= 0 && !ctx->warn_tokens.empty();
+}
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
     return "reasoning-budget";
@@ -80,6 +91,8 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
             if (ctx->start_matcher.advance(token) >= 0) {
                 ctx->state = REASONING_BUDGET_COUNTING;
                 ctx->remaining = ctx->budget;
+                ctx->warn_pos = 0;
+                ctx->warn_fired = false;
                 COM_TRC("activated, budget=%d tokens\n", ctx->budget);
 
                 if (ctx->remaining <= 0) {
@@ -127,7 +140,28 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                         ctx->end_matcher.reset();
                         COM_TRC("%s", "budget exhausted, waiting for UTF-8 completion\n");
                     }
+                } else if (common_reasoning_budget_warn_armed(ctx) && ctx->remaining <= ctx->warn_at && utf8_complete) {
+                    // soft warning (#139): inject the nudge, then resume counting so the
+                    // model can close the block itself. Not UTF-8 complete? do nothing -
+                    // the condition still holds next token, so this self-heals.
+                    ctx->state = REASONING_BUDGET_WARNING;
+                    ctx->warn_pos = 0;
+                    ctx->warn_fired = true;
+                    ctx->end_matcher.reset();
+                    COM_TRC("budget low (%d left), injecting warning\n", ctx->remaining);
                 }
+            }
+            break;
+        }
+        case REASONING_BUDGET_WARNING:
+        {
+            // forced warning tokens do not consume budget and must not be able to
+            // complete an end sequence straddling the injection
+            ctx->warn_pos++;
+            if (ctx->warn_pos >= ctx->warn_tokens.size()) {
+                ctx->state = REASONING_BUDGET_COUNTING;
+                ctx->end_matcher.reset();
+                COM_TRC("warning injected, resuming count (%d left)\n", ctx->remaining);
             }
             break;
         }
@@ -151,6 +185,8 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                 ctx->remaining = ctx->budget;
                 ctx->end_matcher.reset();
                 ctx->end_match = -1;
+                ctx->warn_pos = 0;
+                ctx->warn_fired = false;
                 COM_TRC("re-activated on new start tag, budget=%d tokens\n", ctx->budget);
 
                 if (ctx->remaining <= 0) {
@@ -166,16 +202,21 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
-    if (ctx->state != REASONING_BUDGET_FORCING) {
+    if (ctx->state != REASONING_BUDGET_FORCING && ctx->state != REASONING_BUDGET_WARNING) {
         // passthrough — don't modify logits
         return;
     }
 
-    if (ctx->force_pos >= ctx->forced_tokens.size()) {
+    const bool warning = ctx->state == REASONING_BUDGET_WARNING;
+
+    const llama_tokens & seq = warning ? ctx->warn_tokens  : ctx->forced_tokens;
+    const size_t         pos = warning ? ctx->warn_pos     : ctx->force_pos;
+
+    if (pos >= seq.size()) {
         return;
     }
 
-    const llama_token forced = ctx->forced_tokens[ctx->force_pos];
+    const llama_token forced = seq[pos];
 
     // set all logits to -inf except the forced token
     for (size_t i = 0; i < cur_p->size; i++) {
@@ -193,12 +234,15 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     ctx->force_pos = 0;
     ctx->end_match = -1;
+    ctx->warn_pos = 0;
+    ctx->warn_fired = false;
 }
 
 static struct llama_sampler * common_reasoning_budget_init_state(
         const struct llama_vocab * vocab, const std::vector<llama_tokens> & start_seqs,
         const std::vector<llama_tokens> & end_seqs, const llama_tokens & forced_tokens,
-        int32_t budget, common_reasoning_budget_state initial_state);
+        int32_t budget, common_reasoning_budget_state initial_state,
+        const llama_tokens & warn_tokens, int32_t warn_at);
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl);
 
@@ -234,7 +278,9 @@ static struct llama_sampler * common_reasoning_budget_init_state(
         const std::vector<llama_tokens> & end_seqs,
         const llama_tokens              & forced_tokens,
         int32_t                           budget,
-        common_reasoning_budget_state     initial_state) {
+        common_reasoning_budget_state     initial_state,
+        const llama_tokens              & warn_tokens,
+        int32_t                           warn_at) {
     // promote COUNTING with budget <= 0 to FORCING
     if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
         initial_state = REASONING_BUDGET_FORCING;
@@ -252,6 +298,10 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .state         = */ initial_state,
             /* .force_pos     = */ 0,
             /* .end_match     = */ -1,
+            /* .warn_tokens   = */ warn_tokens,
+            /* .warn_at       = */ warn_at,
+            /* .warn_pos      = */ 0,
+            /* .warn_fired    = */ false,
         }
     );
 }
@@ -262,8 +312,10 @@ struct llama_sampler * common_reasoning_budget_init(
         const std::vector<llama_tokens> & end_seqs,
         const llama_tokens              & forced_tokens,
         int32_t                           budget,
-        common_reasoning_budget_state     initial_state) {
-    return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, budget, initial_state);
+        common_reasoning_budget_state     initial_state,
+        const llama_tokens              & warn_tokens,
+        int32_t                           warn_at) {
+    return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, budget, initial_state, warn_tokens, warn_at);
 }
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {

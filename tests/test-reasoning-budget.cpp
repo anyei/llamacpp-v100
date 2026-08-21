@@ -8,10 +8,12 @@
 #undef NDEBUG
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Reasoning budget sampler test helper
@@ -358,6 +360,80 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
+// #139 soft-warning helper. The basic helper above stops at the first gap in
+// forcing, which cannot express warn -> resume -> hard-cut; this one records
+// EVERY index where a token was forced together with the token forced there.
+static void test_reasoning_budget_warning(
+    const char * test_name,
+    const std::vector<llama_token> & sequence,
+    const std::vector<llama_tokens> & start_seqs,
+    const std::vector<llama_tokens> & end_seqs,
+    const std::vector<llama_token> & forced_tokens,
+    int32_t budget,
+    const std::vector<llama_token> & warn_tokens,
+    int32_t warn_at,
+    const std::vector<std::pair<size_t, llama_token>> & expected_forced
+) {
+    llama_token max_token = 0;
+    for (auto t : sequence) max_token = std::max(max_token, t);
+    for (const auto & seq : start_seqs) { for (auto t : seq) max_token = std::max(max_token, t); }
+    for (const auto & seq : end_seqs)   { for (auto t : seq) max_token = std::max(max_token, t); }
+    for (auto t : forced_tokens) max_token = std::max(max_token, t);
+    for (auto t : warn_tokens)   max_token = std::max(max_token, t);
+
+    auto * sampler = common_reasoning_budget_init(
+        nullptr, start_seqs, end_seqs, forced_tokens, budget,
+        REASONING_BUDGET_IDLE, warn_tokens, warn_at);
+
+    std::vector<llama_token_data> cur;
+    const size_t n_vocab = (size_t) max_token + 1;
+    for (size_t i = 0; i < n_vocab; i++) {
+        cur.emplace_back(llama_token_data{(llama_token) i, logf((float)(i+1)), 0.0f});
+    }
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+
+    std::vector<std::pair<size_t, llama_token>> actual_forced;
+
+    for (size_t i = 0; i < sequence.size(); i++) {
+        cur_p.selected = -1;
+        for (size_t j = 0; j < cur.size(); j++) {
+            cur[j].logit = logf((float)(j+1));
+        }
+
+        llama_sampler_apply(sampler, &cur_p);
+
+        size_t finite_count = 0;
+        llama_token finite_token = -1;
+        for (size_t j = 0; j < cur.size(); j++) {
+            if (std::isfinite(cur[j].logit)) {
+                finite_count++;
+                finite_token = cur[j].id;
+            }
+        }
+        if (finite_count == 1) {
+            actual_forced.emplace_back(i, finite_token);
+        }
+
+        llama_sampler_accept(sampler, sequence[i]);
+    }
+
+    llama_sampler_free(sampler);
+
+    bool ok = actual_forced.size() == expected_forced.size();
+    for (size_t k = 0; ok && k < actual_forced.size(); k++) {
+        ok = actual_forced[k] == expected_forced[k];
+    }
+
+    if (!ok) {
+        fprintf(stderr, "Test '%s' FAILED\n  expected forced:", test_name);
+        for (const auto & e : expected_forced) fprintf(stderr, " (i=%zu tok=%d)", e.first, (int) e.second);
+        fprintf(stderr, "\n  actual forced:  ");
+        for (const auto & a : actual_forced)   fprintf(stderr, " (i=%zu tok=%d)", a.first, (int) a.second);
+        fprintf(stderr, "\n");
+        GGML_ASSERT(false && "reasoning budget warning forcing mismatch");
+    }
+}
+
 int main(void) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
@@ -496,6 +572,47 @@ int main(void) {
     test_reasoning_budget_end_match();
 
     printf("OK (12 tests passed)\n");
+
+    // #139 soft warning: warn -> resume counting -> hard cut still backstops
+    printf("Testing reasoning budget soft warning... ");
+    {
+        const llama_tokens start  = {100};
+        const llama_tokens end    = {101};
+        const llama_tokens forced = {102, 101};  // hard cut: message + end tag
+        const llama_tokens warn   = {200, 201};  // soft warning: NO end tag
+
+        // budget 6, warn when 3 remain.
+        // i=0 accept(100)->COUNTING rem=6; i=1..3 rem=5,4,3 -> at rem<=3 enter WARNING
+        // i=4,5 force warn tokens -> back to COUNTING; i=6,7,8 rem=2,1,0 -> FORCING
+        // i=9,10 force the hard sequence -> DONE
+        const std::vector<llama_token> seq = {100, 50, 51, 52, 200, 201, 53, 54, 55, 102, 101, 60};
+
+        test_reasoning_budget_warning("soft warning then hard cut", seq, {start}, {end}, forced,
+            6, warn, 3,
+            {{4, 200}, {5, 201}, {9, 102}, {10, 101}});
+
+        // OFF-GATE: warn_at = -1 must reproduce the pre-#139 behavior exactly -
+        // only the hard cut forces, and at the same indices as before.
+        // budget 6 is consumed by the accepts at i=1..6, so the first FORCED apply
+        // lands at i=7 (the apply at i=6 still runs while COUNTING).
+        const std::vector<llama_token> seq_off = {100, 50, 51, 52, 53, 54, 102, 101, 60};
+        test_reasoning_budget_warning("warning disabled (off-gate)", seq_off, {start}, {end}, forced,
+            6, warn, -1,
+            {{7, 102}, {8, 101}});
+
+        // an empty warning message is also disabled, even with a threshold set
+        test_reasoning_budget_warning("empty warning message disabled", seq_off, {start}, {end}, forced,
+            6, {}, 3,
+            {{7, 102}, {8, 101}});
+
+        // fires at most once per reasoning block: after the warning, crossing the
+        // threshold again on later tokens must not re-inject
+        const std::vector<llama_token> seq_once = {100, 50, 51, 52, 200, 201, 53, 54, 55, 102, 101};
+        test_reasoning_budget_warning("warning fires once per block", seq_once, {start}, {end}, forced,
+            6, warn, 5,   // threshold high enough that every later token still satisfies it
+            {{2, 200}, {3, 201}, {9, 102}, {10, 101}});
+    }
+    printf("OK (4 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();
