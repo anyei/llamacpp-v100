@@ -78,6 +78,11 @@
 				: null
 	);
 	let shareIsMeasured = $derived(typeof device.model_frac === 'number');
+	// "% experts" must come from the EP expert distribution, not the total-weights
+	// share - a pure attention owner has model_frac > 0 but zero experts
+	let expertPercent = $derived(
+		typeof device.split_frac === 'number' ? Math.round(device.split_frac * 100) : null
+	);
 
 	let latencyMs = $derived(device.stats ? (device.stats.ewma_latency_us / 1000).toFixed(1) : null);
 
@@ -267,13 +272,13 @@
 	{#if device.attn_owner || device.n_layers != null || splitPercent !== null}
 		<p class="text-xs text-muted-foreground">
 			{[
-				device.attn_owner && splitPercent
-					? `attention owner + ${splitPercent}% experts`
+				device.attn_owner && expertPercent
+					? `attention owner + ${expertPercent}% experts`
 					: device.attn_owner
 						? 'attention owner'
 						: null,
 				device.n_layers != null ? `${device.n_layers} layers` : null,
-				!device.attn_owner && splitPercent !== null
+				(!device.attn_owner || !expertPercent) && splitPercent !== null
 					? `${splitPercent}%${shareIsMeasured ? ' of weights' : ' planned'}`
 					: null
 			]
