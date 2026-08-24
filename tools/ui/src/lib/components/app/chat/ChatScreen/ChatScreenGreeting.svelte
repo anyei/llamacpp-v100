@@ -2,7 +2,7 @@
 	import { Rocket } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { serverStore, isRouterMode } from '$lib/stores/server.svelte';
-	import { routerModels, loadedModelIds } from '$lib/stores/models.svelte';
+	import { routerModels, routerModelsFetched, loadedModelIds } from '$lib/stores/models.svelte';
 	import { ServerModelStatus } from '$lib/enums/server.enums';
 
 	interface Props {
@@ -11,9 +11,12 @@
 
 	let { isEmpty = false }: Props = $props();
 
-	// router with nothing loaded or loading: guide the user to the launch wizard
+	// router with nothing loaded or loading: guide the user to the launch wizard.
+	// Gated on a completed fetch so the CTA cannot flash while the list is still
+	// on its way in (review #26)
 	let noModel = $derived(
 		isRouterMode() &&
+			routerModelsFetched() &&
 			loadedModelIds().length === 0 &&
 			!routerModels().some((m) => m.status?.value === ServerModelStatus.LOADING)
 	);

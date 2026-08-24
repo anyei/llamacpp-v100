@@ -47,6 +47,9 @@ class ModelsStore {
 
 	models = $state<ModelOption[]>([]);
 	routerModels = $state<ApiModelDataEntry[]>([]);
+	/** True once routerModels reflects at least one successful fetch - gates
+	 *  "no model" UI so it cannot flash during the first load (review #26). */
+	routerModelsFetched = $state(false);
 	loading = $state(false);
 	updating = $state(false);
 	error = $state<string | null>(null);
@@ -344,6 +347,7 @@ class ModelsStore {
 				const response = await ModelsService.listRouter();
 
 				this.routerModels = response.data;
+				this.routerModelsFetched = true;
 				this.models = this.buildModelOptions(response);
 
 				await this.fetchModalitiesForLoadedModels();
@@ -414,6 +418,7 @@ class ModelsStore {
 		try {
 			const response = await ModelsService.listRouter();
 			this.routerModels = response.data;
+			this.routerModelsFetched = true;
 			await this.fetchModalitiesForLoadedModels();
 
 			const visible = this.getVisibleModels();
@@ -421,8 +426,9 @@ class ModelsStore {
 				this.selectModelById(visible[0].id);
 			}
 		} catch (error) {
+			// keep the last known list: one transient /models failure must not
+			// flip the UI into a sticky "no model is loaded" state (review #26)
 			console.warn('Failed to fetch router models:', error);
-			this.routerModels = [];
 		}
 	}
 
@@ -1018,6 +1024,7 @@ class ModelsStore {
 		this.statusWaiters.clear();
 		this.models = [];
 		this.routerModels = [];
+		this.routerModelsFetched = false;
 		this.loading = false;
 		this.updating = false;
 		this.error = null;
@@ -1042,6 +1049,7 @@ export const modelsStore = new ModelsStore();
 
 export const modelOptions = () => modelsStore.models;
 export const routerModels = () => modelsStore.routerModels;
+export const routerModelsFetched = () => modelsStore.routerModelsFetched;
 export const modelsLoading = () => modelsStore.loading;
 export const modelsUpdating = () => modelsStore.updating;
 export const modelsError = () => modelsStore.error;

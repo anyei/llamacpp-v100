@@ -59,8 +59,8 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 22 conv_models.remember() replace → spurious 400 — fixed 2026-08-23 (per-conv ticket set, alive() single-use, forget() still kills all; live gate: concurrent duplicates 200/200, stop-cancel 400 intact)
 - [x] 23 CHECK_IDS aborts under CUDA graphs — fixed 2026-08-23 (auto-skip while capture active; V100 smoke: MoE decode 93 t/s with CHECK_IDS=1 + graphs on, no abort; env-gates row updated)
 - [x] 24 fleet totals count CPU-holder rows as VRAM — fixed 2026-08-23 (server emits truthful is_cpu on device rows, UI totals key on it with worker_is_cpu fallback; -ngl 0 gate: CPU holder is_cpu=true, CUDA0 false)
-- [ ] 25 header Unload target vs MRU proxy target
-- [ ] 26 greeting no-model CTA during fetch/after failure
+- [x] 25 header Unload target vs MRU proxy target — fixed 2026-08-23 (router stamps router_model into the proxied /fleet/status via buffered child fetch; UI unload prefers it, loadedModelIds[0] fallback; live gate green)
+- [x] 26 greeting no-model CTA during fetch/after failure — fixed 2026-08-23 (routerModelsFetched gate + keep-last-known list on transient /models failure; UI build clean)
 - [x] 27 FleetDeviceCard labels weights share as % experts — fixed 2026-08-23 (experts phrase now from split_frac; pure owner shows 'attention owner · N% of weights'; UI build clean)
 - [x] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE→confirmed by trace) — fixed 2026-08-23 (read size/4 floats + alignment asserts; full-tensor path identical, byte gate c80261ff 6/6 x3 legs)
 - [ ] 29 SESSION_MODEL once per socket (PLAUSIBLE, latent)
