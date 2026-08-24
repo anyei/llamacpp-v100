@@ -26,6 +26,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -53,18 +56,55 @@
 
 #define UNUSED GGML_UNUSED
 
+// the high half of a graph uid is a per-process random salt: plain counters
+// all start at 1, so two client processes sharing one RPC worker would claim
+// each other's server-cached graphs (silently wrong graphs / dropped conns)
+static uint64_t ggml_graph_uid_salt(void) {
+    uint64_t seed = (uint64_t) (uintptr_t) &ggml_graph_uid_salt;
+    seed ^= (uint64_t) time(NULL) << 16;
+#if defined(_WIN32)
+    seed ^= (uint64_t) GetCurrentProcessId() << 40;
+#else
+    seed ^= (uint64_t) getpid() << 40;
+#endif
+    // splitmix64 finalizer: near-identical seeds map far apart
+    seed += 0x9E3779B97F4A7C15ull;
+    seed = (seed ^ (seed >> 30)) * 0xBF58476D1CE4E5B9ull;
+    seed = (seed ^ (seed >> 27)) * 0x94D049BB133111EBull;
+    seed ^= seed >> 31;
+    seed <<= 32;
+    if (seed == 0) {
+        seed = 0xA5A5A5A500000000ull; // uid 0 means "no uid": keep the salt nonzero
+    }
+    return seed;
+}
+
 uint64_t ggml_graph_next_uid(void) {
 #ifdef _MSC_VER
+    static volatile LONGLONG salt = 0;
+    LONGLONG s = InterlockedCompareExchange64(&salt, 0, 0);
+    if (s == 0) {
+        InterlockedCompareExchange64(&salt, (LONGLONG) ggml_graph_uid_salt(), 0);
+        s = InterlockedCompareExchange64(&salt, 0, 0);
+    }
 #if defined(_WIN32)
     static volatile LONG counter = 1;
-    return (uint64_t) InterlockedIncrement(&counter) - 1;
+    return (uint64_t) s | (uint64_t) (uint32_t) (InterlockedIncrement(&counter) - 1);
 #else
     static volatile long long counter = 1;
-    return (uint64_t) _InterlockedIncrement64(&counter) - 1;
+    return (uint64_t) s | (uint64_t) (uint32_t) (_InterlockedIncrement64(&counter) - 1);
 #endif
 #else
+    static uint64_t salt = 0;
+    uint64_t s = __atomic_load_n(&salt, __ATOMIC_ACQUIRE);
+    if (s == 0) {
+        uint64_t fresh    = ggml_graph_uid_salt();
+        uint64_t expected = 0;
+        __atomic_compare_exchange_n(&salt, &expected, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        s = __atomic_load_n(&salt, __ATOMIC_ACQUIRE);
+    }
     static uint64_t counter = 1;
-    return __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
+    return s | (uint64_t) (uint32_t) __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
 #endif
 }
 

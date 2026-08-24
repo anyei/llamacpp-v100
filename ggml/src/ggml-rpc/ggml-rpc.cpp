@@ -388,9 +388,11 @@ struct rpc_msg_graph_recompute_uid_req {
     uint64_t uid;
 };
 
-// server-side per-device cap on cached uid-keyed graphs (proto 4.3). The client
-// tracks at most half of this, so a uid the client remembers is always cached
-// server-side; eviction on either side only costs a re-send, never a failure.
+// server-side per-device cap on cached uid-keyed graphs (proto 4.3). Each
+// client context tracks at most 1/8 of this (room for peers sharing the
+// device) and eviction is LRU (review #18), so a uid a client actively
+// recomputes stays cached; a genuine server-side miss still drops the
+// connection - reachable only past ~8 concurrently active contexts per device.
 #define RPC_GRAPH_UID_CACHE_CAP 512
 
 #pragma pack(pop)
@@ -2970,6 +2972,19 @@ private:
     struct stored_graph_cache {
         std::unordered_map<uint64_t, stored_graph> by_uid;
         std::deque<uint64_t>                       order;
+
+        // LRU refresh (review #18): eviction was pure insert-order FIFO, so a
+        // uid a client still actively recomputes could be evicted by other
+        // clients' inserts and the next recompute dropped the connection
+        void refresh(uint64_t uid) {
+            for (auto rit = order.rbegin(); rit != order.rend(); ++rit) {
+                if (*rit == uid) {
+                    order.erase(std::next(rit).base());
+                    order.push_back(uid);
+                    return;
+                }
+            }
+        }
     };
     std::vector<stored_graph_cache> stored_graph_caches;
 
@@ -4412,6 +4427,8 @@ bool rpc_server::graph_compute_uid(const std::vector<uint8_t> & input) {
         }
         it = cache.by_uid.emplace(uid, stored_graph{}).first;
         cache.order.push_back(uid);
+    } else {
+        cache.refresh(uid);
     }
     return deserialize_compute(device, input.data() + header, input.size() - header, it->second, __func__);
 }
@@ -4427,6 +4444,7 @@ bool rpc_server::graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & req
         GGML_LOG_ERROR("[%s] no cached graph for device %u uid %" PRIu64 "\n", __func__, device, request.uid);
         return false;
     }
+    cache.refresh(request.uid);
     if (it->second.owner_conn != current_conn) {
         // another connection replaced this uid's stored graph - recomputing it
         // would silently run the wrong graph (see graph_recompute)
