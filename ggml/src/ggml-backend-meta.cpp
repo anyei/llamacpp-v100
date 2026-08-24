@@ -4369,8 +4369,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool fused_enabled = !no_fused && !tm_enabled && cgraph->uid != 0 &&
         getenv("GGML_META_NO_STAR") == nullptr &&
         backend_ctx->fused_send != nullptr && backend_ctx->fused_recv != nullptr;
-    std::vector<int>  fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
-    std::vector<char> fused_fetch_pending(n_backends, 0); // member's boundary-i partial arrives via fused_recv
+    std::vector<int>    fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
+    std::vector<size_t> fused_fetch_pending(n_backends, 0); // nbytes of the member's pending fused-FETCH partial (0 = none)
 
     // TASKS #71 probe: GGML_META_PROBE_DEFER_GATHER=1 - the star gather stops
     // waiting for WIRE members' partials: their fused responses are drained one
@@ -4448,6 +4448,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             defer_drain_pending[j]  = 0;
         }
     };
+
+    // An early error return must not abandon an in-flight fused FETCH: the
+    // socket-side stash has no graph tag, decode-graph star boundaries share
+    // nbytes, so the NEXT graph's fused_recv would claim the stale payload and
+    // every later gather would run one boundary late - permanently and
+    // silently. Drain whatever is still owed on ANY exit; a clean exit has
+    // consumed everything and this is a no-op.
+    struct fetch_drain_guard_t {
+        ggml_backend_meta_context * ctx;
+        std::vector<size_t> * fetch_pending;
+        std::vector<char>   * drain_pending;
+        std::vector<size_t> * drain_nbytes;
+        ~fetch_drain_guard_t() {
+            std::vector<uint8_t> discard;
+            for (size_t j = 0; j < fetch_pending->size(); j++) {
+                size_t nb = (*fetch_pending)[j];
+                if (nb == 0 && (*drain_pending)[j]) {
+                    nb = (*drain_nbytes)[j];
+                }
+                if (nb == 0) {
+                    continue;
+                }
+                if (discard.size() < nb) {
+                    discard.resize(nb);
+                }
+                ctx->fused_recv(ctx->backend_configs[j].backend, discard.data(), nb);
+                (*fetch_pending)[j] = 0;
+                (*drain_pending)[j] = 0;
+            }
+        }
+    } fetch_drain_guard { backend_ctx, &fused_fetch_pending, &defer_drain_pending, &defer_drain_nbytes };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
@@ -4530,7 +4561,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             chain.data(), (int) chain.size(),
                             want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
                         fused_carried[j]       = (int) chain.size();
-                        fused_fetch_pending[j] = want_fetch ? 1 : 0;
+                        fused_fetch_pending[j] = want_fetch ? next_nbytes : 0;
                         continue;
                     }
                 }

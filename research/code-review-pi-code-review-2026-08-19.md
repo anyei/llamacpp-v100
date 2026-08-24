@@ -38,7 +38,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 1 PEARL worker races main-thread ctx_dft
 - [ ] 2 PEARL decode-error throw before join / reload UAF
 - [x] 3 /fleet/status leaks LLAMA_API_KEY — fixed 2026-08-23 (redact env values + --api-key argv; live loopback gate: NO-LEAK during load window)
-- [ ] 4 meta early-error abandons in-flight fused FETCH
+- [x] 4 meta early-error abandons in-flight fused FETCH — fixed 2026-08-23 (fetch_pending now records owed nbytes + scope guard drains owed responses on ANY exit; 6-leg gate green, off leg c80261ff 6/6)
 - [ ] 5 deferred cache eviction races new manifest
 - [x] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op — fixed 2026-08-23 (value-parsed like GGML_RPC_TIMING; 3-leg gate: =1 byte sha c80261ff 6/6 + ACTIVE(q8_0), =0 silent, unset silent; env-gates.md rows updated)
 - [x] 7 gguf_get_val_str(general.architecture) no type guard — fixed 2026-08-23 (type guard matching the chat_template pattern; gated with crafted UINT32-arch gguf, router scans it clean)
