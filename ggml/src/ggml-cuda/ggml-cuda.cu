@@ -1939,7 +1939,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // illegal memory access; reports the node, device and offending value.
     {
         static const bool ids_check = getenv("GGML_CUDA_CHECK_IDS") != nullptr;
-        if (ids_check && ids != nullptr && ids->type == GGML_TYPE_I32) {
+        // the sync D2H copy is illegal while a CUDA graph is capturing (graphs stay
+        // default-on for quantized MoE decode) - skip instead of aborting the very
+        // decode this diagnostic exists to debug; set GGML_CUDA_DISABLE_GRAPHS=1
+        // for full coverage
+        cudaStreamCaptureStatus ids_capture = cudaStreamCaptureStatusNone;
+        if (ids_check) {
+            CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &ids_capture));
+        }
+        if (ids_check && ids_capture == cudaStreamCaptureStatusNone && ids != nullptr && ids->type == GGML_TYPE_I32) {
             const int64_t n_ids = ggml_nelements(ids);
             std::vector<int32_t> h_ids(n_ids);
             CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, n_ids*sizeof(int32_t),

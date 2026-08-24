@@ -57,7 +57,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 20 TCP_KEEPIDLE breaks macOS build — fixed 2026-08-23 (#ifdef chain: KEEPIDLE else TCP_KEEPALIVE for Apple, INTVL/CNT guarded; Linux compile verified, Linux behavior unchanged)
 - [x] 21 wizard kind classifier hides target models — fixed 2026-08-23 (metadata-first: drafter arch / trunk-less MTP head => draft, real arch => model, name fallback only without metadata; 4-vehicle catalog gate green; user picked metadata-first)
 - [x] 22 conv_models.remember() replace → spurious 400 — fixed 2026-08-23 (per-conv ticket set, alive() single-use, forget() still kills all; live gate: concurrent duplicates 200/200, stop-cancel 400 intact)
-- [ ] 23 CHECK_IDS aborts under CUDA graphs
+- [x] 23 CHECK_IDS aborts under CUDA graphs — fixed 2026-08-23 (auto-skip while capture active; V100 smoke: MoE decode 93 t/s with CHECK_IDS=1 + graphs on, no abort; env-gates row updated)
 - [ ] 24 fleet totals count CPU-holder rows as VRAM
 - [ ] 25 header Unload target vs MRU proxy target
 - [ ] 26 greeting no-model CTA during fetch/after failure
