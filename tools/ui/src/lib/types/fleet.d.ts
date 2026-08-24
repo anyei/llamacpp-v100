@@ -137,6 +137,8 @@ export interface ApiFleetStatusResponse {
 	split_mode?: string | null;
 	n_gpu_layers?: number | null;
 	model?: ApiFleetModelInfo | null;
+	/** Router-side id of the model this status was proxied from (review #25). */
+	router_model?: string | null;
 	/** Active speculation stack (#100); absent/type "none" = target-only. */
 	speculative?: import('./api').ApiSpeculativeInfo | null;
 	devices: ApiFleetDevice[];

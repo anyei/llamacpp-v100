@@ -1958,7 +1958,46 @@ void server_models_routes::init_routes() {
             res_ok(res, json{{"model", nullptr}, {"devices", json::array()}});
             return res;
         }
-        return models.proxy_request(req, "GET", target, false);
+        // buffered child fetch instead of the streaming proxy so the router can
+        // stamp its own model id into the payload - the page then acts (unload)
+        // on the exact model whose fleet data it is showing (review #25)
+        auto meta = models.get_meta(target);
+        if (!meta.has_value() || !meta->is_running()) {
+            auto res = std::make_unique<server_http_res>();
+            res_ok(res, json{{"model", nullptr}, {"devices", json::array()}});
+            return res;
+        }
+        httplib::Client cli(CHILD_ADDR, meta->port);
+        cli.set_read_timeout(5, 0);
+        httplib::Headers headers;
+        for (const auto & [k, v] : req.headers) {
+            headers.emplace(k, v);
+        }
+        std::string path = req.path;
+        if (!req.query_string.empty()) {
+            path += '?' + req.query_string;
+        }
+        auto res = std::make_unique<server_http_res>();
+        auto r = cli.Get(path.c_str(), headers);
+        if (!r) {
+            res_err(res, format_error_response("child fleet status unreachable", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res->status = r->status;
+        if (r->has_header("Content-Type")) {
+            res->content_type = r->get_header_value("Content-Type");
+        }
+        res->data = r->body;
+        if (r->status == 200) {
+            try {
+                json j = json::parse(r->body);
+                j["router_model"] = target;
+                res->data = j.dump();
+            } catch (...) {
+                // non-JSON child response - forward untouched
+            }
+        }
+        return res;
     };
 
     this->get_router_fleet_worker_log = [this, fleet_proxy_target](const server_http_req & req) {

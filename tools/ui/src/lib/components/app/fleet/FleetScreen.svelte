@@ -168,8 +168,14 @@
 	let isReloading = $state(false);
 
 	// ROUTER mode only: the fleet serve is a router child, so it can be unloaded
-	// from here (same store path as the model selector's unload)
-	let unloadTarget = $derived(isRouterMode() ? (modelsStore.loadedModelIds[0] ?? null) : null);
+	// from here (same store path as the model selector's unload). Prefer the model
+	// this page's data was proxied from - with several loaded models the first
+	// listed id can be a different serve than the one on screen
+	let unloadTarget = $derived(
+		isRouterMode()
+			? (fleetStore.status?.router_model ?? modelsStore.loadedModelIds[0] ?? null)
+			: null
+	);
 	let showUnloadDialog = $state(false);
 	let isUnloading = $state(false);
 
