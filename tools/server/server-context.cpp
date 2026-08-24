@@ -4371,6 +4371,18 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // PEARL (#108): an adopted round never enters the drafting iterate
+                        // below, so capture the target checkpoint here - a partial rejection
+                        // of the adopted draft restores it against this round's positions
+                        if (adopted) {
+                            const bool use_ckpt_tgt =
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                               (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && slot.spec_draft.size() > llama_n_rs_seq(ctx_tgt));
+                            if (use_ckpt_tgt) {
+                                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+                        }
+
                         if (!adopted) {
                             common_speculative_get_draft_params(spec.get(), slot.id) = {
                                 /* .drafting = */ true,
