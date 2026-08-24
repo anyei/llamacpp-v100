@@ -638,9 +638,18 @@ static bool set_keepalive(sockfd_t sockfd) {
     }
 #ifndef _WIN32
     int idle = 60, intvl = 10, cnt = 3;
+#if defined(TCP_KEEPIDLE)
     setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,  (char *)&idle,  sizeof(int));
+#elif defined(TCP_KEEPALIVE)
+    // macOS spells the idle-time option TCP_KEEPALIVE
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPALIVE, (char *)&idle,  sizeof(int));
+#endif
+#ifdef TCP_KEEPINTVL
     setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, (char *)&intvl, sizeof(int));
+#endif
+#ifdef TCP_KEEPCNT
     setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,   (char *)&cnt,   sizeof(int));
+#endif
 #endif
     return true;
 }

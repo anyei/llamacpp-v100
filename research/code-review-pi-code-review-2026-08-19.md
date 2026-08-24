@@ -54,7 +54,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 17 dspark markov head unequal per-slot blocks
 - [ ] 18 RPC graph-uid cross-process collisions
 - [ ] 19 RPC cache cap unenforced while conns live
-- [ ] 20 TCP_KEEPIDLE breaks macOS build
+- [x] 20 TCP_KEEPIDLE breaks macOS build — fixed 2026-08-23 (#ifdef chain: KEEPIDLE else TCP_KEEPALIVE for Apple, INTVL/CNT guarded; Linux compile verified, Linux behavior unchanged)
 - [x] 21 wizard kind classifier hides target models — fixed 2026-08-23 (metadata-first: drafter arch / trunk-less MTP head => draft, real arch => model, name fallback only without metadata; 4-vehicle catalog gate green; user picked metadata-first)
 - [x] 22 conv_models.remember() replace → spurious 400 — fixed 2026-08-23 (per-conv ticket set, alive() single-use, forget() still kills all; live gate: concurrent duplicates 200/200, stop-cancel 400 intact)
 - [ ] 23 CHECK_IDS aborts under CUDA graphs
