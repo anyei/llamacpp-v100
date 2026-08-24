@@ -50,7 +50,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 13 process_rows branch-heal misindexes MTP/EAGLE3 — fixed `c2f43e1f5` (2026-08-21, #137 step 0)
 - [ ] 14 spec-tree row demand vs batch capacity
 - [x] 15 star-gather ignores fused_recv failure — fixed 2026-08-23 (reduce fails the graph on recv failure; defer drain counts ed_lost instead of injecting zeros; 6-leg defer gate: off leg c80261ff 6/6, LOST 0.00 all legs)
-- [ ] 16 fused MUL_MAT_ID+GLU/ADD_ID pre-zero; add-id.cu sentinel
+- [x] 16 fused MUL_MAT_ID+GLU/ADD_ID pre-zero; add-id.cu sentinel — fixed 2026-08-23 (pre-zero in both vec wrappers for fused mul_mat_id; add_id kernel zeros sentinel rows; V100 MoE smoke byte-identical, 92.7 vs 93.3 t/s)
 - [ ] 17 dspark markov head unequal per-slot blocks
 - [ ] 18 RPC graph-uid cross-process collisions
 - [ ] 19 RPC cache cap unenforced while conns live

@@ -638,6 +638,15 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
 
+    if (ids != nullptr && fusion != nullptr) {
+        // fused dispatch bypasses ggml_cuda_mul_mat_id's dst pre-zero; sentinel
+        // (-1) lanes early-return and would leave their fused-dst rows unwritten
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     const size_t ts_src0 = ggml_type_size(src0->type);

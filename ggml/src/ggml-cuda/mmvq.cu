@@ -1205,6 +1205,15 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
+    if (ids != nullptr && fusion != nullptr) {
+        // fused dispatch bypasses ggml_cuda_mul_mat_id's dst pre-zero; sentinel
+        // (-1) lanes early-return and would leave their fused-dst rows unwritten
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
