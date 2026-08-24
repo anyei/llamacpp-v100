@@ -40,7 +40,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 3 /fleet/status leaks LLAMA_API_KEY — fixed 2026-08-23 (redact env values + --api-key argv; live loopback gate: NO-LEAK during load window)
 - [ ] 4 meta early-error abandons in-flight fused FETCH
 - [ ] 5 deferred cache eviction races new manifest
-- [ ] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op
+- [x] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op — fixed 2026-08-23 (value-parsed like GGML_RPC_TIMING; 3-leg gate: =1 byte sha c80261ff 6/6 + ACTIVE(q8_0), =0 silent, unset silent; env-gates.md rows updated)
 - [x] 7 gguf_get_val_str(general.architecture) no type guard — fixed 2026-08-23 (type guard matching the chat_template pattern; gated with crafted UINT32-arch gguf, router scans it clean)
 - [x] 8 /wizard/placements/generate over-read + OOM + unconfined write — fixed 2026-08-23 (roots confinement shared with remove handler + strict counts validation; 4-case generate gate + 3-case remove regate green)
 - [ ] 9 DSpark conf gate reads stale encoder features

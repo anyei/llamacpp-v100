@@ -2250,8 +2250,10 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
     // of GbE byte time (BOUNDARY_STATS census 2026-07-27g). Lossy - opt-in,
     // default off. q8_0 (WIRE_Q8, ~3.76x, needs minor 13 and n%32==0) wins
     // over f16 (WIRE_F16, 2x, minor 12); anything else stays f32.
-    static const bool wire_f16 = getenv("GGML_RPC_WIRE_F16") != nullptr;
-    static const bool wire_q8  = getenv("GGML_RPC_WIRE_Q8")  != nullptr;
+    // value-parsed like GGML_RPC_TIMING: compose files pass NAME=0/empty through,
+    // and presence-gating made =0 a silent no-op (review #6)
+    static const bool wire_f16 = [] { const char * e = getenv("GGML_RPC_WIRE_F16"); return e != nullptr && atoi(e) != 0; }();
+    static const bool wire_q8  = [] { const char * e = getenv("GGML_RPC_WIRE_Q8");  return e != nullptr && atoi(e) != 0; }();
     const uint8_t server_minor = rpc_async_state(sock.get()).server_minor;
     const bool f16_ok = wire_f16 && server_minor >= 12;
     const bool q8_ok  = wire_q8  && server_minor >= 13;
