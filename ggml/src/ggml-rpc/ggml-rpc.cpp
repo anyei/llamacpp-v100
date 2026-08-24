@@ -2887,8 +2887,9 @@ public:
     // folder, the manifest and the eviction preference. Thread-local: each
     // connection runs on its own thread.
     void session_model(const std::string & id);
-    // catch-up run of the cache cap once the last client disconnects (eviction
-    // is deferred while any coordinator is connected - see rpc_cache_enforce_limit)
+    // catch-up run of the cache cap once the last client disconnects - live
+    // connections' folders are exempt from mid-serve trims, so idle is the one
+    // point everything is evictable (see rpc_cache_enforce_limit)
     void cache_enforce_idle();
     bool set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -3393,6 +3394,32 @@ struct rpc_cache_entry {
 // because each connection has its own handler thread.
 static thread_local std::string t_rpc_session_model;
 
+// review #19: model folders any LIVE connection serves from must survive the
+// cache cap, which now also runs while clients are connected. Connections that
+// never announce a session model manifest the FLAT dir, so while any exist the
+// flat entries are protected the same way (see rpc_cache_enforce_limit).
+static std::mutex                            g_rpc_live_models_mutex;
+static std::unordered_multiset<std::string>  g_rpc_live_models;
+static std::atomic<int>                      g_rpc_live_legacy{0};
+
+// conn start/end bookkeeping for the live-model registry; runs on the
+// connection's own thread so t_rpc_session_model identifies its announcement
+static void rpc_live_session_open() {
+    g_rpc_live_legacy.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void rpc_live_session_close() {
+    std::lock_guard<std::mutex> lock(g_rpc_live_models_mutex);
+    if (!t_rpc_session_model.empty()) {
+        auto it = g_rpc_live_models.find(t_rpc_session_model);
+        if (it != g_rpc_live_models.end()) {
+            g_rpc_live_models.erase(it);
+        }
+    } else {
+        g_rpc_live_legacy.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
 void rpc_server::session_model(const std::string & id) {
     std::string s;
     for (char c : id.substr(0, 96)) {
@@ -3400,6 +3427,22 @@ void rpc_server::session_model(const std::string & id) {
     }
     if (s == "." || s == "..") {
         s.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_live_models_mutex);
+        if (!t_rpc_session_model.empty()) {
+            auto it = g_rpc_live_models.find(t_rpc_session_model);
+            if (it != g_rpc_live_models.end()) {
+                g_rpc_live_models.erase(it);
+            }
+        } else {
+            g_rpc_live_legacy.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (!s.empty()) {
+            g_rpc_live_models.insert(s);
+        } else {
+            g_rpc_live_legacy.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     t_rpc_session_model = s;
     if (!s.empty()) {
@@ -3428,12 +3471,11 @@ static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache
     return total;
 }
 
-// active client connections: while a coordinator is connected, cache eviction
-// is DEFERRED. The client trusts the manifest it fetched at handshake for the
-// whole (possibly 30-min) load; evicting reported entries mid-load made its
-// batched placements miss ("manifest went stale") and failed the endpoint.
-// The cap is enforced once the last connection closes - the dir may overshoot
-// by roughly one load's slices in the meantime.
+// active client connections. The client trusts the manifest it fetched at
+// handshake for the whole (possibly 30-min) load, so entries under any LIVE
+// connection's folder are never evicted (see the live-model registry above);
+// everything else stays under the cap even while clients are connected
+// (review #19), with a final full trim once the last connection closes.
 static std::atomic<int> g_rpc_active_conns{0};
 
 // serializes the eviction scan+delete against manifest dir scans: the entry
@@ -3450,15 +3492,16 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     if (limit_mib <= 0) {
         return;
     }
-    if (g_rpc_active_conns.load(std::memory_order_relaxed) > 0) {
-        static std::atomic<bool> warned{false};
-        bool expected = false;
-        if (warned.compare_exchange_strong(expected, true)) {
-            GGML_LOG_INFO("[cache] over limit with a client connected - eviction deferred until idle\n");
-        }
+    const int     conns_at_start = g_rpc_active_conns.load(std::memory_order_relaxed);
+    const int64_t t_start_us     = ggml_time_us();
+    // mid-serve calls arrive once per slice save - a full dir scan each time is
+    // n^2 over a whole load. Rate-limit them; idle/startup runs always scan.
+    static std::atomic<int64_t> t_last_scan_us{0};
+    if (conns_at_start > 0 && t_start_us - t_last_scan_us.load(std::memory_order_relaxed) < 10 * 1000 * 1000) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_rpc_cache_evict_mutex);
+    t_last_scan_us.store(ggml_time_us(), std::memory_order_relaxed);
     const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
     std::vector<rpc_cache_entry> entries;
     uint64_t total = rpc_cache_dir_scan(cache_dir, &entries);
@@ -3470,6 +3513,24 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     entries.erase(std::remove_if(entries.begin(), entries.end(), [](const rpc_cache_entry & e) {
         return e.path.filename().string().rfind("modelidx-", 0) == 0;
     }), entries.end());
+    // review #19: never touch folders a live connection serves from (their
+    // manifests are long-lived); with an un-scoped connection live the flat dir
+    // is protected the same way. New connections manifest under
+    // g_rpc_cache_evict_mutex, so they observe a consistent post-delete state.
+    {
+        std::lock_guard<std::mutex> reg_lock(g_rpc_live_models_mutex);
+        if (!g_rpc_live_models.empty() || g_rpc_live_legacy.load(std::memory_order_relaxed) > 0) {
+            const fs::path root(cache_dir);
+            const bool protect_flat = g_rpc_live_legacy.load(std::memory_order_relaxed) > 0;
+            entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const rpc_cache_entry & e) {
+                const fs::path parent = e.path.parent_path();
+                if (parent == root) {
+                    return protect_flat;
+                }
+                return g_rpc_live_models.count(parent.filename().string()) > 0;
+            }), entries.end());
+        }
+    }
     std::error_code ec;
     // #103 eviction preference: entries OUTSIDE the current session's model
     // folder go first (oldest-first within each class) - the active model's
@@ -3492,10 +3553,15 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
         if (total <= limit) {
             break;
         }
-        // a coordinator connected mid-eviction: any manifest it is served from
-        // here on (under the mutex) must stay valid, so stop deleting now
-        if (g_rpc_active_conns.load(std::memory_order_relaxed) > 0) {
+        // a coordinator connected mid-eviction: its manifest is (or will be)
+        // waiting on the evict mutex - yield fast so the load is not stalled
+        if (g_rpc_active_conns.load(std::memory_order_relaxed) > conns_at_start) {
             GGML_LOG_INFO("[rpc cache] eviction aborted - client connected mid-scan, deferring until idle\n");
+            break;
+        }
+        // mid-serve invocations (cache_store during a load) trim incrementally:
+        // each call gets a slice of deleting so the save path stays fast
+        if (conns_at_start > 0 && ggml_time_us() - t_start_us > 500 * 1000) {
             break;
         }
         if (fs::remove(e.path, ec) && !ec) {
@@ -5453,10 +5519,12 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         GGML_LOG_INFO("Accepted client connection %" PRIu64 "\n", conn_id);
         g_rpc_active_conns.fetch_add(1, std::memory_order_relaxed);
         std::thread([&server, client_socket, conn_id]() {
+            rpc_live_session_open();
             rpc_serve_client(server, client_socket, conn_id);
+            rpc_live_session_close();
             GGML_LOG_INFO("Client connection %" PRIu64 " closed\n", conn_id);
             if (g_rpc_active_conns.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                // last client gone: catch up on the deferred cache-cap enforcement
+                // last client gone: catch up on the residual cache-cap trim
                 server.cache_enforce_idle();
             }
         }).detach();
