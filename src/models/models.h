@@ -1325,9 +1325,14 @@ struct llama_model_dflash : public llama_model_base {
 
     template <bool is_enc>
     struct graph : public llm_graph_context_dsv4_mla {
+        const llama_model & model;
+
         graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_inp_embd_enc() const;
+
+        // DFlash2 selector lattice over the draft logits (no-op without selector tensors)
+        void build_post_sampling() const override;
 
         // DeepSeek-V4 backbone decoder: HC-expand -> 3x (HC-pre/MLA-attn/HC-post, HC-pre/MoE-FFN/HC-post) -> HC-head.
         void build_dsv4(const llama_model & model, ggml_tensor * inp_pos,

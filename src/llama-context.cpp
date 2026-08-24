@@ -2877,7 +2877,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_DFLASH) { // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        uint32_t res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // DFlash2 selector lattice builds ~32 extra nodes per draft position
+        if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+            const uint32_t selector_tokens = std::min<uint32_t>(
+                    n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+            res += 32*selector_tokens;
+        }
+        return res;
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
