@@ -31,6 +31,43 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 
 ---
 
+## Walkthrough checklist (fix scope decided 2026-08-23: CRITICAL+HIGH+MEDIUM; LOW deferred)
+
+`[ ]` open · `[x]` fixed (commit in the note) · `[-]` won't-fix (reason in the note)
+
+- [ ] 1 PEARL worker races main-thread ctx_dft
+- [ ] 2 PEARL decode-error throw before join / reload UAF
+- [x] 3 /fleet/status leaks LLAMA_API_KEY — fixed 2026-08-23 (redact env values + --api-key argv; live loopback gate: NO-LEAK during load window)
+- [ ] 4 meta early-error abandons in-flight fused FETCH
+- [ ] 5 deferred cache eviction races new manifest
+- [ ] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op
+- [ ] 7 gguf_get_val_str(general.architecture) no type guard
+- [ ] 8 /wizard/placements/generate over-read + OOM + unconfined write
+- [ ] 9 DSpark conf gate reads stale encoder features
+- [ ] 10 mirror-strip renumber vs full-batch extraction (tree)
+- [ ] 11 adopted PEARL rounds skip update_tgt
+- [ ] 12 ctx_hold_begin teardown with guards held (PLAUSIBLE, repro first)
+- [x] 13 process_rows branch-heal misindexes MTP/EAGLE3 — fixed `c2f43e1f5` (2026-08-21, #137 step 0)
+- [ ] 14 spec-tree row demand vs batch capacity
+- [ ] 15 star-gather ignores fused_recv failure
+- [ ] 16 fused MUL_MAT_ID+GLU/ADD_ID pre-zero; add-id.cu sentinel
+- [ ] 17 dspark markov head unequal per-slot blocks
+- [ ] 18 RPC graph-uid cross-process collisions
+- [ ] 19 RPC cache cap unenforced while conns live
+- [ ] 20 TCP_KEEPIDLE breaks macOS build
+- [ ] 21 wizard kind classifier hides target models
+- [ ] 22 conv_models.remember() replace → spurious 400
+- [ ] 23 CHECK_IDS aborts under CUDA graphs
+- [ ] 24 fleet totals count CPU-holder rows as VRAM
+- [ ] 25 header Unload target vs MRU proxy target
+- [ ] 26 greeting no-model CTA during fetch/after failure
+- [ ] 27 FleetDeviceCard labels weights share as % experts
+- [ ] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE)
+- [ ] 29 SESSION_MODEL once per socket (PLAUSIBLE, latent)
+- 30-50 LOW: deferred by scope decision 2026-08-23
+
+---
+
 ## CRITICAL
 
 ### 1. PEARL worker thread races main-thread `ctx_dft` mutations in the same pass

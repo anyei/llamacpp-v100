@@ -6607,6 +6607,12 @@ void server_routes::init_routes() {
                     cmd.push_back(all.substr(pos, end - pos));
                     pos = (end == std::string::npos ? all.size() : end + 1);
                 }
+                // /fleet/status is reachable without a key while loading - never echo secrets
+                for (size_t i = 0; i + 1 < cmd.size(); i++) {
+                    if (cmd[i] == "--api-key" || cmd[i] == "--api-key-file") {
+                        cmd[i + 1] = "<redacted>";
+                    }
+                }
 #endif
                 json env = json::array();
                 for (char ** e = environ; e != nullptr && *e != nullptr; e++) {
@@ -6614,7 +6620,13 @@ void server_routes::init_routes() {
                     // LLAMA_SERVER_* is router->child plumbing, not user config
                     if (kv.rfind("LLAMA_SERVER_", 0) == 0) continue;
                     if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
-                        env.push_back(kv);
+                        // secret-shaped values must not reach clients; TOKENS (count vars) is not TOKEN
+                        const std::string name = kv.substr(0, kv.find('='));
+                        const bool secret = name.find("KEY")      != std::string::npos
+                                         || name.find("SECRET")   != std::string::npos
+                                         || name.find("PASSWORD") != std::string::npos
+                                         || (name.find("TOKEN") != std::string::npos && name.find("TOKENS") == std::string::npos);
+                        env.push_back(secret ? name + "=<redacted>" : kv);
                     }
                 }
                 return cmd.empty() && env.empty() ? json(nullptr)
