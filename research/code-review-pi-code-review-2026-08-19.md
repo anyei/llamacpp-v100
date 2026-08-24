@@ -62,7 +62,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 25 header Unload target vs MRU proxy target
 - [ ] 26 greeting no-model CTA during fetch/after failure
 - [ ] 27 FleetDeviceCard labels weights share as % experts
-- [ ] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE)
+- [x] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE→confirmed by trace) — fixed 2026-08-23 (read size/4 floats + alignment asserts; full-tensor path identical, byte gate c80261ff 6/6 x3 legs)
 - [ ] 29 SESSION_MODEL once per socket (PLAUSIBLE, latent)
 - 30-50 LOW: deferred by scope decision 2026-08-23
 

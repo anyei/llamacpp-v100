@@ -2421,10 +2421,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             GGML_ASSERT(tensor->type == GGML_TYPE_F32);
-            const int64_t ne = ggml_nelements(tensor);
+            // the caller's buffer holds only the (offset, size) sub-range - reading
+            // ggml_nelements(tensor) floats from it over-reads on sub-range writes
+            GGML_ASSERT(offset % sizeof(float) == 0);
+            GGML_ASSERT(size   % sizeof(float) == 0);
+            const size_t nf = size / sizeof(float);
             std::vector<float> tmp;
-            tmp.reserve(ne);
-            for (int64_t i = 0; i < ne; i++) {
+            tmp.reserve(nf);
+            for (size_t i = 0; i < nf; i++) {
                 tmp.push_back(((const float *) data)[i] / n_bufs);
             }
             for (size_t j = 0; j < n_bufs; j++) {
