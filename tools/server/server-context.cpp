@@ -1449,6 +1449,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // a PEARL worker still running here (reload after a decode error) would
+        // use spec/ctx_dft after the resets below free them
+        spec_ahead.join();
+
         spec.reset();
         spec_init2.reset();
         spec_init.reset();
@@ -4043,6 +4047,10 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        // called from error catches - a live PEARL worker must finish before
+        // slot state is torn down under it
+        spec_ahead.join();
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -5098,6 +5106,11 @@ private:
         g_spec_timing.t_decode += ggml_time_us() - t_decode_0;
         g_spec_timing.report();
 
+        // PEARL: the overlap ends with the target decode. Joining before ANY
+        // result handling means the error paths below (prompt_clear, throw,
+        // retry) can never free or mutate spec/ctx_dft under a live worker
+        spec_ahead.join();
+
         metrics.on_decoded(slots);
 
         typedef bool (*rpc_any_failed_t)(void);
@@ -5182,9 +5195,6 @@ private:
 
             return false; // retry with the updated n_batch
         }
-
-        // PEARL: the ahead worker must be done with ctx_dft before the mirror below
-        spec_ahead.join();
 
         // spec tree (#132): strip branch-seq rows before the drafter mirror - the draft
         // context's sequence space does not include the branch ids, and the branch rows

@@ -36,7 +36,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 `[ ]` open · `[x]` fixed (commit in the note) · `[-]` won't-fix (reason in the note)
 
 - [x] 1 PEARL worker races main-thread ctx_dft — fixed 2026-08-23 (launch moved after the checkpoint iterate with non-ahead restores deferred into the worker; joins at pre_decode top + prompt-branch entry; gate: on/off byte-identical d4aafddd 6/6, 12 adoptions, np2 concurrent leg clean)
-- [ ] 2 PEARL decode-error throw before join / reload UAF
+- [x] 2 PEARL decode-error throw before join / reload UAF — fixed 2026-08-23 (join moved to immediately after target decode, before ANY result handling, so prompt_clear/throw/retry paths never run under a live worker; belt-and-suspenders joins in abort_all_slots() and destroy() cover the catch-handler and reload teardown; gate: build clean, on/off byte-identical d4aafddd, 12 adoptions, np2 concurrent leg alive 12x200)
 - [x] 3 /fleet/status leaks LLAMA_API_KEY — fixed 2026-08-23 (redact env values + --api-key argv; live loopback gate: NO-LEAK during load window)
 - [x] 4 meta early-error abandons in-flight fused FETCH — fixed 2026-08-23 (fetch_pending now records owed nbytes + scope guard drains owed responses on ANY exit; 6-leg gate green, off leg c80261ff 6/6)
 - [ ] 5 deferred cache eviction races new manifest
