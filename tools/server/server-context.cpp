@@ -576,7 +576,7 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    void handle_last_sampled_token(server_batch & batch, int32_t * spec_tree_budget = nullptr) {
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -611,7 +611,12 @@ struct server_slot {
             // other. Replay rounds carry no fresh draft and are never armed.
             spec_tree_alt = LLAMA_TOKEN_NULL;
             spec_tree_i_batch.clear();
-            if (spec_tree_on && seq_branch >= 0 && !spec_replay && !spec_draft.empty()) {
+            // branch rows draw on a shared per-round budget (review #14): the batch must
+            // keep room for every remaining slot's main anchor+draft rows, which assert
+            // on overflow below rather than failing gracefully like br_ok
+            const int32_t n_rows_branch = 1 + (int32_t) spec_draft.size();
+            if (spec_tree_on && seq_branch >= 0 && !spec_replay && !spec_draft.empty() &&
+                spec_tree_budget && *spec_tree_budget >= n_rows_branch) {
                 const llama_token alt = common_speculative_get_alt1(id, 0, spec_draft.size());
                 if (alt != LLAMA_TOKEN_NULL && alt != spec_draft[0]) {
                     const llama_pos pos_a = prompt.tokens.pos_next(); // anchor (sampled) position
@@ -634,6 +639,7 @@ struct server_slot {
                     if (br_ok) {
                         spec_tree_alt  = alt;
                         spec_tree_pos0 = pos_a;
+                        *spec_tree_budget -= n_rows_branch;
                     } else {
                         // batch full - disarm cleanly; nothing consumes the partial rows
                         spec_tree_i_batch.clear();
@@ -4535,9 +4541,21 @@ private:
             });
         }
 
+        // spec tree (#132): branch rows share the batch with every slot's main
+        // anchor+draft rows - budget them up front so a fully-armed round cannot
+        // starve a later slot's main rows into the add_ok assert (review #14)
+        int32_t spec_tree_budget = 0;
+        if (spec_tree_active) {
+            int32_t n_main = 0;
+            iterate(generating, [&](server_slot & slot) {
+                n_main += 1 + (int32_t) slot.spec_draft.size();
+            });
+            spec_tree_budget = std::max(0, (int32_t) llama_n_batch(ctx_tgt) - (int32_t) batch.size() - n_main);
+        }
+
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, &spec_tree_budget);
         });
 
         // process in chunks of params.n_batch
@@ -5281,6 +5299,12 @@ private:
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
+                }
+            }
+            // spec tree (#132): branch logits rows are sampled by these indices too (review #14)
+            for (auto & i : slot.spec_tree_i_batch) {
+                if (!is_inside_view(i)) {
+                    throw std::runtime_error(string_format("spec-tree batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
                 }
             }
         });
