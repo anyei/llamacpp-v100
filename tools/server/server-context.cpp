@@ -4196,6 +4196,10 @@ private:
     }
 
     void pre_decode() {
+        // PEARL: the context shift below mirrors seq_rm/seq_add onto ctx_dft - a
+        // draft-ahead worker surviving into this tick must be done first
+        spec_ahead.join();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -4399,9 +4403,13 @@ private:
             std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                       COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != params_base.speculative.types.end();
 
+        // collect the ahead slots here; the worker LAUNCHES only after the
+        // checkpoint iterate below, so no main-thread ctx_dft mutation of this
+        // round can race it (empty-draft slots' restores ride the worker too)
+        std::vector<server_slot *> pearl_ahead;
+        std::vector<std::pair<llama_seq_id, llama_pos>> pearl_restores;
         if (spec_pearl && spec_pearl_capable && spec && ctx_dft && ctx_dft != ctx_tgt &&
             ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-            std::vector<server_slot *> ahead;
             iterate(drafting, [&](server_slot & slot) {
                 if (slot.spec_draft.empty()) {
                     return;
@@ -4422,32 +4430,8 @@ private:
                     /* .result   = */ &slot.spec_draft_ahead,
                 };
 
-                ahead.push_back(&slot);
+                pearl_ahead.push_back(&slot);
             });
-
-            if (!ahead.empty()) {
-                auto * spec_ptr  = spec.get();
-                auto * ctx_dft_l = ctx_dft;
-                const int trace_l = trace;
-
-                spec_ahead.join();
-                spec_ahead.th = std::thread([spec_ptr, ahead, ctx_dft_l, trace_l]() {
-                    common_speculative_draft(spec_ptr);
-
-                    for (auto * s : ahead) {
-                        if (trace_l > 0) {
-                            LOG_INF("PEARL: ahead drafted %zu tokens for slot %d (n_past=%d)\n",
-                                    s->spec_draft_ahead.size(), s->id, s->spec_ahead_n_past);
-                        }
-                        common_speculative_get_draft_params(spec_ptr, s->id).drafting = false;
-
-                        // the per-round dft restore, taken over from the checkpoint iterate below
-                        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), s->id, s->spec_ckpt.pos_max + 1, -1)) {
-                            GGML_ABORT("failed to remove sequence %d\n", s->id);
-                        }
-                    }
-                });
-            }
         }
 
         const int64_t t_ckpt_0 = ggml_time_us();
@@ -4464,12 +4448,19 @@ private:
 
             // PEARL: the ahead worker owns this round's dft restore for its slots
             if (ctx_dft && !slot.spec_ahead_live) {
-                if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                }
+                if (!pearl_ahead.empty()) {
+                    // a worker will own ctx_dft this round: defer to it. The PEARL
+                    // gate means PART rm type, so this is a plain seq_rm
+                    GGML_ASSERT(!use_ckpt_dft);
+                    pearl_restores.push_back({slot.id, ckpt.pos_max + 1});
+                } else {
+                    if (use_ckpt_dft) {
+                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
                 }
             }
 
@@ -4503,6 +4494,38 @@ private:
 
         g_spec_timing.t_ckpt += ggml_time_us() - t_ckpt_0;
 
+        // PEARL (#108): launch the draft-ahead worker now that every main-thread
+        // ctx_dft mutation of this round has run or been deferred to it; the
+        // overlap target is the batch build + the target's verify decode
+        if (!pearl_ahead.empty()) {
+            auto * spec_ptr  = spec.get();
+            auto * ctx_dft_l = ctx_dft;
+            const int trace_l = trace;
+
+            spec_ahead.join();
+            spec_ahead.th = std::thread([spec_ptr, ahead = std::move(pearl_ahead), restores = std::move(pearl_restores), ctx_dft_l, trace_l]() {
+                common_speculative_draft(spec_ptr);
+
+                for (auto * s : ahead) {
+                    if (trace_l > 0) {
+                        LOG_INF("PEARL: ahead drafted %zu tokens for slot %d (n_past=%d)\n",
+                                s->spec_draft_ahead.size(), s->id, s->spec_ahead_n_past);
+                    }
+                    common_speculative_get_draft_params(spec_ptr, s->id).drafting = false;
+
+                    // the per-round dft restore, taken over from the checkpoint iterate
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), s->id, s->spec_ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", s->id);
+                    }
+                }
+                // non-ahead drafting slots' restores, deferred so they never race the draft
+                for (const auto & r : restores) {
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), r.first, r.second, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", r.first);
+                    }
+                }
+            });
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -4542,6 +4565,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // PEARL: everything below may mutate ctx_dft (mem mirrors, cache-reuse
+                    // shifts, checkpoint restores) - the draft-ahead worker decodes the same
+                    // context. Prompt work is the overlap's end for this round.
+                    spec_ahead.join();
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
