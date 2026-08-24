@@ -43,7 +43,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op — fixed 2026-08-23 (value-parsed like GGML_RPC_TIMING; 3-leg gate: =1 byte sha c80261ff 6/6 + ACTIVE(q8_0), =0 silent, unset silent; env-gates.md rows updated)
 - [x] 7 gguf_get_val_str(general.architecture) no type guard — fixed 2026-08-23 (type guard matching the chat_template pattern; gated with crafted UINT32-arch gguf, router scans it clean)
 - [x] 8 /wizard/placements/generate over-read + OOM + unconfined write — fixed 2026-08-23 (roots confinement shared with remove handler + strict counts validation; 4-case generate gate + 3-case remove regate green)
-- [ ] 9 DSpark conf gate reads stale encoder features
+- [x] 9 DSpark conf gate reads stale encoder features — fixed 2026-08-24 (llama_model_dspark_has_conf API keys the gate on the actual conf_proj tensor; init warn when conf_min requested headless; covers CLI and per-request conf_min. Gate on trunc-V4 + DSpark vehicles: headless leg = warn + draft_n 40-42 flowing + 6/6 stable b8272afb; conf-head leg = no warn, gate engaged draft_n 2, same 6/6 bytes. Residual: stale read when the head EXISTS but build_dspark_markov_head early-returns on unequal blocks = finding #17's fix)
 - [ ] 10 mirror-strip renumber vs full-batch extraction (tree)
 - [ ] 11 adopted PEARL rounds skip update_tgt
 - [ ] 12 ctx_hold_begin teardown with guards held (PLAUSIBLE, repro first)

@@ -1136,6 +1136,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // the confidence head is optional in the GGUF; without it the conf_min
+    // gate must stay off (the nextn buffer holds stale encoder features)
+    bool has_conf = false;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1172,6 +1176,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+
+        has_conf = is_dspark && llama_model_dspark_has_conf(model_dft);
+        if (is_dspark && !has_conf && this->params.conf_min > 0.0f) {
+            LOG_WRN("%s: conf_min=%.2f requested but the drafter has no confidence head -- gate disabled\n",
+                    __func__, this->params.conf_min);
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
@@ -1480,7 +1490,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = (has_conf && params.conf_min > 0.0f) ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
