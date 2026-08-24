@@ -323,6 +323,14 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    // rows_tgt maps batch rows to the target's extraction-buffer rows when the
+    // caller filtered the decoded batch (spec-tree branch strip); impls reading
+    // per-row target buffers must override (see draft_dflash)
+    virtual bool process(const llama_batch & batch, const int32_t * rows_tgt) {
+        GGML_UNUSED(rows_tgt);
+        return process(batch);
+    }
+
     // #132: re-process specific batch_in rows as seq_id's rows (spec-tree branch heal).
     // Default: re-decode the rows' tokens through process() - correct for stateless
     // drafters whose mirror is a plain token decode. Feature-conditioned impls override.
@@ -765,6 +773,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process(batch_in, nullptr);
+    }
+
+    bool process(const llama_batch & batch_in, const int32_t * rows_tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -811,8 +823,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
             }
             for (int32_t i = 0; i < n_tokens; ++i) {
+                // the extraction buffers are laid out by the DECODED batch; a
+                // filtered mirror (spec-tree strip) supplies the true rows
+                const int32_t row_tgt = rows_tgt ? rows_tgt[i] : i;
                 float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                const float * src = layer + (size_t) i * n_embd_tgt;
+                const float * src = layer + (size_t) row_tgt * n_embd_tgt;
                 std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
             }
         }
@@ -1242,6 +1257,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process(batch_in, nullptr);
+    }
+
+    bool process(const llama_batch & batch_in, const int32_t * rows_tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1295,8 +1314,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
+                        // the extraction buffers are laid out by the DECODED batch; a
+                        // filtered mirror (spec-tree strip) supplies the true rows
+                        const int32_t row     = i_batch_beg[seq_id] + offset + i;
+                        const int32_t row_tgt = rows_tgt ? rows_tgt[row] : row;
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) row_tgt * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -3035,7 +3058,7 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, const int32_t * rows_tgt) {
     bool result = true;
 
     if (spec == nullptr) {
@@ -3043,7 +3066,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        result = result && impl->process(batch, rows_tgt);
     }
 
     return result;

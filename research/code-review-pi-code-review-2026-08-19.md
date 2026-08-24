@@ -44,7 +44,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 7 gguf_get_val_str(general.architecture) no type guard — fixed 2026-08-23 (type guard matching the chat_template pattern; gated with crafted UINT32-arch gguf, router scans it clean)
 - [x] 8 /wizard/placements/generate over-read + OOM + unconfined write — fixed 2026-08-23 (roots confinement shared with remove handler + strict counts validation; 4-case generate gate + 3-case remove regate green)
 - [x] 9 DSpark conf gate reads stale encoder features — fixed 2026-08-24 (llama_model_dspark_has_conf API keys the gate on the actual conf_proj tensor; init warn when conf_min requested headless; covers CLI and per-request conf_min. Gate on trunc-V4 + DSpark vehicles: headless leg = warn + draft_n 40-42 flowing + 6/6 stable b8272afb; conf-head leg = no warn, gate engaged draft_n 2, same 6/6 bytes. Residual: stale read when the head EXISTS but build_dspark_markov_head early-returns on unequal blocks = finding #17's fix)
-- [ ] 10 mirror-strip renumber vs full-batch extraction (tree)
+- [x] 10 mirror-strip renumber vs full-batch extraction (tree) — fixed 2026-08-24 (server strip records mirror-row -> decoded-row map, passed via new rows_tgt param of common_speculative_process; dflash/dspark and eagle3 extraction gathers index the target buffers through it; identity when null. Gate: tree-off leg re-hits b8272afb; tree np1 b8272afb x3 = lossless holds; tree np2 temp-1 concurrent alive, 0 aborts. Armed-branch shifted-map round not provoked live on the trunc vehicle - correctness by construction, real-serve A/B when the fleet returns. Spawned finding #51 for mtp's same-class reads)
 - [ ] 11 adopted PEARL rounds skip update_tgt
 - [ ] 12 ctx_hold_begin teardown with guards held (PLAUSIBLE, repro first)
 - [x] 13 process_rows branch-heal misindexes MTP/EAGLE3 — fixed `c2f43e1f5` (2026-08-21, #137 step 0)
@@ -64,6 +64,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 27 FleetDeviceCard labels weights share as % experts — fixed 2026-08-23 (experts phrase now from split_frac; pure owner shows 'attention owner · N% of weights'; UI build clean)
 - [x] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE→confirmed by trace) — fixed 2026-08-23 (read size/4 floats + alignment asserts; full-tensor path identical, byte gate c80261ff 6/6 x3 legs)
 - [ ] 29 SESSION_MODEL once per socket (PLAUSIBLE, latent)
+- [ ] 51 (NEW 2026-08-24, MEDIUM) mtp process() misindexes nextn/h rows under the tree strip — same class as #10, found while fixing it
 - 30-50 LOW: deferred by scope decision 2026-08-23
 
 ---
@@ -522,6 +523,21 @@ so no stale-manifest failure today — but a drafter sharing a worker with the m
 model gets its tensors cached under the **main** model's folder, weakening the
 `#103` cross-model isolation. Latent fragility if any future flow loads a second
 model over a live socket.
+
+### 51. MTP `process()` misindexes target `nextn`/pending-h rows under the tree strip (NEW 2026-08-24)
+**File:** `common/speculative.cpp` (mtp `process()`) — found during the #10 fix, MEDIUM
+
+Same class as #10, different consumer: mtp's `process()` copies
+`llama_get_embeddings_nextn(ctx_tgt)` into the catch-up batch shifted by one row
+(`memcpy(batch.embd + n_embd, h_tgt, row_bytes*(n_tokens-1))`) and patches each
+seq's first row from `pending_h` — all in MIRROR row space. The target's nextn
+buffer is laid out by the FULL decoded batch; with `LLAMA_SPEC_TREE=1` (mtp is
+tree-admitted since #137 step 0) and an earlier slot armed, every later slot's
+rows shift by that slot's branch-row count → wrong hidden states feed the mtp
+head → silent draft-quality loss. Fix direction: consume the `rows_tgt` map
+added for #10 (the +1-shift trick must become per-row `rows_tgt[k]`-indexed
+reads). Not yet fixed — the tree lane is closed on V4 and mtp+tree is an
+experimental combination; scheduled with the spec family.
 
 ---
 

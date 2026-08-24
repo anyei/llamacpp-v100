@@ -5205,10 +5205,11 @@ private:
         std::vector<llama_seq_id *> mseqp;
         std::vector<llama_seq_id>   mseq;
         std::vector<int8_t>         mlog;
+        std::vector<int32_t>        morig; // mirror row -> decoded-batch row, for extraction reads
         llama_batch batch_mirror = batch_view;
         if (spec_tree_active) {
             const int32_t n = batch_view.n_tokens;
-            mtok.reserve(n); mpos.reserve(n); mnseq.reserve(n); mseq.reserve(n); mlog.reserve(n);
+            mtok.reserve(n); mpos.reserve(n); mnseq.reserve(n); mseq.reserve(n); mlog.reserve(n); morig.reserve(n);
             for (int32_t i = 0; i < n; ++i) {
                 if (batch_view.seq_id[i][0] >= (llama_seq_id) params_base.n_parallel) {
                     continue;
@@ -5218,6 +5219,7 @@ private:
                 mnseq.push_back(1);
                 mseq.push_back(batch_view.seq_id[i][0]);
                 mlog.push_back(batch_view.logits ? batch_view.logits[i] : 0);
+                morig.push_back(i);
             }
             mseqp.resize(mseq.size());
             for (size_t i = 0; i < mseq.size(); ++i) {
@@ -5234,7 +5236,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_mirror)) {
+        if (!common_speculative_process(spec.get(), batch_mirror, spec_tree_active ? morig.data() : nullptr)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error

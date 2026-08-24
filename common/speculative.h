@@ -55,8 +55,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+// process the batch and update the internal state of the speculative context.
+// rows_tgt (optional) maps each batch row to its row in the target's extraction
+// buffers, for callers passing a filtered view of the decoded batch
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, const int32_t * rows_tgt = nullptr);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
