@@ -78,6 +78,19 @@ See:
 
 - #22105
 
+#### DFlash2
+
+DFlash2 checkpoints (for example `z-lab/Qwen3.8-27B-DFlash2`) extend DFlash with dynamic
+convolution mixing in the draft layers and a learned candidate selector: instead of reading raw
+logits, drafting walks a per-position lattice of top-k candidate ids and pairwise transition
+scores, emitted by the draft graph in the same single pass. A DFlash2 file is detected
+automatically inside `--spec-type draft-dflash` (by its `dflash.selector_top_k` metadata) - no
+extra flag. `--spec-draft-p-min` stops the walk when the selector's confidence drops, which is
+the main tuning knob; keep `--spec-draft-n-max` at the smallest value that fits the typical
+accepted span on bandwidth-bound GPUs. At `temperature > 0` the walk samples and records its
+proposal distributions, and verification uses maximal-coupling acceptance where the target
+context supports direct partial rollback - output remains lossless either way.
+
 ### DSpark (`draft-dspark`)
 
 DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
@@ -197,6 +210,15 @@ Example Video:
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
 - ngram-map-k looks for a previous matching n-gram and inserts the following m-gram but uses an internal hash-map of n-grams in the current context window.
 - ngram-mod uses a hash pool which is shared across all server slots. The hash pool is a map from n-gram hash to the next token (not the next m-gram as in ngram-map).
+
+## Running two drafters
+
+A second drafter with its own model and context can be registered behind the primary
+(env-gated): `LLAMA_SPEC_DRAFT2=<gguf>`, `LLAMA_SPEC_DRAFT2_TYPE=<type>` (default
+`draft-simple`), `LLAMA_SPEC_DRAFT2_DEVICE=<dev>` (optional pin). Dispatch is
+priority-fallback: the secondary only drafts sequences the primary left empty, so it is
+capability insurance, not a speed mix. Both drafters stay synced to the target every
+round. Diagrams, semantics and measured sweet spots: [dual-drafters.md](dual-drafters.md).
 
 ## Command-Line Options
 
