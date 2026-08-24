@@ -3436,6 +3436,12 @@ static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache
 // by roughly one load's slices in the meantime.
 static std::atomic<int> g_rpc_active_conns{0};
 
+// serializes the eviction scan+delete against manifest dir scans: the entry
+// conn check alone leaves a window where a coordinator reconnecting right as
+// the last conn closes is served a manifest whose entries the delete loop is
+// about to remove ("manifest went stale" endpoint hard-fail)
+static std::mutex g_rpc_cache_evict_mutex;
+
 static void rpc_cache_enforce_limit(const char * cache_dir) {
     static const long long limit_mib = []() {
         const char * env = getenv("GGML_RPC_CACHE_LIMIT_MIB");
@@ -3452,6 +3458,7 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
         }
         return;
     }
+    std::lock_guard<std::mutex> lock(g_rpc_cache_evict_mutex);
     const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
     std::vector<rpc_cache_entry> entries;
     uint64_t total = rpc_cache_dir_scan(cache_dir, &entries);
@@ -3483,6 +3490,12 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     uint64_t freed     = 0;
     for (const rpc_cache_entry & e : entries) {
         if (total <= limit) {
+            break;
+        }
+        // a coordinator connected mid-eviction: any manifest it is served from
+        // here on (under the mutex) must stay valid, so stop deleting now
+        if (g_rpc_active_conns.load(std::memory_order_relaxed) > 0) {
+            GGML_LOG_INFO("[rpc cache] eviction aborted - client connected mid-scan, deferring until idle\n");
             break;
         }
         if (fs::remove(e.path, ec) && !ec) {
@@ -3917,6 +3930,10 @@ bool rpc_server::set_tensor_hash_data(const std::vector<uint8_t> & input) {
 // before serving starts and read-only afterwards, so no exec lock is needed
 void rpc_server::manifest(std::vector<uint64_t> & hashes) {
     if (cache_dir != nullptr) {
+        // never interleave with an in-flight eviction delete loop (see
+        // g_rpc_cache_evict_mutex): either eviction finished a file before we
+        // scan (we don't list it) or it aborts on our conn before deleting more
+        std::lock_guard<std::mutex> lock(g_rpc_cache_evict_mutex);
         std::error_code ec;
         auto scan_flat = [&](const fs::path & dir) {
             fs::directory_iterator end;
