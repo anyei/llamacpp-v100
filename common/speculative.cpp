@@ -1754,6 +1754,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process(batch_in, nullptr);
+    }
+
+    bool process(const llama_batch & batch_in, const int32_t * rows_tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1805,7 +1809,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                if (rows_tgt == nullptr) {
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                } else {
+                    // filtered mirror (spec-tree strip): the buffer is laid out by the
+                    // DECODED batch, so shift via each row's true index (review #51)
+                    for (int32_t k = 1; k < n_tokens; ++k) {
+                        std::memcpy(batch.embd + (size_t) k * n_embd, h_tgt + (size_t) rows_tgt[k - 1] * n_embd, row_bytes);
+                    }
+                }
             }
 
             // fill the pending embeddings from a previous run
@@ -1863,7 +1875,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const int32_t row     = i_batch_beg[seq_id] + i;
+                const int32_t row_tgt = rows_tgt ? rows_tgt[row] : row;
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, row_tgt);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

@@ -64,7 +64,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [x] 27 FleetDeviceCard labels weights share as % experts — fixed 2026-08-23 (experts phrase now from split_frac; pure owner shows 'attention owner · N% of weights'; UI build clean)
 - [x] 28 meta PARTIAL set_tensor over-read (PLAUSIBLE→confirmed by trace) — fixed 2026-08-23 (read size/4 floats + alignment asserts; full-tensor path identical, byte gate c80261ff 6/6 x3 legs)
 - [ ] 29 SESSION_MODEL once per socket (PLAUSIBLE, latent)
-- [ ] 51 (NEW 2026-08-24, MEDIUM) mtp process() misindexes nextn/h rows under the tree strip — same class as #10, found while fixing it
+- [x] 51 (NEW 2026-08-24, MEDIUM) mtp process() misindexes nextn/h rows under the tree strip — fixed 2026-08-24 (mtp consumes the #10 rows_tgt map: per-row shifted embd fill + verify_h nextn_ith reads; bulk memcpy fast path kept when null. Gate on Qwen3.8+MTP CPU kv-unified: np1 stash-control sha b3f63d2e identical pre/post = np1-inert; off-vs-on divergence pre-exists = benign graft-numerics (2 armed takes at temp 0, traced); np2 concurrent tree leg 4 takes/4 heals 1:1, slot acceptances 19/22 + 15/16, repeatable, 0 aborts)
 - 30-50 LOW: deferred by scope decision 2026-08-23
 
 ---
