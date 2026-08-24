@@ -1155,6 +1155,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // gate must stay off (the nextn buffer holds stale encoder features)
     bool has_conf = false;
 
+    // DFlash2 (#138): the drafter carries conv mixing and a candidate-selector
+    // head; drafts come from a walk over the packed selector lattice in
+    // t_h_nextn instead of raw logits
+    bool    is_dflash2     = false;
+    int32_t selector_top_k = 0;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1189,6 +1195,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
+            if (llama_model_meta_val_str(model_dft, "dflash.selector_top_k", buf, sizeof(buf)) >= 0) {
+                selector_top_k = std::atoi(buf);
+                is_dflash2 = selector_top_k > 0;
+            }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
@@ -1201,6 +1211,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
+        if (is_dflash2) {
+            LOG_INF("%s: - DFlash2 selector active (top_k=%d) - drafts walk the selector lattice\n", __func__, selector_top_k);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
@@ -1219,7 +1232,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = is_dflash2 ? selector_top_k : 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
         }
@@ -1229,7 +1242,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
     }
 
@@ -1361,6 +1375,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                // the server may switch contexts before the next draft decode
+                llama_synchronize(ctx_dft);
             }
         }
 
@@ -1457,11 +1473,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
-        // the markov head reads the decode as uniform strided blocks - unequal
-        // per-seq caps (e.g. a request nearing its n_predict budget) would
-        // misalign its views, so every drafting sequence posts the smallest cap
+        // the markov head and the DFlash2 selector read the decode as uniform
+        // strided blocks - unequal per-seq caps (e.g. a request nearing its
+        // n_predict budget) would misalign their views, so every drafting
+        // sequence posts the smallest cap
         int32_t n_draft_uni = params.n_max;
-        if (is_dspark) {
+        if (is_dspark || is_dflash2) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 const auto & dp = dparams[seq_id];
                 if (dp.drafting && dp.n_max > 0) {
@@ -1490,7 +1507,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
             }
-            if (is_dspark) {
+            if (is_dspark || is_dflash2) {
                 n_draft = n_draft_uni;
             }
 
@@ -1498,7 +1515,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
             }
         }
 
@@ -1526,7 +1543,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
-            if (is_dspark) {
+            if (is_dflash2) {
+                // DFlash2 (#138): greedy walk over the packed selector lattice.
+                // Each position's row is [top_k candidate ids | top_k x top_k
+                // transition scores]; the previously chosen candidate INDEX
+                // selects the score column. Stochastic proposal dists are
+                // increment 3 - until then every temperature drafts greedily
+                // and the standard verifier keeps the output lossless.
+                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                int32_t predecessor = 0;
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+                    predecessor = (int32_t) std::distance(scores,
+                            std::max_element(scores, scores + selector_top_k));
+                    if (params.p_min > 0.0f) {
+                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                        }
+                        if (1.0f / sum < params.p_min) {
+                            break;
+                        }
+                    }
+                    result.push_back((llama_token) row[predecessor]);
+                }
+            } else if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
                 const float * conf = (has_conf && params.conf_min > 0.0f) ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
