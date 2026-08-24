@@ -51,7 +51,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 14 spec-tree row demand vs batch capacity
 - [x] 15 star-gather ignores fused_recv failure — fixed 2026-08-23 (reduce fails the graph on recv failure; defer drain counts ed_lost instead of injecting zeros; 6-leg defer gate: off leg c80261ff 6/6, LOST 0.00 all legs)
 - [x] 16 fused MUL_MAT_ID+GLU/ADD_ID pre-zero; add-id.cu sentinel — fixed 2026-08-23 (pre-zero in both vec wrappers for fused mul_mat_id; add_id kernel zeros sentinel rows; V100 MoE smoke byte-identical, 92.7 vs 93.3 t/s)
-- [ ] 17 dspark markov head unequal per-slot blocks
+- [x] 17 dspark markov head unequal per-slot blocks — fixed 2026-08-24 (dspark draft() posts one uniform block size = the smallest drafting seq's cap, so the head's strided views are aligned by construction and it can no longer silently no-op into #9's stale-conf read; unequal caps fire routinely via the n_remaining-1 term of get_n_draft_max at every bounded request's tail. Gate: single-slot legs re-hit b8272afb exactly (headless + conf), np2 staggered-tail leg all responses drafted, 0 aborts, healthy after)
 - [ ] 18 RPC graph-uid cross-process collisions
 - [ ] 19 RPC cache cap unenforced while conns live
 - [x] 20 TCP_KEEPIDLE breaks macOS build — fixed 2026-08-23 (#ifdef chain: KEEPIDLE else TCP_KEEPALIVE for Apple, INTVL/CNT guarded; Linux compile verified, Linux behavior unchanged)

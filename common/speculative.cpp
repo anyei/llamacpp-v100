@@ -1434,6 +1434,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // the markov head reads the decode as uniform strided blocks - unequal
+        // per-seq caps (e.g. a request nearing its n_predict budget) would
+        // misalign its views, so every drafting sequence posts the smallest cap
+        int32_t n_draft_uni = params.n_max;
+        if (is_dspark) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & dp = dparams[seq_id];
+                if (dp.drafting && dp.n_max > 0) {
+                    n_draft_uni = std::min(n_draft_uni, dp.n_max);
+                }
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1453,6 +1466,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             int32_t n_draft = params.n_max;
             if (dp.n_max > 0) {
                 n_draft = std::min(n_draft, dp.n_max);
+            }
+            if (is_dspark) {
+                n_draft = n_draft_uni;
             }
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
