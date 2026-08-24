@@ -250,7 +250,7 @@ static json server_model_read_gguf_meta(const std::string & path) {
                                 tmpl.find("reasoning_effort") != std::string::npos;
     }
     const int64_t k_arch = gguf_find_key(g, "general.architecture");
-    if (k_arch >= 0) {
+    if (k_arch >= 0 && gguf_get_kv_type(g, k_arch) == GGUF_TYPE_STRING) {
         const std::string arch = gguf_get_val_str(g, k_arch);
         meta["arch"] = arch;
         auto get_u32 = [&](const char * suffix, uint32_t def) -> uint32_t {
