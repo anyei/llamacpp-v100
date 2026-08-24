@@ -45,6 +45,8 @@ export interface ApiFleetDevice {
 	is_rpc: boolean;
 	/** True when the worker exposes CPU RAM instead of GPU VRAM. */
 	worker_is_cpu: boolean;
+	/** True for any RAM-backed row - CPU worker or local CPU holder (review #24). */
+	is_cpu?: boolean;
 	reachable: boolean;
 	failed: boolean;
 	health?: 'healthy' | 'degraded' | 'recovering';

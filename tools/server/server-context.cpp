@@ -6383,6 +6383,9 @@ void server_routes::init_routes() {
                     {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
                     {"is_rpc",           is_rpc},
                     {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)},
+                    // RAM-backed, worker or local - the UI's RAM/VRAM totals key
+                    {"is_cpu",           (is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)) ||
+                                         (!is_rpc && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)},
                     {"reachable",        reachable},
                     {"failed",           failed},
                     {"health",           health},
@@ -6495,6 +6498,9 @@ void server_routes::init_routes() {
                         {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
                         {"is_rpc",           is_rpc},
                         {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && dev != nullptr && procs.dev_worker_is_cpu(dev)},
+                        // the #131a CPU-offload holder row lands here: local, RAM-backed
+                        {"is_cpu",           (is_rpc && procs.dev_worker_is_cpu != nullptr && dev != nullptr && procs.dev_worker_is_cpu(dev)) ||
+                                             (!is_rpc && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)},
                         {"reachable",        true},
                         {"failed",           false},
                         {"health",           "healthy"},

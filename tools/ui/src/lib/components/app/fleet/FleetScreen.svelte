@@ -95,7 +95,7 @@
 			hasLayers: false
 		};
 		for (const device of devices) {
-			if (device.worker_is_cpu) {
+			if (device.is_cpu ?? device.worker_is_cpu) {
 				t.ramFree += device.memory_free_mib;
 				t.ramTotal += device.memory_total_mib;
 				t.cpuLayers += device.n_layers ?? 0;
