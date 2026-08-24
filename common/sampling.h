@@ -33,6 +33,7 @@
 //
 
 struct common_sampler;
+struct common_speculative_token_dist;
 
 // llama_sampler API overloads
 
@@ -84,6 +85,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// maximal-coupling verification for stochastic speculative decoding (#138):
+// accept draft[i] iff u*q(draft[i]) <= p(draft[i]), else sample the clamped
+// residual max(0, p - q) and stop; q comes from the recorded proposal dists
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<common_speculative_token_dist> & dists, bool grammar_first = false);
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, const std::vector<common_speculative_token_dist> & dists, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

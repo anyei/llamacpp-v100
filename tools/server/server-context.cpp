@@ -272,6 +272,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -439,6 +440,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
             spec_draft_ahead.clear();
@@ -4399,6 +4401,9 @@ private:
                                 /* .id_last  = */ slot.sampled,
                                 /* .prompt   = */ &slot.spec_prompt,
                                 /* .result   = */ &slot.spec_draft,
+                                /* .dists    = */ &slot.spec_dists,
+                                /* .temperature = */ slot.task->params.sampling.temp,
+                                /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                             };
 
                             drafting.push_back(&slot);
@@ -5450,7 +5455,17 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // maximal-coupling verification (#138 inc 3): only when the draft carries
+                // proposal dists AND the context can roll back a partial acceptance
+                // directly - checkpoint-class targets re-verify via restore+replay, and
+                // replaying residual-sampled rounds is a separate decision
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                auto accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                slot.spec_dists.size() == slot.spec_draft.size()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -5585,6 +5600,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         // the accepted tokens are kept only to be re-evaluated on the next iteration; they
                         // are not a draft and must not be counted again when they come back through here
@@ -5616,6 +5632,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const int64_t t_now = ggml_time_us();

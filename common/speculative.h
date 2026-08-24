@@ -5,6 +5,13 @@
 
 struct common_speculative;
 
+// sparse proposal distribution for one stochastically drafted token (#138):
+// the verifier needs q(token) for maximal-coupling acceptance
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -48,6 +55,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional sparse proposal distributions, one per draft token (#138 inc 3):
+    // filled only by stochastic drafters (DFlash2 at temperature > 0)
+    std::vector<common_speculative_token_dist> * dists = nullptr;
+
+    float temperature = 0.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

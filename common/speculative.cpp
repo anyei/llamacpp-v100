@@ -14,6 +14,8 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <chrono>
+#include <random>
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -1161,6 +1163,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_dflash2     = false;
     int32_t selector_top_k = 0;
 
+    // per-seq rng for the stochastic lattice walk; reset on begin() so a fresh
+    // request replays deterministically for a fixed seed
+    std::vector<std::mt19937> selector_rng;
+    std::vector<bool>         selector_reset;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1237,6 +1244,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
+        selector_rng.resize(n_seq);
+        selector_reset.assign(n_seq, true);
+
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -1256,6 +1266,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        selector_reset[seq_id] = true;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1543,33 +1555,71 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            if (dp.dists) {
+                dp.dists->clear();
+            }
+
             if (is_dflash2) {
-                // DFlash2 (#138): greedy walk over the packed selector lattice.
-                // Each position's row is [top_k candidate ids | top_k x top_k
+                // DFlash2 (#138): walk the packed selector lattice. Each
+                // position's row is [top_k candidate ids | top_k x top_k
                 // transition scores]; the previously chosen candidate INDEX
-                // selects the score column. Stochastic proposal dists are
-                // increment 3 - until then every temperature drafts greedily
+                // selects the score column. At temperature > 0 with a dists
+                // sink the walk samples and records the proposal distribution
+                // for maximal-coupling verification; otherwise it is greedy
                 // and the standard verifier keeps the output lossless.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (selector_reset[seq_id]) {
+                    uint32_t seed = dp.seed;
+                    if (seed == LLAMA_DEFAULT_SEED) {
+                        seed = (uint32_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                    }
+                    selector_rng[seq_id].seed(seed ^ 0x85ebca6bU);
+                    selector_reset[seq_id] = false;
+                }
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
-                    predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
-                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+
+                    if (dp.temperature > 0.0f && dp.dists) {
+                        common_speculative_token_dist dist;
+                        dist.ids.resize(selector_top_k);
+                        dist.probs.resize(selector_top_k);
+                        const float max_score = *std::max_element(scores, scores + selector_top_k);
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
+                            dist.ids[k] = (llama_token) row[k];
+                            dist.probs[k] = std::exp((scores[k] - max_score) / dp.temperature);
+                            sum += dist.probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
+                        for (float & p : dist.probs) {
+                            p /= sum;
+                        }
+                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
+                        predecessor = sample(selector_rng[seq_id]);
+                        if (dist.probs[predecessor] < params.p_min) {
                             break;
                         }
+                        result.push_back(dist.ids[predecessor]);
+                        dp.dists->push_back(std::move(dist));
+                    } else {
+                        predecessor = (int32_t) std::distance(scores,
+                                std::max_element(scores, scores + selector_top_k));
+                        if (params.p_min > 0.0f) {
+                            // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                            float sum = 0.0f;
+                            for (int32_t k = 0; k < selector_top_k; ++k) {
+                                sum += std::exp(scores[k] - scores[predecessor]);
+                            }
+                            if (1.0f / sum < params.p_min) {
+                                break;
+                            }
+                        }
+                        result.push_back((llama_token) row[predecessor]);
                     }
-                    result.push_back((llama_token) row[predecessor]);
                 }
             } else if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
