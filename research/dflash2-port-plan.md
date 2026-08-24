@@ -1,10 +1,29 @@
 # DFlash2 port plan (#138) - study before implementation
 
-**Status: STUDY (2026-08-24). No code written yet - user chose "study first,
-then implement".** This doc maps upstream PR 27342's DFlash2 support onto this
-fork so the design is owned before any graft. Source: upstream commits
-`9731ad3f2..1deefcca3` (`5ecbe1ac1 support DFlash2`, `1deefcca3 Add p_min`) on
-the fetched branch `pr-27342-dflash2`.
+**Status: STUDY VERIFIED (2026-08-24). No code written yet - user chose "study
+first, then implement", then "study a little bit more, double check".** This
+doc maps upstream PR 27342's DFlash2 support onto this fork so the design is
+owned before any graft. Source: upstream commits `9731ad3f2..1deefcca3`
+(`5ecbe1ac1 support DFlash2`, `1deefcca3 Add p_min`) on the fetched branch
+`pr-27342-dflash2`.
+
+**Verification pass (second study round)**: every load-bearing claim below was
+re-checked directly against the diffs and the fork's code, not agent summaries:
+the conv shapes/strides and selector packing walked op-by-op; the lattice row
+layout vs draft()'s `row + top_k + predecessor*top_k` indexing confirmed
+consistent (scores are predecessor-major); the maximal-coupling overload read
+line-by-line (accept iff u*q<=p, clamped-residual resample, break-on-reject,
+bonus on full accept - drop-in compatible with the fork's smpl_save/clone
+verify pattern since the rng rides clone/copy); fork-side APIs confirmed
+present: `llama_set_embeddings_nextn(ctx, value, masked)` (llama-ext.h:99),
+`llm->build_sampling()` call site (llama-model.cpp:2755), both dflash graph
+ctors delegate `llm_graph_context_dsv4_mla(params)` (dflash.cpp:199/:442),
+LLAMA_DEFAULT_SEED, n_embd_dec. Block arithmetic verified: dflash posts
+`n_draft+1` rows (anchor+drafts) and the fork clamps non-dspark n_draft to
+`block_size-1`, so tokens_per_block == hparams.dflash_block_size exactly and
+the selector's packed rows align 1:1 with batch rows - PROVIDED blocks are
+uniform, which upstream implicitly assumes and the fork must guarantee by
+extending the #17 min-uniform cap to is_dflash2 (with the +1 preserved).
 
 ## 0. Strategy verdict: MANUAL GRAFT, not merge/cherry-pick
 
@@ -215,21 +234,37 @@ slots beside the fork's `is_dspark` as a sibling mode.
 4. **Conversion parity** (optional, later): conversion/ + gguf-py graft for
    future HF rebuilds.
 
-## 8. Open questions for the user
+## 8. Decisions and remaining questions
 
-- **Q1 conv perf on V100**: `build_dflash2_conv` runs kernel_size taps x 4
-  sites x n_layers of view/repeat/mul/add - the drafter graph gets notably
-  heavier than plain dense. Assess at increment-2 gate (t/s + acceptance
-  before the fleet A/B).
-- **Q2 increment boundary**: OK to defer stochastic/temp>0 support to
-  increment 3? Production serves run temp>0 - until increment 3 lands, a
-  DFlash2 drafter is only correct for greedy serving (increment 2 would
-  REFUSE temp>0 + dflash2 or fall back to no-dists acceptance = NOT lossless;
-  refusing is safer).
+DECIDED (user, 2026-08-24):
+- **temp>0 before increment 3 lands: draft greedily anyway.** The greedy
+  lattice walk runs for all temperatures; verification stays the standard
+  sampler path, which is LOSSLESS by construction (acceptance degrades at
+  high temp, output correctness never). No refusal, no skip.
+
+Verification-pass corrections to the plan:
+- **process() reconciliation is EASIER than first stated**: upstream's flat
+  chunking indexes extraction by full-batch row order, which composes with
+  #10 directly (`src row = rows_tgt ? rows_tgt[offset+i] : offset+i`). BUT
+  upstream's flat version has NO per-seq stale-noise seq_rm - the fork added
+  that hygiene and MUST keep it (pre-pass over the seqs present in the
+  batch). Either keep the fork's per-seq loop (safe default) or adopt flat +
+  rows_tgt + seq_rm pre-pass; decide at implementation, gate identically.
+- **Increment 3's dists gate stays upstream-shaped initially**
+  (PART/RS-rollback targets only). The fork's checkpoint-class targets
+  (dsv4) handle rejection via restore+REPLAY, and replaying rounds whose
+  tokens came from residual sampling has determinism implications - extending
+  dists-verification to ckpt targets is a separate, fork-specific decision.
+- **GATE VEHICLES: RESOLVED** - both DFlash2 GGUFs exist locally at
+  /mnt/BigStorage6tb/models/Qwen3.8-27B-DFlash2-{Q4_K_M,Q8_0}.gguf (verified
+  2026-08-24), and the Qwen3.8-27B target is already at /work. Copy the Q8_0
+  (~2GB) into /work for the gates - no X99 wait, no HF fetch, increments stay
+  1 -> 2 -> 3 (-> 4 later). HF is also reachable (200 on the z-lab repo) as a
+  fallback for rebuilds.
+
+STILL OPEN:
+- **Q1 conv perf on V100**: assess at increment-2 gate (t/s + acceptance
+  before any fleet A/B).
 - **Q3 tree**: gate DFlash2 out of LLAMA_SPEC_TREE for v1 (roster exclusion,
-  safest - its lattice reads are not rows_tgt-aware), wire later if the tree
+  safest - its lattice reads are not rows_tgt-aware); wire later if the tree
   lane reopens.
-- **Q4 upstream refactor of process()**: NOT ported (would clobber the #10
-  rows_tgt fix); only sync/reset/n_batch pieces come over. Flag if you want
-  the full upstream process() shape instead - it would need re-applying #10
-  on top.
