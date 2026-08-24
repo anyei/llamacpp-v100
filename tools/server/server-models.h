@@ -136,24 +136,32 @@ private:
     // proxy_request forwards a POST carrying an X-Conversation-Id. best effort: a stale entry just
     // makes the child answer not found and the client recovers. owns its lock, one mutex per struct
     struct conv_model_tracker {
-        // returns the ticket of this registration, 0 when nothing was registered. erasing or
-        // replacing the entry invalidates the ticket, which is how a stop cancels a request
-        // parked in the model load wait
+        // returns the ticket of this registration, 0 when nothing was registered. a stop
+        // (forget) invalidates every ticket parked for the conversation; a concurrent
+        // same-conversation request must NOT - it only refreshes the routing model
         uint64_t remember(const std::string & conv_id, const std::string & model) {
             if (conv_id.empty() || model.empty()) {
                 return 0;
             }
             std::lock_guard<std::mutex> lock(mu);
             uint64_t ticket = next_ticket++;
-            map[conv_id] = { model, ticket };
+            auto & e = map[conv_id];
+            e.model = model;
+            e.tickets.insert(ticket);
+            // parked tickets are single-use (consumed by alive); the cap defends against
+            // a caller path that registers but never reaches its alive check
+            while (e.tickets.size() > 16) {
+                e.tickets.erase(e.tickets.begin());
+            }
             return ticket;
         }
 
-        // false means a stop erased the entry or a newer request replaced it
+        // single-use: consumes the ticket. false means a stop erased the conversation
+        // while this request was parked in the model load wait
         bool alive(const std::string & conv_id, uint64_t ticket) {
             std::lock_guard<std::mutex> lock(mu);
             auto it = map.find(conv_id);
-            return it != map.end() && it->second.ticket == ticket;
+            return it != map.end() && it->second.tickets.erase(ticket) > 0;
         }
 
         std::optional<std::string> lookup(const std::string & conv_id) {
@@ -179,7 +187,7 @@ private:
       private:
         struct entry_t {
             std::string model;
-            uint64_t    ticket;
+            std::set<uint64_t> tickets;
         };
         std::mutex                               mu;
         uint64_t                                 next_ticket = 1;
