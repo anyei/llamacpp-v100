@@ -66,8 +66,10 @@ public:
     bool ctx_guard_enter(int hold_timeout_ms = -1);
     void ctx_guard_exit();
     // teardown side (queue thread): block new guards, then wait for in-flight
-    // ones to drain (bounded); end releases the hold
-    void ctx_hold_begin(int timeout_ms);
+    // ones to drain (bounded); end releases the hold. Returns false if the
+    // timeout expired with guards still held - the caller must NOT free the
+    // model (a guard-holder is still reading it) and should retry later.
+    bool ctx_hold_begin(int timeout_ms);
     void ctx_hold_end();
 
     bool is_sleeping() {

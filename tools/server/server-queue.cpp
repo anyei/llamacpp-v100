@@ -153,14 +153,16 @@ void server_queue::ctx_guard_exit() {
     }
 }
 
-void server_queue::ctx_hold_begin(int timeout_ms) {
+bool server_queue::ctx_hold_begin(int timeout_ms) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     ctx_hold = true;
     if (!condition_tasks.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                                   [&]{ return n_ctx_guards == 0; })) {
-        QUE_WRN("%d request thread(s) still inside the pre-task window after %d ms - proceeding with teardown\n",
+        QUE_WRN("%d request thread(s) still inside the pre-task window after %d ms - deferring teardown\n",
                 n_ctx_guards, timeout_ms);
+        return false;
     }
+    return true;
 }
 
 void server_queue::ctx_hold_end() {

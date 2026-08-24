@@ -1919,8 +1919,16 @@ private:
         SRV_ERR("%s", "an RPC worker connection was lost - reloading in-process across the reachable workers (--rpc-reload)\n");
         // block new pre-task work and drain HTTP threads out of the model
         // (tokenize/template reads) before destroying it - they were
-        // use-after-free crashing (exit 139) when requests raced the reload
-        queue_tasks.ctx_hold_begin(15000);
+        // use-after-free crashing (exit 139) when requests raced the reload.
+        // If a thread outlasts the window, do NOT free the model under it
+        // (that IS the use-after-free): drop the hold and re-arm so the next
+        // update_slots retries once the slow reader has drained.
+        if (!queue_tasks.ctx_hold_begin(15000)) {
+            queue_tasks.ctx_hold_end();
+            rpc_reload_pending = true;
+            fleet.reload_active.store(false);
+            return;
+        }
         handle_sleeping_state(true); // destroy the model; buffers on live workers are freed remotely
 
         for (int attempt = 1;; attempt++) {
