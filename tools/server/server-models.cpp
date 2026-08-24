@@ -1784,6 +1784,27 @@ static std::optional<server_model_meta> resolve_child_for_conv(
     return std::nullopt;
 }
 
+// canonicalized path if it sits under a scanned models dir or /root/.cache, else empty
+static std::string canon_inside_roots(const std::string & models_dirs, const std::string & path) {
+    std::error_code ec;
+    const std::string canon = std::filesystem::weakly_canonical(path, ec).string();
+    if (canon.empty()) {
+        return std::string();
+    }
+    std::vector<std::string> roots = string_split<std::string>(models_dirs, ',');
+    roots.push_back("/root/.cache");
+    for (const auto & root : roots) {
+        if (root.empty()) {
+            continue;
+        }
+        const std::string rc = std::filesystem::weakly_canonical(root, ec).string();
+        if (!rc.empty() && canon.rfind(rc + "/", 0) == 0) {
+            return canon;
+        }
+    }
+    return std::string();
+}
+
 void server_models_routes::init_routes() {
     if (!common_subproc::is_supported()) {
         throw std::runtime_error("subprocess is not enabled on this build");
@@ -2200,9 +2221,14 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("ts must contain at least one nonzero share", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        const std::string prof_canon = canon_inside_roots(models.get_models_dirs(), prof_path);
+        if (prof_canon.empty()) {
+            res_err(res, format_error_response("profile path is outside the scanned roots", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         json prof;
         try {
-            std::ifstream f(prof_path);
+            std::ifstream f(prof_canon);
             prof = json::parse(f);
         } catch (...) {
             res_err(res, format_error_response("cannot read profile json", ERROR_TYPE_INVALID_REQUEST));
@@ -2212,8 +2238,17 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("not a #74 profile (needs counts/n_expert/n_layer)", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        if (!prof["n_layer"].is_number_integer() || !prof["n_expert"].is_number_integer() || !prof["counts"].is_array()) {
+            res_err(res, format_error_response("profile n_layer/n_expert/counts have the wrong types", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         const int n_layer  = prof["n_layer"].get<int>();
         const int n_expert = prof["n_expert"].get<int>();
+        const json & counts = prof["counts"];
+        if (n_layer <= 0 || n_expert <= 0 || (int) counts.size() < n_layer) {
+            res_err(res, format_error_response("profile n_layer/n_expert do not match the counts table", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         std::vector<double> fracs;
         fracs.reserve(shares.size());
         for (double s : shares) {
@@ -2238,9 +2273,18 @@ void server_models_routes::init_routes() {
         json perms = json::array();
         json cpl   = json::array();
         for (int il = 0; il < n_layer; il++) {
+            const json & row = counts[il];
+            if (!row.is_array() || (int) row.size() != n_expert) {
+                res_err(res, format_error_response("counts row " + std::to_string(il) + " does not have n_expert entries", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             std::vector<double> c;
             c.reserve(n_expert);
-            for (const auto & v : prof["counts"][il]) {
+            for (const auto & v : row) {
+                if (!v.is_number()) {
+                    res_err(res, format_error_response("counts row " + std::to_string(il) + " has a non-numeric entry", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
                 c.push_back(v.get<double>());
             }
             double lsum = 0.0;
@@ -2262,7 +2306,7 @@ void server_models_routes::init_routes() {
             {"model",          prof.value("model", json())},
             {"n_layer",        n_layer},
             {"n_expert",       n_expert},
-            {"source_profile", {{"path", prof_path}, {"sha256_16", ""}, {"tokens", prof.value("tokens_profiled", json())}}},
+            {"source_profile", {{"path", prof_canon}, {"sha256_16", ""}, {"tokens", prof.value("tokens_profiled", json())}}},
             {"member_shares",  fracs},
             {"counts_per_layer", cpl},
             {"perm",           perms},
@@ -2273,7 +2317,7 @@ void server_models_routes::init_routes() {
         for (size_t j = 0; j < shares.size(); j++) {
             ts_name += (j ? "-" : "") + std::to_string((int) std::llround(shares[j]));
         }
-        const std::filesystem::path pp(prof_path);
+        const std::filesystem::path pp(prof_canon);
         const std::string base = pp.stem().string() + "-place-" + ts_name + ".json";
         std::vector<std::filesystem::path> candidates = { pp.parent_path() / base };
         std::error_code ec;
@@ -2308,21 +2352,8 @@ void server_models_routes::init_routes() {
         json body = json::parse(req.body);
         const std::string path = json_value(body, "path", std::string());
         std::error_code ec;
-        const std::string canon = std::filesystem::weakly_canonical(path, ec).string();
-        std::vector<std::string> roots = string_split<std::string>(models.get_models_dirs(), ',');
-        roots.push_back("/root/.cache");
-        bool inside = false;
-        for (const auto & root : roots) {
-            if (root.empty()) {
-                continue;
-            }
-            const std::string rc = std::filesystem::weakly_canonical(root, ec).string();
-            if (!rc.empty() && canon.rfind(rc + "/", 0) == 0) {
-                inside = true;
-                break;
-            }
-        }
-        if (canon.empty() || !inside) {
+        const std::string canon = canon_inside_roots(models.get_models_dirs(), path);
+        if (canon.empty()) {
             res_err(res, format_error_response("path is outside the scanned roots", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

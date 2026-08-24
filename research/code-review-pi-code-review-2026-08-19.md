@@ -42,7 +42,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 5 deferred cache eviction races new manifest
 - [ ] 6 WIRE_F16/Q8 presence-gate, =0 is a no-op
 - [x] 7 gguf_get_val_str(general.architecture) no type guard — fixed 2026-08-23 (type guard matching the chat_template pattern; gated with crafted UINT32-arch gguf, router scans it clean)
-- [ ] 8 /wizard/placements/generate over-read + OOM + unconfined write
+- [x] 8 /wizard/placements/generate over-read + OOM + unconfined write — fixed 2026-08-23 (roots confinement shared with remove handler + strict counts validation; 4-case generate gate + 3-case remove regate green)
 - [ ] 9 DSpark conf gate reads stale encoder features
 - [ ] 10 mirror-strip renumber vs full-batch extraction (tree)
 - [ ] 11 adopted PEARL rounds skip update_tgt
