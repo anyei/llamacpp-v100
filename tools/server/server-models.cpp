@@ -273,11 +273,17 @@ static json server_model_read_gguf_meta(const std::string & path) {
         // (the IQ2XXS chat-v2 keeper) and the wizard then offers speculation the
         // model cannot serve. The head is real only if its defining tensor
         // (nextn.eh_proj) actually shipped.
-        bool has_nextn = false;
-        for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !has_nextn; i++) {
-            has_nextn = strstr(gguf_get_tensor_name(g, i), "nextn.eh_proj") != nullptr;
+        bool has_nextn  = false;
+        bool has_trunk0 = false;
+        for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !(has_nextn && has_trunk0); i++) {
+            const char * tn = gguf_get_tensor_name(g, i);
+            has_nextn  = has_nextn  || strstr(tn, "nextn.eh_proj") != nullptr;
+            has_trunk0 = has_trunk0 || (strncmp(tn, "blk.0.", 6) == 0 && strstr(tn, ".nextn.") == nullptr);
         }
         meta["has_mtp"] = has_nextn;
+        // extracted MTP head files (#124) carry the TARGET's arch; the missing
+        // trunk is what marks them as drafter-only
+        meta["mtp_head_only"] = has_nextn && !has_trunk0;
         // KV bytes per context token at f16, the wizard's sizing input
         // (same estimate the fleet capacity gate uses; MLA models cache one
         // shared latent per layer and no V)
@@ -2648,7 +2654,19 @@ void server_models_routes::init_routes() {
             {
                 std::string lname = meta.name;
                 std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+                // metadata-first: a draft-ish NAME must not hide a real target
+                // model; real drafters are identified by their header (drafter
+                // arch, or an MTP head file without a trunk). The name substring
+                // only classifies files whose metadata is unreadable.
+                const json & gm = meta.gguf_meta;
+                const std::string arch = gm.is_null() ? std::string() : gm.value("arch", std::string());
+                const bool meta_draft = arch.find("dflash") != std::string::npos ||
+                                        arch.find("eagle3") != std::string::npos ||
+                                        (!gm.is_null() && gm.value("mtp_head_only", false));
                 model_info["kind"] = lname.find("mmproj") != std::string::npos ? "mmproj"
+                                   : meta_draft ? "draft"
+                                   : arch == "clip" ? "mmproj"
+                                   : !arch.empty() ? "model"
                                    : lname.find("draft")  != std::string::npos ||
                                      lname.find("dflash") != std::string::npos ? "draft"
                                    : "model";
