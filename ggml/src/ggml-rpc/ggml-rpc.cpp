@@ -623,9 +623,11 @@ struct ggml_backend_rpc_async_state {
     std::string endpoint;      // for failure attribution (set by get_socket)
     struct rpc_ep_stat * stat = nullptr; // per-endpoint counters (set with endpoint)
     // proto 4.10 manifest handshake (TASKS.md #62): every hash the worker can
-    // serve locally, fetched once per connection; known weight placements queue
+    // serve locally, fetched once per SCOPE (review #29: a model switch on a
+    // live socket re-announces and re-fetches); known weight placements queue
     // here and flush as ONE batched command instead of one offer RTT per tensor
     bool manifest_fetched = false;
+    std::string announced_model;
     std::unordered_set<uint64_t> manifest;
     std::vector<rpc_msg_set_tensor_hash_batch_entry> pending_batch;
     // unified in-order FIFO of the responses outstanding on this socket: PING
@@ -1422,10 +1424,24 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
 static void rpc_manifest_ensure(socket_ptr sock) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (st.manifest_fetched || st.server_minor < 10) {
+    if (st.server_minor < 10) {
         return;
     }
-    st.manifest_fetched = true; // one attempt; on failure the load just streams
+    // review #29: one announce+manifest per SCOPE, not per socket - a second
+    // model loading over a live socket (a remote drafter after its target)
+    // re-announces so its tensors file under their own folder (#103 isolation)
+    const bool rescope = st.server_minor >= 16 && st.manifest_fetched &&
+                         st.announced_model != g_rpc_session_model;
+    if (st.manifest_fetched && !rescope) {
+        return;
+    }
+    st.manifest_fetched = true; // one attempt per scope; on failure the load just streams
+    st.announced_model  = g_rpc_session_model;
+    if (rescope) {
+        // the old scope's entries would batch-place and hard-miss under the new
+        // one; cleared up front so a failed refetch degrades to streaming
+        st.manifest.clear();
+    }
     if (!rpc_drain_all_locked(sock, st)) {
         return;
     }
