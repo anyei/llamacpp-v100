@@ -4436,10 +4436,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (defer_bufs[j].size() < defer_drain_nbytes[j]) {
                 defer_bufs[j].resize(defer_drain_nbytes[j]);
             }
-            backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
-                                    defer_bufs[j].data(), defer_drain_nbytes[j]);
-            defer_drained[j]        = 1;
-            defer_drained_nbytes[j] = defer_drain_nbytes[j];
+            // a failed recv zero-fills - injecting that adds nothing but would
+            // count as a correction; drop it and count loudly like a shape miss
+            if (backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                        defer_bufs[j].data(), defer_drain_nbytes[j])) {
+                defer_drained[j]        = 1;
+                defer_drained_nbytes[j] = defer_drain_nbytes[j];
+            } else {
+                backend_ctx->ed_lost++;
+            }
             defer_drain_pending[j]  = 0;
         }
     };
@@ -4905,9 +4910,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     if (fused_fetch_pending[j]) {
-                        backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
-                                                scratch.data() + k*nbytes, nbytes);
                         fused_fetch_pending[j] = 0;
+                        // a failed recv zero-fills its slot; summing that in would
+                        // broadcast a silently wrong total - fail the graph instead
+                        if (!backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                                     scratch.data() + k*nbytes, nbytes)) {
+                            GGML_LOG_ERROR("%s: fused fetch recv failed (member %zu) - failing the graph\n", "meta_reduce", j);
+                            return GGML_STATUS_FAILED;
+                        }
                     }
                 }
                 // GGML_META_DEBUG_BSUM=1: per-boundary value checksums, printed

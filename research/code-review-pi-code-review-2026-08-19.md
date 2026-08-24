@@ -49,7 +49,7 @@ trigger or display) · **LOW** (bounded / opt-in / cosmetic / cleanup).
 - [ ] 12 ctx_hold_begin teardown with guards held (PLAUSIBLE, repro first)
 - [x] 13 process_rows branch-heal misindexes MTP/EAGLE3 — fixed `c2f43e1f5` (2026-08-21, #137 step 0)
 - [ ] 14 spec-tree row demand vs batch capacity
-- [ ] 15 star-gather ignores fused_recv failure
+- [x] 15 star-gather ignores fused_recv failure — fixed 2026-08-23 (reduce fails the graph on recv failure; defer drain counts ed_lost instead of injecting zeros; 6-leg defer gate: off leg c80261ff 6/6, LOST 0.00 all legs)
 - [ ] 16 fused MUL_MAT_ID+GLU/ADD_ID pre-zero; add-id.cu sentinel
 - [ ] 17 dspark markov head unequal per-slot blocks
 - [ ] 18 RPC graph-uid cross-process collisions
