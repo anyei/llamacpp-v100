@@ -1699,6 +1699,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_embd = 0;
 
+    // #140: fused in-graph draft chain (env LLAMA_SPEC_MTP_FUSED, value-parsed).
+    // One llama_decode runs the whole greedy chain; p_min/entropy/alt/adaptive
+    // gates are bypassed. Single-drafting-seq rounds only - others fall back.
+    bool    fused_chain   = false;
+
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
@@ -1790,6 +1795,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        {
+            const char * e = getenv("LLAMA_SPEC_MTP_FUSED");
+            fused_chain = e && *e && strcmp(e, "0") != 0 && !chain_heads && !is_mem_shared;
+        }
+        if (fused_chain) {
+            llama_set_mtp_fused(ctx_dft, true);
+            llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ false);
+            LOG_INF("%s: - fused in-graph draft chain ACTIVE (#140): greedy fixed-n, draft gates bypassed\n", __func__);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -2100,6 +2115,61 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<bool> drafting(n_seq);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // #140: single-seq rounds run the whole chain in ONE decode - the graph
+        // derives rows 1..n-1 in-graph (argmax-chained), killing the per-step
+        // decode round-trips that cost ~11.6 ms each on a V100
+        if (fused_chain) {
+            llama_seq_id fseq = -1;
+            int n_fdrafting = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    n_fdrafting++;
+                    fseq = seq_id;
+                }
+            }
+            auto & dpf = dparams[fseq >= 0 ? fseq : 0];
+            int32_t n_draft_f = params.n_max;
+            if (fseq >= 0 && dpf.n_max > 0) {
+                n_draft_f = std::min(n_draft_f, dpf.n_max);
+            }
+            // n_draft 1 builds the normal single-row graph (no packed id row):
+            // let the per-step loop below handle it
+            if (n_fdrafting == 1 && n_draft_f > 1) {
+                auto & dp = dparams[fseq];
+
+                const int32_t n_draft = n_draft_f;
+
+                common_sampler_reset(smpls[fseq].get());
+                spec_alt_begin(fseq);
+
+                common_batch_add(batch, dp.id_last, dp.n_past, { fseq }, n_draft == 1);
+                std::memcpy(batch.embd, pending_h[fseq].data(), row_bytes);
+                for (int32_t i = 1; i < n_draft; ++i) {
+                    common_batch_add(batch, 0, dp.n_past + i, { fseq }, i == n_draft - 1);
+                    std::memset(batch.embd + (size_t) i * n_embd, 0, row_bytes);
+                }
+
+                const int ret = llama_decode(ctx_dft, batch);
+                if (ret != 0) {
+                    SPC_ERR("fused chain llama_decode returned %d\n", ret);
+                    return;
+                }
+
+                // the drafted ids ride the nextn channel, packed as F32 in row 0
+                const float * ids = llama_get_embeddings_nextn(ctx_dft);
+                if (ids == nullptr) {
+                    SPC_ERR("%s", "fused chain produced no id row\n");
+                    return;
+                }
+                auto & result = *dp.result;
+                for (int32_t i = 0; i < n_draft; ++i) {
+                    result.push_back((llama_token) ids[i]);
+                }
+                return;
+            }
+            // >1 drafting seq: fall through to the per-step loop this round
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];

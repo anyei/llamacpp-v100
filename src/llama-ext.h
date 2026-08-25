@@ -103,6 +103,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// #140: run the whole MTP draft chain inside one DECODER_MTP graph - the
+// n-row batch's rows 1..n-1 are placeholders whose inputs are derived
+// in-graph (argmax-chained). Greedy, fixed-n; qwen35-class single head only.
+LLAMA_API void llama_set_mtp_fused(struct llama_context * ctx, bool fused);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

@@ -781,6 +781,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.mtp_fused != other.cparams.mtp_fused) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
