@@ -136,3 +136,4 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // conf_min gate must not engage without it (the nextn staging buffer would
 // hold whatever the last writer staged, e.g. encoder features)
 LLAMA_API bool            llama_model_dspark_has_conf   (const struct llama_model * model);
+LLAMA_API llama_split_mode llama_model_split_mode       (const struct llama_model * model);

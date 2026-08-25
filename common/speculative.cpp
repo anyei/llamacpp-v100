@@ -1801,6 +1801,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             fused_chain = e && *e && strcmp(e, "0") != 0 && !chain_heads && !is_mem_shared;
         }
         if (fused_chain) {
+            // row/tensor-split models split the lm_head across GPUs: the chain's
+            // in-graph ARGMAX then runs on an AXIS_0-split src with no single
+            // owner and the meta backend aborts. Per-step drafting only there.
+            const llama_split_mode sm = llama_model_split_mode(llama_get_model(ctx_dft));
+            if (sm == LLAMA_SPLIT_MODE_ROW || sm == LLAMA_SPLIT_MODE_TENSOR) {
+                LOG_WRN("%s: - fused draft chain DISABLED: row/tensor-split model (in-graph argmax needs a single-owner logits row)\n", __func__);
+                fused_chain = false;
+            }
+        }
+        if (fused_chain) {
             // the fused flag is toggled around the draft submit only: any other
             // 2..8-row decode (accepted-token ingestion) must build the normal
             // single-pass graph or it pays the unrolled chain AND poisons the

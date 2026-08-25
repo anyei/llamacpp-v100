@@ -3264,3 +3264,7 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
 bool llama_model_dspark_has_conf(const struct llama_model * model) {
     return model->dspark_conf_proj != nullptr;
 }
+
+llama_split_mode llama_model_split_mode(const struct llama_model * model) {
+    return model->split_mode();
+}
