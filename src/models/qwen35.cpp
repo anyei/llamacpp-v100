@@ -534,8 +534,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     res->add_input(std::move(inp));
 
+    // the unroll is draft-sized only: reserve/prefill shapes (up to n_ubatch
+    // rows) must build the normal single-pass graph
+    const bool fused = cparams.mtp_fused && ubatch.token && n_tokens > 1 && n_tokens <= 8;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // the fused chain has no out_ids gather - building the input would leave it
+    // unallocated (no consumer) and set_input asserts on the missing buffer
+    ggml_tensor * inp_out_ids = fused ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -549,8 +555,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // #140: the whole block as a function of (token embeddings, previous hidden),
     // so the fused draft chain can iterate it in-graph. `last` keeps the
-    // out_ids gather on the final logits only.
-    auto build_step = [&](ggml_tensor * e_in, ggml_tensor * h_in, bool last) -> std::pair<ggml_tensor *, ggml_tensor *> {
+    // out_ids gather on the final logits only; `chain_row >= 0` computes the
+    // head over that single row (the chain only ever needs the row that
+    // converged this iteration).
+    auto build_step = [&](ggml_tensor * e_in, ggml_tensor * h_in, bool last, int chain_row = -1) -> std::pair<ggml_tensor *, ggml_tensor *> {
         ggml_tensor * h_norm = build_norm(h_in, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
         cb(h_norm, "mtp_hnorm", il);
 
@@ -638,7 +646,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * h_nextn = cur;
 
         ggml_tensor * out = cur;
-        if (last) {
+        if (chain_row >= 0) {
+            out = ggml_view_2d(ctx0, out, out->ne[0], 1, out->nb[1], (size_t) chain_row * out->nb[1]);
+        } else if (last) {
             out = ggml_get_rows(ctx0, out, inp_out_ids);
             cb(out, "mtp_shared_head_norm", -1);
         }
@@ -646,10 +656,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
         return { h_nextn, out };
     };
-
-    // the unroll is draft-sized only: reserve/prefill shapes (up to n_ubatch
-    // rows) must build the normal single-pass graph
-    const bool fused = cparams.mtp_fused && ubatch.token && n_tokens > 1 && n_tokens <= 8;
 
     ggml_tensor * h_nextn = nullptr;
     ggml_tensor * logits  = nullptr;
@@ -660,42 +666,48 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         logits  = sr.second;
     } else {
         // #140 fused draft chain: iterate the block n_tokens times in ONE graph.
-        // Row 0's inputs are real (id_last + pending_h); each next iteration
-        // feeds row j from row j-1's previous-iteration outputs (argmax token,
-        // h_nextn), so row j converges at iteration j+1 while unconverged rows
-        // stay causally masked and are simply rewritten. The drafted ids are
-        // harvested IN-GRAPH (final argmax) and ride the nextn channel packed
-        // as F32 in one row, so the batch declares a single logits output.
+        // Row 0's inputs are real (id_last + pending_h); iteration `it` computes
+        // the head + argmax over row `it` only (it converges this iteration) and
+        // feeds ONLY row it+1 from it (embedding of the argmax token, h_nextn).
+        // Converged rows keep their inputs, later rows stay placeholders - they
+        // are causally masked, never read. The drafted ids accumulate across
+        // iterations and ride the nextn channel packed as F32 in one row, so
+        // the batch declares a single logits output.
         const int64_t n_embd_row = hparams.n_embd;
         ggml_tensor * e_cur = tok_embd;
         ggml_tensor * h_cur = h_embd;
+        ggml_tensor * ids_f = nullptr;
         for (uint32_t it = 0; it < (uint32_t) n_tokens; ++it) {
-            auto sr = build_step(e_cur, h_cur, /*last=*/ false);
+            auto sr = build_step(e_cur, h_cur, /*last=*/ false, /*chain_row=*/ (int) it);
             h_nextn = sr.first;
             logits  = sr.second;
+            ggml_tensor * id_it = ggml_argmax(ctx0, logits);
+            ggml_tensor * id_f  = ggml_cast(ctx0, id_it, GGML_TYPE_F32);
+            ids_f = ids_f == nullptr ? id_f : ggml_concat(ctx0, ids_f, id_f, 0);
             if (it + 1 == (uint32_t) n_tokens) {
                 break;
             }
-            ggml_tensor * ids = ggml_argmax(ctx0, logits);
-            ids = ggml_view_1d(ctx0, ids, n_tokens - 1, 0);
-            ggml_tensor * e_next = ggml_get_rows(ctx0, tok_embd_w, ids);
-            ggml_tensor * e_row0 = ggml_view_2d(ctx0, tok_embd, n_embd_row, 1, tok_embd->nb[1], 0);
-            e_cur = ggml_concat(ctx0, e_row0, e_next, 1);
-            ggml_tensor * h_next = ggml_view_2d(ctx0, h_nextn, n_embd_row, n_tokens - 1, h_nextn->nb[1], 0);
-            ggml_tensor * h_row0 = ggml_view_2d(ctx0, h_embd, n_embd_row, 1, h_embd->nb[1], 0);
-            h_cur = ggml_concat(ctx0, h_row0, h_next, 1);
+            ggml_tensor * e_new = ggml_get_rows(ctx0, tok_embd_w, id_it);
+            ggml_tensor * h_new = ggml_view_2d(ctx0, h_nextn, n_embd_row, 1, h_nextn->nb[1], (size_t) it * h_nextn->nb[1]);
+            ggml_tensor * e_pre = ggml_view_2d(ctx0, e_cur, n_embd_row, it + 1, e_cur->nb[1], 0);
+            ggml_tensor * h_pre = ggml_view_2d(ctx0, h_cur, n_embd_row, it + 1, h_cur->nb[1], 0);
+            e_cur = ggml_concat(ctx0, e_pre, e_new, 1);
+            h_cur = ggml_concat(ctx0, h_pre, h_new, 1);
+            if (it + 2 < (uint32_t) n_tokens) {
+                ggml_tensor * e_tail = ggml_view_2d(ctx0, tok_embd, n_embd_row, n_tokens - it - 2, tok_embd->nb[1], (size_t) (it + 2) * tok_embd->nb[1]);
+                ggml_tensor * h_tail = ggml_view_2d(ctx0, h_embd,   n_embd_row, n_tokens - it - 2, h_embd->nb[1],   (size_t) (it + 2) * h_embd->nb[1]);
+                e_cur = ggml_concat(ctx0, e_cur, e_tail, 1);
+                h_cur = ggml_concat(ctx0, h_cur, h_tail, 1);
+            }
         }
 
-        ggml_tensor * ids_all = ggml_argmax(ctx0, logits);
-        ggml_tensor * ids_f   = ggml_cast(ctx0, ids_all, GGML_TYPE_F32);
         ids_f = ggml_reshape_2d(ctx0, ids_f, n_tokens, 1);
         // the unmasked nextn extraction copies n_tokens rows: pad the id row
         // out to the full [n_embd, n_tokens] shape (rows past 0 are zeros)
         ggml_tensor * packed = ggml_pad(ctx0, ids_f, (int) (n_embd_row - n_tokens), (int) (n_tokens - 1), 0, 0);
         h_nextn = ggml_reshape_2d(ctx0, packed, n_embd_row, n_tokens);
 
-        // one declared output row: gather its logits for the standard channel
-        logits = ggml_get_rows(ctx0, logits, inp_out_ids);
+        // `logits` is already the one declared output row (the last drafted row)
     }
 
     cb(h_nextn, "h_nextn", -1);

@@ -1801,7 +1801,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             fused_chain = e && *e && strcmp(e, "0") != 0 && !chain_heads && !is_mem_shared;
         }
         if (fused_chain) {
-            llama_set_mtp_fused(ctx_dft, true);
+            // the fused flag is toggled around the draft submit only: any other
+            // 2..8-row decode (accepted-token ingestion) must build the normal
+            // single-pass graph or it pays the unrolled chain AND poisons the
+            // drafter KV with chain-derived rows instead of the real tokens
             llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ false);
             LOG_INF("%s: - fused in-graph draft chain ACTIVE (#140): greedy fixed-n, draft gates bypassed\n", __func__);
         }
@@ -2134,8 +2137,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 n_draft_f = std::min(n_draft_f, dpf.n_max);
             }
             // n_draft 1 builds the normal single-row graph (no packed id row):
-            // let the per-step loop below handle it
-            if (n_fdrafting == 1 && n_draft_f > 1) {
+            // let the per-step loop below handle it. The upper bound mirrors the
+            // graph unroll bound (qwen35 graph_mtp) - past it the builder makes
+            // a plain graph with no packed id row either.
+            if (n_fdrafting == 1 && n_draft_f > 1 && n_draft_f <= 8) {
                 auto & dp = dparams[fseq];
 
                 const int32_t n_draft = n_draft_f;
@@ -2150,7 +2155,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memset(batch.embd + (size_t) i * n_embd, 0, row_bytes);
                 }
 
+                llama_set_mtp_fused(ctx_dft, true);
                 const int ret = llama_decode(ctx_dft, batch);
+                llama_set_mtp_fused(ctx_dft, false);
                 if (ret != 0) {
                     SPC_ERR("fused chain llama_decode returned %d\n", ret);
                     return;

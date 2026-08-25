@@ -2606,6 +2606,17 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// #140: trace the per-compute capture decision (value-parsed). One line per
+// graph compute + the first differing node on a property change - the
+// instrument for "why does this graph not capture/replay".
+static bool ggml_cuda_graph_trace_enabled() {
+    static const bool en = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_TRACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return en;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2655,17 +2666,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+        if (ggml_cuda_graph_trace_enabled()) {
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu UID-REUSE\n", graph_key, (unsigned long long) cgraph->uid);
+        }
         return false;
     }
 
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
-    if ((int)graph->node_props.size() != cgraph->n_nodes) {
+    const int prev_n_nodes = (int) graph->node_props.size();
+    if (prev_n_nodes != cgraph->n_nodes) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    int first_diff = -1;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -2678,9 +2694,25 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool diff = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        if (res || diff) {
             graph->node_props[i] = prop;
             res = true;
+        }
+        if (diff && first_diff < 0) {
+            first_diff = i;
+        }
+    }
+
+    if (res && ggml_cuda_graph_trace_enabled()) {
+        if (prev_n_nodes != cgraph->n_nodes) {
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu SIZE %d -> %d\n",
+                    graph_key, (unsigned long long) cgraph->uid, prev_n_nodes, cgraph->n_nodes);
+        } else if (first_diff >= 0) {
+            const ggml_tensor * t = cgraph->nodes[first_diff];
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu DIFF node %d/%d op=%s name=%s\n",
+                    graph_key, (unsigned long long) cgraph->uid, first_diff, cgraph->n_nodes,
+                    ggml_op_name(t->op), t->name);
         }
     }
 
@@ -4268,10 +4300,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    bool graph_compatible   = false;
+    bool properties_changed = false;
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4294,6 +4328,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+
+    if (ggml_cuda_graph_trace_enabled()) {
+        fprintf(stderr, "GRAPH_TRACE cmp ctx=%p key=%p uid=%llu n=%d en=%d compat=%d changed=%d warm=%d inst=%d use=%d cap=%d\n",
+                (void *) cuda_ctx, graph_key, (unsigned long long) cgraph->uid, cgraph->n_nodes,
+                graph->is_enabled(), graph_compatible, properties_changed, graph->warmup_complete,
+                graph->instance != nullptr, use_cuda_graph, cuda_graph_update_required);
     }
 #endif // USE_CUDA_GRAPH
 
