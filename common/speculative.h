@@ -115,6 +115,9 @@ bool common_speculative_process_rows(common_speculative * spec, const llama_batc
 // captured draft length).
 llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_draft);
 
+// the drafter's probability for its own top pick at draft position i, or -1 when unavailable
+float common_speculative_get_conf(llama_seq_id seq_id, size_t i, size_t n_draft);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

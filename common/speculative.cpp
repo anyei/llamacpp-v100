@@ -47,9 +47,14 @@ static bool spec_alt_enabled() {
     return en || common_speculative_tree_enabled();
 }
 
+struct spec_alt_entry {
+    std::array<llama_token, 2> alt = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    float p_top = -1.0f; // drafter's probability for its own top pick, -1 = unknown
+};
+
 struct spec_alt_registry {
     std::mutex mu;
-    std::map<llama_seq_id, std::vector<std::array<llama_token, 2>>> alts;
+    std::map<llama_seq_id, std::vector<spec_alt_entry>> alts;
     std::atomic<uint64_t> n_reject{0};
     std::atomic<uint64_t> n_alt1{0};
     std::atomic<uint64_t> n_alt2{0};
@@ -68,11 +73,12 @@ static void spec_alt_push(llama_seq_id seq_id, const llama_token_data_array * cu
     if (!spec_alt_enabled()) {
         return;
     }
-    std::array<llama_token, 2> alt = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
-    if (cur_p->size > 1) { alt[0] = cur_p->data[1].id; }
-    if (cur_p->size > 2) { alt[1] = cur_p->data[2].id; }
+    spec_alt_entry e;
+    if (cur_p->size > 0) { e.p_top  = cur_p->data[0].p; }
+    if (cur_p->size > 1) { e.alt[0] = cur_p->data[1].id; }
+    if (cur_p->size > 2) { e.alt[1] = cur_p->data[2].id; }
     std::lock_guard<std::mutex> lock(g_spec_alt.mu);
-    g_spec_alt.alts[seq_id].push_back(alt);
+    g_spec_alt.alts[seq_id].push_back(e);
 }
 
 llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_draft) {
@@ -84,7 +90,19 @@ llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_
     if (it == g_spec_alt.alts.end() || it->second.size() != n_draft || i >= it->second.size()) {
         return LLAMA_TOKEN_NULL; // no capture, or the served draft was reshaped after capture
     }
-    return it->second[i][0];
+    return it->second[i].alt[0];
+}
+
+float common_speculative_get_conf(llama_seq_id seq_id, size_t i, size_t n_draft) {
+    if (!spec_alt_enabled()) {
+        return -1.0f;
+    }
+    std::lock_guard<std::mutex> lock(g_spec_alt.mu);
+    auto it = g_spec_alt.alts.find(seq_id);
+    if (it == g_spec_alt.alts.end() || it->second.size() != n_draft || i >= it->second.size()) {
+        return -1.0f;
+    }
+    return it->second[i].p_top;
 }
 
 void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok) {
@@ -98,7 +116,7 @@ void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llam
         if (it == g_spec_alt.alts.end() || i_rej >= it->second.size()) {
             return; // draft did not come from an instrumented loop (or was reshaped) - skip
         }
-        alt = it->second[i_rej];
+        alt = it->second[i_rej].alt;
     }
     const uint64_t nr = g_spec_alt.n_reject.fetch_add(1) + 1;
     if (tgt_tok != LLAMA_TOKEN_NULL && tgt_tok == alt[0]) {

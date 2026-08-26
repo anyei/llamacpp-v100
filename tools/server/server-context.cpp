@@ -617,8 +617,19 @@ struct server_slot {
             // keep room for every remaining slot's main anchor+draft rows, which assert
             // on overflow below rather than failing gracefully like br_ok
             const int32_t n_rows_branch = 1 + (int32_t) spec_draft.size();
+            // LLAMA_SPEC_TREE_CONF (value-parsed float, default 1.0 = arm whenever an alt
+            // exists): only pay the branch rows when the drafter's own probability for its
+            // top pick at position 0 is BELOW the threshold - confident rounds skip the
+            // wide-row cost, shaky rounds (the ones alt1 rescues) still arm. A missing
+            // capture (-1) arms unconditionally.
+            static const float spec_tree_conf = [] {
+                const char * v = getenv("LLAMA_SPEC_TREE_CONF");
+                const float f = v != nullptr ? (float) atof(v) : 0.0f;
+                return f > 0.0f && f <= 1.0f ? f : 1.0f;
+            }();
             if (spec_tree_on && seq_branch >= 0 && !spec_replay && !spec_draft.empty() &&
-                spec_tree_budget && *spec_tree_budget >= n_rows_branch) {
+                spec_tree_budget && *spec_tree_budget >= n_rows_branch &&
+                common_speculative_get_conf(id, 0, spec_draft.size()) < spec_tree_conf) {
                 const llama_token alt = common_speculative_get_alt1(id, 0, spec_draft.size());
                 if (alt != LLAMA_TOKEN_NULL && alt != spec_draft[0]) {
                     const llama_pos pos_a = prompt.tokens.pos_next(); // anchor (sampled) position
