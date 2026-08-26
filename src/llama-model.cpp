@@ -3022,7 +3022,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DFLASH:
             // a drafter has to rotate exactly like the target it drafts for: the DeepSeek-V4
             // backbone pairs the rotary dimensions like deepseek2/4 (NORM), the original
-            // Qwen3-style backbone pairs them like Qwen (NEOX).
+            // Qwen3-style backbone pairs them like Qwen (NEOX). Drafts for M-RoPE targets
+            // carry rope sections and follow the target's temporal dim.
+            if (const auto & s = model->hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
+                return LLAMA_ROPE_TYPE_MROPE;
+            }
             return model->hparams.dflash_dsv4_backbone ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:

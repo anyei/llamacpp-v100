@@ -682,6 +682,37 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
 
+        # M-RoPE target: the draft ropes on the temporal dim only, so write
+        # degenerate sections [n_rot/2, 0, 0, 0]
+        if self._target_uses_mrope():
+            head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+            self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
+
+    def _target_uses_mrope(self) -> bool:
+        if self.target_model_dir is None:
+            return False
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg = cfg.get("text_config", cfg)
+        rope = cfg.get("rope_parameters") or cfg.get("rope_scaling") or {}
+        return "mrope_section" in rope
+
+    _ROPE_PERMUTE_SUFFIXES = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    )
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # interleaved-rope checkpoints (rope_is_neox_style = false) -> NeoX layout: per head, even dims first then odd
+        if not self.hparams.get("rope_is_neox_style", True) and name.endswith(self._ROPE_PERMUTE_SUFFIXES):
+            head_dim = self.hparams["head_dim"]
+            shape = data_torch.shape
+            data_torch = data_torch.reshape(-1, head_dim // 2, 2, *shape[1:]).transpose(1, 2).reshape(shape)
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item

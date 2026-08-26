@@ -10,7 +10,8 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
     hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,      hparams.f_final_logit_softcapping, false);
-    ml.get_key(LLM_KV_EMBEDDING_SCALE,              hparams.f_embedding_scale, false);
+    // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
+    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
@@ -529,13 +530,18 @@ void llama_model_dflash::graph<false>::build_dsv4(const llama_model & model, ggm
 
     cur = build_lora_mm(output, cur);
 
-    if (hparams.f_logit_scale != 0.0f) {
-        cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-    }
-    if (hparams.f_final_logit_softcapping > 0.0f) {
-        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-        cur = ggml_tanh(ctx0, cur);
-        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+    // DFlash2 feeds these logits to the selector, so they carry the target's
+    // output transforms. DFlash1 and DSpark read them through the sampler and
+    // are left untouched.
+    if (model.dflash_selector_hidden) {
+        if (hparams.f_logit_scale != 0.0f) {
+            cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
+        }
+        if (hparams.f_final_logit_softcapping > 0.0f) {
+            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+        }
     }
 
     cb(cur, "result_output", -1);
@@ -574,6 +580,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     const int64_t n_embd_head_rope = hparams.dflash_dsv4_backbone ? n_rot : 0;
+
+    // drafts for M-RoPE targets use degenerate sections (temporal dim only)
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos) {
+        return rope_type == GGML_ROPE_TYPE_MROPE
+            ? ggml_rope_multi(ctx0, cur, pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow)
+            : ggml_rope_ext(ctx0, cur, pos, nullptr,
+                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+    };
 
     // KV cache injection
     if (ubatch.embd) {
@@ -623,11 +643,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
                 Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
-                Kcur = ggml_rope_ext(
-                        ctx0, Kcur, inp_pos, nullptr,
-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                        ext_factor, attn_factor, beta_fast, beta_slow
-                        );
+                Kcur = build_rope(Kcur, inp_pos);
             }
             cb(Kcur, "Kcur_injected", il);
             cb(Vcur, "Vcur_injected", il);
@@ -698,9 +714,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
-    if (hparams.f_embedding_scale != 0.0f) {
-        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
-    }
     cb(inpL, "inp_noise_embd", -1);
 
     for (int il = 0; il < n_layer; ++il) {
@@ -727,16 +740,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
 
-        Qcur = ggml_rope_ext(
-                ctx0, Qcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow
-                );
-        Kcur = ggml_rope_ext(
-                ctx0, Kcur, inp_pos, nullptr,
-                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                ext_factor, attn_factor, beta_fast, beta_slow
-                );
+        Qcur = build_rope(Qcur, inp_pos);
+        Kcur = build_rope(Kcur, inp_pos);
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
