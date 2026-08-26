@@ -690,7 +690,7 @@ class DFlashModel(Qwen3Model):
         return super().filter_tensors((name, gen))
 
 
-@ModelBase.register("Qwen3DSparkModel")
+@ModelBase.register("Qwen3DSparkModel", "DSparkDraftModel")
 class DSparkModel(DFlashModel):
     # DSpark = DFlash + a semi-autoregressive Markov head
     model_arch = gguf.MODEL_ARCH.DFLASH
