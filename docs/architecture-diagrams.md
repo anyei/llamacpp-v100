@@ -75,6 +75,13 @@ flowchart TD
 - Per MoE layer boundary: ONE fused message per worker (proto 4.5/4.6
   `GRAPH_FUSED`: carries the previous reduced value + the next subgraph chain
   + returns the boundary partial in the same response).
+- Boundary payloads optionally ride compressed (set BOTH — each connection
+  uses the best format its worker speaks): `GGML_RPC_WIRE_F16` (proto 4.12) /
+  `GGML_RPC_WIRE_Q8` (4.13), PPL-neutral, fleet ~+15-20% decode. Proto 4.14
+  answers all-zero fused fetches with a 1-byte marker automatically. And
+  readiness-gated expert deferral (`GGML_META_EXPERT_DEFER=1`, decode-only)
+  lets actual stragglers' partials drain one boundary late: +34% on the
+  record roster at baseline PPL.
 - Single-stream is RTT-serialized (~43 boundaries x RTT; workers idle >90%).
   Batching is the scaling axis: B=8 measured x2.85 aggregate.
 - `LLAMA_META_ATTN_OWNER=0,1` = owner group (comma list). Requires
@@ -175,6 +182,15 @@ provenance (tensor name + row range) still resolves against the local GGUF
 (measured -71% wire bytes on a boundary-moved load). Older workers simply
 never see HASH2 (version-gated) and keep the first three branches.
 
+Since #113 (`GGML_META_TILED_UPLOAD`, default ON) expert-tensor split
+segments are additionally cut on a fixed grid anchored in root-tensor
+coordinates (dim-1 column tiles ~256 KiB; whole-expert slabs for placed
+layouts), so interior tiles keep their content hash across `-ts` retunes —
+a reload after a share change batch-places from the worker DISK CACHE and
+streams only boundary/moved tiles. The 4.8 provenance route covers
+`--model-dir` boxes; tiling extends cache-hit survival to disk-cache-only
+workers.
+
 ## 5. Worker cache lifecycle (housekeeping, #45)
 
 ```mermaid
@@ -244,6 +260,31 @@ flowchart TD
   without rebuilding split states (prod: 27B ~81 t/s, 35B ~166 t/s serving).
 - Acceptance is the whole game: ~88% on the prod models; hy_v3 needs
   `p-min 0.75` (its single-depth head collapses at the default).
+
+The loop above is the base machine. The 2026-08 speculation era (#132-#142)
+grew it in four directions — none of which changes the diagram's shape, all
+of which plug into the same draft -> one-batch-verify round:
+
+- **Drafter roster** (`--spec-type`): the in-model `draft-mtp` head, learned
+  block drafters `draft-dflash` (DFlash2 selector lattice) / `draft-dspark` /
+  `draft-eagle3`, the model-free `ngram-*` family, and `draft-simple` (a
+  separate small LM). Production configs STACK `ngram-mod,draft-mtp`: ngram
+  tables learn across requests (X99 2-GPU tensor: 66-71 t/s fresh prose ->
+  108-128 warmed; 171-177 warmed code).
+- **Dual drafters** (`LLAMA_SPEC_DRAFT2*`, #132/#138): a second drafter
+  behind the primary in priority-fallback dispatch — capability standby at
+  under ~1 t/s premium. Diagrams + measured sweet spots:
+  [dual-drafters.md](dual-drafters.md).
+- **Fused draft chain** (`LLAMA_SPEC_MTP_FUSED`, #140): the whole greedy MTP
+  chain in ONE decode graph. Measured parity everywhere it runs — the cost
+  was never draft round-trips but verify rows (~9.2 ms/row on the MoE
+  target); auto-disabled on row/tensor-split (in-graph argmax needs a
+  single-owner logits row).
+- **Spec tree** (`LLAMA_SPEC_TREE` + `LLAMA_SPEC_TREE_CONF`, #132/#137/#141):
+  one alt branch per verify round. Net negative at V100 verify-row prices
+  even confidence-gated — off in production, lane parked. (PEARL
+  post-verify draft-ahead, #108, is likewise built but excluded for feature
+  drafters and off by default.)
 
 ## 8. TP island (worker-side tensor parallel)
 

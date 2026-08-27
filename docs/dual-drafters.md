@@ -129,3 +129,32 @@ Reads that generalize:
 - The dual configuration is capability, not speed: the entropy-threshold mixing
   curve between the two drafters is monotone, so its value is the live standby
   (under 1 t/s premium over the primary alone), plus per-workload switching.
+
+## 5. Post-guide updates (2026-08-25/26)
+
+Landed after the sections above were written; the shapes there still hold.
+
+- **Fused MTP draft chain** (`LLAMA_SPEC_MTP_FUSED`, #140): the primary's n
+  micro-forwards collapse into ONE decode graph. Verdict: byte-identical,
+  draft-stream-identical, and speed-PARITY everywhere it runs — the per-step
+  tax the fusion targeted turned out to be verify-row cost on the MoE target
+  (~9.2 ms/row), not draft round-trips. Auto-disabled on row/tensor-split
+  models (in-graph argmax needs a single-owner logits row); engages cleanly
+  under the ngram-mod stack. Opt-in.
+- **Confidence-gated tree arming** (`LLAMA_SPEC_TREE_CONF`, #141): the spec
+  tree can now arm only on low-confidence rounds. The gate works (take-rate
+  triples) but every setting stays below the no-tree line — tree-as-built is
+  structurally unpayable at V100 verify-row prices. Lane parked; keep the
+  tree off in production.
+- **DSpark drafter** (#142): `RadixArk/Qwen3.8-27B-DSpark` converts cleanly
+  (the `DSparkDraftModel` architecture alias) and runs as `draft-dspark`, but
+  MTP n2 beats it on both prose and code — no published drafter beats the free
+  in-model head on this stack. The apparent "~2x SGLang acceptance gap" was a
+  METRIC ARTIFACT (reference numbers are acceptance LENGTH at temp 1 with
+  lossless rejection sampling; converted apples-to-apples we are AT or ABOVE
+  reference). The acceptance wall is the drafter checkpoints' training data,
+  not the fork.
+- **Standby premium is box-dependent** (#138 X99 ladders): the DFlash2-Q4
+  DRAFT2 standby cost 0.83 t/s on the local V100 but -2 t/s on the X99 1-GPU
+  shape, where it was CUT from the stored winner config (ngram-mod + MTP n2).
+  Measure the premium on the serving box before keeping the standby.

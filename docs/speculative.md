@@ -113,6 +113,10 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+Checkpoints published under the `DSparkDraftModel` architecture name (for example
+`RadixArk/Qwen3.8-27B-DSpark`) convert with the same recipe — the converter accepts that
+name as an alias (#142).
+
 `--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
