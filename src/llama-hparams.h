@@ -3,11 +3,14 @@
 #include "llama.h"
 
 #include <array>
+#include <bitset>
 #include <cassert>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
+#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
+#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -256,6 +259,33 @@ struct llama_hparams {
     // true when a DFlash drafter uses a DeepSeek-V4 backbone (MLA + MoE + hyper-connections)
     // instead of the original dense Qwen3-style backbone.
     bool dflash_dsv4_backbone = false;
+
+    // 0 = full rank (DeepSeek-V4)
+    uint32_t hc_low_rank = 0;
+
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;
+    uint32_t ple_eos_token_id    = 0;
+    // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
+    uint32_t ple_image_token_id  = 0;
+    // unlike is_swa_impl and friends this is never read or written as a per-layer gguf array
+    // (the file lists PLE layer indices), so it is not tied to the loader's uint32 array type
+    // and can hold one bit per layer instead of one word
+    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
+    // the hash multipliers reach ~2e13 and have to stay 64-bit
+    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
+    // head offsets and vocab sizes are token-space indices; the gather that consumes them
+    // truncates to int32, so 64-bit storage could never have been used
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
+
+    bool is_ple(uint32_t il) const;
+
+    // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
+    uint32_t ple_conv_state() const;
 
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
