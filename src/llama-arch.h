@@ -654,6 +654,10 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_HNORM,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    // qwen4exp mtp: separate embed/hidden fusion projections (fc_hid applies per
+    // hyper-connection branch - not foldable into a concat eh_proj)
+    LLM_TENSOR_NEXTN_FC_EMBD,
+    LLM_TENSOR_NEXTN_FC_HID,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,

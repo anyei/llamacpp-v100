@@ -2595,6 +2595,14 @@ class TensorNameMap:
             "model.layers.{bid}.hnorm",
         ),
 
+        MODEL_TENSOR.NEXTN_FC_EMBD: (
+            "model.layers.{bid}.fc_embedding",  # qwen4exp mtp
+        ),
+
+        MODEL_TENSOR.NEXTN_FC_HID: (
+            "model.layers.{bid}.fc_hidden",  # qwen4exp mtp
+        ),
+
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
         ),

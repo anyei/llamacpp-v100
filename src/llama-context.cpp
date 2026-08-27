@@ -2248,7 +2248,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    // MTP contexts carry hidden-state rows in batch.embd at the h_nextn width -
+    // on qwen4exp that is the HC bundle (n_embd_out = hc x n_embd), wider than
+    // the token-embedding width the allocator normally sizes for
+    const int64_t n_embd  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+            ? std::max<int64_t>(hparams.n_embd_inp(), hparams.n_embd_out())
+            : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;

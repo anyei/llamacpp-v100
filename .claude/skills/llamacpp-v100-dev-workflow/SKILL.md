@@ -78,6 +78,13 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
 
 ## Traps (every one of these has cost an hour+)
 
+0. **Gate harnesses pkill container-wide (#146)**: /work gate scripts used bare
+   `pkill -f llama-server / ggml-rpc-server` in their kill_all - running a gate
+   while a USER serve lives in llama-devcuda kills that serve mid-flight (it
+   killed a live Flash-Next expert-fleet on 2026-08-27). 71-defer-v2-gate.sh is
+   now port-scoped; before running ANY other gate script, `pgrep -af
+   "llama-server|ggml-rpc-server"` in the container - foreign rows = user serve,
+   do not run the gate (or scope its kills first).
 1. **`pkill -f` self-kill**: a `docker exec bash -c` whose cmdline mentions the
    pattern kills its own shell (exit 143). Use `pkill -x <name>` or kill by PID.
    `fuser` does not exist in llama-devcuda.

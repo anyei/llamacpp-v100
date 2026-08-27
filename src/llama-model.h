@@ -224,6 +224,9 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    // qwen4exp: separate embed/hidden fusion (fc_hid applies per HC branch)
+    struct ggml_tensor * fc_embd               = nullptr;
+    struct ggml_tensor * fc_hid                = nullptr;
 };
 
 struct llama_layer {

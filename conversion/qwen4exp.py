@@ -15,7 +15,6 @@ from .qwen3vl import Qwen3VLVisionModel
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
-@ModelBase.example("unsloth/Qwen3.8-Flash-Next")
 class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """Qwen3.8-Flash-Next.
 
@@ -26,12 +25,26 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
+    # Target conversions always drop the MTP block (the bundled-in-target form
+    # needs a nextn layer in the target graph, which the port does not build);
+    # --mtp exports the head as its own file, reusing the target embed/lm_head
+    # (mtp_use_dedicated_embeddings is false) - vLLM drops the head entirely.
+    supports_mtp_export = True
     no_mtp = True
+    _original_block_count: int | None = None
+
+    @staticmethod
+    def _text_hparams(hparams: dict) -> dict:
+        # the multimodal checkpoint nests the text keys until base.py merges them
+        return {**hparams, **hparams.get("text_config", {})}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.mtp_only:
+            # the head file carries the MTP layer at index num_hidden_layers
+            hp = self._text_hparams(self.hparams)
+            self.block_count = hp["num_hidden_layers"] + hp.get("mtp_num_hidden_layers", 1)
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         # shards held only until the row stride is known, normally none
         self._ple_pending: dict[int, Tensor] = {}
         self._ple_shard_rows: dict[int, int] = {}
@@ -39,6 +52,46 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_rows_per_shard: int | None = None
         self._ple_map: np.memmap | None = None
         self._ple_path: Path | None = None
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._original_block_count = self._text_hparams(self.hparams)["num_hidden_layers"]
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+        if name.startswith("mtp."):
+            if not cls.mtp_only:
+                return None
+            assert cls._original_block_count is not None
+            bc = cls._original_block_count
+            parts = name.split(".", 3)
+            # the head's own final mixer takes the model-level mixer slot
+            if parts[1] == "hyper_connection_mixer":
+                name = "model." + name[len("mtp."):]
+            elif len(parts) == 4 and parts[1] == "layers" and parts[2].isdecimal():
+                name = f"model.layers.{bc + int(parts[2])}.{parts[3]}"
+            elif len(parts) == 3:
+                remapper = {
+                    "fc_embedding":          "fc_embedding",
+                    "fc_hidden":             "fc_hidden",
+                    "pre_fc_norm_embedding": "enorm",
+                    "pre_fc_norm_hidden":    "hnorm",
+                }
+                if parts[1] not in remapper:
+                    raise ValueError(f"unexpected MTP tensor {name!r}")
+                name = f"model.layers.{bc}.{remapper[parts[1]]}.{parts[2]}"
+            return super().filter_tensors((name, gen))
+        if cls.mtp_only:
+            # the head reuses the target's embeddings and lm head; the 48 main
+            # layers, the PLE table and its hash constants all stay out
+            if name not in ("model.embed_tokens.weight",
+                            "model.language_model.embed_tokens.weight",
+                            "lm_head.weight"):
+                return None
+        return super().filter_tensors(item)
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -67,6 +120,15 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
+
+        if self.mtp_only:
+            # the head file: only the nextn slots exist, and the MTP layer is
+            # always full attention (config `mtp.layer_types`); no PLE
+            n_mtp = self.hparams.get("mtp_num_hidden_layers", 1)
+            self.gguf_writer.add_attention_compress_ratios([0] * n_layer + [ratio] * n_mtp)
+            self.gguf_writer.add_nextn_predict_layers(n_mtp)
+            return
+
         layer_types = hp["layer_types"]
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
@@ -226,6 +288,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                         shape=(total_rows, self._ple_row_dim))
         return torch.from_numpy(np.asarray(raw))
 
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+        if not self.mtp_only or not from_dir:
+            return
+        output_type: str = self.ftype.name.partition("_")[2]
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
+
     def prepare_tensors(self):
         super().prepare_tensors()
         if self._ple_pending:
@@ -242,6 +315,5 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")
-@ModelBase.example("unsloth/Qwen3.8-Flash-Next")
 class Qwen4ExpVisionModel(Qwen3VLVisionModel):
     """The vision tower is an unmodified Qwen3-VL ViT."""
