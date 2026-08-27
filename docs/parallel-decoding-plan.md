@@ -191,7 +191,7 @@ named baseline; spec rungs add the temp-0 spec-vs-nospec byte leg):
   the keeper (~10 single-stream) extrapolates to ~30 aggregate at np4:
   the 20-30 goal in aggregate terms (decision (b)) is plausibly in reach
   today. V4-arch curve (256-expert union, skewed routing) = first leg when
-  the X99 returns. Harness /work/np-curve.sh.
+  the X99 returns. Harness: `np-curve.sh` (dev-container work dir).
   **A5-ON-V4 MEASURED 2026-08-16 (X99, keeper shape -ncmoe 25 -ts 27,8,8
   -c 8192 --parallel 4, image 5091efd76-era): TARGET-ONLY np1 10.11 (4 runs,
   10.02-10.15) / np2 ~14.6 aggregate (1.44x) / np4 19.3-19.9 aggregate mean
@@ -299,8 +299,8 @@ Ladder:
   #124 drafter file carries it, which is exactly A3's config). So the A6
   endgame build (UD-Q4_K_XL 144.5 GiB) is a different checkpoint AND quant:
   A6 needs its own profile+placement (trap confirmed, not hypothetical). GLM-5.2:
-  UD-Q4_K_XL 436 GiB (X99 + /mnt/files local); Q2_K_XL 6 shards at
-  /mnt/full-models on the local box - must be copied to the X99 for B1.
+  UD-Q4_K_XL 436 GiB (X99 + the local models dir); Q2_K_XL 6 shards on the
+  local box's secondary models drive - must be copied to the X99 for B1.
   IQ2XXS keeper 81 GiB on X99.
 - **GLM-5.2 arch (B0, gguf header)**: glm-dsa, block_count 79 = 3 leading
   dense + 76 MoE trunk (nextn/MTP head is extra, hy3 pattern;

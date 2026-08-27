@@ -130,7 +130,8 @@ Landed beyond the original increments:
 - GET /wizard/hw: RAM, per-dir disk, GPUs via nvidia-smi subprocess (the
   router never inits CUDA), workers via beacon listen (k=v parsed).
 - GET /wizard/sweeps: merged sweeps.json from every source dir (measured
-  t/s per model|mode|spec keys; /mnt/files/sweeps.json seeded).
+  t/s per model|mode|spec keys; sweeps.json seeded at the primary
+  models-dir root).
 - POST /models/load: extra_args + extra_env overlay (LLAMA_SERVER_* refused).
 - wizard.html embedded in the image UI assets (no-cache so browsers track
   updates); docker-compose.launcher.yml = image + /models + host /mnt tree

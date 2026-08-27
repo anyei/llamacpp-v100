@@ -178,7 +178,7 @@ Log one INFO line per model: aggregate owner coverage implied by the profile
 
 ## 4. Validation staircase (gates before any fleet touch)
 
-Vehicle: `/mnt/files/hy3-trunc5-mtp.gguf` + CPU loopback workers (dev-container
+Vehicle: `hy3-trunc5-mtp.gguf` (models dir) + CPU loopback workers (dev-container
 build, docs/dev-workflow.md §1c). CPU meta paths are deterministic - byte gates
 are valid here (NOT on the GPU fleet - gotcha #4).
 
@@ -239,7 +239,7 @@ mounted read-only.
 
    ```bash
    docker run -d --name llama-ep-trunc --gpus all \
-     -v "$BUILD:/srcbin:ro" -v "$ART_DIR:/place:ro" -v /mnt/files:/models:ro --network host \
+     -v "$BUILD:/srcbin:ro" -v "$ART_DIR:/place:ro" -v "$MODELS_DIR":/models:ro --network host \
      -e LD_LIBRARY_PATH=/srcbin/bin -e GGML_META_DEBUG=1 \
      -e LLAMA_META_EP_ONLY=1 -e LLAMA_META_ATTN_OWNER=0,1 -e LLAMA_META_ALLOW_MULTI_LOCAL=1 \
      -e CUDA_VISIBLE_DEVICES=0,1 -e LLAMA_META_EXPERT_PLACEMENT=/place/trunc-place-4.json \
