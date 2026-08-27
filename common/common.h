@@ -391,8 +391,11 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // any speculation rolls rejected tokens back; on recurrent-state targets that takes the
+        // rollback snapshots, so weightless drafters (ngram) count too. non-recurrent targets
+        // roll back via partial seq_rm and zero this at context init.
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t != COMMON_SPECULATIVE_TYPE_NONE;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
