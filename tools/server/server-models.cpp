@@ -277,7 +277,9 @@ static json server_model_read_gguf_meta(const std::string & path) {
         bool has_trunk0 = false;
         for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !(has_nextn && has_trunk0); i++) {
             const char * tn = gguf_get_tensor_name(g, i);
-            has_nextn  = has_nextn  || strstr(tn, "nextn.eh_proj") != nullptr;
+            // any .nextn. tensor marks an MTP block - qwen35-class heads carry
+            // nextn.eh_proj, qwen4exp heads nextn.fc_embd/fc_hid (#149)
+            has_nextn  = has_nextn  || strstr(tn, ".nextn.") != nullptr;
             has_trunk0 = has_trunk0 || (strncmp(tn, "blk.0.", 6) == 0 && strstr(tn, ".nextn.") == nullptr);
         }
         meta["has_mtp"] = has_nextn;
