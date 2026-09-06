@@ -15,6 +15,16 @@
 > approximation for 0731 (same family, different checkpoint - validate with an
 > 0731 collection on the X99 when free). Side fact: V4-Flash = 43 MoE layers
 > of ~78 total (the len-43 `swiglu_clamp_exp` array counts MoE layers).
+>
+> **2026-09-06: Qwen3.8-Flash-Next profiled** (X99 side serve, 1-GPU ncmoe 48,
+> spec OFF, 6831 rows / 5689 completion tokens, two 10-prompt buckets):
+> coverage@25.5% = **0.584** merged (0.661 / 0.662 per bucket) - but the hot
+> sets are DOMAIN-SENSITIVE: bucket A's top set covers only 0.354 of bucket B
+> (the bar was a <= 5 pp drop). Artifacts `profiles/flash-next-q4-2026-09-06*.json`;
+> recipe + full numbers in TASKS #148 addendum 2. Two arch facts: the profiler
+> counts PROMPT tokens on qwen4exp (its prefill routes <= 2 tokens wide, TASKS
+> #150), and MTP verify batches are invisible to it (4-wide) - profile with
+> spec off. Procedure section below.
 
 How to measure per-layer router expert-selection frequencies on a serving
 model and turn them into a frequency-ranked VRAM placement. General workflow
@@ -121,6 +131,34 @@ frequency-placed. Two ways to get the profile, choose by box availability:
 - The placement feeds the same #75 scatter-list mechanism; combined with the
   capacity math redo (diagrams §3b), it decides whether GLM EP lands at a
   usable t/s.
+
+## Qwen3.8-Flash-Next procedure (2026-09-06, reusable for any single-box model)
+
+- **Side serve, not the launcher**: the launcher runs one model at a time, so a
+  profiling load would replace the user's serve. A second `docker run` of the
+  launcher's own image (`--entrypoint /app/llama-server`, `--gpus all`,
+  `--network host`, models dir + an output dir mounted) loads in seconds when the
+  page cache is warm (default mmap; do NOT copy the user's `--load-mode none`, it
+  would duplicate the 111 GB in RAM) and fits next to a running ncmoe serve
+  (~6.5 GiB VRAM at `-ngl 99 -ncmoe 48 -c 4096`). Exact command: TASKS #148
+  addendum 2.
+- **Spec OFF**: the profiler only sees graphs <= 2 tokens wide; MTP/ngram verify
+  batches are wider and vanish from the histogram.
+- **`LLAMA_EXPERT_PROFILE` is a FILE path**; the parent directory must exist (the
+  writer does `fopen(path + ".tmp")` then `rename`, no mkdir).
+- **Traffic**: `scripts/expert-profile-driver.py <base_url> A|B <out.jsonl>` -
+  bucket A = code + factual chat with `enable_thinking=false`, bucket B =
+  reasoning + summarization with thinking on; temp 0.8, 320 tokens each; the
+  JSONL keeps the full text for the coherence read (READ it - #48 rule).
+- **Two buckets from one serve**: copy the cumulative JSON after bucket A, run
+  bucket B, then `scripts/expert-profile-diff.py final.json snapA.json B.json`
+  (B = final - A; the boundary smears by < 500 rows, the dump cadence). Take the
+  exact final count with `docker stop` - the context destructor writes the last
+  dump. Then `scripts/expert-coverage.py A.json B.json` for the cross-domain check.
+- **qwen4exp-specific**: rows = prompt + completion tokens (+3) because the
+  prefill routes <= 2 wide (#150) - the histogram is prefill+decode, and the chat
+  template's boilerplate repeats in every request (~10% of rows at 20 requests).
+  Keep prompts short and numerous, or subtract nothing and say so.
 
 ## Interactions
 
