@@ -6,6 +6,7 @@
 #include "download.h"
 #include "gguf.h" // model header read (block_count) for --rpc-auto-weight's layer-granularity margin
 #include "json-schema-to-grammar.h"
+#include "llama.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -539,6 +540,13 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     };
 
+    // an explicit draft file selection (e.g. -md with -hfd) disables the sidecar resolution of the draft repo
+    if (!params.speculative.draft.mparams.hf_file.empty()) {
+        plan_spec.mtp    = {};
+        plan_spec.dflash = {};
+        plan_spec.eagle3 = {};
+    }
+
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
         if (!plan_spec.mtp.local_path.empty()) {
@@ -586,6 +594,11 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 hf_cache::finalize_file(plan_spec.eagle3);
             }
         });
+    }
+
+    // a wired draft sidecar counts as an explicit draft for the main plan fallback below
+    if (spec_sidecar_found) {
+        had_spec_url = true;
     }
 
     // handle plan_spec (e.g. --spec-draft-hf)
@@ -801,6 +814,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     arg.c_str(), e.what(), opt.to_string().c_str()));
             }
         }
+
+        // TODO: remove this check after deprecating --mmap|mlock|dio
+        auto has_arg = [&](std::initializer_list<const char *> names) {
+            return std::any_of(names.begin(), names.end(), [&](const char * name) {
+                return seen_args.count(name);
+            });
+        };
+        if (has_arg({"-lm", "--load-mode"}) &&
+            has_arg({"--mlock", "--mmap", "--no-mmap", "-dio", "--direct-io", "-ndio", "--no-direct-io"})) {
+            LOG_WRN("DEPRECATED: `--load-mode` and `--mlock`/`--mmap`/`--direct-io` should not be combined; only the last flag on the command line will take effect\n");
+        }
     };
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
@@ -813,6 +837,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // after discovery so every registered worker gets weighted (TASKS.md #35f)
     if (params.rpc_auto_weight) {
         apply_rpc_auto_weight(params);
+    }
+
+    // TASKS #82: -sm tensor + -ncmoe on multi-GPU silently corrupts decode
+    // (coherent-then-repetition-spiral, damaged arithmetic; A/B 2026-08-04:
+    // identical config under -sm layer is coherent). Warn, don't fail (#90).
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+        !params.tensor_buft_overrides.empty() && getenv("LLAMA_META_EP_ONLY") == nullptr) {
+        LOG_WRN("-sm tensor combined with -ncmoe/--cpu-moe is KNOWN to corrupt decode quality "
+                "(repetition spirals) - use -sm layer for CPU-expert offload (TASKS #82)\n");
     }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
@@ -863,8 +896,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.kv_overrides.back().key[0] = 0;
     }
 
-    if (!params.server_tools.empty() && !params.cors_origins_explicit) {
-        LOG_WRN("server tools are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
+    const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
+    if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
+        LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
         params.cors_origins = "localhost";
     }
 
@@ -1049,9 +1083,14 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         devices.push_back(nullptr);
     } else {
         ggml_backend_load_all();
+        // TASKS #71 (LLAMA_META_LOCAL_DRAFT): the coordinator-local draft needs an
+        // in-process member in the meta device; on CPU-only fleets that member is
+        // the host CPU itself, so allow it in the list when the feature is on.
+        const char * local_draft = getenv("LLAMA_META_LOCAL_DRAFT");
+        const bool   allow_cpu   = local_draft != nullptr; // presence gates the topology; =0 keeps the feature off
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && !allow_cpu)) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }
             devices.push_back(dev);
@@ -1059,6 +1098,31 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         devices.push_back(nullptr);
     }
     return devices;
+}
+
+void common_print_available_devices() {
+    constexpr size_t MiB = 1024 * 1024;
+    std::vector<ggml_backend_dev_t> devices;
+
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    printf("Available devices:\n");
+
+    if (devices.empty()) {
+        printf("  (none)\n");
+        return;
+    }
+    for (auto * dev : devices) {
+        size_t free, total;
+        ggml_backend_dev_memory(dev, &free, &total);
+        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
+    }
 }
 
 static void add_rpc_devices(const std::string & servers, bool skip_unavailable) {
@@ -1522,13 +1586,65 @@ static void apply_rpc_auto_weight(common_params & params) {
             break;
         }
     }
+    // TASKS #95: shares below the segment-rounding floor produce layouts where a
+    // member's slice rounds to ZERO on some tensors and nonzero on others - the
+    // split-state algebra then aborts at warmup (repro: -ts 0,0.924,0.038,0.038
+    // on v4-trunc6; exact-zero members are handled fine). Floor tiny shares to
+    // exact 0 and hand their bytes to the remaining uncapped members.
+    {
+        double min_share = 0.05;
+        if (const char * env = getenv("LLAMA_RPC_AUTO_WEIGHT_MIN_SHARE")) {
+            min_share = atof(env);
+        }
+        double dropped = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (share[i] > 0.0 && share[i] < min_share) {
+                LOG_WRN("--rpc-auto-weight: %s share %.1f%% is below the %.0f%% segment-rounding floor - "
+                        "dropping it from the expert split (TASKS #95; raise via LLAMA_RPC_AUTO_WEIGHT_MIN_SHARE)\n",
+                        ggml_backend_dev_name(devs[i]), 100.0*share[i], 100.0*min_share);
+                dropped += share[i];
+                share[i] = 0.0;
+                capped[i] = true;
+            }
+        }
+        if (dropped > 0.0) {
+            double uncapped_sum = 0.0;
+            int    n_nonzero    = 0;
+            for (size_t i = 0; i < n; ++i) {
+                uncapped_sum += capped[i] ? 0.0 : share[i];
+                n_nonzero    += share[i] > 0.0;
+            }
+            if (n_nonzero < 2) {
+                // a single expert member + dedicated owners is its own aborting
+                // shape (csa_state_kv, same split-state algebra hole) - bail to
+                // the default split rather than emit a known-bad layout
+                LOG_WRN("--rpc-auto-weight: flooring left %d expert member(s) - "
+                        "keeping the default split (TASKS #95)\n", n_nonzero);
+                return;
+            }
+            for (size_t i = 0; i < n && uncapped_sum > 0.0; ++i) {
+                if (!capped[i] && share[i] > 0.0) {
+                    share[i] += dropped * share[i] / uncapped_sum;
+                }
+            }
+        }
+    }
     double share_sum = 0.0;
     for (size_t i = 0; i < n; ++i) {
         share_sum += share[i];
     }
     if (share_sum < 0.999 && w_bytes > 0.0) {
+        // The estimate can be transiently low (a worker restarting or still
+        // releasing buffers), so this stays a WARNING, not a hard fail
+        // (user call 2026-08-01, revisits TASKS #90). The default split may
+        // still OOM on capacity-shaped rosters - the message names the risk
+        // and the remedies so the wizard error tail shows the actual cause.
         LOG_WRN("--rpc-auto-weight: the model (%.1f GiB) does not fit the fleet's free memory "
-                "at 90%% headroom, keeping the default split\n", w_bytes / (1024.0 * 1024.0 * 1024.0));
+                "at 90%% headroom (only %.0f%% of the weights are placeable) - keeping the "
+                "default split, which MAY OOM a device (TASKS #90: a 32GB V100 drew a 39.7GB "
+                "share). If the load fails: free worker/GPU memory, shrink the model or "
+                "context, retry once workers settle, or pass an explicit -ts.\n",
+                w_bytes / (1024.0 * 1024.0 * 1024.0), share_sum * 100.0);
         return;
     }
 
@@ -3049,25 +3165,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     }
     add_opt(common_arg(
         {"--mlock"},
-        "force system to keep model in RAM rather than swapping or compressing",
+        "DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing",
         [](common_params & params) {
-            params.use_mlock = true;
+            LOG_WRN("DEPRECATED: --mlock is deprecated. use --load-mode mlock instead\n");
+            // the old flag was an independent boolean on top of mmap (default on);
+            // compose with the current mode instead of dropping its mmap bit
+            switch (params.load_mode) {
+                case LLAMA_LOAD_MODE_MMAP:
+                case LLAMA_LOAD_MODE_MMAP_MLOCK:
+                    params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
+                    break;
+                case LLAMA_LOAD_MODE_DIRECT_IO:
+                    LOG_WRN("--mlock does not compose with dio; using mlock\n");
+                    params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+                    break;
+                default:
+                    params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+                    break;
+            }
         }
     ).set_env("LLAMA_ARG_MLOCK"));
     add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
-        string_format("whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),
+        "DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)",
         [](common_params & params, bool value) {
-            params.use_mmap = value;
+            LOG_WRN("DEPRECATED: --mmap and --no-mmap are deprecated. use --load-mode mmap instead\n");
+            // set/clear only the mmap bit: keep a requested mlock either way,
+            // keep dio on --no-mmap (dio bypasses mmap already)
+            if (value) {
+                params.load_mode = (params.load_mode == LLAMA_LOAD_MODE_MLOCK ||
+                                    params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK)
+                    ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_MMAP) {
+                params.load_mode = LLAMA_LOAD_MODE_NONE;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+                params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+            }
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
-        string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),
+        "DEPRECATED in favor of `--load-mode`: use DirectIO if available",
         [](common_params & params, bool value) {
-            params.use_direct_io = value;
+            LOG_WRN("DEPRECATED: --direct-io and --no-direct-io are deprecated. use --load-mode dio instead\n");
+            // -ndio / LLAMA_ARG_DIO=0 only ever meant "no direct-io"; it must
+            // not disable the default mmap (it was OOM-ing boxes sized for
+            // file-backed weights)
+            if (value) {
+                params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+            } else if (params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO) {
+                params.load_mode = LLAMA_LOAD_MODE_MMAP;
+            }
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
@@ -3076,7 +3226,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "whose experts exceed VRAM+RAM can still run. implies --no-mmap.\n"
         "sets LLAMA_SSD_STREAM_BUFFER",
         [](common_params & params) {
-            params.use_mmap = false; // streamed experts skip the read; keep others resident
+            params.load_mode = LLAMA_LOAD_MODE_NONE; // no mmap: streamed experts skip the read; keep others resident
             common_set_env("LLAMA_SSD_STREAM_BUFFER", "1");
         }
     ));
@@ -3106,6 +3256,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-lm", "--load-mode"}, "MODE",
+        "model loading mode (default: mmap)\n"
+        "- none: no special loading mode\n"
+        "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
+        "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
+        "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
+        "- dio: use DirectIO if available\n",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
+            else if (value == "mmap")       { params.load_mode = LLAMA_LOAD_MODE_MMAP;       }
+            else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
+            else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
+            else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
@@ -3132,20 +3299,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--list-devices"},
         "print list of available devices and exit",
         [](common_params &) {
-            ggml_backend_load_all();
-            std::vector<ggml_backend_dev_t> devices;
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                auto * dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    devices.push_back(dev);
-                }
-            }
-            printf("Available devices:\n");
-            for (auto * dev : devices) {
-                size_t free, total;
-                ggml_backend_dev_memory(dev, &free, &total);
-                printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
-            }
+            common_print_available_devices();
             exit(0);
         }
     ));
@@ -3821,6 +3975,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS"));
     add_opt(common_arg(
+        {"--mcp-servers-config"}, "PATH",
+        "experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, const std::string & value) {
+            params.mcp_servers_config = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_CONFIG"));
+    add_opt(common_arg(
+        {"--mcp-servers-json"}, "JSON",
+        "experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, const std::string & value) {
+            params.mcp_servers_json = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
+    add_opt(common_arg(
         {"-ag", "--agent"},
         {"-no-ag", "--no-agent"},
         "whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)\n"
@@ -4023,7 +4193,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--models-dir"}, "PATH",
-        "directory containing models for the router server (default: disabled)",
+        "directory containing models for the router server; accepts a comma-separated list of directories, earlier dirs win on name collisions (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.models_dir = value;
         }
@@ -4102,6 +4272,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.reasoning_budget_message = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-budget-warn-at"}, "N",
+        "soft warning (#139): when N thinking tokens remain, inject --reasoning-budget-warn-message\n"
+        "into the reasoning stream WITHOUT an end tag and keep counting, so the model can wind down\n"
+        "and close the block itself; the hard budget cut still applies at 0 (default: -1 = disabled)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_warn_at = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_WARN_AT"));
+    add_opt(common_arg(
+        {"--reasoning-budget-warn-message"}, "MESSAGE",
+        "message injected into the reasoning stream when --reasoning-budget-warn-at fires (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_budget_warn_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_WARN_MESSAGE"));
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
@@ -4531,6 +4718,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.p_min = std::stof(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-conf-min"}, "P",
+        string_format("DSpark: minimum predicted acceptance from the draft confidence head to keep a "
+                      "drafted token; truncates the block at the first position below it (0.0 = disabled) (default: %.2f)", (double)params.speculative.draft.conf_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.conf_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CONF_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-entropy-max"}, "H",
+        string_format("stop drafting when the draft candidate distribution entropy exceeds this many bits; "
+                      "high entropy predicts rejection (0.0 = disabled) (default: %.2f)", (double)params.speculative.draft.entropy_max),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.entropy_max = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ENTROPY_MAX"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

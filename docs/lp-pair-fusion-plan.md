@@ -1,0 +1,213 @@
+# Layer-Parallel pair fusion (TASKS #71, escape (b): fewer boundaries)
+
+Status: **LANE CLOSED 2026-08-01** (fleet gates: boundary halving works, +8-13% only, quality catastrophic - see 3e). Machinery stays in-tree default-off. Originally design v1 2026-07-30, written on the day the ceiling probe passed.
+Sources: 2502.02790 (TMLR 2026) via docs/research/2026-07-parallel-decoding-
+and-distribution.md (2026-07-27 addendum re-rank); measured frame from
+fill-the-bubble-plan 2.2c and the 2026-07-30 nulls.
+
+## 1. Why now - the measured case
+
+Three results this week point every remaining watt at boundary COUNT:
+
+1. **Member lateness is pipeline phase lag, not weight.** The leg-skip
+   fleet A/B shipped 1-byte replies instead of 57 KB payloads and moved
+   NOTHING (4.61 vs 4.97-5.21, defer rate unchanged) - a wire member
+   executes its fused-chain pieces in order and reaches each fetch a
+   boundary behind the owner. Payload size, routed bytes (placement x2),
+   and thread count (sweep) are all falsified levers.
+2. **The 40-layer ceiling probe is GO: ~9.3 t/s = ~1.8x** the 4.97-5.21
+   plateau (defers halved to 72.5/graph, LOST 0). Halving the lap count
+   nearly doubles decode.
+3. Deferral v3 (+34%) already harvests the overlap available WITHIN the
+   current boundary structure; its WAIT_US=3000 leg showed the residual
+   wait is structural. Fewer laps is the axis deferral cannot reach.
+
+Honest LP ceiling: the probe halves compute AND boundaries; LP pairing
+halves boundaries only (members compute BOTH layers' experts per cycle).
+From the #7 split (~250 ms token = ~110 compute + ~120-140 boundary at
+4.0 t/s; proportionally ~192 ms at today's 5.2), removing half the
+boundary term prices LP at **~+45-55% decode** before quality costs -
+on top of v3, with which it composes (deferral still applies to the
+remaining boundaries).
+
+## 2. Mechanism
+
+The paper's transform, translated to this fleet's graph:
+
+    sequential (today):   x1 = x0 + attn_a(x0) + ffn_a(x0 + attn_a(x0))
+                          x2 = x1 + attn_b(x1) + ffn_b(x1 + attn_b(x1))
+    paired (LP):          x2 = x0 + [attn_a(x0) + ffn_a(...)]
+                              + [attn_b(x0) + ffn_b(...)]
+
+Both layers of a pair consume the SAME residual input; their deltas add.
+Weights are untouched - this is pure dataflow, so it is a BUILDER-side
+rewrite (llama-graph), not a GGUF transform. No new proto, no meta
+backend surgery:
+
+- **One B1 per pair**: the pair's shared input broadcasts once. Members
+  compute both layers' routed experts from it (2x k routed ids; layer
+  b's router sees x0 instead of x1 - an inherent, priced part of the
+  paper's accuracy cost) and **sum the two FFN contributions member-side
+  into ONE boundary tensor** - one B2 gather per pair, same payload
+  size as today. 79 expert boundaries -> ~40.
+- **Attention pairs on the owner**: attn_a and attn_b both read x0 and
+  can run concurrently on the owner GPUs (independent KV per layer,
+  unchanged). The delayed-reduce walker already crosses the mirrored
+  residual ADDs (BCAST_FUSE machinery); the pair ADD tree is the same
+  shape one level deeper.
+- **Deferral composes**: the paired boundaries remain star reduces;
+  EXPERT_DEFER=1 keeps its decode-only readiness gating on them.
+
+## 3. Build plan (increments, each gated)
+
+1. **inc-0 builder rewire behind `LLAMA_LP_PAIRS` (default off, =N pairs
+   depth-2 only):** llama-graph builds pair blocks for the middle layers;
+   `LLAMA_LP_SYNC_EDGE=k` keeps the first/last k layers sequential (the
+   deferral sweep's edge-protection instinct; the paper also finds deep/
+   shallow layers tolerate pairing worst). Off = byte-identical (gate).
+2. **inc-1 stub bring-up:** trunc-hy3 loopback, LP=on - correctness is
+   "builds, runs, deterministic, finite", NOT byte-identity (the math
+   changes by design). Boundary count per graph via BOUNDARY_STATS is
+   the engagement instrument (star reduces ~halve).
+3. **inc-2 quality gates on the record roster (the REAL gates):**
+   - fleet PPL wikitext 8x -c 512 vs baseline family 3.7669-3.7950
+     (paper prices -1.5-4% overall quality; PPL should move but
+     modestly);
+   - REASONING reads: hy3 is a reasoning model and GSM8K-class
+     collapse is the documented failure mode - the coherence gate for
+     LP must include math/multi-step prompts, not just prose;
+   - sweep LLAMA_LP_SYNC_EDGE (0/4/8) and pair only middle layers.
+4. **inc-3 fleet t/s A/B:** LP=on + EXPERT_DEFER=1 vs today's 4.97-5.21
+   plateau; target >= +30% to justify the quality tax; also re-measure
+   -np 2 aggregate (fewer boundaries shrink the bubble the second
+   stream fills - aggregate gain may compress).
+
+## 3b. Build state (2026-07-31)
+
+**inc-0 builder rewire LANDED (hy-v3.cpp): off = verified no-op**
+(loopback 6/6 byte-identical c80261ff after the lambda refactor); on =
+pairs engage, output changes (lossy as designed), stable and finite.
+**Found requirement: the boundary win needs a meta-backend extension.**
+The pair-out add is PARTIAL + PARTIAL, and the delayed-reduce walker
+only crosses ADDs with a MIRRORED operand - so each layer's expert
+partial still reduces separately BEFORE the add (star count unchanged
+on the stub). inc-1b: teach the PARTIAL derivation/delay that an ADD of
+two same-split PARTIALs derives PARTIAL (member-side sums are exact:
+(a+b)_j = a_j + b_j), so ONE boundary serves the pair. Until then the
+transform is pure quality-cost with no speed gain - do NOT run fleet
+quality gates before inc-1b lands (they would price the wrong thing).
+
+## 3e. FLEET QUALITY GATES MEASURED 2026-07-31/08-01: LANE CLOSED
+
+Record roster, LP=1 SYNC_EDGE=2 (38 pairs) + PARTIAL_MERGE + EXPERT_DEFER=1:
+
+- **Engagement PERFECT: star 41.0/graph** (79 -> 41 exactly as designed;
+  bcast1 80, defers 72.7 LOST 0). The partial-merge machinery works at
+  fleet scale.
+- **Speed: +8-13% only** - 5.48-5.84 t/s vs the 4.97-5.21 v3 plateau.
+  The phase-lag insight cuts BOTH ways: members compute two layers'
+  experts per piece, so per-boundary member latency ~doubles while lap
+  count halves - the serialized member path is unchanged in total and
+  only FIXED per-boundary costs are saved. The 40-layer probe's 1.8x
+  was compute-halving + boundary-halving; boundary count alone is worth
+  the ~+10-15% the 2.2c re-rank originally priced.
+- **Quality: CATASTROPHIC FAIL.** 2/10 leg runs tripped the response
+  formatter, and a direct read produced token salad (CJK/fragment mix,
+  worse than v1 deferral's repetition collapse). Train-free pairing of
+  ~96% of MoE layers destroys this model. Sparser pairing would restore
+  quality only by shrinking the already-small win (edge=20 ~ 18 pairs
+  ~ +5%) - the economics are dead regardless.
+
+**VERDICT: LP pair-fusion CLOSED on this fleet.** Keep in-tree,
+default-off: the builder transform (LLAMA_LP_PAIRS) and especially the
+partial-merge machinery (name-tag PARTIAL derivation + reduce
+suppression, GGML_META_PARTIAL_MERGE) are correct, gated, and reusable
+- any future mechanism that wants two partials to share one boundary
+(true multi-token decode, tree verify, replicated-expert reduce shapes)
+gets it for free. No PPL run (coherence fail is terminal). Escape (b)
+is now closed alongside (a); remaining #71 levers: transport-class
+latency (#60 soft-RoCE/UCCL attacks the per-lap fixed cost that LP
+proved is worth ~10-15%... x a full removal), faster member lanes, and
+-np>1 throughput scaling (already banked).
+
+## 3d. inc-1b COMPLETE on the stub (2026-07-31): the pair shares ONE boundary
+
+The 3c blocker resolved exactly as diagnosed - two pieces:
+1. **Name-tag derivation**: the builder-tagged `lp_moe_pair` ADD derives
+   PARTIAL by name (its inputs' states read as the post-reduce view, so
+   a state-equality rule can never fire; ffn_moe_weighted_placed
+   precedent).
+2. **Reduce suppression at the tree boundaries**: a PARTIAL boundary
+   whose sole consumer is an lp_moe_pair ADD keeps its subgraph split
+   but SKIPS the reduce (GGML_META_PARTIAL_MERGE=1) - members hold
+   their tree partials across the intervening pieces (gallocr keeps the
+   slots live until the pair consumes them), the pair ADD computes
+   a_j + b_j member-side, and its OWN boundary reduces once.
+
+The failed window-crossing attempts (3c) stay in the tree, dormant and
+gated - the linear-piece structure makes spanning windows the wrong
+shape (a sibling layer's attention boundary must exist INSIDE any
+spanned window).
+
+Stub gates (trunc-hy3, 3 loopback workers, fuse=2 + q8): off = stable
+byte-identical c80261ff, star 3.0 (production untouched); LP+merge =
+**star 3.0 -> 2.0** with sha 2265c9e7 = BYTE-IDENTICAL to the unmerged
+LP graph (member-side sum then one reduce == two reduces then add -
+the exactness proof in the wild); +EXPERT_DEFER=1 composes (star 2.0,
+defers==injects, LOST 0, 6/6 responses). REMAINING = the plan's quality
+ladder (3) and fleet A/B (4) on the record roster - needs a fleet
+window (the V4 soak serve holds the GPUs); expected star count on the
+full model at SYNC_EDGE=2: 79 -> ~41.
+
+## 3c. inc-1b state (2026-07-31, parked mid-build with precise handoff)
+
+Landed behind default-off gates (off-legs byte-identical c80261ff at
+every step): (a) derivation rule - ADD of two PARTIALs derives PARTIAL
+(handle_bin_bcast); (b) GGML_META_PARTIAL_MERGE=1 window extensions in
+get_i_delayed: taint-guarded relaxed skip over unrelated non-mirrored
+nodes (a sibling layer's subtree sits inside the pair window) + a
+partial+partial ADD crossing + a round loop (the weighted-tree match
+used to return immediately; the pair ADD consumes the finished tree's
+output so crossing needs a second round). Diagnosis instruments added
+under GGML_META_DEBUG_REDUCE (PM-ROUND / PM-SKIPBRK / PM-NOCROSS).
+
+**Why it still does not merge (the precise blocker):** the round-2 walk
+DOES reach `lp_moe_pair` with the right shape, but
+`get_split_state(src, false)` returns MIRRORED (10) for both tree
+outputs at the junction - their split states were fixed during the
+shadow-creation pass, which bakes in the boundary-at-tree-end world
+(the state IS the post-reduce view). A state-equality test can never
+see partial+partial there. Next steps: (1) crossing test by NAME TAG
+(`lp_moe_pair`, builder-authored - the ffn_moe_weighted_placed
+precedent) instead of state equality; (2) verify the shadow-pass state
+for the pair ADD derives PARTIAL (it may need the same name-tag rule in
+the derivation, since its INPUTS read as mirrored post-boundary states)
+so downstream consumers see a consistent world when the boundary moves
+to the pair; (3) regate: stub star 3.0 -> 2.0, off byte-identity, then
+the quality ladder (3). All current work is default-off and safe.
+
+## 4. Risks and falsifiers
+
+- **Reasoning collapse** (the paper's GSM8K result) even at edge-
+  protected middle-layer pairing: the lane dies without a finetune,
+  which is out of scope - fall back to transport (#60) and V4 fleet
+  levers.
+- Routing drift: layer b's router on x0 changes expert selection; on a
+  192-expert 8-of model the paper's tolerance may not transfer -
+  watch PPL first, it is the cheap early warning.
+- KV correctness: attn_b consumes x0 but writes its own KV as today;
+  positions/streams unchanged. Prefill pairs identically (no decode-only
+  gate needed for exactness - LP is uniformly lossy by design, which is
+  why the quality gates carry the whole decision).
+- Owner VRAM: pair blocks double peak attention concurrency on the
+  owner; hy3's owner group (0,1) interleaves layers - pairing must keep
+  a pair's two layers on the SAME owner or pay a cross-GPU hop (pair
+  assignment follows `owners[pair % n]`).
+
+## 5. Prior art (one line each)
+
+- 2502.02790 (TMLR 2026): the transform itself, 1.19-1.46x on NVLink
+  TP; our hops cost ~1000x more, hence the outsized ceiling here.
+- METRO-style member-skip reduce + the #75 masks: orthogonal, parked.
+- distributed-llama: the existence proof that plain-Ethernet fleets can
+  scale single-stream when sync points are few and cheap.

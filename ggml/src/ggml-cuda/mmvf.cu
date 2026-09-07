@@ -30,11 +30,17 @@ static __global__ void mul_mat_vec_f(
         // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
         token_idx  = blockIdx.z;
         channel_x  = ids[channel_dst + token_idx * ids_stride];
+        if (channel_x < 0) {
+            return; // skip sentinel: this lane uses no expert, dst rows stay zeroed
+        }
         channel_y  = fastmodulo(channel_dst, nchannels_y);
         sample_dst = 0;
     } else {
         token_idx  = ids ? blockIdx.z                                          : 0;
         channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
+        if (ids && channel_x < 0) {
+            return; // skip sentinel: this lane uses no expert, dst rows stay zeroed
+        }
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
@@ -631,6 +637,15 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
+
+    if (ids != nullptr && fusion != nullptr) {
+        // fused dispatch bypasses ggml_cuda_mul_mat_id's dst pre-zero; sentinel
+        // (-1) lanes early-return and would leave their fused-dst rows unwritten
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 

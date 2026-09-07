@@ -1,10 +1,13 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "ggml-ssd-stream.h"
 #include "gguf.h"
+#include "llama-expert-placement.h"
 #include "llama-hparams.h"
+#include "llama.h"
 
 #include <algorithm>
 #include <array>
@@ -316,14 +319,19 @@ namespace GGUFMeta {
         struct GGUFMeta::ArrayInfo arr_info =
             GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
 
+        bool type_ok = false;
         switch (arr_info.gt) {
             case GGUF_TYPE_UINT32:
-            case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
-                                                (std::is_same<T,    uint32_t>::value)); break;
-            case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
-            case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+        }
+        if (!type_ok) {
+            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
         }
 
         if constexpr (std::is_same<T, std::string>::value) {
@@ -357,15 +365,20 @@ namespace GGUFMeta {
         struct GGUFMeta::ArrayInfo arr_info =
             GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
 
+        bool type_ok = false;
         switch (arr_info.gt) {
             case GGUF_TYPE_BOOL:
             case GGUF_TYPE_UINT32:
-            case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
-                                                (std::is_same<T,    uint32_t>::value)); break;
-            case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
-            case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+        }
+        if (!type_ok) {
+            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
         }
 
         if (arr_info.length > N_MAX) {
@@ -402,6 +415,9 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -534,8 +550,7 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
+        llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
@@ -553,6 +568,9 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -573,20 +591,6 @@ llama_model_loader::llama_model_loader(
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
-
-        if (use_mmap && use_direct_io) {
-            if (files.back()->has_direct_io()) {
-                LLAMA_LOG_WARN("%s: direct I/O is enabled, disabling mmap\n", __func__);
-                use_mmap = false;
-            } else {
-                LLAMA_LOG_WARN("%s: direct I/O is not available, using mmap\n", __func__);
-                use_direct_io = false;
-
-                // reopen file using std::fopen for mmap
-                files.pop_back();
-                files.emplace_back(new llama_file(fname.c_str(), "rb", false));
-            }
-        }
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -828,13 +832,11 @@ llama_model_loader::llama_model_loader(
         }
     }
 
-    if (!llama_mmap::SUPPORTED) {
+    if (this->use_mmap && !llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
-        use_mmap = false;
+        this->use_mmap = false;
     }
 
-    this->use_mmap = use_mmap;
-    this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
 }
@@ -1367,7 +1369,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
+        for (size_t i = 0; i < files.size(); ++i) {
+            const auto & file = files[i];
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1379,7 +1382,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            const auto no_prefetch = mmap_no_prefetch.find((uint16_t) i);
+
+            // the eager pull-in would read a gather table in full to populate pages the gathers
+            // hit a few percent of. skip it for this file and ask for everything else instead,
+            // so the tensors that really are streamed once keep the readahead they had.
+            const bool split_prefetch = prefetch && !is_numa && no_prefetch != mmap_no_prefetch.end();
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch && !split_prefetch ? -1 : 0, is_numa);
+            if (split_prefetch) {
+                mapping->prefetch_except(no_prefetch->second);
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1572,6 +1585,43 @@ bool llama_model_loader::load_all_data(
         // branches (both would otherwise make the tensor resident).
         if (ggml_ssd_stream_is_streamed(cur)) {
             ggml_ssd_stream_note(cur, files.at(weight->idx)->file_id(), weight->offs);
+            size_done += n_size;
+            continue;
+        }
+
+        // TASKS #75: placed routed-expert weights - read the whole tensor into a
+        // staging buffer with its dim-2 expert chunks PERMUTED (hottest-first),
+        // then upload through the normal set path. The meta buffer sees an
+        // already-permuted logical tensor, so its unchanged AXIS_2 contiguous
+        // chunk splice gives member j exactly its placement experts. Bypasses
+        // the mmap-alias and chunked-async fast paths (needs a mutable copy).
+        // Only fire for tensors that actually landed on the meta buffer - a
+        // displaced tensor (-ot, partial -ngl) falls through to the normal path
+        // and the load-time guard in llama.cpp rejects the config gracefully.
+        if (const std::vector<int32_t> * perm = llama_expert_placement_perm_for(expert_placement, ggml_get_name(cur));
+                perm != nullptr && cur->buffer != nullptr && ggml_backend_buffer_is_meta(cur->buffer)) {
+            GGML_ASSERT(ggml_is_contiguous(cur) && cur->ne[3] == 1);
+            GGML_ASSERT((int64_t) perm->size() == cur->ne[2]);
+            const size_t chunk_size = cur->nb[2]; // one expert
+            GGML_ASSERT(chunk_size * perm->size() == n_size);
+            read_buf.resize(n_size);
+            const auto & file = files.at(weight->idx);
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                const uint8_t * src = (const uint8_t *) mapping->addr() + weight->offs;
+                for (size_t k = 0; k < perm->size(); k++) {
+                    memcpy(read_buf.data() + k*chunk_size, src + (size_t) (*perm)[k]*chunk_size, chunk_size);
+                }
+            } else {
+                for (size_t k = 0; k < perm->size(); k++) {
+                    file->seek(weight->offs + (size_t) (*perm)[k]*chunk_size, SEEK_SET);
+                    file->read_raw(read_buf.data() + k*chunk_size, chunk_size);
+                }
+            }
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
             size_done += n_size;
             continue;
         }

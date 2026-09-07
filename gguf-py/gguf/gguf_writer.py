@@ -793,6 +793,16 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_indexer_block_size(self, block_size: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.BLOCK_SIZE.format(arch=self.arch), block_size)
+
+    def add_indexer_local_blocks(self, local_blocks: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.LOCAL_BLOCKS.format(arch=self.arch), local_blocks)
+
+    def add_indexer_types(self, value: Sequence[bool]) -> None:
+        key = Keys.Attention.Indexer.TYPES.format(arch=self.arch)
+        self.add_array(key, value)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
@@ -898,6 +908,12 @@ class GGUFWriter:
     def add_token_shift_count(self, count: int) -> None:
         self.add_uint32(Keys.LLM.TOKEN_SHIFT_COUNT.format(arch=self.arch), count)
 
+    def add_num_loops(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NUM_LOOPS.format(arch=self.arch), count)
+
+    def add_skip_loop_final_norm(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.SKIP_LOOP_FINAL_NORM.format(arch=self.arch), value)
+
     def add_interleave_moe_layer_step(self, value: int) -> None:
         self.add_uint32(Keys.LLM.INTERLEAVE_MOE_LAYER_STEP.format(arch=self.arch), value)
 
@@ -955,6 +971,9 @@ class GGUFWriter:
     def add_norm_before_residual(self, value: bool) -> None:
         self.add_bool(Keys.LLM.NORM_BEFORE_RESIDUAL.format(arch=self.arch), value)
 
+    def add_norm_before_fc(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.NORM_BEFORE_FC.format(arch=self.arch), value)
+
     def add_attention_output_group_count(self, count: int) -> None:
         self.add_uint32(Keys.Attention.OUTPUT_GROUP_COUNT.format(arch=self.arch), count)
 
@@ -975,6 +994,40 @@ class GGUFWriter:
 
     def add_hyper_connection_epsilon(self, value: float) -> None:
         self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
+
+    def add_hyper_connection_low_rank(self, value: int) -> None:
+        self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)
+
+    def add_ple_layers(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.PerLayerEmbedding.LAYERS.format(arch=self.arch), values)
+
+    def add_ple_ngram_size(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.NGRAM_SIZE.format(arch=self.arch), value)
+
+    def add_ple_heads_per_ngram(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.HEADS_PER_NGRAM.format(arch=self.arch), value)
+
+    def add_ple_conv_kernel(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.CONV_KERNEL.format(arch=self.arch), value)
+
+    # multipliers reach ~2.4e13; default INT32 inference would truncate them
+    def _add_u64_array(self, key: str, values: Sequence[int]) -> None:
+        self.add_key_value(key, list(values), GGUFValueType.ARRAY, GGUFValueType.UINT64)
+
+    def add_ple_layer_multipliers(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.PerLayerEmbedding.LAYER_MULTIPLIERS.format(arch=self.arch), values)
+
+    def add_ple_head_offsets(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.PerLayerEmbedding.HEAD_OFFSETS.format(arch=self.arch), values)
+
+    def add_ple_head_vocab_sizes(self, values: Sequence[int]) -> None:
+        self._add_u64_array(Keys.PerLayerEmbedding.HEAD_VOCAB_SIZES.format(arch=self.arch), values)
+
+    def add_ple_eos_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.EOS_TOKEN_ID.format(arch=self.arch), value)
+
+    def add_ple_image_token_id(self, value: int) -> None:
+        self.add_uint32(Keys.PerLayerEmbedding.IMAGE_TOKEN_ID.format(arch=self.arch), value)
 
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
@@ -1334,8 +1387,29 @@ class GGUFWriter:
     def add_audio_num_mel_bins(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.NUM_MEL_BINS, value)
 
+    def add_audio_rvq_num_quantizers(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.RVQ_NUM_QUANTIZERS, value)
+
+    def add_audio_rvq_codebook_size(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.ClipAudio.RVQ_CODEBOOK_SIZE, values)
+
+    def add_audio_wa_pattern_mode(self, modes: Sequence[int]) -> None:
+        self.add_array(Keys.ClipAudio.WA_PATTERN_MODE, modes)
+
+    def add_audio_window_size(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.WINDOW_SIZE, value)
+
+    def add_audio_local_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.LOCAL_BLOCK_COUNT, value)
+
+    def add_audio_local_group_size(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.LOCAL_GROUP_SIZE, value)
+
     def add_audio_stack_factor(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Projector.STACK_FACTOR, value)
+
+    def add_audio_subsampling_factor(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.SUBSAMPLING_FACTOR, value)
 
     def add_audio_chunk_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.CHUNK_SIZE, value)

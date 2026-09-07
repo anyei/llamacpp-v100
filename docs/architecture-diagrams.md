@@ -52,17 +52,21 @@ flowchart LR
 
 ## 3. Expert-parallel (`-sm tensor` + `LLAMA_META_ATTN_OWNER`)
 
-For MoE models: only the routed experts are split; one local GPU owns
-attention/KV/router; workers hold expert shards. The composition law flips
-from SUM-over-stages to MAX-over-contacted-workers.
+For MoE models: only the routed experts are split; an owner GROUP of local
+GPUs holds attention/KV/router (layers interleaved `il % n_owners`, all
+attention syncs on NVLink); workers hold expert shards. Owners may ALSO hold
+expert shards in leftover VRAM (dual-role, #70 — validated live 2026-07-23).
+The composition law flips from SUM-over-stages to MAX-over-contacted-workers.
 
 ```mermaid
 flowchart TD
     subgraph coordinator box
-        A["CUDA0 = attention owner<br/>attention + KV + router + dense<br/>(0% expert share)"]
+        A["CUDA0 owner (even layers)<br/>attention + KV + router<br/>+ dual-role expert shard"]
+        B["CUDA1 owner (odd layers)<br/>attention + KV + router<br/>+ dual-role expert shard"]
+        A <-->|NVLink| B
     end
-    A -->|"activations (KB)"| W1["worker .11<br/>expert shard ~60%"]
-    A -->|"activations (KB)"| W2["worker .15<br/>expert shard ~40%"]
+    A -->|"activations (KB)"| W1["worker .11<br/>expert shard"]
+    A -->|"activations (KB)"| W2["worker .15<br/>expert shard"]
     W1 -->|"partial expert sums"| A
     W2 -->|"partial expert sums"| A
     A -->|"star reduce: host sum,<br/>broadcast identical bytes"| A
@@ -71,31 +75,52 @@ flowchart TD
 - Per MoE layer boundary: ONE fused message per worker (proto 4.5/4.6
   `GRAPH_FUSED`: carries the previous reduced value + the next subgraph chain
   + returns the boundary partial in the same response).
+- Boundary payloads optionally ride compressed (set BOTH — each connection
+  uses the best format its worker speaks): `GGML_RPC_WIRE_F16` (proto 4.12) /
+  `GGML_RPC_WIRE_Q8` (4.13), PPL-neutral, fleet ~+15-20% decode. Proto 4.14
+  answers all-zero fused fetches with a 1-byte marker automatically. And
+  readiness-gated expert deferral (`GGML_META_EXPERT_DEFER=1`, decode-only)
+  lets actual stragglers' partials drain one boundary late: +34% on the
+  record roster at baseline PPL.
 - Single-stream is RTT-serialized (~43 boundaries x RTT; workers idle >90%).
   Batching is the scaling axis: B=8 measured x2.85 aggregate.
-- Constraint: exactly ONE local GPU may be a member (the owner); a second
-  local GPU as expert member corrupts the reduce (#48, rejected at load).
-  REMOTE GPUs (a worker box's GPU) are legal members — they are just RPC
-  devices — but a small-VRAM card contributes little expert *capacity* while
-  adding a serialized hop, so worker RAM is usually the better member.
+- `LLAMA_META_ATTN_OWNER=0,1` = owner group (comma list). Requires
+  `LLAMA_META_ALLOW_MULTI_LOCAL=1`; the old one-local-GPU limit (#48) is
+  retired — the owner-group A/B is byte-identical to single-owner (#70).
+- Dual-role: give owners nonzero `-ts` shares and they hold experts at
+  VRAM bandwidth (~800 GB/s vs 25-57 on CPU boxes). Measured hy3:
+  CPU-only experts 3.5-3.8 t/s -> dual-role 5.06-5.22 t/s (+85-90% vs the
+  2.74 layer baseline).
+- Dedicated attention applies to STANDARD MoE archs too (#70), not just
+  DSA: the per-member mirror is only embd/shexp/norms/output — measured
+  1.9 GiB (hy3) / 3.4 GiB (GLM-5.2), NOT the whole non-expert stack.
+- Shares are BYTES, so capacity-fit them per box (parse the GGUF: experts
+  vs attention vs mirror) — auto-weight is not yet owner-group aware and
+  a 76 GiB share on a 59 GiB box kills the worker (#68b, #72).
+- ALWAYS pass `--rpc-reload` on EP loads: a batched-placement manifest miss
+  fails the endpoint by design and only the reload/surgical machinery
+  re-provisions it; without it the load wedges silently (#72).
 - Slow-LINK boxes must stay out of the ring entirely: the cost is per
   boundary, not per byte (100-Mbit member = 0.42 vs 1.82 t/s, #28).
 
 ### 3b. The capacity law: whose memory counts (layer vs EP)
 
-EP pools only what can hold *experts* — the owner takes no expert share and
-the second local GPU is excluded (#48) — while `-sm layer` pools every
-device. Worked example, GLM-5.2 Q2_K_XL (226.9 GiB + 8 GiB reserve =
-**240.5 GiB required**) on this fleet, 2026-07-21:
+Post-#70 the EP pool is: EVERY member's expert budget = (free memory −
+per-member mirror − compute reserve), including BOTH owners' leftover VRAM
+(dual-role). What must fit is only the EXPERT bytes — parse the GGUF for
+the real split; the old "whole non-expert stack mirrors per member" law is
+dead (dedicated attention lives on the owner group; residual mirror is
+1.9-3.4 GiB). Worked example, GLM-5.2 Q2_K_XL — GGUF-parsed 2026-07-23:
+**experts 216.2 GiB** + attention 7.3 (owners) + mirror 3.4/member:
 
 ```mermaid
 flowchart TB
-    subgraph EP["EP pool = worker RAM + owner only -> 178.6 GiB : HOLDS (62 GiB short)"]
+    subgraph EP["EP expert pool (#70 owner group + dual-role) -> ~218-225 GiB vs 216.2 needed : BORDERLINE-FEASIBLE (was '62 short, closed' pre-#70)"]
         direction LR
-        O1["CUDA0 owner<br/>~30 GiB"]:::gpu ---
-        E1["local worker<br/>~38 GiB"] --- E2[".11<br/>~58 GiB"] ---
-        E3[".25<br/>~28 GiB"] --- E4[".30<br/>~13 GiB"]
-        X1["CUDA1 32 GiB<br/>EXCLUDED (#48)"]:::dead
+        O1["CUDA0 owner<br/>~20-23 GiB experts<br/>(32 - attn/KV/compute)"]:::gpu ---
+        O2["CUDA1 owner<br/>~20-23 GiB experts"]:::gpu ---
+        E1["local worker<br/>~60 GiB"] --- E2[".11<br/>~51 GiB"] ---
+        E3[".15<br/>~41 GiB"] --- E4[".25<br/>~24 GiB (100-Mbit!)"]:::slow
         X2["1660 Ti 6 GiB<br/>legal, ~nil capacity"]:::dead
     end
     subgraph LAYER["-sm layer pool = every device -> 231.5 GiB : 9 GiB short, auto-starts when a box joins"]
@@ -105,10 +130,19 @@ flowchart TB
     end
     classDef gpu fill:#8ecae6,color:#000
     classDef dead fill:#e5e5e5,color:#888,stroke-dasharray: 5 5
+    classDef slow fill:#ffb703,color:#000
 ```
 
-- The capacity gate prints exactly this math and, under `--rpc-discover`,
-  holds the load and starts it automatically when a new box beacons.
+- GLM EP now closes only if .25 joins (100-Mbit straggler — expect the
+  per-boundary tax, #28) or owner shares are pushed to ~23 GiB each; it
+  is no longer physics-closed. Proof point of the law: hy3 (experts
+  164.9 GiB) went from "EP infeasible, 34.7 GiB mirror" to the FASTEST
+  hy3 serve (4.6-4.8 t/s dual-role EP) under exactly this math.
+- The capacity gate does NOT yet know dedicated-split sizing — EP loads
+  currently need `LLAMA_FLEET_CAPACITY_CHECK=0` and hand-fitted `-ts`
+  (open in #70); the gate still prints the correct math for layer mode
+  and, under `--rpc-discover`, holds the load and starts it automatically
+  when a new box beacons.
 - Sharded GGUFs are sized as the SUM of all `-NNNNN-of-NNNNN` siblings
   (fixed 2026-07-21: 0-based `llama_split_prefix` — before that every
   sharded model was silently sized as shard 1 alone, and auto-weight could
@@ -147,6 +181,15 @@ stream-free on `--model-dir` boxes: boundaries move, hashes change, but the
 provenance (tensor name + row range) still resolves against the local GGUF
 (measured -71% wire bytes on a boundary-moved load). Older workers simply
 never see HASH2 (version-gated) and keep the first three branches.
+
+Since #113 (`GGML_META_TILED_UPLOAD`, default ON) expert-tensor split
+segments are additionally cut on a fixed grid anchored in root-tensor
+coordinates (dim-1 column tiles ~256 KiB; whole-expert slabs for placed
+layouts), so interior tiles keep their content hash across `-ts` retunes —
+a reload after a share change batch-places from the worker DISK CACHE and
+streams only boundary/moved tiles. The 4.8 provenance route covers
+`--model-dir` boxes; tiling extends cache-hit survival to disk-cache-only
+workers.
 
 ## 5. Worker cache lifecycle (housekeeping, #45)
 
@@ -217,6 +260,31 @@ flowchart TD
   without rebuilding split states (prod: 27B ~81 t/s, 35B ~166 t/s serving).
 - Acceptance is the whole game: ~88% on the prod models; hy_v3 needs
   `p-min 0.75` (its single-depth head collapses at the default).
+
+The loop above is the base machine. The 2026-08 speculation era (#132-#142)
+grew it in four directions — none of which changes the diagram's shape, all
+of which plug into the same draft -> one-batch-verify round:
+
+- **Drafter roster** (`--spec-type`): the in-model `draft-mtp` head, learned
+  block drafters `draft-dflash` (DFlash2 selector lattice) / `draft-dspark` /
+  `draft-eagle3`, the model-free `ngram-*` family, and `draft-simple` (a
+  separate small LM). Production configs STACK `ngram-mod,draft-mtp`: ngram
+  tables learn across requests (X99 2-GPU tensor: 66-71 t/s fresh prose ->
+  108-128 warmed; 171-177 warmed code).
+- **Dual drafters** (`LLAMA_SPEC_DRAFT2*`, #132/#138): a second drafter
+  behind the primary in priority-fallback dispatch — capability standby at
+  under ~1 t/s premium. Diagrams + measured sweet spots:
+  [dual-drafters.md](dual-drafters.md).
+- **Fused draft chain** (`LLAMA_SPEC_MTP_FUSED`, #140): the whole greedy MTP
+  chain in ONE decode graph. Measured parity everywhere it runs — the cost
+  was never draft round-trips but verify rows (~9.2 ms/row on the MoE
+  target); auto-disabled on row/tensor-split (in-graph argmax needs a
+  single-owner logits row).
+- **Spec tree** (`LLAMA_SPEC_TREE` + `LLAMA_SPEC_TREE_CONF`, #132/#137/#141):
+  one alt branch per verify round. Net negative at V100 verify-row prices
+  even confidence-gated — off in production, lane parked. (PEARL
+  post-verify draft-ahead, #108, is likewise built but excluded for feature
+  drafters and off by default.)
 
 ## 8. TP island (worker-side tensor parallel)
 

@@ -18,7 +18,10 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -534,6 +537,10 @@ struct ggml_backend_meta_buffer_context {
     std::vector<ggml_backend_meta_simple_tensor_container> stc_compute;
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // slot cleared by the most recent rebuild: the ring only advances on
+    // init_tensor, so consecutive rebuilds re-clear the same slot and only the
+    // first clear after an advance recycles live shadows (see reset_seq)
+    int stc_last_reset         = -1;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // never-recycled buffer generation, mixed into the prepared-build content key:
@@ -839,6 +846,88 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return nullptr;
 }
 
+size_t ggml_backend_meta_dev_n_members(ggml_backend_dev_t dev) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    return ((const ggml_backend_meta_device_context *) dev->context)->simple_devs.size();
+}
+
+ggml_backend_dev_t ggml_backend_meta_dev_member(ggml_backend_dev_t dev, size_t j) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    GGML_ASSERT(j < dev_ctx->simple_devs.size());
+    return dev_ctx->simple_devs[j];
+}
+
+bool ggml_backend_meta_tensor_is_meta_hosted(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer);
+}
+
+struct ggml_tensor * ggml_backend_meta_tensor_full_shadow(const struct ggml_tensor * tensor, size_t j) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return nullptr;
+    }
+    if (j >= ggml_backend_meta_buffer_n_bufs(tensor->buffer)) {
+        return nullptr;
+    }
+    ggml_tensor * shadow = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+    if (shadow == nullptr || ggml_nelements(shadow) == 0 || ggml_nelements(shadow) != ggml_nelements(tensor)) {
+        return nullptr; // member j holds a slice (or nothing), not the full tensor
+    }
+    return shadow;
+}
+
+bool ggml_backend_meta_graph_localize(struct ggml_cgraph * gf, const size_t * members, size_t n_members) {
+    auto localize = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (!ggml_backend_meta_tensor_is_meta_hosted(t)) {
+            return t;
+        }
+        for (size_t k = 0; k < n_members; k++) {
+            ggml_tensor * shadow = ggml_backend_meta_tensor_full_shadow(t, members[k]);
+            if (shadow != nullptr) {
+                return shadow;
+            }
+        }
+        GGML_LOG_ERROR("%s: no listed member holds a full copy of '%s' (split across members?) - "
+                "the graph cannot run locally\n", __func__, t->name);
+        return nullptr;
+    };
+
+    for (int i = 0; i < gf->n_nodes; i++) {
+        ggml_tensor * node = gf->nodes[i];
+
+        if (node->view_src != nullptr && ggml_backend_meta_tensor_is_meta_hosted(node->view_src)) {
+            ggml_tensor * vs = localize(node->view_src);
+            if (vs == nullptr) {
+                return false;
+            }
+            node->view_src = vs;
+            node->buffer   = vs->buffer;
+            node->data     = (char *) vs->data + node->view_offs;
+        }
+
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (node->src[s] == nullptr) {
+                continue;
+            }
+            ggml_tensor * src = localize(node->src[s]);
+            if (src == nullptr) {
+                return false;
+            }
+            node->src[s] = src;
+        }
+    }
+
+    for (int i = 0; i < gf->n_leafs; i++) {
+        ggml_tensor * leaf = localize(gf->leafs[i]);
+        if (leaf == nullptr) {
+            return false;
+        }
+        gf->leafs[i] = leaf;
+    }
+
+    return true;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -946,12 +1035,47 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         // a feature-dim split breaks row integrity - except degenerate, where the
         // owner's rows are complete
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && split_state_owner(src_ss[0]) < 0) {
+            GGML_LOG_ERROR("%s: per-row op '%s' (%s) on AXIS_0 src '%s' (%s) without single owner: ne=[%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "]\n",
+                           __func__, tensor->name, ggml_op_name(tensor->op),
+                           tensor->src[0] ? tensor->src[0]->name : "?",
+                           tensor->src[0] ? ggml_op_name(tensor->src[0]->op) : "?",
+                           src_ss[0].ne[0], src_ss[0].ne[1], src_ss[0].ne[2], src_ss[0].ne[3]);
+        }
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0 || split_state_owner(src_ss[0]) >= 0);
         return src_ss[0];
     };
 
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // TASKS #75 hot-expert placement: the masked expert product - each member
+        // holds full-shape values where only its OWNED (token, k) lanes are
+        // nonzero (the mirrored-state mask contents differ per member), so the
+        // member sum is the logical value: honestly PARTIAL, reconciled at the
+        // expert-sum AllReduce. Tagged by name from build_moe_ffn (the derivation
+        // is structural and cannot see contents; same pattern as the island-exit
+        // name checks in handle_mul_mat).
+        if (tensor->op == GGML_OP_MUL && strstr(tensor->name, "ffn_moe_weighted_placed") != nullptr) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // TASKS #71 LP pair fusion (lp-pair-fusion-plan 3c): the builder-tagged
+        // pair ADD sums two expert partials member-side ((a+b)_j = a_j + b_j,
+        // exact) - it is PARTIAL by construction. Tagged by NAME because its
+        // inputs' derived states read as the post-reduce view (the shadow pass
+        // bakes in per-tree boundaries); the reduce at the upstream trees is
+        // SUPPRESSED by the boundary scan when their sole consumer is this
+        // node, so ONE boundary serves the pair. ffn_moe_weighted_placed
+        // precedent above.
+        if (tensor->op == GGML_OP_ADD && strncmp(tensor->name, "lp_moe_pair", 11) == 0) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        // generic form of the same rule (kept: exact whenever both inputs
+        // genuinely derive PARTIAL)
+        if (tensor->op == GGML_OP_ADD &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
@@ -1009,6 +1133,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
+        // TASKS #75 hot-expert placement: MUL_MAT_ID against expert-axis-split
+        // weights. Each member computes every (token, k) pair against its LOCAL
+        // expert set (ids remapped member-locally in the graph); non-owned lanes
+        // are finite garbage neutralized by the PARTIAL ownership mask on the
+        // gating weights. The per-member output is full-shape -> MIRRORED.
+        if (tensor->op == GGML_OP_MUL_MAT_ID && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
@@ -1024,12 +1157,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // same-owner degenerate operands: PARTIAL is only wanted at the
                 // designated island EXIT (the dedicated attention out projection,
                 // dot-dim split by the policy - names must stay in sync with
-                // pattern_dsa_attn_exit in llama-model.cpp). Everything else
-                // (indexer scores, cache reads) stays on the owner - a broadcast
-                // there is pure boundary overhead.
+                // pattern_dsa_attn_exit / pattern_attn_out_weight in
+                // llama-model.cpp: "attn_output_b" is the DSA exit, "attn_output."
+                // the standard-arch exit under TASKS #70 dedicated attention).
+                // Everything else (indexer scores, cache reads) stays on the
+                // owner - a broadcast there is pure boundary overhead.
                 const int owner0 = split_state_owner(src_ss[0]);
-                if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) &&
-                        !(tensor->src[0]->op == GGML_OP_NONE && strstr(tensor->src[0]->name, "attn_output_b") != nullptr)) {
+                // TASKS #114: ffn_down is the EP exit the same way attn_output is
+                // the attention-island exit - when a member's expert strips are
+                // zero-width (true-zero owner share), BOTH down operands collapse
+                // to the single populated member and this shortcut used to return
+                // owner-local, skipping the expert-sum AllReduce; the un-mirrored
+                // activation then aborted the next dedicated-attention mul_mat
+                // (the -ts 0,N qr crash). PARTIAL is exact here (absent members
+                // contribute zero) and the existing boundary mirrors it.
+                const bool island_exit = tensor->src[0]->op == GGML_OP_NONE &&
+                    (strstr(tensor->src[0]->name, "attn_output_b") != nullptr ||
+                     strstr(tensor->src[0]->name, "attn_output.") != nullptr ||
+                     strstr(tensor->src[0]->name, "ffn_down") != nullptr);
+                if (owner0 >= 0 && owner0 == split_state_owner(src_ss[1]) && !island_exit) {
                     return degenerate_state(GGML_BACKEND_SPLIT_AXIS_0, owner0, tensor->ne[0]);
                 }
             }
@@ -1050,6 +1196,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         // note: do not print src names here - over RPC the src pointers of a lone
         // deserialized struct can dangle and turn this abort into a silent segfault
+        for (int s = 0; s < 2; s++) {
+            std::string segs;
+            for (int k = 0; k < 8; k++) {
+                segs += " " + std::to_string(src_ss[s].ne[k]);
+            }
+            GGML_LOG_ERROR("mul_mat src%d axis=%s n_segments=%u nr0=%u ne[0..7]=[%s] owner=%d\n",
+                    s, ggml_backend_meta_split_axis_name(src_ss[s].axis), src_ss[s].n_segments,
+                    src_ss[s].nr[0], segs.c_str(), split_state_owner(src_ss[s]));
+        }
         GGML_ABORT("unsupported mul_mat split combination: %s = src0[%s] x src1[%s]",
                 tensor->name,
                 ggml_backend_meta_split_axis_name(src_ss[0].axis),
@@ -1126,11 +1281,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
+            // the split axis can carry through unchanged (same position, stride and
+            // full extent) while the view elides OTHER dims - e.g. the post-merge
+            // MoE weighted-sum views one expert's rows out of [hidden, expert, token],
+            // which breaks the stride-of-next-dim match below
+            if (tensor->nb[axis] == tensor->src[0]->nb[axis] && tensor->ne[axis] == tensor->src[0]->ne[axis]) {
+                return {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+            }
             for (int dim = 0; dim < GGML_MAX_DIMS-1; dim++) {
                 if (tensor->nb[dim+1] == tensor->src[0]->nb[axis+1]) {
                     return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                 }
             }
+            GGML_LOG_ERROR("%s: unmapped view '%s' ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
+                           "of '%s' (op %s, split axis %d) ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu]\n",
+                           __func__, tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                           tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                           tensor->src[0]->name, ggml_op_name(tensor->src[0]->op), axis,
+                           tensor->src[0]->ne[0], tensor->src[0]->ne[1], tensor->src[0]->ne[2], tensor->src[0]->ne[3],
+                           tensor->src[0]->nb[0], tensor->src[0]->nb[1], tensor->src[0]->nb[2], tensor->src[0]->nb[3]);
             GGML_ABORT("fatal error");
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -1291,6 +1460,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        if (src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[2].axis != GGML_BACKEND_SPLIT_AXIS_1 || src_ss[3].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            src_ss[4].axis != GGML_BACKEND_SPLIT_AXIS_1 ||
+            (src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_2 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_1 && src_ss[5].axis != GGML_BACKEND_SPLIT_AXIS_0)) {
+            for (int s = 0; s < 6; s++) {
+                GGML_LOG_ERROR("%s: '%s' src[%d] '%s' (op %s) split axis %d\n", __func__, tensor->name,
+                               s, tensor->src[s] ? tensor->src[s]->name : "?",
+                               tensor->src[s] ? ggml_op_name(tensor->src[s]->op) : "?", src_ss[s].axis);
+            }
+        }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
@@ -1332,7 +1511,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
             if (buf_ctx->debug > 1) {
-                GGML_LOG_DEBUG("SRC_RESOLVE: %s[%s] src%zu %s[%s] -> %s\n",
+                GGML_LOG_ERROR("SRC_RESOLVE: %s[%s] src%zu %s[%s] -> %s\n",
                         tensor->name, ggml_op_name(tensor->op), i, tensor->src[i]->name,
                         ggml_op_name(tensor->src[i]->op), ggml_backend_meta_split_axis_name(src_ss[i].axis));
             }
@@ -1514,6 +1693,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_LIGHTNING_INDEXER: {
+                // dsv4 sparse-attention indexer: attention-side, so in the
+                // supported configs every src is mirrored or owner-degenerate
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -1601,7 +1785,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 if (!srcs_info.empty()) {
                     srcs_info += ", ";
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor->src[0], true);
+                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor->src[i], true);
                 GGML_ASSERT(split_state.n_segments == 1);
                 const char * axis_name = ggml_backend_meta_split_axis_name(split_state.axis);
                 std::string ne_info;
@@ -1621,7 +1805,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 const ggml_backend_meta_split_state & ss = buf_ctx->split_state_cache[key].first;
                 ne_info += std::to_string(ss.ne[j]) + "x" + std::to_string(ss.nr[0]);
             }
-            GGML_LOG_DEBUG("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
+            GGML_LOG_ERROR("SPLIT_STATE: {%s} -> %s[%s, %s, {%s}]\n", srcs_info.c_str(), tensor->name, ggml_op_name(tensor->op),
                 ggml_backend_meta_split_axis_name(buf_ctx->split_state_cache[key].first.axis), ne_info.c_str());
         }
     }
@@ -1923,6 +2107,104 @@ static void ggml_backend_meta_buffer_reject_unknown_alias(const struct ggml_tens
     }
 }
 
+// TASKS #71 (replication inc-0): host-side expert ownership registry, one
+// entry per placed layer. Written by the llama loader alongside the #75 table
+// upload; read at gather time to attribute a boundary's routed experts to
+// members (GGML_META_ZL_STATS). Process-global like the placement itself.
+static std::mutex                              g_expert_owner_mtx;
+static std::map<int32_t, std::vector<int32_t>> g_expert_owner;
+// last decode-token routed ids per layer, noted at COMPUTE time by the
+// llama-side eval callback (a gather-time read of the topk tensor returns
+// recycled bytes - the member ring allocator reuses the slot intra-subgraph
+// and ignores the OUTPUT flag)
+static std::map<int32_t, std::vector<int32_t>> g_routed_ids;
+static int32_t                                 g_routed_last_il = -1;
+// TASKS #84 (GGML_META_UNION_STATS): full [k, n_tok] routed ids of the last
+// noted graph per layer - the union counters need every lane, not just token 0
+static std::map<int32_t, std::vector<int32_t>> g_routed_ids_all;
+static std::map<int32_t, size_t>               g_routed_k;
+
+void ggml_backend_meta_note_routed_ids_batch(int32_t il, const int32_t * ids, size_t k, size_t n_tok) {
+    std::lock_guard<std::mutex> lock(g_expert_owner_mtx);
+    if (ids == nullptr || k == 0 || n_tok == 0) {
+        g_routed_ids.erase(il);
+        g_routed_ids_all.erase(il);
+        g_routed_k.erase(il);
+        return;
+    }
+    g_routed_ids[il].assign(ids, ids + k); // token 0 (ZL semantics unchanged)
+    g_routed_ids_all[il].assign(ids, ids + k*n_tok);
+    g_routed_k[il] = k;
+    g_routed_last_il = il;
+}
+
+void ggml_backend_meta_note_routed_ids(int32_t il, const int32_t * ids, size_t k) {
+    ggml_backend_meta_note_routed_ids_batch(il, ids, k, 1);
+}
+
+void ggml_backend_meta_set_expert_ownership(int32_t il, const int32_t * member_of, size_t n_expert) {
+    std::lock_guard<std::mutex> lock(g_expert_owner_mtx);
+    if (member_of == nullptr || n_expert == 0) {
+        g_expert_owner.erase(il);
+        return;
+    }
+    g_expert_owner[il].assign(member_of, member_of + n_expert);
+    static const bool zl_debug = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+    if (zl_debug) {
+        fprintf(stderr, "ZL: ownership registered layer %d (%zu experts)\n", il, n_expert);
+    }
+}
+
+// TASKS #75: member-targeted write for tensors whose per-member contents differ
+// (expert ownership mask / id-remap tables). Bypasses the split-state fan-out
+// and writes exactly one member's shadow.
+void ggml_backend_meta_tensor_set_member(ggml_tensor * tensor, size_t member, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer));
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    GGML_ASSERT(member < n_bufs);
+    ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, member);
+    GGML_ASSERT(st != nullptr && st->buffer != nullptr);
+    GGML_ASSERT(ggml_nbytes(st) == ggml_nbytes(tensor)); // full-shape shadows only (MIRRORED/PARTIAL states)
+    ggml_backend_tensor_set(st, data, offset, size);
+}
+
+static void ggml_backend_meta_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    // needed since the upstream merge: the dsv4 compressed-KV cache clears
+    // per-stream slices via ggml_backend_tensor_memset (llama-kv-cache-dsv4.cpp)
+    if (!ggml_backend_meta_buffer_adopt_identity(tensor)) {
+        ggml_backend_meta_buffer_reject_unknown_alias(tensor, __func__);
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
+        if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) == 0) {
+            continue; // zero-size shard (degenerate/dedicated non-owner)
+        }
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            ggml_backend_tensor_memset(st, value, offset, size);
+            continue;
+        }
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            ggml_backend_tensor_memset(st, value, 0, ggml_nbytes(st));
+            continue;
+        }
+        // per-stream clear (a whole dim-2 slice) of a tensor split on axis 0/1:
+        // each member shard keeps the stream structure with a shrunken stride
+        if ((split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) &&
+                tensor->ne[3] == 1 && tensor->nb[2] != 0 &&
+                offset % tensor->nb[2] == 0 && size == (size_t) tensor->nb[2]) {
+            const size_t stream         = offset / tensor->nb[2];
+            const size_t st_stream_size = ggml_nbytes(st) / tensor->ne[2];
+            ggml_backend_tensor_memset(st, value, stream*st_stream_size, st_stream_size);
+            continue;
+        }
+        GGML_ABORT("meta memset_tensor: unsupported range for split tensor %s (axis %d, offset %zu, size %zu)",
+                   tensor->name, (int) split_state.axis, offset, size);
+    }
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     // RPC commands arrive as freshly deserialized structs - resolve them by identity
     // first so no lookup or derivation ever walks their src pointers
@@ -1975,6 +2257,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         }
     };
 
+    // #113 diag: GGML_META_DEBUG_UPLOAD=1 - scatter path + per-member tiling decisions for expert tensors
+    static const bool dbg_upload = [] { const char * e = getenv("GGML_META_DEBUG_UPLOAD"); return e != nullptr && atoi(e) != 0; }();
+    if (dbg_upload && strstr(tensor->name, "_exps")) {
+        fprintf(stderr, "[upload-diag] %s axis=%d n_seg=%u nr0=%u path=%s\n",
+                tensor->name, (int) split_state.axis, (unsigned) split_state.n_segments,
+                (unsigned) split_state.nr[0],
+                (split_state.n_segments != 1 || split_state.nr[0] != 1) ? "MULTISEG" : "SWITCH");
+    }
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
@@ -2048,6 +2338,31 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
             const int64_t i_stop  = (offset + size)/chunk_size_full;
+            // TASKS.md #113: tiled weight uploads. The RPC worker cache is
+            // content-addressed per UPLOAD CALL, so a member's whole segment
+            // hashed as one blob renames on every -ts change and reloads
+            // re-stream unchanged bytes. For RPC weight members, cut the
+            // segment on a FIXED grid anchored in the ROOT tensor's coordinates
+            // (independent of the split): interior tiles keep their hash across
+            // layouts and batch-place from the worker's disk cache; only the
+            // moved boundary tiles stream. AXIS_1 tiles dim-1 (per-expert
+            // column strips of gate/up_exps), AXIS_2 tiles dim-2 (whole-expert
+            // slabs of placed layouts). AXIS_0 cuts inside rows (KB slivers) -
+            // not worth caching, keeps the bulk path. Kill switch:
+            // GGML_META_TILED_UPLOAD=0.
+            static const bool tiled_upload = [] {
+                const char * env = getenv("GGML_META_TILED_UPLOAD");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            const bool tile_axis = split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                                   split_state.axis == GGML_BACKEND_SPLIT_AXIS_2;
+            const size_t tile_unit = tile_axis ? tensor->nb[split_state.axis] : 0;
+            // fixed grid step: geometry-derived only (never from the split), so
+            // every layout sees the same tile boundaries. ~256 KiB: per-expert
+            // member strips of small-ff MoEs are ~1 MB, so the tile must be a
+            // fraction of that or nothing ever spans a tile and the guard below
+            // keeps everything on the bulk path (burned in the first gate run)
+            const size_t tile_units = tile_unit > 0 ? std::max<size_t>(1, (256u << 10) / tile_unit) : 0;
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_ensure_simple_tensor(tensor, j);
@@ -2056,8 +2371,43 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     continue;
                 }
                 const size_t simple_offset = i_start * chunk_size_j;
-                hint(offset + offset_j);
-                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                bool tiled = false;
+                if (tiled_upload && tile_axis && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        chunk_size_j > tile_units * tile_unit) {
+                    ggml_backend_buffer_t sb = simple_tensor->buffer;
+                    ggml_backend_dev_t sdev = sb != nullptr ?
+                        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(sb)) : nullptr;
+                    ggml_backend_reg_t sreg = sdev != nullptr ? ggml_backend_dev_backend_reg(sdev) : nullptr;
+                    tiled = sreg != nullptr && strcmp(ggml_backend_reg_name(sreg), "RPC") == 0;
+                }
+                // #113 diag: GGML_META_DEBUG_UPLOAD=1 - scatter path + per-member tiling decisions for expert tensors
+                if (dbg_upload && strstr(tensor->name, "blk.0.ffn_gate_exps") != nullptr) {
+                    fprintf(stderr, "[upload-diag2] %s member=%zu usage=%d chunk_j=%zu tile_bytes=%zu tiled=%d\n",
+                            tensor->name, j, (int) buffer->usage, chunk_size_j, tile_units * tile_unit, (int) tiled);
+                }
+                if (!tiled) {
+                    hint(offset + offset_j);
+                    ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_j, simple_offset, chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
+                } else {
+                    // this member's piece spans [lo, lo + n_u) units of the split
+                    // axis in root coordinates; emit one call per grid tile
+                    const size_t lo  = offset_j / tile_unit;
+                    const size_t n_u = chunk_size_j / tile_unit;
+                    GGML_ASSERT(lo * tile_unit == offset_j && n_u * tile_unit == chunk_size_j);
+                    for (int64_t i = i_start; i < i_stop; i++) {
+                        const char * src_i  = (const char *) data + (i - i_start) * chunk_size_full + offset_j;
+                        const size_t  dst_i = simple_offset + (i - i_start) * chunk_size_j;
+                        size_t a = lo;
+                        while (a < lo + n_u) {
+                            const size_t b = std::min((a / tile_units + 1) * tile_units, lo + n_u);
+                            const size_t blob_off   = (a - lo) * tile_unit;
+                            const size_t blob_bytes = (b - a) * tile_unit;
+                            hint(offset + (i - i_start) * chunk_size_full + offset_j + blob_off);
+                            ggml_backend_tensor_set(simple_tensor, src_i + blob_off, dst_i + blob_off, blob_bytes);
+                            a = b;
+                        }
+                    }
+                }
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
@@ -2071,10 +2421,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             GGML_ASSERT(tensor->type == GGML_TYPE_F32);
-            const int64_t ne = ggml_nelements(tensor);
+            // the caller's buffer holds only the (offset, size) sub-range - reading
+            // ggml_nelements(tensor) floats from it over-reads on sub-range writes
+            GGML_ASSERT(offset % sizeof(float) == 0);
+            GGML_ASSERT(size   % sizeof(float) == 0);
+            const size_t nf = size / sizeof(float);
             std::vector<float> tmp;
-            tmp.reserve(ne);
-            for (int64_t i = 0; i < ne; i++) {
+            tmp.reserve(nf);
+            for (size_t i = 0; i < nf; i++) {
                 tmp.push_back(((const float *) data)[i] / n_bufs);
             }
             for (size_t j = 0; j < n_bufs; j++) {
@@ -2240,7 +2594,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
-    /* .memset_tensor   = */ nullptr, // TODO implement
+    /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
     /* .set_tensor_2d   = */ nullptr,
@@ -2369,6 +2723,11 @@ struct ggml_backend_meta_context {
         // partial node, or under per-node debug execution - and skipping its
         // reduce silently corrupts every consumer of that tensor.
         bool          reduce      = false;
+        // TASKS #9 delivery skip (GGML_META_BCAST_FUSE=2): false when the reduced
+        // boundary value is provably never consumed by a computing node on THIS
+        // member - the writeback is withheld (the fused message still carries the
+        // subgraph chain) and the member's copy goes permanently stale.
+        bool          deliver     = true;
     };
     struct backend_config {
         ggml_backend_t backend;
@@ -2389,13 +2748,23 @@ struct ggml_backend_meta_context {
     // unchanged); an inactive build parks it here.
     struct meta_build {
         uint64_t key       = 0; // content hash of the outer graph
-        uint64_t outer_uid = 0; // outer cgraph->uid at build time (uid fast path)
-        uint64_t built_seq = 0; // rebuild counter at creation (shadow-ring validity)
+        uint64_t outer_uid = 0; // outer cgraph->uid at build time (uid fast path; 0 = chunked piece)
+        uint64_t built_seq = 0; // reset_seq at creation (shadow-ring validity)
         uint64_t used_seq  = 0; // LRU
         size_t   n_subgraphs = 0;
         ggml_context_ptr ctx;   // owns this build's cgraph_main structures
         std::vector<std::vector<cgraph_config>> cgraphs; // [n_backends][...]
         std::vector<std::vector<ggml_tensor *>> nodes;   // [n_backends][n_nodes]
+        // TASKS #9: copies restoring stale member values this piece actually reads
+        // (a value skipped or window-hidden by an earlier piece); recomputed when
+        // the stale registry changes
+        struct repair_copy {
+            int                 j_src;
+            int                 j_dst;
+            const ggml_tensor * t; // meta tensor to restore on j_dst
+        };
+        uint64_t                 repair_seq = 0;
+        std::vector<repair_copy> repairs;
     };
     std::string                 name;
     std::vector<backend_config> backend_configs;
@@ -2409,33 +2778,126 @@ struct ggml_backend_meta_context {
 
     std::vector<std::unique_ptr<meta_build>> builds;
     meta_build * build_active = nullptr;
-    uint64_t     rebuild_seq  = 0;
+    // count of FRESH shadow-ring clears: a rebuild clears each used buffer's
+    // next slot, but the ring index only advances on init_tensor, so repeated
+    // rebuilds between advances re-clear the same (already empty) slot. Aging
+    // builds by rebuild count instead of this clock evicted every chunked-graph
+    // (eval-callback) build before reuse - permanent rebuild churn whose stale
+    // reads corrupted the computation (research/84-seam-dissection-2026-08-04.md).
+    uint64_t     reset_seq    = 0;
     uint64_t     use_seq      = 0;
-    // compute-node shadows of a build live in the stc ring slot that was current
-    // when it was built; every rebuild advances each used buffer's ring by one
-    // slot, so a build older than ring_slots-1 rebuilds may point at reset
-    // shadows and must be discarded. Mirrors the buffer context's ring sizing.
+    // compute-node shadows of a build live in the stc ring slots that were live
+    // when it was built; after ring_slots-1 fresh clears the oldest of those
+    // slots has been recycled, so older builds must be discarded. Mirrors the
+    // buffer context's ring sizing.
     int          ring_slots;
+
+    // GGML_META_BOUNDARY_STATS tallies (TASKS #9 follow-up: aim the next
+    // reduce-share lever). Pure counters - no device syncs, so unlike
+    // GGML_META_TIMING they are valid on a production-speed run.
+    int64_t bs_bcast1        = 0; // single-computer boundaries (owner broadcast)
+    int64_t bs_star          = 0; // star reduces
+    int64_t bs_butterfly     = 0; // fold/butterfly fallbacks
+    int64_t bs_parts_fused   = 0; // partials that arrived via fused_recv (pre-requested, no fresh RTT)
+    int64_t bs_parts_wire    = 0; // partials read from wire members via get_batch/tensor_get
+    int64_t bs_parts_local   = 0; // partials read from local members
+    int64_t bs_gather_bytes  = 0; // bytes gathered from wire members
+    int64_t bs_deliver_wire  = 0; // boundary values delivered to wire members
+    int64_t bs_deliver_skip  = 0; // wire deliveries withheld (BCAST_FUSE=2)
+    int64_t bs_deliver_bytes = 0; // bytes delivered to wire members
+    int64_t bs_repairs       = 0; // stale-value repair copies executed
+    int64_t bs_sub_reduces   = 0; // TASKS #105: boundaries pre-reduced within the local subgroup
+    int64_t ed_defers        = 0; // wire partials deferred to the next reduce (GGML_META_EXPERT_DEFER)
+    int64_t ed_ready         = 0; // deferral candidates whose response had already arrived (consumed exactly)
+    int64_t ed_injects       = 0; // deferred partials injected one reduce late
+    int64_t ed_lost          = 0; // deferred partials dropped at graph end (should stay 0)
+    // GGML_META_ZL_STATS (TASKS #71 replication inc-0): decode-gather routed-
+    // ownership tallies - how often each wire member holds ZERO of the routed
+    // experts (the boundary a dynamic leg-skip would remove) and the owner
+    // group's routed-slot share. Needs expert ownership registered (PLACE=1);
+    // cost = one 32-byte host read per decode gather.
+    int64_t zl_gathers       = 0;
+    int64_t zl_free          = 0; // gathers where EVERY wire member had zero routed experts
+    int64_t zl_owner_slots   = 0;
+    int64_t zl_total_slots   = 0;
+    std::array<int64_t, 16> zl_zero {}; // per member: gathers with zero routed experts
+    // GGML_META_UNION_STATS (TASKS #84): expert-union width curve. Per
+    // lane-width bucket: boundaries seen, total routed slots (k*width) and
+    // the distinct-expert UNION across the boundary's lanes - the measured
+    // verify member-read multiplier the #52 law priced as linear-in-width.
+    // Member tier (distinct OWNED experts per member) needs the #75 tables.
+    std::array<int64_t, 17> us_bounds {}; // index = lane width (1..16)
+    std::array<int64_t, 17> us_slots  {};
+    std::array<int64_t, 17> us_uniq   {};
+    std::array<int64_t, 16> us_mem_uniq  {}; // width>1 boundaries
+    std::array<int64_t, 16> us_mem_uniq1 {}; // width==1 floor
+    int64_t us_mem_bounds  = 0;
+    int64_t us_mem_bounds1 = 0;
+    int64_t bs_graphs        = 0;
 
     // GGML_META_TIMING accumulators (compute vs reduce-boundary attribution)
     int64_t tm_compute_us = 0;
     int64_t tm_reduce_us  = 0;
     int64_t tm_reduces    = 0;
+    // TASKS #9: bucket boundary cost by kind - attention-owner broadcast vs true reduce
+    int64_t tm_bcast_us   = 0;
+    int64_t tm_bcasts     = 0;
     int64_t tm_graphs     = 0;
     int64_t tm_build_hits   = 0;
     int64_t tm_build_misses = 0;
 
     void *                               comm_ctx       = nullptr;
+    // TASKS #105: on a MIXED roster (local CUDA + RPC) the backend comm init
+    // refuses the whole set, so every boundary staged through host RAM and
+    // NVLink sat idle. A second context over just the local subset pre-reduces
+    // those members among themselves (NCCL/p2p), and only their representative
+    // joins the host/wire star - one D2H per boundary instead of one per GPU.
+    void *                               comm_ctx_sub   = nullptr;
+    std::vector<size_t>                  comm_sub;      // member indices in comm_ctx_sub order
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_cpy_tensor_batch_async_t cpy_batch     = nullptr;
     ggml_backend_get_tensor_batch_t       get_batch     = nullptr;
     ggml_backend_boundary_fused_send_t    fused_send    = nullptr;
     ggml_backend_boundary_fused_recv_t    fused_recv    = nullptr;
+    ggml_backend_boundary_fused_ready_t   fused_ready   = nullptr;
 
     // members whose reg provides the batched-get proc reach their data over a wire
     // (RPC-class); a member without it is local and can root a star reduce
     std::vector<bool>    wire_member;
     std::vector<uint8_t> star_scratch; // host staging for star-reduce partials
+
+    // TASKS #9 (GGML_META_BCAST_FUSE): registry of member copies left stale by
+    // design - single-contributor window nodes never computed off-owner, and
+    // boundary cells whose delivery was skipped. A later graph piece that READS
+    // one on a computing node repairs it first (see the repair pass in
+    // graph_compute); everything inside the deciding piece is proven safe at
+    // rebuild. Keyed by (buffer generation, logical data offset): meta tensor
+    // ->data is an offset, identical across same-shaped arenas, so it is only
+    // unique per buffer generation. Fingerprint-checked on every hit.
+    struct stale_entry {
+        ggml_backend_meta_tensor_fingerprint fp;
+        int src_member; // member holding a valid copy to repair from
+    };
+    std::vector<std::map<std::pair<uint64_t, const void *>, stale_entry>> stale_map; // [n_backends]
+    uint64_t stale_seq = 0; // bumped on registry change; validates cached repair lists
+
+    void mark_stale(size_t j, const ggml_tensor * t, int src_member) {
+        if (t->data == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+            return;
+        }
+        const uint64_t buf_uid = ((ggml_backend_meta_buffer_context *) t->buffer->context)->uid;
+        const auto key = std::make_pair(buf_uid, (const void *) t->data);
+        stale_entry e;
+        e.fp         = ggml_backend_meta_tensor_fingerprint(t);
+        e.src_member = src_member;
+        auto it = stale_map[j].find(key);
+        if (it != stale_map[j].end() &&
+                memcmp(&it->second.fp, &e.fp, sizeof(e.fp)) == 0 && it->second.src_member == src_member) {
+            return; // unchanged (same build re-registering) - keep repair caches valid
+        }
+        stale_map[j][key] = e;
+        stale_seq++;
+    }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2444,6 +2906,7 @@ struct ggml_backend_meta_context {
         const char * GGML_META_MAX_GRAPHS = getenv("GGML_META_MAX_GRAPHS");
         ring_slots = std::max(2, GGML_META_MAX_GRAPHS ? atoi(GGML_META_MAX_GRAPHS) : 8);
         name = "Meta(";
+        stale_map.resize(n_devs);
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
         simple_backends.reserve(n_devs);
@@ -2486,12 +2949,54 @@ struct ggml_backend_meta_context {
                     fused_recv = (ggml_backend_boundary_fused_recv_t)
                         ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_recv");
                 }
+                if (fused_ready == nullptr) {
+                    fused_ready = (ggml_backend_boundary_fused_ready_t)
+                        ggml_backend_reg_get_proc_address(reg_i, "ggml_backend_boundary_fused_ready");
+                }
             }
         }
-        if (comm_ctx != nullptr) {
+        // TASKS #105: local-subset comm for mixed rosters (see comm_ctx_sub).
+        // The backend's comm_init self-selects - it returns null unless every
+        // backend handed to it is its own kind - so trying the local members is
+        // enough to discover a usable subgroup. Opt-in until the fleet A/B lands.
+        static const bool sub_enabled = getenv("GGML_META_LOCAL_COMM") != nullptr && atoi(getenv("GGML_META_LOCAL_COMM")) != 0;
+        if (comm_ctx == nullptr && sub_enabled && n_devs > 1) {
+            // same-reg local members only: the backend comm init refuses a mixed
+            // list, so an in-process CPU member (single-box EP: CUDA0,CUDA1,CPU)
+            // would otherwise veto the GPU pair that this exists to accelerate
+            std::vector<ggml_backend_t> sub_backends;
+            ggml_backend_reg_t reg_sub = nullptr;
+            for (size_t i = 0; i < n_devs; i++) {
+                if (wire_member[i]) {
+                    continue;
+                }
+                ggml_backend_reg_t reg_i = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[i]));
+                if (reg_sub == nullptr) {
+                    reg_sub = reg_i;
+                } else if (reg_i != reg_sub) {
+                    continue;
+                }
+                comm_sub.push_back(i);
+                sub_backends.push_back(simple_backends[i]);
+            }
+            if (sub_backends.size() >= 2 && sub_backends.size() < n_devs) {
+                ggml_backend_comm_init_t comm_init_sub = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(ggml_backend_get_device(sub_backends[0])), "ggml_backend_comm_init");
+                if (comm_init_sub != nullptr) {
+                    comm_ctx_sub = comm_init_sub(sub_backends.data(), sub_backends.size());
+                }
+            }
+            if (comm_ctx_sub == nullptr) {
+                comm_sub.clear();
+            } else {
+                GGML_LOG_INFO("%s: local-subset allreduce active over %zu members (TASKS #105)\n", __func__, comm_sub.size());
+            }
+        }
+        if (comm_ctx != nullptr || comm_ctx_sub != nullptr) {
+            ggml_backend_t ref = comm_ctx != nullptr ? simple_backends[0] : simple_backends[comm_sub[0]];
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                    ggml_backend_get_device(ref)), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
     }
@@ -2515,9 +3020,193 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     return backend_ctx->name.c_str();
 }
 
+// TASKS #75 gate 4 (ownership audit, docs/expert-placement-plan.md section 4):
+// with expert placement active every member computes every selected (token, k)
+// pair against its LOCAL expert slots; owned pairs carry mask 1.0, non-owned
+// pairs carry the SKIP sentinel (-1) so the backend leaves their rows alone. Recount from
+// the member shadows after compute: a non-owned pair computed against a slot
+// other than 0 is a bug even when the (masked) output still matches.
+// GGML_META_DEBUG>0 only - zero cost when unset.
+struct ggml_meta_expert_audit_totals {
+    uint64_t computed   = 0; // (slot, row) pairs computed across the layer's expert GEMMs
+    uint64_t owned      = 0; // pairs the member owns (mask 1.0)
+    uint64_t skipped    = 0; // non-owned pairs carrying the skip sentinel
+    uint64_t violations = 0; // non-owned pairs on a real slot / slots out of range
+};
+
+static std::vector<ggml_meta_expert_audit_totals> ggml_meta_expert_audit_totals_by_member;
+
+static void ggml_meta_expert_audit_pairs(
+        ggml_meta_expert_audit_totals & tot,
+        const int32_t * ids, const float * mask, int64_t n_ids, int64_t k, int64_t n_local, int n_gemm,
+        size_t member, int il, const char * tag) {
+    for (int64_t p = 0; p < n_ids; p++) {
+        const int32_t slot = ids[p];
+        const bool   owned = mask[p] > 0.5f;
+        tot.computed += n_gemm;
+        if (owned) {
+            tot.owned += n_gemm;
+        } else if (slot == -1) {
+            tot.skipped += n_gemm;
+        }
+        const char * why = nullptr;
+        if (slot != -1 && (slot < 0 || slot >= n_local)) {
+            why = "slot out of range";
+        } else if (owned && slot == -1) {
+            why = "owned pair carries the skip sentinel";
+        } else if (!owned && slot != -1) {
+            why = "non-owned pair on a real slot (mul_mat_id needs distinct ids)";
+        }
+        if (why != nullptr) {
+            tot.violations += n_gemm;
+            GGML_LOG_ERROR("EXPERT_AUDIT: WARN%s member %zu layer %d pair (tok %" PRId64 ", k %" PRId64 "): %s "
+                           "(slot %d, member owns %" PRId64 " experts, ids shared by %d expert gemms) - violation #%" PRIu64 "\n",
+                           tag, member, il, p/k, p%k, why, slot, n_local, n_gemm, tot.violations);
+        }
+    }
+}
+
+static void ggml_backend_meta_expert_audit(ggml_backend_t backend, const ggml_cgraph * cgraph) {
+    static const int debug = []() {
+        const char * d = getenv("GGML_META_DEBUG");
+        return d != nullptr ? atoi(d) : 0;
+    }();
+    if (debug <= 0) {
+        return;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    const size_t n_backends = backend_ctx->backend_configs.size();
+
+    // placed expert GEMMs: MUL_MAT_ID against an expert-axis (dim-2) split weight -
+    // only the placement split policy (llama-model.cpp) splits _exps that way
+    std::map<const ggml_tensor *, int> ids_users; // member-local ids tensor -> #expert GEMMs using it
+    std::map<const ggml_tensor *, int> ids_gemm;  // ... -> node index of one such GEMM
+    std::map<const ggml_tensor *, int> ids_layer; // ... -> layer id from the weight name
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr || node->src[2] == nullptr ||
+                node->src[0]->buffer == nullptr || !ggml_backend_buffer_is_meta(node->src[0]->buffer)) {
+            continue;
+        }
+        if (ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            continue;
+        }
+        int il = -1;
+        sscanf(node->src[0]->name, "blk.%d.", &il);
+        if (ids_users[node->src[2]]++ == 0) {
+            ids_gemm [node->src[2]] = i;
+            ids_layer[node->src[2]] = il;
+        }
+    }
+    if (ids_users.empty()) {
+        return;
+    }
+
+    // GGML_META_DEBUG>1 negative control: the pair counter must warn on a
+    // synthetic non-owned pair mapped off the dummy slot (run once)
+    if (debug > 1) {
+        static bool selftest_done = false;
+        if (!selftest_done) {
+            selftest_done = true;
+            const int32_t ids_bad [] = {1, -1, 3, -1}; // pair 2: mask 0 but a real slot
+            const float   mask_bad[] = {1, 0, 0, 1};
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST injecting 1 non-owned pair on a real slot (expect 1 WARN + 1 violation)\n");
+            ggml_meta_expert_audit_totals tot;
+            ggml_meta_expert_audit_pairs(tot, ids_bad, mask_bad, 4, 2, 4, 1, 0, -1, " SELFTEST");
+            fprintf(stderr, "EXPERT_AUDIT: SELFTEST counted computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
+                    " violations=%" PRIu64 " (want 4/2/1/1)\n",
+                    tot.computed, tot.owned, tot.skipped, tot.violations);
+        }
+    }
+
+    auto & totals = ggml_meta_expert_audit_totals_by_member;
+    if (totals.size() != n_backends) {
+        totals.assign(n_backends, {});
+    }
+    const std::vector<ggml_meta_expert_audit_totals> before = totals;
+    static uint64_t n_graphs = 0;
+    n_graphs++;
+
+    for (const auto & it : ids_users) {
+        const ggml_tensor * ids    = it.first;
+        const int           n_gemm = it.second;
+        const int           il     = ids_layer[ids];
+        const int           i_gemm = ids_gemm [ids];
+        const int64_t n_ids = ggml_nelements(ids);
+        const int64_t k     = ids->ne[0];
+
+        // the layer's ownership mask rows (build_moe_ffn names them ffn_moe_exp_mask-<il>)
+        char mask_name[GGML_MAX_NAME];
+        snprintf(mask_name, sizeof(mask_name), "ffn_moe_exp_mask-%d", il);
+        int i_mask = -1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (strcmp(cgraph->nodes[i]->name, mask_name) == 0) {
+                i_mask = i;
+                break;
+            }
+        }
+        if (i_mask < 0) {
+            GGML_LOG_ERROR("EXPERT_AUDIT: layer %d: '%s' not in this graph piece - layer skipped\n", il, mask_name);
+            continue;
+        }
+
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_tensor * st_ids  = bcj.nodes[i_gemm]->src[2];
+            const ggml_tensor * st_mask = bcj.nodes[i_mask];
+            // The end-of-graph readback is only trustworthy on host members. On CUDA
+            // it returns foreign bytes and reports violations that GGML_CUDA_CHECK_IDS
+            // (no bad ids at the point of use), the CPU audit (0 violations over 2376
+            // pairs) and the CUDA PPL gate all contradict - the ggml_set_output pins do
+            // not keep these gathers readable on a device member. Counting there would
+            // be worse than not counting: it cries wolf on a correct run.
+            const char * buft_name = st_ids->buffer != nullptr && st_ids->buffer->buft != nullptr ?
+                                     ggml_backend_buft_name(st_ids->buffer->buft) : "";
+            const bool readback_ok = st_ids->buffer != nullptr &&
+                                     (ggml_backend_buffer_is_host(st_ids->buffer) ||
+                                      strstr(buft_name, "RPC") != nullptr);
+            if (!readback_ok) {
+                static std::set<size_t> warned;
+                if (warned.insert(j).second) {
+                    GGML_LOG_ERROR("EXPERT_AUDIT: member %zu (%s) - runtime pair counting SKIPPED: the "
+                                   "end-of-graph readback is only trustworthy on host and RPC members. The "
+                                   "load-time static table audit still covers it.\n", j, buft_name);
+                }
+                continue;
+            }
+            const int64_t n_local = bcj.nodes[i_gemm]->src[0]->ne[2]; // member's local expert count
+            GGML_ASSERT(ggml_nelements(st_ids) == n_ids && ggml_nelements(st_mask) == n_ids);
+            GGML_ASSERT(st_ids->type == GGML_TYPE_I32 && st_mask->type == GGML_TYPE_F32);
+            std::vector<int32_t> ids_buf (n_ids);
+            std::vector<float>   mask_buf(n_ids);
+            ggml_backend_tensor_get(st_ids,  ids_buf.data(),  0, n_ids*sizeof(int32_t));
+            ggml_backend_tensor_get(st_mask, mask_buf.data(), 0, n_ids*sizeof(float));
+            ggml_meta_expert_audit_pairs(totals[j], ids_buf.data(), mask_buf.data(), n_ids, k, n_local, n_gemm, j, il, "");
+        }
+    }
+
+    for (size_t j = 0; j < n_backends; j++) {
+        const ggml_meta_expert_audit_totals & b = before[j];
+        const ggml_meta_expert_audit_totals & t = totals[j];
+        fprintf(stderr, "EXPERT_AUDIT: member %zu graph #%" PRIu64 ": computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
+                " violations=%" PRIu64 " | total computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64 " violations=%" PRIu64 "\n",
+                j, n_graphs,
+                t.computed - b.computed, t.owned - b.owned, t.skipped - b.skipped, t.violations - b.violations,
+                t.computed, t.owned, t.skipped, t.violations);
+    }
+}
+
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    // TASKS #75 gate 4: final ownership-audit totals (only if the audit ran)
+    for (size_t j = 0; j < ggml_meta_expert_audit_totals_by_member.size(); j++) {
+        const ggml_meta_expert_audit_totals & t = ggml_meta_expert_audit_totals_by_member[j];
+        fprintf(stderr, "EXPERT_AUDIT: FINAL member %zu: computed=%" PRIu64 " owned=%" PRIu64 " skipped=%" PRIu64
+                " violations=%" PRIu64 "%s\n",
+                j, t.computed, t.owned, t.skipped, t.violations, t.violations == 0 ? "" : " - BUGS DETECTED");
+    }
+    ggml_meta_expert_audit_totals_by_member.clear();
     delete backend_ctx;
     delete backend;
 }
@@ -2724,6 +3413,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    // TASKS #9 boundary fusion, default OFF:
+    //   1 = walker crossing: a single-contributor PARTIAL (owner-broadcast
+    //       pattern) may cross an ADD with a MIRRORED operand, so the boundary
+    //       broadcasts the residual sum (ffn_inp) instead of attn_out
+    //   2 = additionally skip delivering a reduce boundary's value to wire
+    //       members that provably never consume it (gather-only B2)
+    static const int bcast_fuse = getenv("GGML_META_BCAST_FUSE") ? atoi(getenv("GGML_META_BCAST_FUSE")) : 0;
+
     // The scheduler skips view ops when splitting, so views whose data lives on
     // another backend (CPU-hosted weights via -ncmoe / partial -ngl, coordinator
     // CPU tensors over RPC) sit positionally inside the meta split's node range.
@@ -2754,6 +3451,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         cgraph = &cgraph_local;
     }
 
+    // GGML_META_CHUNK_SYNC=1 (diagnostic): drain every member before a chunked
+    // graph piece runs - discriminates cross-piece ORDERING from wrong values
+    static const bool chunk_sync = getenv("GGML_META_CHUNK_SYNC") != nullptr && atoi(getenv("GGML_META_CHUNK_SYNC")) != 0;
+    if (chunk_sync && cgraph->uid == 0) {
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+    }
+
     // park the active build's per-member state back into its cache entry so a
     // different build can be activated (or a fresh one written) in its place
     auto park_active = [&]() {
@@ -2770,14 +3476,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
     // look up a prepared build: by outer uid when the graph carries one, else by
-    // content hash. A build older than ring_slots-1 rebuilds may reference reset
-    // shadow-ring slots and is dropped instead of trusted.
+    // content hash. A build older than ring_slots-1 fresh ring clears may
+    // reference recycled shadow-ring slots and is dropped instead of trusted.
     backend_ctx->use_seq++;
     ggml_backend_meta_context::meta_build * build = nullptr;
     uint64_t outer_key = 0;
     for (size_t k = 0; k < backend_ctx->builds.size(); ) {
         ggml_backend_meta_context::meta_build * b = backend_ctx->builds[k].get();
-        if (backend_ctx->rebuild_seq - b->built_seq >= (uint64_t) (backend_ctx->ring_slots - 1)) {
+        if (backend_ctx->reset_seq - b->built_seq >= (uint64_t) (backend_ctx->ring_slots - 1)) {
             if (b == backend_ctx->build_active) {
                 park_active();
             }
@@ -2821,7 +3527,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->n_subgraphs = build->n_subgraphs;
     } else {
         backend_ctx->tm_build_misses++;
-        backend_ctx->rebuild_seq++;
         park_active();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2842,9 +3547,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
+        bool fresh_reset = false;
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = (buf_ctx->stc_compute_index + 1) % (int) buf_ctx->stc_compute.size();
+            if (buf_ctx->stc_compute_index_next != buf_ctx->stc_last_reset) {
+                buf_ctx->stc_last_reset = buf_ctx->stc_compute_index_next;
+                fresh_reset = true;
+            }
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
@@ -2852,6 +3562,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             stc.ctxs_retired.clear(); // frees overflow arenas chained by shadow_ctx
             stc.simple_tensors.clear();
             stc.by_data.clear();
+        }
+        if (fresh_reset) {
+            backend_ctx->reset_seq++;
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -2898,10 +3611,66 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[id];
                 int32_t n_used = ggml_node_get_use_count(cgraph, id);
 
+                // TASKS #9 walker crossing: when exactly ONE member computes the
+                // PARTIAL (owner-broadcast pattern - dedicated attention exits),
+                // the member sum IS the owner's value, so the delay window may
+                // additionally cross an ADD with a MIRRORED operand (the residual
+                // add): the owner computes it exactly and the boundary broadcasts
+                // the result. Invalid once another PARTIAL source has been merged
+                // into the window (ADD_ID below) - the owner then holds only its
+                // own slice of that source and its local value is no longer the
+                // logical one.
+                bool single_contrib = false;
+                if (bcast_fuse >= 1) {
+                    int n_contrib = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                            n_contrib++;
+                        }
+                    }
+                    single_contrib = n_contrib == 1;
+                }
+                bool partials_merged = false;
+
+                // TASKS #71 LP pair fusion (GGML_META_PARTIAL_MERGE=1): the
+                // window may additionally (a) skip UNRELATED non-mirrored
+                // nodes (a sibling layer's whole subtree sits between a pair's
+                // two expert trees), guarded by a taint set so nothing that
+                // transitively consumes the window's value is skipped, and
+                // (b) cross an ADD of two PARTIALs (member-side sums are
+                // exact) so the pair shares ONE reduce boundary.
+                static const bool partial_merge = getenv("GGML_META_PARTIAL_MERGE") != nullptr
+                    && atoi(getenv("GGML_META_PARTIAL_MERGE")) != 0;
+                std::unordered_set<const ggml_tensor *> tainted;
+                if (partial_merge) {
+                    tainted.insert(node);
+                }
+
                 // Skip MIRRORED nodes that don't consume node
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
+                        if (partial_merge) {
+                            // relaxed skip: any split state, as long as no src
+                            // is tainted (nothing here carries node's value)
+                            bool clean = true;
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (next->src[s] != nullptr && tainted.count(next->src[s]) > 0) {
+                                    clean = false;
+                                    break;
+                                }
+                            }
+                            if (!clean) {
+                                static const bool pm_dbg2 = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                                if (pm_dbg2) {
+                                    fprintf(stderr, "PM-SKIPBRK: at %d next '%s'[%s]\n",
+                                            id + 1, next->name, ggml_op_name(next->op));
+                                }
+                                break;
+                            }
+                            id++;
+                            continue;
+                        }
                         if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
@@ -2944,24 +3713,63 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         id++;
                         idr = id;
                         n_used = ggml_node_get_use_count(cgraph, id);
+                        partials_merged = true;
                     }
                 }
-                // Chain of MULs with MIRRORED src[1]
+                // Chain of MULs with MIRRORED src[1] (and, for a single-contributor
+                // window, ADDs with a MIRRORED operand - TASKS #9). Under
+                // GGML_META_PARTIAL_MERGE the [crossings + weighted-tree] round
+                // REPEATS: the pair ADD consumes the finished tree's output, so
+                // a second round is what crosses it.
+                for (;;) {
+                const int id_round = id;
                 while (true) {
                     skip_unrelated();
                     if (id + 1 >= cgraph->n_nodes) {
                         return idr;
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
+                    bool crossed = false;
                     if (n_used == 1 && next->op == GGML_OP_MUL && next->src[0] == node &&
                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-                        node = next;
-                        id++;
-                        idr = id;
-                        n_used = ggml_node_get_use_count(cgraph, id);
-                    } else {
+                        crossed = true;
+                    } else if (single_contrib && !partials_merged && n_used == 1 && next->op == GGML_OP_ADD &&
+                            ((next->src[0] == node &&
+                              ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+                             (next->src[1] == node &&
+                              ggml_backend_meta_get_split_state(next->src[0], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED))) {
+                        crossed = true;
+                    } else if (partial_merge && n_used == 1 && next->op == GGML_OP_ADD &&
+                            ((next->src[0] == node && next->src[1] != node &&
+                              ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) ||
+                             (next->src[1] == node && next->src[0] != node &&
+                              ggml_backend_meta_get_split_state(next->src[0], false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL))) {
+                        // LP pair: ADD of two PARTIALs - member-side (a+b)_j is
+                        // exact, the merged window reduces ONCE downstream
+                        crossed         = true;
+                        partials_merged = true;
+                        single_contrib  = false;
+                    }
+                    if (!crossed) {
+                        if (partial_merge) {
+                            static const bool pm_dbg3 = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                            if (pm_dbg3) {
+                                fprintf(stderr, "PM-NOCROSS: at %d next '%s'[%s] n_used %d src0==node %d src1==node %d s0 %d s1 %d\n",
+                                        id + 1, next->name, ggml_op_name(next->op), n_used,
+                                        next->src[0] == node, next->src[1] == node,
+                                        next->src[0] ? (int) ggml_backend_meta_get_split_state(next->src[0], false).axis : -99,
+                                        next->src[1] ? (int) ggml_backend_meta_get_split_state(next->src[1], false).axis : -99);
+                            }
+                        }
                         break;
                     }
+                    node = next;
+                    if (partial_merge) {
+                        tainted.insert(node);
+                    }
+                    id++;
+                    idr = id;
+                    n_used = ggml_node_get_use_count(cgraph, id);
                 }
 
                 if (n_used != node->ne[1] || id + 2*n_used-1 >= cgraph->n_nodes) {
@@ -2993,8 +3801,76 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     id++;
                 }
                 idr = id;
-                return idr;
+                if (!partial_merge) {
+                    return idr;
+                }
+                // next round: the finished tree's output is the window value now
+                node = cgraph->nodes[id];
+                tainted.insert(node);
+                n_used = ggml_node_get_use_count(cgraph, id);
+                static const bool pm_debug = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                if (pm_debug) {
+                    fprintf(stderr, "PM-ROUND: tree end %d '%s' n_used %d id_round %d\n",
+                            id, node->name, n_used, id_round);
+                }
+                if (id == id_round) {
+                    return idr;
+                }
+                }
             };
+
+            // GGML_META_DEBUG_KVSUM also traces per-member COMPUTE flags of the
+            // matching cache writes at build time (did the owner's write run?)
+            {
+                static const char * kvw = getenv("GGML_META_DEBUG_KVSUM");
+                if (kvw != nullptr && kvw[0] != '\0') {
+                    for (int i = 0; i < cgraph->n_nodes; i++) {
+                        ggml_tensor * nd = cgraph->nodes[i];
+                        if (nd->op != GGML_OP_SET_ROWS || nd->src[0] == nullptr) {
+                            continue;
+                        }
+                        const ggml_tensor * dstt = nd->view_src != nullptr ? nd->view_src : nd;
+                        if (strstr(dstt->name, kvw) == nullptr && strstr(nd->name, kvw) == nullptr) {
+                            continue;
+                        }
+                        char fbuf[128];
+                        int fo = 0;
+                        for (size_t j = 0; j < n_backends && fo < (int) sizeof(fbuf) - 8; j++) {
+                            fo += snprintf(fbuf + fo, sizeof(fbuf) - fo, " m%zu=%d", j,
+                                           backend_ctx->backend_configs[j].nodes[i] != nullptr &&
+                                           (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) ? 1 : 0);
+                        }
+                        fprintf(stderr, "KVWRITE: node %d '%s' -> '%s' compute:%s\n", i, nd->name, dstt->name, fbuf);
+                        // the row-index operand is a persistent INPUT (not a
+                        // ring-recycled intermediate), so it is safe to read here
+                        ggml_tensor * idxs = nd->src[1];
+                        const bool ix32 = idxs != nullptr && idxs->type == GGML_TYPE_I32;
+                        const bool ix64 = idxs != nullptr && idxs->type == GGML_TYPE_I64;
+                        if (idxs != nullptr && idxs->buffer != nullptr && ggml_backend_buffer_is_meta(idxs->buffer) &&
+                                (ix32 || ix64) && ggml_nbytes(idxs) <= 8192) {
+                            const size_t nb_ix = ggml_nbytes(idxs);
+                            std::vector<int64_t> ix(nb_ix/(ix64 ? sizeof(int64_t) : sizeof(int32_t)));
+                            for (size_t j = 0; j < n_backends; j++) {
+                                ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(idxs, j);
+                                if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) < nb_ix) {
+                                    continue;
+                                }
+                                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                                std::vector<char> raw(nb_ix);
+                                ggml_backend_tensor_get(st, raw.data(), 0, nb_ix);
+                                for (size_t v = 0; v < ix.size(); v++) {
+                                    ix[v] = ix64 ? ((const int64_t *) raw.data())[v] : (int64_t) ((const int32_t *) raw.data())[v];
+                                }
+                                int64_t s = 0;
+                                for (int64_t v : ix) s += v;
+                                fprintf(stderr, "KVIDX: '%s' m%zu n=%zu sum=%lld first=%lld,%lld\n",
+                                        idxs->name, j, ix.size(), (long long) s,
+                                        (long long)(ix.size() > 0 ? ix[0] : -1), (long long)(ix.size() > 1 ? ix[1] : -1));
+                            }
+                        }
+                    }
+                }
+            }
 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3048,7 +3924,62 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
 
+                // TASKS #9: a single-contributor window leaves nodes [i, i_delayed)
+                // permanently unwritten on the non-contributing members (only the
+                // boundary node i_delayed is overwritten by the broadcast). Register
+                // them so a LATER graph piece that reads one on a computing node can
+                // repair from the owner first (cross-piece consumer safety).
+                if (bcast_fuse >= 1 && i_delayed > i &&
+                        split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    int owner = -1;
+                    int n_contrib = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (backend_ctx->backend_configs[j].nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                            owner = (int) j;
+                            n_contrib++;
+                        }
+                    }
+                    if (n_contrib == 1) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            if ((int) j == owner) {
+                                continue;
+                            }
+                            for (int ii = i; ii < i_delayed; ii++) {
+                                backend_ctx->mark_stale(j, cgraph->nodes[ii], owner);
+                            }
+                        }
+                    }
+                }
+
                 i = i_delayed;
+
+                // TASKS #71 LP pair fusion (GGML_META_PARTIAL_MERGE=1): a tree
+                // boundary whose value is consumed ONLY by a builder-tagged
+                // lp_moe_pair ADD keeps its subgraph split but SKIPS the reduce -
+                // members hold their partials until the pair ADD (itself PARTIAL
+                // by the name-tag derivation) reduces both at ONE boundary.
+                bool lp_suppress = false;
+                {
+                    static const bool pm_on = getenv("GGML_META_PARTIAL_MERGE") != nullptr
+                        && atoi(getenv("GGML_META_PARTIAL_MERGE")) != 0;
+                    if (pm_on && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                            ggml_node_get_use_count(cgraph, i_delayed) == 1) {
+                        const ggml_tensor * bt = cgraph->nodes[i_delayed];
+                        for (int k = i_delayed + 1; k < cgraph->n_nodes; k++) {
+                            const ggml_tensor * cand = cgraph->nodes[k];
+                            if (cand->src[0] == bt || cand->src[1] == bt) {
+                                lp_suppress = cand->op == GGML_OP_ADD &&
+                                        strncmp(cand->name, "lp_moe_pair", 11) == 0;
+                                break;
+                            }
+                        }
+                        static const bool pm_dbg = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                        if (pm_dbg && lp_suppress) {
+                            fprintf(stderr, "PM-SUPPRESS: boundary %d '%s' reduce deferred to pair\n",
+                                    i_delayed, bt->name);
+                        }
+                    }
+                }
 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
@@ -3057,12 +3988,150 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // this includes a PARTIAL node that happens to be the LAST node
                     // of the graph (scheduler split or per-node debug execution),
                     // which the old position-based check silently skipped
-                    bcj.cgraphs[n_subgraphs].reduce = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                    bcj.cgraphs[n_subgraphs].reduce = split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !lp_suppress;
                 }
                 n_subgraphs++;
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+        }
+
+        // TASKS #9 delivery skip (GGML_META_BCAST_FUSE=2): decide per reduce
+        // boundary and per WIRE member whether the reduced value must be written
+        // back. It may be withheld when every path from the boundary cell to a
+        // node that member actually computes is dead: consumers that are
+        // COMPUTE-off on the member never execute, and contaminated computing
+        // consumers are safe only while their garbage provably never reaches a
+        // reduce contribution, a graph output, an in-place write, or the end of
+        // the piece. Local members are always delivered - they are the repair
+        // sources, and member 0 anchors host reads (get_tensor MIRRORED).
+        // TASKS #84c: cross-piece consumer safety rests on the repair pass, and
+        // under heavy graph fragmentation (eval-callback sched splits: 1-2
+        // reduce boundaries per piece) that path measurably corrupts decode -
+        // loopback ladder 2026-07-31: FUSE=2 + splits diverges run-to-run
+        // (wire-format-independent) while FUSE=1 + splits is byte-exact
+        // (c80261ff 6/6). Until the exact repair hole is found, withhold
+        // deliveries only in monolithic-class pieces (>= 3 reduce boundaries -
+        // production decode graphs carry ~160); fragmented pieces fall back to
+        // FUSE=1 semantics (deliver everything), which is exact by measurement.
+        size_t n_reduce_sg = 0;
+        for (size_t g = 0; g < n_subgraphs; g++) {
+            n_reduce_sg += backend_ctx->backend_configs[0].cgraphs[g].reduce ? 1 : 0;
+        }
+        if (bcast_fuse >= 2 && n_reduce_sg >= 3 && n_backends > 1 &&
+                !backend_ctx->wire_member.empty() && !backend_ctx->wire_member[0]) {
+            const auto & cfg0 = backend_ctx->backend_configs[0].cgraphs;
+            std::vector<char> is_cell(cgraph->n_nodes, 0);
+            for (size_t g = 0; g < n_subgraphs; g++) {
+                if (!cfg0[g].reduce) {
+                    continue;
+                }
+                const int b = (int) (g + 1 < n_subgraphs ? cfg0[g + 1].offset : cgraph->n_nodes) - 1;
+                is_cell[b] = 1;
+            }
+            // consumer adjacency, view-chain aware: reading a view reads its base,
+            // so a node consuming any view ancestor is a consumer of that ancestor
+            std::unordered_map<const ggml_tensor *, int> node_index;
+            node_index.reserve(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                node_index.emplace(cgraph->nodes[n], n);
+            }
+            std::vector<std::vector<int>> consumers(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const ggml_tensor * r = t->src[s];
+                    while (r != nullptr) {
+                        auto it = node_index.find(r);
+                        if (it != node_index.end() && it->second < n) {
+                            consumers[it->second].push_back(n);
+                        }
+                        r = r->view_src;
+                    }
+                }
+            }
+            std::vector<char> seen(cgraph->n_nodes, 0);
+            std::vector<int>  work;
+            std::vector<int>  closure;
+            for (size_t g = 0; g < n_subgraphs; g++) {
+                if (!cfg0[g].reduce) {
+                    continue;
+                }
+                const int b = (int) (g + 1 < n_subgraphs ? cfg0[g + 1].offset : cgraph->n_nodes) - 1;
+                ggml_tensor * cell = cgraph->nodes[b];
+                if (cell->view_src != nullptr || (cell->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                        b == cgraph->n_nodes - 1) {
+                    continue; // host/sched may read the cell itself - always deliver
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (!backend_ctx->wire_member[j]) {
+                        continue;
+                    }
+                    std::fill(seen.begin(), seen.end(), 0);
+                    work.assign(1, b);
+                    closure.clear();
+                    seen[b] = 1;
+                    bool safe = true;
+                    while (safe && !work.empty()) {
+                        const int gi = work.back();
+                        work.pop_back();
+                        for (const int c : consumers[gi]) {
+                            if (seen[c]) {
+                                continue;
+                            }
+                            seen[c] = 1;
+                            const ggml_tensor * ct = cgraph->nodes[c];
+                            if (ct->op == GGML_OP_VIEW || ct->op == GGML_OP_RESHAPE ||
+                                    ct->op == GGML_OP_PERMUTE || ct->op == GGML_OP_TRANSPOSE) {
+                                work.push_back(c); // pure view: aliases, executes nothing
+                                continue;
+                            }
+                            const ggml_tensor * cj = backend_ctx->backend_configs[j].nodes[c];
+                            if (cj == nullptr || cj == ct) {
+                                safe = false; // host view - opaque to this analysis
+                                break;
+                            }
+                            if ((cj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                                continue; // never executed on j
+                            }
+                            // executes on j reading a stale value -> garbage result
+                            if (is_cell[c] || (ct->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                                    ct->view_src != nullptr || c == cgraph->n_nodes - 1) {
+                                safe = false; // would reach a reduce / output / in-place write / piece end
+                                break;
+                            }
+                            closure.push_back(c);
+                            work.push_back(c);
+                        }
+                    }
+                    // contaminated nodes must be repairable cross-piece: a local
+                    // member that computes them holds the true value
+                    std::vector<int> closure_src(closure.size(), -1);
+                    for (size_t k = 0; safe && k < closure.size(); k++) {
+                        for (size_t m = 0; m < n_backends; m++) {
+                            if (!backend_ctx->wire_member[m] &&
+                                    (backend_ctx->backend_configs[m].nodes[closure[k]]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                                closure_src[k] = (int) m;
+                                break;
+                            }
+                        }
+                        safe = closure_src[k] >= 0;
+                    }
+                    if (!safe) {
+                        continue;
+                    }
+                    backend_ctx->backend_configs[j].cgraphs[g].deliver = false;
+                    backend_ctx->mark_stale(j, cell, 0);
+                    for (size_t k = 0; k < closure.size(); k++) {
+                        backend_ctx->mark_stale(j, cgraph->nodes[closure[k]], closure_src[k]);
+                    }
+                    static const bool debug_skip = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                    if (debug_skip) {
+                        fprintf(stderr, "SKIP-WB: boundary %4d '%s' member %zu (closure %zu)\n",
+                                b, cell->name, j, closure.size());
+                    }
+                }
+            }
         }
 
         backend_ctx->n_subgraphs = n_subgraphs;
@@ -3149,20 +4218,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         // register the build; its per-member state stays live in backend_configs
         // until another build is activated. Entries past the shadow-ring horizon
-        // were dropped during lookup, cap the rest by LRU.
-        while (backend_ctx->builds.size() >= (size_t) (backend_ctx->ring_slots - 1)) {
-            size_t lru = 0;
-            for (size_t k = 1; k < backend_ctx->builds.size(); k++) {
-                if (backend_ctx->builds[k]->used_seq < backend_ctx->builds[lru]->used_seq) {
-                    lru = k;
+        // were dropped during lookup, cap the rest by LRU - per class: chunked
+        // pieces (uid 0, eval-callback chunking) arrive ~2 per layer per outer
+        // graph, so counting them against the outer cap evicted every one of
+        // them before reuse (permanent rebuild churn, the trunc20 corruption).
+        {
+            const bool  chunk = cgraph->uid == 0;
+            const size_t cap  = chunk ? std::max((size_t) 256, (size_t) (8*backend_ctx->ring_slots))
+                                      : (size_t) (backend_ctx->ring_slots - 1);
+            for (;;) {
+                size_t n_class = 0;
+                size_t lru     = SIZE_MAX;
+                for (size_t k = 0; k < backend_ctx->builds.size(); k++) {
+                    if ((backend_ctx->builds[k]->outer_uid == 0) != chunk) {
+                        continue;
+                    }
+                    n_class++;
+                    if (lru == SIZE_MAX || backend_ctx->builds[k]->used_seq < backend_ctx->builds[lru]->used_seq) {
+                        lru = k;
+                    }
                 }
+                if (n_class < cap) {
+                    break;
+                }
+                backend_ctx->builds.erase(backend_ctx->builds.begin() + lru);
             }
-            backend_ctx->builds.erase(backend_ctx->builds.begin() + lru);
         }
         auto build_new = std::make_unique<ggml_backend_meta_context::meta_build>();
         build_new->key         = outer_key;
         build_new->outer_uid   = cgraph->uid;
-        build_new->built_seq   = backend_ctx->rebuild_seq;
+        build_new->built_seq   = backend_ctx->reset_seq;
         build_new->used_seq    = backend_ctx->use_seq;
         build_new->n_subgraphs = n_subgraphs;
         build_new->ctx         = std::move(build_ctx);
@@ -3170,6 +4255,73 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         build_new->nodes.resize(n_backends);
         backend_ctx->builds.push_back(std::move(build_new));
         backend_ctx->build_active = backend_ctx->builds.back().get();
+    }
+
+    // TASKS #9 repair pass: if any member holds by-design-stale values (skipped
+    // deliveries / hidden single-contributor windows, both decided by an EARLIER
+    // piece) and a node of THIS piece computes on one, restore it first from a
+    // member that holds the true value. This is what makes cross-piece consumers
+    // safe: the deciding piece can only prove safety within itself. The per-build
+    // repair list is cached and revalidated whenever the stale registry changes.
+    if (bcast_fuse >= 1 && backend_ctx->stale_seq != 0) {
+        ggml_backend_meta_context::meta_build * build_a = backend_ctx->build_active;
+        if (build_a->repair_seq != backend_ctx->stale_seq) {
+            build_a->repair_seq = backend_ctx->stale_seq;
+            build_a->repairs.clear();
+            std::unordered_set<const ggml_tensor *> produced;
+            produced.reserve(cgraph->n_nodes);
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                produced.insert(cgraph->nodes[n]);
+            }
+            std::set<std::pair<const ggml_tensor *, size_t>> dedup;
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    const ggml_tensor * r = t->src[s];
+                    if (r == nullptr) {
+                        continue;
+                    }
+                    while (r->view_src != nullptr) {
+                        r = r->view_src; // reading a view reads its base
+                    }
+                    if (r->buffer == nullptr || !ggml_backend_buffer_is_meta(r->buffer)) {
+                        continue;
+                    }
+                    if (produced.count(r) != 0) {
+                        continue; // recomputed by this piece before any use
+                    }
+                    const uint64_t buf_uid = ((ggml_backend_meta_buffer_context *) r->buffer->context)->uid;
+                    const auto key = std::make_pair(buf_uid, (const void *) r->data);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        const auto it = backend_ctx->stale_map[j].find(key);
+                        if (it == backend_ctx->stale_map[j].end() || !it->second.fp.matches(r)) {
+                            continue;
+                        }
+                        const ggml_tensor * nj = backend_ctx->backend_configs[j].nodes[n];
+                        if (nj == nullptr || nj == t || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                            continue; // not executed on j - the stale value stays unread
+                        }
+                        if (!dedup.insert({r, j}).second) {
+                            continue;
+                        }
+                        build_a->repairs.push_back({it->second.src_member, (int) j, r});
+                        static const bool debug_repair = getenv("GGML_META_DEBUG_REDUCE") != nullptr;
+                        if (debug_repair) {
+                            fprintf(stderr, "REPAIR: piece reads stale '%s' on member %zu - restoring from member %d\n",
+                                    r->name, j, it->second.src_member);
+                        }
+                    }
+                }
+            }
+        }
+        backend_ctx->bs_repairs += (int64_t) build_a->repairs.size();
+        for (const auto & rc : build_a->repairs) {
+            ggml_tensor * src_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_src);
+            ggml_tensor * dst_t = ggml_backend_meta_buffer_ensure_simple_tensor(rc.t, rc.j_dst);
+            GGML_ASSERT(src_t != nullptr && dst_t != nullptr);
+            ggml_backend_tensor_copy_async(backend_ctx->backend_configs[rc.j_src].backend,
+                                           backend_ctx->backend_configs[rc.j_dst].backend, src_t, dst_t);
+        }
     }
 
     size_t iga = 0; // i graph aux
@@ -3213,12 +4365,124 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // a fused response is pending, which would desync the stream.
     static const bool no_fused = getenv("GGML_META_NO_FUSED") != nullptr;
     // requires the star reduce: a carried fetch is only ever consumed by the star
-    // gather, so with GGML_META_NO_STAR the pipeline must stay off too
-    const bool fused_enabled = !no_fused && !tm_enabled &&
+    // gather, so with GGML_META_NO_STAR the pipeline must stay off too.
+    // Chunked pieces (uid 0: eval-callback graph views) stay off the pipeline -
+    // its piece-boundary invariant does not hold across chunk-sized calls, and
+    // wire members then compute from desynced state (~5e-2 logits per decode
+    // pass; the whole ladder is in research/84-seam-dissection-2026-08-04.md)
+    const bool fused_enabled = !no_fused && !tm_enabled && cgraph->uid != 0 &&
         getenv("GGML_META_NO_STAR") == nullptr &&
         backend_ctx->fused_send != nullptr && backend_ctx->fused_recv != nullptr;
-    std::vector<int>  fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
-    std::vector<char> fused_fetch_pending(n_backends, 0); // member's boundary-i partial arrives via fused_recv
+    std::vector<int>    fused_carried(n_backends, 0);       // member's next N subgraph dispatches already sent
+    std::vector<size_t> fused_fetch_pending(n_backends, 0); // nbytes of the member's pending fused-FETCH partial (0 = none)
+
+    // TASKS #71 probe: GGML_META_PROBE_DEFER_GATHER=1 - the star gather stops
+    // waiting for WIRE members' partials: their fused responses are drained one
+    // reduce boundary LATE (values DISCARDED, slot zeroed) and their plain reads
+    // are skipped, so each sum holds local contributions only. OUTPUT IS GARBAGE
+    // BY DESIGN - this exists solely to price the Expert-Deferral ceiling (owner
+    // compute overlapping wire arrival). Never serve with it. Draining one
+    // boundary late (not at graph end) keeps TCP backpressure off the workers.
+    static const bool probe_defer_gather = getenv("GGML_META_PROBE_DEFER_GATHER") != nullptr;
+    // TASKS #71 Expert Deferral (the real mechanism the probe priced at +32%):
+    // an ELIGIBLE reduce sums local contributions only and distributes; the wire
+    // members' fused partials are drained at the NEXT reduce and ADDED there, so
+    // the stream is corrected additively one reduce late and owners never stall
+    // on wire arrival. Eligible = a next same-size star reduce exists (the
+    // injection point) - the last reduce of a graph always gathers fully, which
+    // keeps the logits path exact-sum. Lossy by construction (the layer between
+    // defer and inject reads the uncorrected stream): PPL + coherence gated,
+    // default off.
+    //   =1 (v2) READINESS-GATED: each candidate's socket is polled at the
+    //      gather - a response that already arrived is consumed exactly, only
+    //      actual stragglers defer, so the perturbation scales with real
+    //      lateness instead of total wire mass.
+    //   =2 (v1) defer ALL wire partials - measurement only: the majority of
+    //      each layer's expert mass lands one reduce late and coherence
+    //      COLLAPSES on real fleets (measured 2026-07-28).
+    // GGML_META_EXPERT_DEFER_WAIT_US: grace window a not-yet-ready response is
+    // given before it is declared a straggler (busy-poll; 0 = none).
+    // GGML_META_EXPERT_DEFER_SYNC_EDGE: the first/last k multi-contributor
+    // reduces of the graph never defer (shallow/deep layers tolerate it worst).
+    static const int expert_defer_mode = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    const bool expert_defer = expert_defer_mode != 0;
+    static const int64_t defer_wait_us = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_WAIT_US");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
+    static const int64_t defer_sync_edge = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_SYNC_EDGE");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
+    // GGML_META_EXPERT_DEFER_VERIFY: widen the v3 decode-only gate to
+    // spec-verify-shaped boundaries (ne[1] <= value, i.e. set to 1 + n_draft
+    // max). 0/absent = decode-only. Prefill stays excluded either way; the
+    // injection-shape walk below already rejects cross-shape defers.
+    static const int64_t defer_verify_max = [] {
+        const char * env = getenv("GGML_META_EXPERT_DEFER_VERIFY");
+        return env != nullptr ? (int64_t) atoll(env) : 0;
+    }();
+    int64_t ed_star_ord = 0; // ordinal of the current multi-contributor star reduce
+    std::vector<char>    defer_now(n_backends, 0); // this boundary's per-member defer decision
+    std::vector<char>    defer_drain_pending(n_backends, 0);
+    std::vector<size_t>  defer_drain_nbytes (n_backends, 0);
+    std::vector<char>    defer_drained(n_backends, 0);      // drained this boundary, awaiting injection
+    std::vector<size_t>  defer_drained_nbytes(n_backends, 0);
+    std::vector<std::vector<uint8_t>> defer_bufs(n_backends);
+    auto drain_deferred = [&]() {
+        for (size_t j = 0; j < n_backends; j++) {
+            if (!defer_drain_pending[j]) {
+                continue;
+            }
+            if (defer_bufs[j].size() < defer_drain_nbytes[j]) {
+                defer_bufs[j].resize(defer_drain_nbytes[j]);
+            }
+            // a failed recv zero-fills - injecting that adds nothing but would
+            // count as a correction; drop it and count loudly like a shape miss
+            if (backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                        defer_bufs[j].data(), defer_drain_nbytes[j])) {
+                defer_drained[j]        = 1;
+                defer_drained_nbytes[j] = defer_drain_nbytes[j];
+            } else {
+                backend_ctx->ed_lost++;
+            }
+            defer_drain_pending[j]  = 0;
+        }
+    };
+
+    // An early error return must not abandon an in-flight fused FETCH: the
+    // socket-side stash has no graph tag, decode-graph star boundaries share
+    // nbytes, so the NEXT graph's fused_recv would claim the stale payload and
+    // every later gather would run one boundary late - permanently and
+    // silently. Drain whatever is still owed on ANY exit; a clean exit has
+    // consumed everything and this is a no-op.
+    struct fetch_drain_guard_t {
+        ggml_backend_meta_context * ctx;
+        std::vector<size_t> * fetch_pending;
+        std::vector<char>   * drain_pending;
+        std::vector<size_t> * drain_nbytes;
+        ~fetch_drain_guard_t() {
+            std::vector<uint8_t> discard;
+            for (size_t j = 0; j < fetch_pending->size(); j++) {
+                size_t nb = (*fetch_pending)[j];
+                if (nb == 0 && (*drain_pending)[j]) {
+                    nb = (*drain_nbytes)[j];
+                }
+                if (nb == 0) {
+                    continue;
+                }
+                if (discard.size() < nb) {
+                    discard.resize(nb);
+                }
+                ctx->fused_recv(ctx->backend_configs[j].backend, discard.data(), nb);
+                (*fetch_pending)[j] = 0;
+                (*drain_pending)[j] = 0;
+            }
+        }
+    } fetch_drain_guard { backend_ctx, &fused_fetch_pending, &defer_drain_pending, &defer_drain_nbytes };
 
     // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
@@ -3265,25 +4529,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     next_nbytes = ggml_nbytes(next_node(0));
                 }
             }
+            // TASKS #9 probe: GGML_META_PROBE_NO_WRITEBACK=1 skips delivering the
+            // reduced value to non-root members (chain-only fused messages; no plain
+            // set). OUTPUT IS GARBAGE BY DESIGN - this exists solely to price the
+            // writeback's true wall-clock share, which the per-boundary timing drains
+            // cannot see. Never serve with it.
+            static const bool probe_no_wb = getenv("GGML_META_PROBE_NO_WRITEBACK") != nullptr;
             std::vector<ggml_cgraph *> chain;
             for (size_t j = 0; j < n_backends; j++) {
                 if (j == j_skip) {
                     continue;
                 }
                 auto & bcj = backend_ctx->backend_configs[j];
+                // TASKS #9 delivery skip: the value is withheld from members whose
+                // rebuild-time analysis proved it unconsumed; the fused message
+                // still carries the subgraph chain (value-less messages are the
+                // exact shape the NO_WRITEBACK probe priced at ~47 ms/token)
+                const bool deliver_j = !probe_no_wb && bcj.cgraphs[i].deliver;
+                if (backend_ctx->wire_member[j]) {
+                    if (deliver_j) {
+                        backend_ctx->bs_deliver_wire++;
+                        backend_ctx->bs_deliver_bytes += nbytes_v;
+                    } else {
+                        backend_ctx->bs_deliver_skip++;
+                    }
+                }
                 if (have_next && backend_ctx->wire_member[j]) {
                     chain.clear();
                     for (size_t g = i_next; g <= chain_end; g++) {
                         chain.push_back(bcj.cgraphs[g].cgraph_main);
                     }
                     const bool want_fetch = next_star && (next_node(j)->flags & GGML_TENSOR_FLAG_COMPUTE);
-                    if (backend_ctx->fused_send(bcj.backend, boundary_node(j), value, nbytes_v,
+                    if (backend_ctx->fused_send(bcj.backend, deliver_j ? boundary_node(j) : nullptr,
+                            value, deliver_j ? nbytes_v : 0,
                             chain.data(), (int) chain.size(),
                             want_fetch ? next_node(j) : nullptr, want_fetch ? next_nbytes : 0)) {
                         fused_carried[j]       = (int) chain.size();
-                        fused_fetch_pending[j] = want_fetch ? 1 : 0;
+                        fused_fetch_pending[j] = want_fetch ? next_nbytes : 0;
                         continue;
                     }
+                }
+                if (!deliver_j) {
+                    continue;
                 }
                 ggml_backend_tensor_set(boundary_node(j), value, 0, nbytes_v);
             }
@@ -3346,6 +4633,124 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 star_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node);
             }
             if (star_ok) {
+                backend_ctx->bs_star++;
+                ed_star_ord++;
+                // TASKS #71 inc-0 (GGML_META_ZL_STATS=1): attribute this decode
+                // gather's routed experts to members - counts how often each wire
+                // member holds ZERO routed experts (exactly the leg a dynamic
+                // skip would remove) and the owner group's routed-slot share.
+                // One 32-byte host read per gather; no-op without PLACE tables.
+                static const bool zl_stats = getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0;
+                static const bool zl_debug  = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+                if (zl_debug) {
+                    static int zl_dbg_n = 0;
+                    if (zl_dbg_n < 6) {
+                        zl_dbg_n++;
+                        std::lock_guard<std::mutex> dbg_lock(g_expert_owner_mtx);
+                        const auto it_dbg = g_routed_ids.find(g_routed_last_il);
+                        fprintf(stderr, "ZL-DBG: sg %zu ne1 %lld last_il %d owners %zu noted %s ids %d %d %d %d\n",
+                                (size_t) i, (long long) boundary_node(part[0])->ne[1],
+                                g_routed_last_il, g_expert_owner.size(),
+                                it_dbg != g_routed_ids.end() ? "yes" : "no",
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[0] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[1] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[2] : -1,
+                                it_dbg != g_routed_ids.end() && it_dbg->second.size() > 3 ? it_dbg->second[3] : -1);
+                    }
+                }
+                if (zl_stats && boundary_node(part[0])->ne[1] == 1) {
+                    // the boundary consumes the most recently NOTED layer's
+                    // routing (dataflow: topk-L computes, then L's reduce, then
+                    // topk-(L+1)) - robust to eval-callback graph splits
+                    {
+                        std::lock_guard<std::mutex> zl_lock(g_expert_owner_mtx);
+                        const auto it_own = g_expert_owner.find(g_routed_last_il);
+                        const auto it_ids = g_routed_ids.find(g_routed_last_il);
+                        if (it_own != g_expert_owner.end() && it_ids != g_routed_ids.end()) {
+                            const auto &  owner_of = it_own->second;
+                            const auto &  ids      = it_ids->second;
+                            const int64_t kk       = (int64_t) ids.size();
+                            int     member_hits[16] = {0};
+                            int64_t owner_slots     = 0;
+                            for (int64_t s = 0; s < kk; s++) {
+                                const int32_t e = ids[s];
+                                if (e < 0 || (size_t) e >= owner_of.size()) {
+                                    continue;
+                                }
+                                const int32_t jm = owner_of[e];
+                                if (jm >= 0 && jm < 16) {
+                                    member_hits[jm]++;
+                                    if ((size_t) jm < backend_ctx->wire_member.size() &&
+                                            !backend_ctx->wire_member[jm]) {
+                                        owner_slots++;
+                                    }
+                                }
+                            }
+                            backend_ctx->zl_gathers++;
+                            backend_ctx->zl_total_slots += kk;
+                            backend_ctx->zl_owner_slots += owner_slots;
+                            bool all_zero = true;
+                            for (size_t km = 0; km < part.size(); km++) {
+                                const size_t jm = part[km];
+                                if (jm < backend_ctx->wire_member.size() && backend_ctx->wire_member[jm] && jm < 16) {
+                                    if (member_hits[jm] == 0) {
+                                        backend_ctx->zl_zero[jm]++;
+                                    } else {
+                                        all_zero = false;
+                                    }
+                                }
+                            }
+                            if (all_zero) {
+                                backend_ctx->zl_free++;
+                            }
+                        }
+                    }
+                }
+                // TASKS #84 (GGML_META_UNION_STATS=1): expert-union width
+                // curve - distinct experts routed across ALL lanes of this
+                // boundary vs total routed slots, bucketed by lane width.
+                // Needs the widened id capture (llama_zl_ids_cb notes every
+                // lane when the env is set); member tier needs #75 tables.
+                // Pure host counters on already-noted ids - no device reads.
+                static const bool union_stats = getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0;
+                if (union_stats) {
+                    const int64_t w = boundary_node(part[0])->ne[1];
+                    if (w >= 1 && w <= 16) {
+                        std::lock_guard<std::mutex> us_lock(g_expert_owner_mtx);
+                        const auto it_all = g_routed_ids_all.find(g_routed_last_il);
+                        const auto it_k   = g_routed_k.find(g_routed_last_il);
+                        if (it_all != g_routed_ids_all.end() && it_k != g_routed_k.end() && it_k->second > 0 &&
+                                it_all->second.size() == it_k->second * (size_t) w) {
+                            // shape agreement (noted lanes == boundary lanes)
+                            // skips boundaries whose capture was clipped or
+                            // belongs to a different-width graph in flight
+                            const auto &      ids = it_all->second;
+                            std::set<int32_t> uniq;
+                            for (const int32_t e : ids) {
+                                if (e >= 0) {
+                                    uniq.insert(e);
+                                }
+                            }
+                            backend_ctx->us_bounds[w]++;
+                            backend_ctx->us_slots[w] += (int64_t) ids.size();
+                            backend_ctx->us_uniq[w]  += (int64_t) uniq.size();
+                            const auto it_own = g_expert_owner.find(g_routed_last_il);
+                            if (it_own != g_expert_owner.end()) {
+                                const auto & owner_of = it_own->second;
+                                auto & mem_acc = w == 1 ? backend_ctx->us_mem_uniq1 : backend_ctx->us_mem_uniq;
+                                for (const int32_t e : uniq) {
+                                    if ((size_t) e < owner_of.size()) {
+                                        const int32_t jm = owner_of[e];
+                                        if (jm >= 0 && jm < 16) {
+                                            mem_acc[jm]++;
+                                        }
+                                    }
+                                }
+                                (w == 1 ? backend_ctx->us_mem_bounds1 : backend_ctx->us_mem_bounds)++;
+                            }
+                        }
+                    }
+                }
                 const size_t nbytes = ggml_nbytes(boundary_node(part[0]));
                 const size_t n_vals = nbytes/sizeof(float);
                 auto & scratch = backend_ctx->star_scratch;
@@ -3356,17 +4761,174 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 std::vector<const ggml_tensor *> get_tensors(part.size());
                 std::vector<void *>              get_datas(part.size());
                 std::vector<size_t>              get_sizes(part.size(), nbytes);
+                if (probe_defer_gather || expert_defer) {
+                    drain_deferred(); // previous reduce's deferred wire responses
+                }
+                // v3: defer only on DECODE-shaped boundaries (single token).
+                // A late injection during prefill corrupts the KV every later
+                // token conditions on - measured on the record roster: ~10
+                // prefill defers/graph cost the same +0.6 PPL as 123 (the
+                // damage rides the poisoned context, not the defer count),
+                // and the serve-side artifact (prompt-quoting glitches) was
+                // prompt-KV corruption. Prefill amortizes boundaries across
+                // the ubatch anyway - the bubble deferral fills is a decode
+                // phenomenon. Override for measurement only.
+                static const bool defer_prefill = getenv("GGML_META_EXPERT_DEFER_PREFILL") != nullptr;
+                // deferral eligibility: the next reduce subgraph must be a
+                // same-size star (F32, contiguous, >= 2 contributors) so the
+                // deferred partial has an injection point of identical shape
+                bool defer_ok = false;
+                const int64_t defer_ne1 = boundary_node(part[0])->ne[1];
+                if (expert_defer && fused_enabled &&
+                        (defer_prefill || defer_ne1 == 1 ||
+                         (defer_verify_max > 0 && defer_ne1 <= defer_verify_max))) {
+                    // walk to the next MULTI-contributor reduce (single-contributor
+                    // reduces are owner broadcasts - drains do not run there); it
+                    // must be a same-size star so the injection shape matches
+                    int64_t n_multi_after = 0;
+                    for (size_t i_r2 = i + 1; i_r2 < backend_ctx->n_subgraphs; i_r2++) {
+                        if (!backend_ctx->backend_configs[0].cgraphs[i_r2].reduce) {
+                            continue;
+                        }
+                        size_t n_comp2 = 0;
+                        bool   ok2     = true;
+                        for (size_t j2 = 0; j2 < n_backends && ok2; j2++) {
+                            ggml_cgraph * cg2 = backend_ctx->backend_configs[j2].cgraphs[i_r2].cgraph_main;
+                            ggml_tensor * nd2 = cg2->nodes[cg2->n_nodes - 1];
+                            if (nd2->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                                n_comp2++;
+                                ok2 = nd2->type == GGML_TYPE_F32 && ggml_is_contiguous(nd2) &&
+                                      ggml_nbytes(nd2) == nbytes;
+                            }
+                        }
+                        if (n_comp2 >= 2) {
+                            if (n_multi_after == 0) {
+                                defer_ok = ok2; // the first multi-contributor reduce decides
+                                if (defer_sync_edge == 0) {
+                                    break;
+                                }
+                            }
+                            n_multi_after++; // the edge cap needs the full remaining count
+                        }
+                    }
+                    if (defer_sync_edge > 0 &&
+                            (ed_star_ord <= defer_sync_edge || n_multi_after < defer_sync_edge)) {
+                        defer_ok = false;
+                    }
+                }
+                // per-member defer decision. Mode 1 (v2): poll each candidate's
+                // socket - an already-arrived response is consumed exactly (the
+                // normal fused path below), only actual stragglers defer, after
+                // an optional grace window. Mode 2 / probe: every candidate defers.
+                if (defer_ok || probe_defer_gather) {
+                    int64_t n_wait = 0;
+                    for (size_t k = 0; k < part.size(); k++) {
+                        const size_t j = part[k];
+                        const bool cand = backend_ctx->wire_member[j] && fused_fetch_pending[j];
+                        if (cand && defer_ok && expert_defer_mode == 1) {
+                            defer_now[j] = backend_ctx->fused_ready != nullptr &&
+                                !backend_ctx->fused_ready(backend_ctx->backend_configs[j].backend) ? 1 : 0;
+                            n_wait += defer_now[j];
+                        } else {
+                            defer_now[j] = cand ? 1 : 0;
+                        }
+                    }
+                    if (n_wait > 0 && defer_wait_us > 0) {
+                        const int64_t t_end = ggml_time_us() + defer_wait_us;
+                        while (n_wait > 0 && ggml_time_us() < t_end) {
+                            for (size_t k = 0; k < part.size(); k++) {
+                                const size_t j = part[k];
+                                if (defer_now[j] &&
+                                        backend_ctx->fused_ready(backend_ctx->backend_configs[j].backend)) {
+                                    defer_now[j] = 0;
+                                    n_wait--;
+                                }
+                            }
+                            if (n_wait > 0) {
+                                // yield between sweeps - a hard spin starves the
+                                // very compute the window is waiting on
+                                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            }
+                        }
+                    }
+                    if (defer_ok && expert_defer_mode == 1) {
+                        for (size_t k = 0; k < part.size(); k++) {
+                            const size_t j = part[k];
+                            if (backend_ctx->wire_member[j] && fused_fetch_pending[j] && !defer_now[j]) {
+                                backend_ctx->ed_ready++;
+                            }
+                        }
+                    }
+                }
+                // TASKS #105: pre-reduce the local subgroup among themselves
+                // (NCCL/p2p over NVLink), then contribute ONE representative to
+                // the host sum - the others' partials are already inside it, so
+                // they must be skipped or they would be counted twice.
+                std::vector<char> sub_folded(n_backends, 0);
+                if (backend_ctx->comm_ctx_sub != nullptr) {
+                    bool all_present = true;
+                    for (size_t js : backend_ctx->comm_sub) {
+                        if (std::find(part.begin(), part.end(), js) == part.end()) {
+                            all_present = false;
+                            break;
+                        }
+                    }
+                    if (all_present) {
+                        std::vector<ggml_tensor *> sub_nodes;
+                        sub_nodes.reserve(backend_ctx->comm_sub.size());
+                        bool ok_sub = true;
+                        for (size_t js : backend_ctx->comm_sub) {
+                            ggml_tensor * nd = boundary_node(js);
+                            ok_sub = ok_sub && nd->type == GGML_TYPE_F32 && ggml_is_contiguous(nd) && ggml_nbytes(nd) == nbytes;
+                            sub_nodes.push_back(nd);
+                        }
+                        if (ok_sub && backend_ctx->comm_allreduce(backend_ctx->comm_ctx_sub, sub_nodes.data())) {
+                            for (size_t s = 1; s < backend_ctx->comm_sub.size(); s++) {
+                                sub_folded[backend_ctx->comm_sub[s]] = 1;
+                            }
+                            backend_ctx->bs_sub_reduces++;
+                        }
+                    }
+                }
                 size_t n_plain = 0;
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     auto & bcj = backend_ctx->backend_configs[j];
+                    if (sub_folded[j]) {
+                        // already inside the subgroup representative's value
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
+                    if (backend_ctx->wire_member[j] && fused_fetch_pending[j] &&
+                            (probe_defer_gather || defer_ok) && defer_now[j]) {
+                        // do not wait: defer the fused response to the next reduce;
+                        // zero the slot so the sum holds local contributions only
+                        defer_drain_pending[j] = 1;
+                        defer_drain_nbytes[j]  = nbytes;
+                        fused_fetch_pending[j] = 0;
+                        backend_ctx->ed_defers++;
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
+                    if (probe_defer_gather && backend_ctx->wire_member[j]) {
+                        // probe only: skip even the plain read (garbage by design);
+                        // real deferral reads non-fused wire partials synchronously
+                        // (their buffer cells recycle member-side, a late read is unsafe)
+                        memset(scratch.data() + k*nbytes, 0, nbytes);
+                        continue;
+                    }
                     if (fused_fetch_pending[j]) {
+                        backend_ctx->bs_parts_fused++;
                         continue; // its partial arrives as a fused response, collected below
                     }
                     if (!backend_ctx->wire_member[j]) {
                         // a local partial is read directly from device memory - order
                         // it behind the compute that produced it
                         ggml_backend_synchronize(bcj.backend);
+                        backend_ctx->bs_parts_local++;
+                    } else {
+                        backend_ctx->bs_parts_wire++;
+                        backend_ctx->bs_gather_bytes += nbytes;
                     }
                     get_backends[n_plain] = bcj.backend;
                     get_tensors[n_plain]  = boundary_node(j);
@@ -3383,9 +4945,29 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t k = 0; k < part.size(); k++) {
                     const size_t j = part[k];
                     if (fused_fetch_pending[j]) {
-                        backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
-                                                scratch.data() + k*nbytes, nbytes);
                         fused_fetch_pending[j] = 0;
+                        // a failed recv zero-fills its slot; summing that in would
+                        // broadcast a silently wrong total - fail the graph instead
+                        if (!backend_ctx->fused_recv(backend_ctx->backend_configs[j].backend,
+                                                     scratch.data() + k*nbytes, nbytes)) {
+                            GGML_LOG_ERROR("%s: fused fetch recv failed (member %zu) - failing the graph\n", "meta_reduce", j);
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                }
+                // GGML_META_DEBUG_BSUM=1: per-boundary value checksums, printed
+                // from the reduce itself so ctl and chunked legs are observable
+                // without an eval callback perturbing the graph (seam dissection)
+                static const bool bsum_debug = getenv("GGML_META_DEBUG_BSUM") != nullptr && atoi(getenv("GGML_META_DEBUG_BSUM")) != 0;
+                if (bsum_debug) {
+                    for (size_t k = 0; k < part.size(); k++) {
+                        const float * p = (const float *) (scratch.data() + k*nbytes);
+                        double s = 0.0;
+                        for (size_t v = 0; v < n_vals; v++) {
+                            s += p[v];
+                        }
+                        fprintf(stderr, "BSUM: %s w%lld m%zu %.9e\n",
+                                boundary_node(part[k])->name, (long long) boundary_node(part[0])->ne[1], part[k], s);
                     }
                 }
                 float * acc = (float *) scratch.data();
@@ -3393,6 +4975,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const float * p = (const float *) (scratch.data() + k*nbytes);
                     for (size_t v = 0; v < n_vals; v++) {
                         acc[v] += p[v];
+                    }
+                }
+                if (bsum_debug) {
+                    double s = 0.0;
+                    for (size_t v = 0; v < n_vals; v++) {
+                        s += acc[v];
+                    }
+                    fprintf(stderr, "BSUM: %s w%lld FINAL %.9e\n",
+                            boundary_node(part[0])->name, (long long) boundary_node(part[0])->ne[1], s);
+                }
+                if (expert_defer) {
+                    // inject the previous reduce's deferred wire partials: the
+                    // stream downstream of this boundary is corrected additively
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (!defer_drained[j]) {
+                            continue;
+                        }
+                        if (defer_drained_nbytes[j] != nbytes) {
+                            backend_ctx->ed_lost++; // shape moved under us - drop, count loudly
+                            defer_drained[j] = 0;
+                            continue;
+                        }
+                        const float * p = (const float *) defer_bufs[j].data();
+                        for (size_t v = 0; v < n_vals; v++) {
+                            acc[v] += p[v];
+                        }
+                        defer_drained[j] = 0;
+                        backend_ctx->ed_injects++;
                     }
                 }
                 fused_distribute(SIZE_MAX, acc, nbytes);
@@ -3436,9 +5046,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         if (part.size() == 1) {
             // the sum IS the single computer's value: broadcast it
+            backend_ctx->bs_bcast1++;
             const size_t j_src = part[0];
             auto & bcs = backend_ctx->backend_configs[j_src];
             ggml_tensor * node_src = boundary_node(j_src);
+            static const bool bsum_debug_bc = getenv("GGML_META_DEBUG_BSUM") != nullptr && atoi(getenv("GGML_META_DEBUG_BSUM")) != 0;
+            if (bsum_debug_bc && node_src->type == GGML_TYPE_F32 && ggml_is_contiguous(node_src)) {
+                const size_t nb_bc = ggml_nbytes(node_src);
+                std::vector<char> tmp_bc(nb_bc);
+                ggml_backend_synchronize(bcs.backend);
+                ggml_backend_tensor_get(node_src, tmp_bc.data(), 0, nb_bc);
+                double s = 0.0;
+                const float * p = (const float *) tmp_bc.data();
+                for (size_t v = 0; v < nb_bc/sizeof(float); v++) {
+                    s += p[v];
+                }
+                fprintf(stderr, "BSUM: %s w%lld BCAST1 m%zu %.9e\n",
+                        node_src->name, (long long) node_src->ne[1], j_src, s);
+            }
             // local sole computer + fused pipeline: read the value once and push it
             // with each wire member's next subgraph chain in one message (the copy
             // path below pays a bridged copy per member and carries nothing)
@@ -3460,7 +5085,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             std::vector<ggml_backend_t> backends_src, backends_dst;
             std::vector<ggml_tensor *>  srcs, dsts;
             for (size_t j = 0; j < n_backends; j++) {
-                if (j == j_src) {
+                if (j == j_src || !backend_ctx->backend_configs[j].cgraphs[i].deliver) {
                     continue;
                 }
                 backends_src.push_back(bcs.backend);
@@ -3477,6 +5102,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             return GGML_STATUS_SUCCESS;
         }
+
+        backend_ctx->bs_butterfly++;
 
         // pulls of one reduce step are collected and flushed together: the batch
         // proc (RPC) overlaps them on the wire, the per-pair path serializes on
@@ -3667,25 +5294,213 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (tm_enabled) {
                 tm_sync_all();
                 const int64_t t = ggml_time_us();
-                backend_ctx->tm_reduce_us += t - tm_last;
+                // classify by the boundary node's name: attn_out* boundaries are the
+                // owner broadcast (non-owners contribute exact zeros); the rest are
+                // true partial-sum reduces (expert merge, exit projections). Under
+                // GGML_META_BCAST_FUSE the owner broadcast lands on ffn_inp instead.
+                const ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                const char * bname = cg0->n_nodes > 0 ? cg0->nodes[cg0->n_nodes-1]->name : "";
+                if (strncmp(bname, "attn_out", 8) == 0 || strncmp(bname, "ffn_inp", 7) == 0) {
+                    backend_ctx->tm_bcast_us += t - tm_last;
+                    backend_ctx->tm_bcasts++;
+                } else {
+                    backend_ctx->tm_reduce_us += t - tm_last;
+                    backend_ctx->tm_reduces++;
+                }
                 tm_last = t;
-                backend_ctx->tm_reduces++;
+            }
+        }
+    }
+    if (probe_defer_gather || expert_defer) {
+        drain_deferred(); // the last reduce's deferred responses
+        if (expert_defer) {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (defer_drained[j]) {
+                    // no reduce left to inject into - contribution dropped; the
+                    // eligibility rule should keep this at zero
+                    backend_ctx->ed_lost++;
+                    defer_drained[j] = 0;
+                }
             }
         }
     }
     if (tm_enabled && ++backend_ctx->tm_graphs >= 128) {
-        fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
+        fprintf(stderr, "META_TIMING: %" PRId64 " graphs: compute %.2f ms/graph, attn-bcast %.2f ms/graph over %.1f, reduce %.2f ms/graph over %.1f boundaries/graph, build cache %" PRId64 "/%" PRId64 " hits\n",
                 backend_ctx->tm_graphs,
                 backend_ctx->tm_compute_us / 1000.0 / backend_ctx->tm_graphs,
+                backend_ctx->tm_bcast_us   / 1000.0 / backend_ctx->tm_graphs,
+                (double) backend_ctx->tm_bcasts / backend_ctx->tm_graphs,
                 backend_ctx->tm_reduce_us  / 1000.0 / backend_ctx->tm_graphs,
                 (double) backend_ctx->tm_reduces / backend_ctx->tm_graphs,
                 backend_ctx->tm_build_hits, backend_ctx->tm_build_hits + backend_ctx->tm_build_misses);
         backend_ctx->tm_compute_us = 0;
         backend_ctx->tm_reduce_us  = 0;
         backend_ctx->tm_reduces    = 0;
+        backend_ctx->tm_bcast_us   = 0;
+        backend_ctx->tm_bcasts     = 0;
         backend_ctx->tm_graphs     = 0;
         backend_ctx->tm_build_hits   = 0;
         backend_ctx->tm_build_misses = 0;
+    }
+    // GGML_META_BOUNDARY_STATS=1: structural tallies of the boundary traffic
+    // (production-valid - pure counters, no drains). Aims the next reduce-share
+    // lever: how many partials ride the fused pre-request vs cost a plain read,
+    // and how much writeback the delivery skip actually removes.
+    static const bool bs_enabled = getenv("GGML_META_BOUNDARY_STATS") != nullptr;
+    if (bs_enabled && ++backend_ctx->bs_graphs >= 128) {
+        fprintf(stderr, "META_BOUNDARY_STATS: %" PRId64 " graphs: bcast1 %.1f star %.1f butterfly %.1f /graph; "
+                "parts fused %.1f wire %.1f local %.1f /graph, gather %.1f KiB/graph; "
+                "wire deliveries %.1f (skipped %.1f) /graph, %.1f KiB/graph; repairs %.2f /graph\n",
+                backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_bcast1      / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_star        / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_butterfly   / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_fused / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_wire  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_parts_local / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_gather_bytes  / 1024.0 / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_wire  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_skip  / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_deliver_bytes / 1024.0 / backend_ctx->bs_graphs,
+                (double) backend_ctx->bs_repairs       / backend_ctx->bs_graphs);
+        if (backend_ctx->bs_sub_reduces > 0) {
+            fprintf(stderr, "META_LOCAL_COMM: %.1f subgroup pre-reduces/graph (%zu members)\n",
+                    (double) backend_ctx->bs_sub_reduces / backend_ctx->bs_graphs, backend_ctx->comm_sub.size());
+            backend_ctx->bs_sub_reduces = 0;
+        }
+        if (backend_ctx->ed_defers + backend_ctx->ed_ready + backend_ctx->ed_injects + backend_ctx->ed_lost > 0) {
+            const double cand = (double) (backend_ctx->ed_defers + backend_ctx->ed_ready);
+            fprintf(stderr, "META_EXPERT_DEFER: defers %.1f ready %.1f (rate %.1f%%) injects %.1f LOST %.2f /graph\n",
+                    (double) backend_ctx->ed_defers  / backend_ctx->bs_graphs,
+                    (double) backend_ctx->ed_ready   / backend_ctx->bs_graphs,
+                    cand > 0 ? 100.0 * backend_ctx->ed_defers / cand : 0.0,
+                    (double) backend_ctx->ed_injects / backend_ctx->bs_graphs,
+                    (double) backend_ctx->ed_lost    / backend_ctx->bs_graphs);
+            backend_ctx->ed_defers = backend_ctx->ed_ready = backend_ctx->ed_injects = backend_ctx->ed_lost = 0;
+        }
+        if (backend_ctx->zl_gathers > 0) {
+            char zbuf[256];
+            int  zo = 0;
+            for (size_t j = 0; j < backend_ctx->wire_member.size() && j < 16; j++) {
+                if (backend_ctx->wire_member[j]) {
+                    zo += snprintf(zbuf + zo, sizeof(zbuf) - zo, " m%zu %.1f%%", j,
+                                   100.0 * backend_ctx->zl_zero[j] / backend_ctx->zl_gathers);
+                }
+            }
+            fprintf(stderr, "META_ZL: %" PRId64 " decode gathers: zero-leg%s; all-local %.1f%%; owner slot share %.1f%%\n",
+                    backend_ctx->zl_gathers, zbuf,
+                    100.0 * backend_ctx->zl_free / backend_ctx->zl_gathers,
+                    backend_ctx->zl_total_slots > 0 ? 100.0 * backend_ctx->zl_owner_slots / backend_ctx->zl_total_slots : 0.0);
+            backend_ctx->zl_gathers = backend_ctx->zl_free = 0;
+            backend_ctx->zl_owner_slots = backend_ctx->zl_total_slots = 0;
+            backend_ctx->zl_zero.fill(0);
+        }
+        {
+            // TASKS #84: META_UNION dump - per width bucket the mean distinct-
+            // expert union per boundary, and its multiplier vs the width-1
+            // floor (the number the #52 law assumed equals the width)
+            int64_t us_total = 0;
+            for (size_t w = 1; w < backend_ctx->us_bounds.size(); w++) {
+                us_total += backend_ctx->us_bounds[w];
+            }
+            if (us_total > 0) {
+                char ubuf[512];
+                int  uo = 0;
+                const double u1 = backend_ctx->us_bounds[1] > 0 ?
+                    (double) backend_ctx->us_uniq[1] / backend_ctx->us_bounds[1] : 0.0;
+                for (size_t w = 1; w < backend_ctx->us_bounds.size() && uo < (int) sizeof(ubuf) - 64; w++) {
+                    if (backend_ctx->us_bounds[w] == 0) {
+                        continue;
+                    }
+                    const double uw = (double) backend_ctx->us_uniq[w] / backend_ctx->us_bounds[w];
+                    uo += snprintf(ubuf + uo, sizeof(ubuf) - uo, " | w%zu g %" PRId64 " uniq/b %.2f slots/b %.2f",
+                                   w, backend_ctx->us_bounds[w], uw,
+                                   (double) backend_ctx->us_slots[w] / backend_ctx->us_bounds[w]);
+                    if (w > 1 && u1 > 0) {
+                        uo += snprintf(ubuf + uo, sizeof(ubuf) - uo, " mult %.2f", uw / u1);
+                    }
+                }
+                fprintf(stderr, "META_UNION:%s\n", ubuf);
+                if (backend_ctx->us_mem_bounds > 0 || backend_ctx->us_mem_bounds1 > 0) {
+                    char mbuf[512];
+                    int  mo = 0;
+                    for (size_t j = 0; j < backend_ctx->wire_member.size() && j < 16 && mo < (int) sizeof(mbuf) - 32; j++) {
+                        if (!backend_ctx->wire_member[j]) {
+                            continue;
+                        }
+                        mo += snprintf(mbuf + mo, sizeof(mbuf) - mo, " m%zu %.2f/%.2f", j,
+                                       backend_ctx->us_mem_bounds  > 0 ? (double) backend_ctx->us_mem_uniq[j]  / backend_ctx->us_mem_bounds  : 0.0,
+                                       backend_ctx->us_mem_bounds1 > 0 ? (double) backend_ctx->us_mem_uniq1[j] / backend_ctx->us_mem_bounds1 : 0.0);
+                    }
+                    fprintf(stderr, "META_UNION_MEM: owned-uniq/boundary multi/floor:%s\n", mbuf);
+                }
+                backend_ctx->us_bounds.fill(0);
+                backend_ctx->us_slots.fill(0);
+                backend_ctx->us_uniq.fill(0);
+                backend_ctx->us_mem_uniq.fill(0);
+                backend_ctx->us_mem_uniq1.fill(0);
+                backend_ctx->us_mem_bounds = backend_ctx->us_mem_bounds1 = 0;
+            }
+        }
+        backend_ctx->bs_bcast1 = backend_ctx->bs_star = backend_ctx->bs_butterfly = 0;
+        backend_ctx->bs_parts_fused = backend_ctx->bs_parts_wire = backend_ctx->bs_parts_local = 0;
+        backend_ctx->bs_gather_bytes = backend_ctx->bs_deliver_wire = backend_ctx->bs_deliver_skip = 0;
+        backend_ctx->bs_deliver_bytes = backend_ctx->bs_repairs = 0;
+        backend_ctx->bs_graphs = 0;
+    }
+    // TASKS #75 gate 4: expert ownership audit (no-op unless GGML_META_DEBUG>0)
+    ggml_backend_meta_expert_audit(backend, cgraph);
+    // GGML_META_DEBUG_KVSUM=<name-substring>: per-member checksums of matching
+    // cache leafs after every compute call (two-owner seam dissection: does a
+    // non-root owner's KV write go wrong under chunking, or only its read)
+    static const char * kvsum = getenv("GGML_META_DEBUG_KVSUM");
+    if (kvsum != nullptr && kvsum[0] != '\0') {
+        // chunk views carry no leafs - find the cache tensors through node srcs
+        // and their view sources instead
+        std::set<ggml_tensor *> kv_targets;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            for (int s = -1; s < GGML_MAX_SRC; s++) {
+                ggml_tensor * t = s < 0 ? node->view_src : node->src[s];
+                if (t == nullptr) {
+                    continue;
+                }
+                if (t->view_src != nullptr) {
+                    t = t->view_src;
+                }
+                if (strstr(t->name, kvsum) != nullptr) {
+                    kv_targets.insert(t);
+                }
+            }
+        }
+        for (ggml_tensor * leaf : kv_targets) {
+            if (leaf->buffer == nullptr || !ggml_backend_buffer_is_meta(leaf->buffer)) {
+                continue;
+            }
+            if (leaf->type != GGML_TYPE_F32 && leaf->type != GGML_TYPE_F16) {
+                continue;
+            }
+            const size_t nb_kv = ggml_nbytes(leaf);
+            std::vector<char> tmp_kv(nb_kv);
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_tensor * st = ggml_backend_meta_buffer_ensure_simple_tensor(leaf, j);
+                if (st == nullptr || st->buffer == nullptr || ggml_nbytes(st) == 0) {
+                    continue;
+                }
+                const size_t nb_j = std::min(nb_kv, ggml_nbytes(st));
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                ggml_backend_tensor_get(st, tmp_kv.data(), 0, nb_j);
+                double s = 0.0;
+                if (leaf->type == GGML_TYPE_F32) {
+                    const float * p = (const float *) tmp_kv.data();
+                    for (size_t v = 0; v < nb_j/sizeof(float); v++) s += p[v];
+                } else {
+                    const ggml_fp16_t * p = (const ggml_fp16_t *) tmp_kv.data();
+                    for (size_t v = 0; v < nb_j/sizeof(ggml_fp16_t); v++) s += ggml_fp16_to_fp32(p[v]);
+                }
+                fprintf(stderr, "KVSUM: %s m%zu %.9e\n", leaf->name, j, s);
+            }
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -3711,6 +5526,24 @@ static const ggml_backend_i ggml_backend_meta_i = {
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;
+}
+
+void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_threads) {
+    if (!ggml_backend_is_meta(backend)) {
+        return;
+    }
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    for (auto & bc : backend_ctx->backend_configs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bc.backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto set_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_fn != nullptr) {
+            set_fn(bc.backend, n_threads);
+        }
+    }
 }
 
 static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {

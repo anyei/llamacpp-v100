@@ -7,19 +7,17 @@
 #
 #   docker compose -f docker-compose.registry.yml up -d
 #
-# Bound to the private LAN interface only (same threat model as the RPC workers:
-# no auth/TLS, trusted network). Workers need this box in "insecure-registries".
+# Bound to all interfaces (same threat model as the RPC workers: no auth/TLS,
+# trusted networks only). Covers localhost pushes, the fleet LAN (10.5.5.1) and
+# the home LAN (192.168.68.x, DHCP on wlan0 — which is why we don't pin that IP).
+# Workers need this box in "insecure-registries".
 services:
   registry:
     image: registry:2
     container_name: llamacpp-registry
     restart: always
     ports:
-      # localhost: push side on this box (docker's TLS exemption covers only localhost,
-      # and adding insecure-registries here would need a dockerd restart = kills prod containers)
-      - "127.0.0.1:5000:5000"
-      # LAN: pull side for the worker boxes (they add 10.5.5.1:5000 to insecure-registries)
-      - "10.5.5.1:5000:5000"
+      - "5000:5000"
     environment:
       # allow DELETE of manifests so old tags can be pruned + garbage-collected
       REGISTRY_STORAGE_DELETE_ENABLED: "true"

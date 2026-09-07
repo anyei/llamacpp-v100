@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-expert-placement.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -21,8 +22,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <ctime>
+#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -44,6 +47,31 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
             return "enabled";
     }
     GGML_ABORT("fatal error");
+}
+
+const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+    switch (load_mode) {
+        case LLAMA_LOAD_MODE_NONE:
+            return "none";
+        case LLAMA_LOAD_MODE_MMAP:
+            return "mmap";
+        case LLAMA_LOAD_MODE_MLOCK:
+            return "mlock";
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            return "mmap+mlock";
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            return "dio";
+    }
+    GGML_ABORT("fatal error");
+}
+
+enum llama_load_mode llama_load_mode_from_str(const char * str) {
+    if (std::strcmp(str, "none") == 0)       { return LLAMA_LOAD_MODE_NONE;       }
+    if (std::strcmp(str, "mmap") == 0)       { return LLAMA_LOAD_MODE_MMAP;       }
+    if (std::strcmp(str, "mlock") == 0)      { return LLAMA_LOAD_MODE_MLOCK;      }
+    if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+    if (std::strcmp(str, "dio") == 0)        { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    throw std::invalid_argument(std::string("unknown load mode: ") + str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
@@ -143,18 +171,47 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             // CPU RAM + NVMe: 3.54 vs ~2.5 t/s on 2x V100 for DeepSeek-V4-Flash).
             const char * attn_owner_env = getenv("LLAMA_META_ATTN_OWNER");
             if (attn_owner_env != nullptr && atoi(attn_owner_env) >= 0) {
-                size_t n_local = 0;
+                size_t n_local_gpu = 0;
+                size_t n_local_cpu = 0;
                 for (size_t i = 0; i < n_devs; ++i) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(params.devices[i]);
                     if (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC")) {
-                        n_local++;
+                        if (ggml_backend_dev_type(params.devices[i]) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            n_local_cpu++;
+                        } else {
+                            n_local_gpu++;
+                        }
                     }
                 }
-                if (n_local > 1) {
-                    LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) supports at most "
-                                    "one local GPU (the attention owner), but %zu local members were given. Put experts "
-                                    "on RPC workers, or use both local GPUs via single-box '-sm tensor -ngl 99 -ncmoe N' "
-                                    "(faster when experts fit CPU RAM+NVMe).\n", __func__, n_local);
+                // an owner GROUP (TASKS #70, comma list e.g. "0,1") legitimately
+                // spans that many local members - attention head-splits among them
+                size_t n_owners = 1;
+                for (const char * p = attn_owner_env; *p != '\0'; p++) {
+                    n_owners += *p == ',';
+                }
+                // local CPU members are valid NON-owner expert members (#118): the
+                // member math is that of a remote CPU worker minus the socket. Only
+                // a local GPU outside the owner group stays gated (the #48 class).
+                if (n_local_cpu > 0 && n_local_gpu <= n_owners) {
+                    LLAMA_LOG_INFO("%s: %zu local CPU expert member(s) alongside %zu attention owner(s)\n",
+                                   __func__, n_local_cpu, n_owners);
+                }
+                // LLAMA_META_ALLOW_MULTI_LOCAL=1: re-test gate for the #48 corruption
+                // after major merges - outputs MUST pass the coherence gate before
+                // trusting a multi-local EP config
+                static const bool allow_multi_local = [] {
+                    const char * env = getenv("LLAMA_META_ALLOW_MULTI_LOCAL");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (n_local_gpu > n_owners && allow_multi_local) {
+                    LLAMA_LOG_WARN("%s: LLAMA_META_ALLOW_MULTI_LOCAL: running %zu local GPU members with %zu dedicated "
+                                   "attention owners - this config corrupted output pre-merge (TASKS.md #48), verify coherence\n",
+                                   __func__, n_local_gpu, n_owners);
+                } else if (n_local_gpu > n_owners) {
+                    LLAMA_LOG_ERROR("%s: expert-parallel dedicated attention (LLAMA_META_ATTN_OWNER) requires every local "
+                                    "GPU to be an attention owner, but %zu local GPUs exceed the %zu-owner group. Put those "
+                                    "experts on RPC workers or a local CPU member, or use single-box "
+                                    "'-sm tensor -ngl 99 -ncmoe N'.\n", __func__, n_local_gpu, n_owners);
                     return false;
                 }
             }
@@ -336,7 +393,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
@@ -379,6 +436,84 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->load_stats(ml);
         model->print_info();
 
+        // TASKS #75: hot-expert placement - load + validate the artifact before
+        // tensors so the split policy can consult it. Meta (tensor-split) configs
+        // only; loud error on any shape mismatch (docs/expert-placement-plan.md §3).
+        ggml_backend_dev_t meta_dev = nullptr;
+        if (const char * pl_path = getenv("LLAMA_META_EXPERT_PLACEMENT"); pl_path != nullptr && pl_path[0] != '\0') {
+            const auto it_meta = std::find_if(model->devices.begin(), model->devices.end(),
+                                              [](const llama_device & d) { return d.is_meta; });
+            if (it_meta == model->devices.end()) {
+                LLAMA_LOG_WARN("%s: LLAMA_META_EXPERT_PLACEMENT is set but there is no meta (tensor-split) device - ignored\n", __func__);
+            } else if (model->hparams.n_expert == 0) {
+                throw std::runtime_error("LLAMA_META_EXPERT_PLACEMENT set but the model has no experts");
+            } else {
+                // v1 arch gates: fail at load instead of aborting at first decode
+                if (model->arch == LLM_ARCH_GROVEMOE) {
+                    throw std::runtime_error("expert placement does not support GroveMoE id rescaling (v1)");
+                }
+                if (model->arch == LLM_ARCH_LLAMA4) {
+                    throw std::runtime_error("expert placement does not support weight_before_ffn arches (v1)");
+                }
+                meta_dev = it_meta->dev;
+                model->expert_placement = llama_expert_placement_load(
+                    pl_path, model->hparams.n_layer(), model->hparams.n_expert, model->get_split_state_ud.n_devices);
+                ml.expert_placement = model->expert_placement.get();
+
+                // plan section 5: the artifact is generated for a specific expert -ts.
+                // Whole-expert rounding also shifts bytes on its own (the record roster
+                // puts ~0.5 GB more on member 0 than -ts asks for), and with -fit off +
+                // LLAMA_FLEET_CAPACITY_CHECK=0 nothing else would say so.
+                if (params.tensor_split != nullptr) {
+                    const size_t n_dev = model->get_split_state_ud.n_devices;
+                    double ts_sum = 0.0;
+                    for (size_t j = 0; j < n_dev; j++) {
+                        ts_sum += params.tensor_split[j];
+                    }
+                    const auto & cnt0 = model->expert_placement->counts;
+                    const std::vector<int32_t> * cnt = nullptr;
+                    for (uint32_t il = 0; il < cnt0.size() && cnt == nullptr; il++) {
+                        if (!cnt0[il].empty()) {
+                            cnt = &cnt0[il];
+                        }
+                    }
+                    if (ts_sum > 0.0 && cnt != nullptr) {
+                        for (size_t j = 0; j < n_dev; j++) {
+                            const double want = params.tensor_split[j] / ts_sum;
+                            const double got  = (double) (*cnt)[j] / (double) model->hparams.n_expert;
+                            if (std::fabs(want - got) > 0.005) {
+                                LLAMA_LOG_WARN("%s: expert placement: member %zu holds %.2f%% of the experts "
+                                               "(%d/%u) but -ts asks for %.2f%% - regenerate the artifact for this "
+                                               "roster if that is not intended (whole-expert rounding accounts for "
+                                               "up to half an expert)\n",
+                                               __func__, j, 100.0*got, (*cnt)[j], model->hparams.n_expert, 100.0*want);
+                            }
+                        }
+                    }
+                }
+
+                // v1 gate: an -ot override on a placed expert tensor displaces it
+                // from the meta buffer (the loader would then upload with no
+                // buffer set - ggml-backend.cpp tensor_set assert) - reject at load
+                for (const llama_model_tensor_buft_override * ov = params.tensor_buft_overrides;
+                        ov != nullptr && ov->pattern != nullptr; ov++) {
+                    const std::regex ov_pattern(ov->pattern);
+                    for (uint32_t il = 0; il < model->expert_placement->n_layer; il++) {
+                        if (!model->expert_placement->layer_placed(il)) {
+                            continue;
+                        }
+                        for (const char * kind : {"gate", "up", "gate_up", "down"}) {
+                            const std::string tname = "blk." + std::to_string(il) + ".ffn_" + kind + "_exps.weight";
+                            if (std::regex_match(tname, ov_pattern)) {
+                                throw std::runtime_error(format("expert placement: -ot override '%s' targets routed expert tensor '%s' - "
+                                                                "placement requires routed experts on the meta device (v1)", ov->pattern, tname.c_str()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
@@ -386,6 +521,64 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        // TASKS #75: build + upload the per-member ownership tables (remap/mask)
+        // once the meta device exists and weights are placed
+        if (model->expert_placement != nullptr && !params.no_alloc) {
+            GGML_ASSERT(meta_dev != nullptr); // placement load already required a meta device
+
+            // v1 gate: routed-expert biases are incompatible with ownership
+            // masking (plan section 2d) - fail at load, not at first decode
+            for (size_t il = 0; il < model->layers.size(); il++) {
+                const llama_layer & layer = model->layers[il];
+                if (layer.ffn_gate_exps_b != nullptr || layer.ffn_up_exps_b != nullptr ||
+                    layer.ffn_down_exps_b != nullptr || layer.ffn_gate_up_exps_b != nullptr) {
+                    throw std::runtime_error(format("expert placement does not support routed-expert biases (v1): "
+                                                    "layer %zu has ffn_*_exps.bias", il));
+                }
+                // per-expert scales are indexed by expert like the weights are, but the
+                // split policy only moves the WEIGHTS to the expert axis - a scale would
+                // keep a feature-axis split and silently pair with the wrong expert
+                if (layer.ffn_gate_exps_s != nullptr || layer.ffn_up_exps_s != nullptr ||
+                    layer.ffn_down_exps_s != nullptr ||
+                    layer.ffn_gate_exps_in_s != nullptr || layer.ffn_up_exps_in_s != nullptr ||
+                    layer.ffn_down_exps_in_s != nullptr) {
+                    throw std::runtime_error(format("expert placement does not support per-expert scales (v1): "
+                                                    "layer %zu has ffn_*_exps.(input_)scale", il));
+                }
+            }
+
+            // the loader permutes placed expert weights by NAME and build_moe_ffn
+            // remaps expert ids - both blind to where the weights landed, so a
+            // placed layer whose routed experts are off the meta buffer would
+            // silently pair remapped ids with unpermuted weights
+            for (uint32_t il = 0; il < model->layers.size(); il++) {
+                if (!model->expert_placement->layer_placed(il)) {
+                    continue;
+                }
+                const llama_layer & layer = model->layers[il];
+                const std::pair<const ggml_tensor *, const char *> exps[] = {
+                    { layer.ffn_gate_exps,    "ffn_gate_exps.weight"    },
+                    { layer.ffn_up_exps,      "ffn_up_exps.weight"      },
+                    { layer.ffn_down_exps,    "ffn_down_exps.weight"    },
+                    { layer.ffn_gate_up_exps, "ffn_gate_up_exps.weight" },
+                };
+                for (const auto & e : exps) {
+                    if (e.first != nullptr && !ggml_backend_buffer_is_meta(e.first->buffer)) {
+                        throw std::runtime_error(format("expert placement: layer %u tensor '%s' is not on the meta "
+                                                        "device buffer (likely causes: -ot override, partial -ngl, "
+                                                        "ssd-streaming) - placement requires routed experts on the "
+                                                        "meta device", il, e.second));
+                    }
+                }
+            }
+
+            model->expert_tables = llama_expert_placement_create_tables(
+                *model->expert_placement, ggml_backend_dev_buffer_type(meta_dev),
+                model->get_split_state_ud.n_devices);
+            LLAMA_LOG_INFO("%s: expert placement: ownership tables uploaded (%u layers)\n",
+                           __func__, model->expert_placement->n_layer);
         }
 
         return {0, model_ptr.release()};
@@ -469,7 +662,7 @@ struct llama_model * llama_model_init_from_user(
     GGML_ASSERT(metadata != nullptr);
     std::string path_model;
     std::vector<std::string> splits = {};
-    params.use_mmap = false;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }

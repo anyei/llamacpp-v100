@@ -760,7 +760,17 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
+// per-split cap: ALSO the split-formation heuristic - raising it merges splits
+// and changes reduction order (byte-visible; canonical gate flipped at 64)
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
+#endif
+
+#ifndef GGML_SCHED_MAX_GRAPH_INPUTS
+// global graph-inputs array (#148): qwen4exp multi-device LAYER splits carry
+// per-layer QSA/recurrent-state input tensors graph-wide - 49 layers x several
+// inputs each blew through 30 and then 64. Pure capacity - unlike
+// MAX_SPLIT_INPUTS it steers no split decisions, so bytes are unchanged.
+#define GGML_SCHED_MAX_GRAPH_INPUTS 256
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -812,7 +822,7 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_GRAPH_INPUTS];
     int n_graph_inputs;
 
     struct ggml_context * ctx;
@@ -915,36 +925,45 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     }
 
     // operations with weights are preferably run on the same backend as the weights
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        const struct ggml_tensor * src = tensor->src[i];
-        if (src == NULL) {
-            continue;
-        }
-        // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
-        // not an ideal solution
-        if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-            // check if a backend with higher prio wants to offload the op
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                // In multi-GPU streaming, keep streamed experts on the CPU tier.
-                // Offloading them builds full-size input_cpy copies whose worst-case
-                // gallocr reserve balloons (~73 GB on one device -> a noisy non-fatal
-                // OOM that recovers). GPU landing - the reason to offload streamed
-                // experts - is single-GPU-only, so there's no benefit to offloading
-                // them across >1 GPU. Single-GPU offload is unaffected.
-                const bool ssd_multi_gpu =
-                    ggml_ssd_stream_is_streamed(src) && ggml_backend_sched_n_gpu(sched) > 1;
-                if (!ssd_multi_gpu) {
-                    for (int b = 0; b < src_backend_id; b++) {
-                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                            SET_CAUSE(tensor, "1.off");
-                            return b;
+    // TODO: there are exceptions (see below) - not an ideal solution
+    bool allow = true;
+
+    // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
+    allow = allow && tensor->op != GGML_OP_ROPE;
+
+    // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+
+    if (allow) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor * src = tensor->src[i];
+            if (src == NULL) {
+                continue;
+            }
+            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // check if a backend with higher prio wants to offload the op
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // In multi-GPU streaming, keep streamed experts on the CPU tier.
+                    // Offloading them builds full-size input_cpy copies whose worst-case
+                    // gallocr reserve balloons (~73 GB on one device -> a noisy non-fatal
+                    // OOM that recovers). GPU landing - the reason to offload streamed
+                    // experts - is single-GPU-only, so there's no benefit to offloading
+                    // them across >1 GPU. Single-GPU offload is unaffected.
+                    const bool ssd_multi_gpu =
+                        ggml_ssd_stream_is_streamed(src) && ggml_backend_sched_n_gpu(sched) > 1;
+                    if (!ssd_multi_gpu) {
+                        for (int b = 0; b < src_backend_id; b++) {
+                            if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                                SET_CAUSE(tensor, "1.off");
+                                return b;
+                            }
                         }
                     }
                 }
+                SET_CAUSE(tensor, "1.wgt%d", i);
+                return src_backend_id;
             }
-            SET_CAUSE(tensor, "1.wgt%d", i);
-            return src_backend_id;
         }
     }
 
@@ -1372,7 +1391,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_graph_inputs = sched->n_graph_inputs++;
-                        GGML_ASSERT(n_graph_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                        GGML_ASSERT(n_graph_inputs < GGML_SCHED_MAX_GRAPH_INPUTS);
                         sched->graph_inputs[n_graph_inputs] = src;
                     }
                 }
@@ -1849,7 +1868,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2 + GGML_SCHED_MAX_GRAPH_INPUTS*2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -1858,7 +1877,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    sched->context_buffer_size = (ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS + GGML_SCHED_MAX_GRAPH_INPUTS)*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
     const int initial_splits_capacity = 16;

@@ -5,6 +5,13 @@
 
 struct common_speculative;
 
+// sparse proposal distribution for one stochastically drafted token (#138):
+// the verifier needs q(token) for maximal-coupling acceptance
+struct common_speculative_token_dist {
+    llama_tokens ids;
+    std::vector<float> probs;
+};
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -48,6 +55,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional sparse proposal distributions, one per draft token (#138 inc 3):
+    // filled only by stochastic drafters (DFlash2 at temperature > 0)
+    std::vector<common_speculative_token_dist> * dists = nullptr;
+
+    float temperature = 0.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -55,8 +69,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+// process the batch and update the internal state of the speculative context.
+// rows_tgt (optional) maps each batch row to its row in the target's extraction
+// buffers, for callers passing a filtered view of the decoded batch
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, const int32_t * rows_tgt = nullptr);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
@@ -69,6 +85,38 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// LLAMA_SPEC_ALT_STATS=1 instrument (#132): score the drafter's runner-up candidates at a
+// rejected draft position. i_rej indexes the draft, tgt_tok is the target's actual pick there.
+// No-op unless the env gate is set; capture happens inside the drafter sampling loops.
+void common_speculative_alt_stats_verify(llama_seq_id seq_id, size_t i_rej, llama_token tgt_tok);
+
+// LLAMA_SPEC_TREE=1 (#132): multi-candidate verification - the server adds a branch row set
+// (drafter's runner-up at draft position 0 + shared continuation) to the verify batch on a
+// spare sequence, rescuing first-position rejections. Value-parsed gate, off by default.
+bool common_speculative_tree_enabled();
+
+// #132 (experimental, env-gated at the server): register an ADDITIONAL drafter with its own
+// draft context behind the existing priority-fallback dispatch - impls draft in registration
+// order and later impls only draft sequences the earlier ones left empty. params must carry
+// the second drafter's ctx_tgt/ctx_dft. Supported types: draft-simple/eagle3/mtp/dflash/dspark.
+bool common_speculative_add_drafter(common_speculative * spec, const common_params_speculative & params, enum common_speculative_type type, uint32_t n_seq);
+
+// #132 inc 2: re-process specific rows of the just-decoded target batch as seq_id's rows.
+// Spec-tree branch rows carry a foreign sequence tag, so the normal process() pass skips
+// them; after a branch acceptance the drafter's mirrored/injected state for those positions
+// is rebuilt from these rows. `rows` are ascending batch indices into batch_in, which must
+// be the batch of the MOST RECENT target decode (feature-conditioned drafters read the
+// target's per-row extraction buffers).
+bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch_in, llama_seq_id seq_id, const std::vector<int32_t> & rows);
+
+// the drafter's runner-up candidate for draft position i of seq_id's most recent draft, or
+// LLAMA_TOKEN_NULL when unavailable / the capture is misaligned (n_draft must match the
+// captured draft length).
+llama_token common_speculative_get_alt1(llama_seq_id seq_id, size_t i, size_t n_draft);
+
+// the drafter's probability for its own top pick at draft position i, or -1 when unavailable
+float common_speculative_get_conf(llama_seq_id seq_id, size_t i, size_t n_draft);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

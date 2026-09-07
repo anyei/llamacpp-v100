@@ -1231,6 +1231,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // TASKS #103: announce the model identity to RPC workers so their tensor
+    // caches scope per model (basename, shard suffix stripped so every shard
+    // of one model shares a folder). Resolved via the registry: no hard dep.
+    {
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        if (rpc_reg != nullptr) {
+            auto set_sm = (void (*)(const char *))
+                ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_session_model");
+            if (set_sm != nullptr) {
+                std::string base = params.model.path;
+                const size_t slash = base.find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    base = base.substr(slash + 1);
+                }
+                base = std::regex_replace(base, std::regex("-\\d{5}-of-\\d{5}"), "");
+                if (string_ends_with(base, ".gguf")) {
+                    base.resize(base.size() - 5);
+                }
+                set_sm(base.c_str());
+            }
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1532,21 +1555,47 @@ done:
     return res;
 }
 
-void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
 
-void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
 }
 
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+static void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_add(mem, seq_id, p0, p1, delta);
+}
+
+void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    this->ctx_tgt = ctx_tgt;
+    this->ctx_dft = ctx_dft;
+}
+
+void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+    }
+}
+
+void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
+    common_context_seq_cp(ctx_tgt, seq_id_src, seq_id_dst, p0, p1);
+    if (ctx_dft) {
+        common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
+    }
+}
+
+void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
+    common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
+    if (ctx_dft) {
+        common_context_seq_add(ctx_dft, seq_id, p0, p1, delta);
+    }
 }
 
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
@@ -1571,10 +1620,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
+    mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap;
-    mparams.use_direct_io   = params.use_direct_io;
-    mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
@@ -1604,7 +1651,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = params.n_parallel + params.n_seq_extra;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;

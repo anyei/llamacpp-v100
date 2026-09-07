@@ -209,6 +209,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0.0f, 1.0f)
         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
 
+    add((new field_num("speculative.conf_min", params.speculative.draft.conf_min))
+        ->set_hard_limits(0.0f, 1.0f)
+        ->set_desc("DSpark: minimum confidence-head acceptance to keep a drafted token (0 = disabled)"));
+
+    add((new field_num("speculative.entropy_max", params.speculative.draft.entropy_max))
+        ->set_hard_limits(0.0f, 32.0f)
+        ->set_desc("Stop drafting when the draft distribution entropy exceeds this many bits (0 = disabled)"));
+
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -390,21 +398,55 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.sampling.reasoning_budget_start = common_tokenize(ctx.vocab, data.at("reasoning_budget_start_tag").get<std::string>(), false, true);
         }));
 
-    add((new field_str("reasoning_budget_end_tag"))
-        ->set_desc("Token string marking the end of the reasoning budget section")
+    add((new field_json("reasoning_budget_end_tags"))
+        ->add_alias("reasoning_budget_end_tag")
+        ->set_desc("Token strings marking the end of the reasoning budget section; the first is forced when the budget expires")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            std::string end_tag = data.at("reasoning_budget_end_tag").get<std::string>();
-            ctx.params.sampling.reasoning_budget_end = common_tokenize(ctx.vocab, end_tag, false, true);
+            ctx.params.sampling.reasoning_budget_end.clear();
+            if (data.contains("reasoning_budget_end_tags")) {
+                for (const auto & t : data.at("reasoning_budget_end_tags")) {
+                    std::string tag = t.get<std::string>();
+                    if (!tag.empty()) {
+                        ctx.params.sampling.reasoning_budget_end.push_back(common_tokenize(ctx.vocab, tag, false, true));
+                    }
+                }
+            } else if (data.contains("reasoning_budget_end_tag")) {
+                std::string tag = data.at("reasoning_budget_end_tag").get<std::string>();
+                if (!tag.empty()) {
+                    ctx.params.sampling.reasoning_budget_end.push_back(common_tokenize(ctx.vocab, tag, false, true));
+                }
+            }
         }));
 
     add((new field_str("reasoning_budget_message"))
         ->set_desc("Message to prepend to the reasoning budget end tag when forcing it")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            std::string end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
-            std::string message = data.at("reasoning_budget_message").get<std::string>();
-            ctx.params.sampling.reasoning_budget_forced = common_tokenize(ctx.vocab, message + end_tag, false, true);
+            if (!ctx.params.sampling.reasoning_budget_end.empty()) {
+                llama_tokens end_tag = ctx.params.sampling.reasoning_budget_end.front();
+                std::string message = json_value(data, "reasoning_budget_message", std::string());
+                if (!message.empty()) {
+                    llama_tokens message_tokens = common_tokenize(ctx.vocab, message, false, true);
+                    end_tag.insert(end_tag.begin(), message_tokens.begin(), message_tokens.end());
+                }
+                ctx.params.sampling.reasoning_budget_forced = std::move(end_tag);
+            }
+        }));
+
+    add((new field_num("reasoning_budget_warn_at", params.sampling.reasoning_budget_warn_at))
+        ->set_desc("Soft warning (#139): inject the warning message into the reasoning stream when this many "
+                   "thinking tokens remain, WITHOUT an end tag, then keep counting so the model can close the "
+                   "block itself. -1 disables. The hard reasoning_budget_tokens cut still applies."));
+
+    add((new field_str("reasoning_budget_warn_message"))
+        ->set_desc("Text injected into the reasoning stream when reasoning_budget_warn_at fires")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            const std::string message = json_value(data, "reasoning_budget_warn_message", std::string());
+            ctx.params.sampling.reasoning_budget_warn_message = message;
+            ctx.params.sampling.reasoning_budget_warn =
+                message.empty() ? llama_tokens{} : common_tokenize(ctx.vocab, message, false, true);
         }));
 
     add((new field_json("logit_bias"))
@@ -546,7 +588,7 @@ task_params eval_llama_cmpl_schema(
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;
-        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
+        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks\n",
                 budget, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),

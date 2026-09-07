@@ -15,10 +15,180 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+
+// TASKS #74: per-layer expert-selection histogram. Env LLAMA_EXPERT_PROFILE=<path>
+// installs a sched eval callback that reads every "ffn_moe_topk-<il>" tensor
+// (the router's selected expert ids, [n_expert_used, n_tokens] I32 - works on the
+// meta backend too, tensor_get gathers from the owning member) and accumulates
+// counts[layer][expert]. The histogram is what #75 hot-expert placement consumes.
+struct llama_expert_profile {
+    std::string path;
+    std::string model_name;
+    uint32_t n_layer       = 0;
+    uint32_t n_expert      = 0;
+    uint32_t n_expert_used = 0;
+
+    std::vector<std::vector<uint64_t>> counts;   // [n_layer][n_expert]
+    std::vector<uint64_t> rows;                  // [n_layer] tokens routed per layer
+    int      ref_layer      = -1;                // first MoE layer seen - paces the dumps
+    uint64_t last_dump_rows = 0;
+    std::mutex mtx;
+
+    void accumulate(int il, const int32_t * ids, int64_t n_ids, int64_t n_tokens) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (il < 0 || (uint32_t) il >= n_layer) {
+            return;
+        }
+        auto & c = counts[il];
+        for (int64_t i = 0; i < n_ids; i++) {
+            if (ids[i] >= 0 && (uint32_t) ids[i] < n_expert) {
+                c[ids[i]]++;
+            }
+        }
+        rows[il] += n_tokens;
+        if (ref_layer < 0) {
+            ref_layer = il;
+        }
+        if (il == ref_layer && rows[il] - last_dump_rows >= 500) {
+            last_dump_rows = rows[il];
+            dump();
+        }
+    }
+
+    void dump() { // caller holds mtx (or is the single-threaded dtor)
+        const std::string tmp = path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("expert-profile: cannot write '%s'\n", tmp.c_str());
+            return;
+        }
+        const uint64_t tokens = ref_layer >= 0 ? rows[ref_layer] : 0;
+        fprintf(f, "{\n  \"model\": \"%s\",\n  \"n_layer\": %u,\n  \"n_expert\": %u,\n  \"n_expert_used\": %u,\n  \"tokens_profiled\": %" PRIu64 ",\n  \"rows_per_layer\": [",
+                model_name.c_str(), n_layer, n_expert, n_expert_used, tokens);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            fprintf(f, "%s%" PRIu64, il ? ", " : "", rows[il]);
+        }
+        fprintf(f, "],\n  \"counts\": [\n");
+        for (uint32_t il = 0; il < n_layer; il++) {
+            fprintf(f, "    [");
+            for (uint32_t e = 0; e < n_expert; e++) {
+                fprintf(f, "%s%" PRIu64, e ? "," : "", counts[il][e]);
+            }
+            fprintf(f, "]%s\n", il + 1 < n_layer ? "," : "");
+        }
+        fprintf(f, "  ]\n}\n");
+        fclose(f);
+        rename(tmp.c_str(), path.c_str());
+    }
+
+    // TASKS #84: optional per-position routed-ids dump (binary int32 records:
+    // il, k, n_tok, ids[k*n_tok] lane-major) for offline union analysis
+    FILE * ids_f = nullptr;
+
+    ~llama_expert_profile() {
+        if (ids_f != nullptr) {
+            fclose(ids_f);
+        }
+    }
+};
+
+// TASKS #71 inc-0 (GGML_META_ZL_STATS): capture each layer's routed ids at
+// compute time for the meta backend's zero-leg counters. Same mechanism as the
+// profiler below (the ask phase forces a sched split so the read is fresh);
+// decode-shaped tensors only - prefill ids are not what the ZL gather counts.
+static bool llama_zl_ids_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    constexpr const char * prefix = "ffn_moe_topk-";
+    constexpr size_t prefix_len = 13;
+    const auto is_base_topk = [&](const char * name) {
+        if (strncmp(name, prefix, prefix_len) != 0 || name[prefix_len] == '\0') {
+            return false;
+        }
+        const char * p = name + prefix_len;
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+        return *p == '\0';
+    };
+    if (ask) {
+        return is_base_topk(t->name);
+    }
+    static const bool zl_debug = getenv("GGML_META_ZL_DEBUG") != nullptr && atoi(getenv("GGML_META_ZL_DEBUG")) != 0;
+    // TASKS #84 (GGML_META_UNION_STATS): capture verify/multi-token-shaped
+    // graphs too (all lanes) for the union counters; without the env the
+    // original decode-only gate (ne[1] <= 2) stands bit-for-bit
+    static const bool union_stats = getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0;
+    const int64_t max_w = union_stats ? 16 : 2;
+    // decode-shaped graphs only (an MTP head can make them 2-wide; ids are
+    // [k, n_tok] so token 0's ids are the first k values either way)
+    if (!is_base_topk(t->name) || t->type != GGML_TYPE_I32 || t->ne[1] > max_w || t->ne[0] > 64) {
+        if (zl_debug) {
+            static int n = 0;
+            if (n < 8) {
+                n++;
+                fprintf(stderr, "ZL-CB-SKIP: %s type %d ne %lld,%lld\n",
+                        t->name, (int) t->type, (long long) t->ne[0], (long long) t->ne[1]);
+            }
+        }
+        return true;
+    }
+    int32_t ids[64*16];
+    const size_t k     = (size_t) t->ne[0];
+    const size_t n_tok = (size_t) t->ne[1];
+    // ffn_moe_topk is a top-k VIEW over the full argsort ([n_expert, n_tok]
+    // base): lanes are nb[1]-strided, NOT contiguous - a linear read returns
+    // token 0's argsort PERMUTATION (distinct by construction, poisoning the
+    // union counters with exact-disjoint lanes). Read lane by lane.
+    for (size_t j = 0; j < n_tok; j++) {
+        ggml_backend_tensor_get(t, ids + j*k, j*t->nb[1], k*sizeof(int32_t));
+    }
+    ggml_backend_meta_note_routed_ids_batch(atoi(t->name + prefix_len), ids, k, n_tok);
+    if (zl_debug) {
+        static int n = 0;
+        if (n < 8) {
+            n++;
+            fprintf(stderr, "ZL-CB-NOTE: %s ids %d %d %d %d\n", t->name, ids[0], ids[1], ids[2], ids[3]);
+        }
+    }
+    return true;
+}
+
+static bool llama_expert_profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    constexpr const char * prefix = "ffn_moe_topk-";
+    constexpr size_t prefix_len = 13;
+    if (ask) {
+        return strncmp(t->name, prefix, prefix_len) == 0;
+    }
+    if (strncmp(t->name, prefix, prefix_len) != 0 || t->type != GGML_TYPE_I32) {
+        return true;
+    }
+    auto * prof = (llama_expert_profile *) user_data;
+    const int il = atoi(t->name + prefix_len);
+    const int64_t k     = t->ne[0];
+    const int64_t n_tok = t->ne[1];
+    std::vector<int32_t> ids(k*n_tok);
+    // ffn_moe_topk is a top-k VIEW over the argsort ([n_expert, n_tok] base):
+    // lanes are nb[1]-strided, so a linear read returns argsort-permutation
+    // bytes for n_tok > 1 (the #84 poison signature). Read lane by lane.
+    for (int64_t j = 0; j < n_tok; j++) {
+        ggml_backend_tensor_get(t, ids.data() + j*k, (size_t) j*t->nb[1], k*sizeof(int32_t));
+    }
+    prof->accumulate(il, ids.data(), k*n_tok, n_tok);
+    // TASKS #84: per-position dump for the offline union curve
+    if (prof->ids_f != nullptr) {
+        std::lock_guard<std::mutex> lock(prof->mtx);
+        const int32_t hdr[3] = { (int32_t) il, (int32_t) k, (int32_t) n_tok };
+        fwrite(hdr, sizeof(int32_t), 3, prof->ids_f);
+        fwrite(ids.data(), sizeof(int32_t), ids.size(), prof->ids_f);
+    }
+    return true;
+}
 
 //
 // llama_context
@@ -121,8 +291,9 @@ llama_context::llama_context(
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // one extra slot: index n_layer captures the output of the final layer
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -137,6 +308,79 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // TASKS #74: expert-selection profiling - only on the primary decode context
+    // (an MTP draft context would clobber the same output file), only when no
+    // other eval callback claims the single sched slot
+    if (cparams.cb_eval == nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && hparams.n_expert > 0) {
+        const char * prof_path = getenv("LLAMA_EXPERT_PROFILE");
+        if (prof_path != nullptr && prof_path[0] != '\0') {
+            expert_profile = std::make_unique<llama_expert_profile>();
+            expert_profile->path          = prof_path;
+            expert_profile->model_name    = model.name;
+            expert_profile->n_layer       = hparams.n_layer();
+            expert_profile->n_expert      = hparams.n_expert;
+            expert_profile->n_expert_used = hparams.n_expert_used;
+            expert_profile->counts.assign(expert_profile->n_layer, std::vector<uint64_t>(expert_profile->n_expert, 0));
+            expert_profile->rows.assign(expert_profile->n_layer, 0);
+            cparams.cb_eval           = llama_expert_profile_cb;
+            cparams.cb_eval_user_data = expert_profile.get();
+            LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE: recording per-layer expert selections to '%s'\n",
+                           __func__, prof_path);
+            // TASKS #84: optional per-position ids dump alongside the counts
+            const char * ids_path = getenv("LLAMA_EXPERT_PROFILE_IDS");
+            if (ids_path != nullptr && ids_path[0] != '\0') {
+                expert_profile->ids_f = fopen(ids_path, "wb");
+                if (expert_profile->ids_f != nullptr) {
+                    LLAMA_LOG_INFO("%s: LLAMA_EXPERT_PROFILE_IDS: dumping per-position routed ids to '%s'\n",
+                                   __func__, ids_path);
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_EXPERT_PROFILE_IDS: cannot open '%s'\n", __func__, ids_path);
+                }
+            }
+        }
+        // TASKS #84 probe 2: per-layer routing-budget mask (measurement only)
+        if (const char * mask_path = getenv("LLAMA_EXPERT_MASK"); mask_path != nullptr && mask_path[0] != '\0') {
+            expert_mask = std::make_unique<llama_expert_mask>();
+            if (expert_mask->init(model, mask_path)) {
+                LLAMA_LOG_INFO("%s: LLAMA_EXPERT_MASK: routing budget loaded from '%s'\n", __func__, mask_path);
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_EXPERT_MASK: failed to load '%s' - unmasked\n", __func__, mask_path);
+                expert_mask.reset();
+            }
+        }
+        // seam-bug discriminator: chunk the sched exactly like the ZL/union
+        // callback (ask=true on every base topk) but never read the tensor -
+        // separates graph-chunking effects from the get_tensor gathers
+        if (cparams.cb_eval == nullptr &&
+                getenv("LLAMA_CB_CHUNK_ONLY") != nullptr && atoi(getenv("LLAMA_CB_CHUNK_ONLY")) != 0) {
+            cparams.cb_eval = [](struct ggml_tensor * t, bool ask, void * ud) {
+                GGML_UNUSED(ud);
+                if (!ask) {
+                    return true;
+                }
+                constexpr const char * prefix = "ffn_moe_topk-";
+                if (strncmp(t->name, prefix, 13) != 0 || t->name[13] == '\0') {
+                    return false;
+                }
+                const char * p = t->name + 13;
+                while (*p >= '0' && *p <= '9') { p++; }
+                return *p == '\0';
+            };
+            cparams.cb_eval_user_data = nullptr;
+            LLAMA_LOG_INFO("%s: LLAMA_CB_CHUNK_ONLY: chunking sched at topk without reads\n", __func__);
+        }
+        if (cparams.cb_eval == nullptr && // profiler owns the one eval-callback slot when set
+                ((getenv("GGML_META_ZL_STATS") != nullptr && atoi(getenv("GGML_META_ZL_STATS")) != 0) ||
+                 (getenv("GGML_META_UNION_STATS") != nullptr && atoi(getenv("GGML_META_UNION_STATS")) != 0))) {
+            // TASKS #71 inc-0 / #84: routed-id capture for the meta zero-leg
+            // and expert-union counters (mutually exclusive with the profiler
+            // - one eval-callback slot)
+            cparams.cb_eval           = llama_zl_ids_cb;
+            cparams.cb_eval_user_data = nullptr;
+            LLAMA_LOG_INFO("%s: GGML_META_ZL_STATS/UNION_STATS: capturing routed ids for meta counters\n", __func__);
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -156,6 +400,76 @@ llama_context::llama_context(
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
+        }
+    }
+
+    // #12: the DFlash/EAGLE3 draft graph reads the TARGET's lm_head and token
+    // embeddings through ctx_other. When those live in a buffer this context's
+    // scheduler cannot address - the meta (tensor-split) device, or a device
+    // outside this model's list (a layer-split target parks output.weight on
+    // its last device, possibly a remote worker) - sched_split_graph aborts.
+    // Materialize one-time mirrors on this model's own device instead.
+    if (cparams.ctx_other != nullptr &&
+        (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH)) {
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        auto reachable = [&](const ggml_tensor * t) {
+            ggml_backend_buffer_t buf = t->buffer;
+            if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+                return true;
+            }
+            if (ggml_backend_buffer_is_meta(buf)) {
+                return false;
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            if (dev == nullptr) {
+                return true;
+            }
+            for (const auto & d : model.devices) {
+                if (!d.is_meta && d.dev == dev) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::vector<const ggml_tensor *> need;
+        if (model.output   == nullptr && model_other->output   != nullptr && !reachable(model_other->output))   need.push_back(model_other->output);
+        if (model.tok_embd == nullptr && model_other->tok_embd != nullptr && !reachable(model_other->tok_embd)) need.push_back(model_other->tok_embd);
+        if (!need.empty()) {
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (auto it = model.devices.rbegin(); it != model.devices.rend(); ++it) {
+                if (!it->is_meta) {
+                    buft = ggml_backend_dev_buffer_type(it->dev);
+                    break;
+                }
+            }
+            if (buft == nullptr) {
+                buft = ggml_backend_cpu_buffer_type();
+            }
+            ggml_init_params ip = { ggml_tensor_overhead() * need.size(), nullptr, true };
+            mirror_other_ctx.reset(ggml_init(ip));
+            std::vector<ggml_tensor *> dsts;
+            for (const ggml_tensor * src : need) {
+                ggml_tensor * dst = ggml_dup_tensor(mirror_other_ctx.get(), src);
+                ggml_format_name(dst, "%s.other_mirror", src->name);
+                dsts.push_back(dst);
+            }
+            mirror_other_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mirror_other_ctx.get(), buft));
+            if (mirror_other_buf == nullptr) {
+                throw std::runtime_error("failed to allocate draft-side mirrors of the target's shared tensors");
+            }
+            std::vector<uint8_t> tmp;
+            for (size_t i = 0; i < need.size(); ++i) {
+                tmp.resize(ggml_nbytes(need[i]));
+                ggml_backend_tensor_get(need[i], tmp.data(), 0, tmp.size());
+                ggml_backend_tensor_set(dsts[i], tmp.data(), 0, tmp.size());
+                if (need[i] == model_other->output) {
+                    cparams.other_output_mirror = dsts[i];
+                } else {
+                    cparams.other_tok_embd_mirror = dsts[i];
+                }
+                LLAMA_LOG_INFO("%s: mirrored target '%s' (%.1f MiB) onto the draft device for the %s draft graph\n",
+                        __func__, need[i]->name, tmp.size() / 1024.0 / 1024.0, model.arch_name().c_str());
+            }
         }
     }
 
@@ -335,9 +649,63 @@ llama_context::llama_context(
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
     }
 
+    // TASKS #71 stage 1: coordinator-local MTP draft. The draft context gets a
+    // scheduler WITHOUT the meta backend - only the meta device's in-process
+    // members - and graph_localize() remaps meta-hosted weights to their local
+    // full shadows. Requires every draft-graph weight to have a full local copy
+    // (EP_ONLY mirrors + dedicated attention + LLAMA_META_LOCAL_DRAFT's
+    // nextn-expert dedication provide exactly that).
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const char * env = getenv("LLAMA_META_LOCAL_DRAFT");
+        if (env != nullptr && atoi(env) != 0) {
+            for (const auto & dev : model.devices) {
+                if (dev.is_meta) {
+                    mtp_meta_dev = dev.dev;
+                    break;
+                }
+            }
+            if (mtp_meta_dev != nullptr) {
+                const size_t n_members = ggml_backend_meta_dev_n_members(mtp_meta_dev);
+                for (size_t j = 0; j < n_members; j++) {
+                    ggml_backend_dev_t member = ggml_backend_meta_dev_member(mtp_meta_dev, j);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(member);
+                    if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+                        continue; // remote member - defeats the purpose
+                    }
+                    mtp_local_members.push_back(j);
+                }
+                if (!mtp_local_members.empty()) {
+                    mtp_local = true;
+                    LLAMA_LOG_INFO("%s: LLAMA_META_LOCAL_DRAFT: MTP draft context runs on %zu in-process member(s) of %s\n",
+                            __func__, mtp_local_members.size(), ggml_backend_dev_name(mtp_meta_dev));
+                } else {
+                    LLAMA_LOG_WARN("%s: LLAMA_META_LOCAL_DRAFT requested but the meta device has no in-process members - draft stays fleet-scheduled\n",
+                            __func__);
+                }
+            }
+        }
+    }
+
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
+            if (mtp_local && dev.is_meta) {
+                // local-draft mode: init the meta device's in-process members
+                // instead of the meta backend itself (CPU members are covered by
+                // the CPU backend added below)
+                for (size_t j : mtp_local_members) {
+                    ggml_backend_dev_t member = ggml_backend_meta_dev_member(mtp_meta_dev, j);
+                    if (ggml_backend_dev_type(member) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    ggml_backend_t backend = ggml_backend_dev_init(member, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(member)));
+                    }
+                    backends.emplace_back(backend);
+                }
+                continue;
+            }
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -390,6 +758,10 @@ llama_context::llama_context(
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
             }
+            // the meta backend hides its members from the reg lookup above - the
+            // forwarder no-ops on non-meta backends (#118: an in-process CPU
+            // expert member otherwise computes on the ggml default thread count)
+            set_n_threads_fns.emplace_back(backend.get(), ggml_backend_meta_set_n_threads);
         }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
@@ -503,6 +875,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (expert_profile) {
+        std::lock_guard<std::mutex> lock(expert_profile->mtx);
+        expert_profile->dump();
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1197,7 +1573,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid < cparams.embeddings_layer_inp.size());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1207,6 +1583,10 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_mtp_fused(bool fused) {
+    cparams.mtp_fused = fused;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1493,10 +1873,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (mtp_local && !graph_localize(gf)) {
+            res->reset();
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
         const auto t_alloc_0 = ggml_time_us();
 
         if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // invalidate the built-but-unallocated graph: it stays in the decode
+            // cache (or gf_res_prev) and a later same-shape decode would pass
+            // can_reuse, skip allocation and abort in set_inputs on tensors the
+            // failed reserve left without buffers
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1857,7 +2248,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    // MTP contexts carry hidden-state rows in batch.embd at the h_nextn width -
+    // on qwen4exp that is the HC bundle (n_embd_out = hc x n_embd), wider than
+    // the token-embedding width the allocator normally sizes for
+    const int64_t n_embd  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
+            ? std::max<int64_t>(hparams.n_embd_inp(), hparams.n_embd_out())
+            : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2486,8 +2882,19 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        model.arch == LLM_ARCH_QWEN4EXP ||
+        model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_MINIMAX_M3 ||
+        model.arch == LLM_ARCH_DFLASH) { // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
+        uint32_t res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // DFlash2 selector lattice builds ~32 extra nodes per draft position
+        if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+            const uint32_t selector_tokens = std::min<uint32_t>(
+                    n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+            res += 32*selector_tokens;
+        }
+        return res;
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
@@ -2541,6 +2948,12 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (mtp_local && !graph_localize(gf)) {
+        this->n_outputs = save_n_outputs;
+        LLAMA_LOG_ERROR("%s: LLAMA_META_LOCAL_DRAFT: failed to localize the reserve graph\n", __func__);
+        return nullptr;
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -2557,6 +2970,18 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     return gf;
+}
+
+// TASKS #71 stage 1: remap every meta-hosted weight src in the freshly built
+// draft graph to a local member's FULL shadow tensor, so the local-only
+// scheduler never touches the meta backend. Returns false (and logs once) if
+// any weight lacks a full local copy - the compute would then fail loudly
+// rather than silently mixing backends.
+bool llama_context::graph_localize(ggml_cgraph * gf) {
+    if (!mtp_local) {
+        return true;
+    }
+    return ggml_backend_meta_graph_localize(gf, mtp_local_members.data(), mtp_local_members.size());
 }
 
 llm_graph_params llama_context::graph_params(
@@ -2577,8 +3002,10 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
+        /*.n_outputs     =*/ n_outputs,
+        /*.expert_tables =*/ model.expert_tables.get(),
+        /*.expert_mask   =*/ expert_mask.get(),
+        /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
 }
@@ -2625,11 +3052,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
@@ -3875,6 +4303,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_mtp_fused(llama_context * ctx, bool fused) {
+    ctx->set_mtp_fused(fused);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

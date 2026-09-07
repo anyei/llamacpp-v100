@@ -28,6 +28,14 @@ export interface ApiFleetDeviceTiming {
 	exec_max_us: number;
 }
 
+/** Per-device buffer composition (#97): what fills the device's memory.
+ * Present only after a successful load. */
+export interface ApiFleetDeviceMemBreakdown {
+	model_mib: number;
+	context_mib: number;
+	compute_mib: number;
+}
+
 /** A device participating in the inference pipeline (local or RPC worker). */
 export interface ApiFleetDevice {
 	name: string;
@@ -37,14 +45,24 @@ export interface ApiFleetDevice {
 	is_rpc: boolean;
 	/** True when the worker exposes CPU RAM instead of GPU VRAM. */
 	worker_is_cpu: boolean;
+	/** True for any RAM-backed row - CPU worker or local CPU holder (review #24). */
+	is_cpu?: boolean;
 	reachable: boolean;
 	failed: boolean;
 	health?: 'healthy' | 'degraded' | 'recovering';
 	failure_count?: number | null;
 	memory_free_mib: number;
 	memory_total_mib: number;
+	memory_breakdown?: ApiFleetDeviceMemBreakdown | null;
 	/** Share of the model split assigned to this device (0..1). */
 	split_frac?: number | null;
+	/** MEASURED share of the model's bytes resident on this device (0..1) - the
+	 * truthful number under CPU-offload modes where split_frac lies (#131). */
+	model_frac?: number | null;
+	/** What the device hosts: target layers, a speculative drafter, or both (#133). */
+	role?: 'target' | 'drafter' | 'target+drafter';
+	/** Speculative drafter weights resident on this device, MiB (#133). */
+	drafter_model_mib?: number | null;
 	/** EP dedicated-attention owner: holds attention/KV/router, takes no expert share. */
 	attn_owner?: boolean;
 	n_layers?: number | null;
@@ -119,6 +137,10 @@ export interface ApiFleetStatusResponse {
 	split_mode?: string | null;
 	n_gpu_layers?: number | null;
 	model?: ApiFleetModelInfo | null;
+	/** Router-side id of the model this status was proxied from (review #25). */
+	router_model?: string | null;
+	/** Active speculation stack (#100); absent/type "none" = target-only. */
+	speculative?: import('./api').ApiSpeculativeInfo | null;
 	devices: ApiFleetDevice[];
 	recent_failures?: number;
 	discovered: ApiFleetDiscoveredWorker[];
@@ -132,6 +154,9 @@ export interface ApiFleetStatusResponse {
 	perf?: ApiFleetPerf | null;
 	/** Duration of the last completed model load, ms (null until one finishes). */
 	load_ms?: number | null;
+	/** Exact serve command of the answering child: process argv + LLAMA_*/GGML_*
+	 * env gates (null when the platform can't provide it). */
+	launch?: { cmd: string[]; env: string[] } | null;
 }
 
 /** Response of `GET ./fleet/worker/log`. */

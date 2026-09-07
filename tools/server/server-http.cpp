@@ -433,7 +433,11 @@ bool server_http_context::init(const common_params & params) {
                 "sw.js",
                 "manifest.webmanifest",
                 "_app/version.json",
-                "build.json"
+                "build.json",
+                // standalone pages, iterated on across image builds - a year of
+                // immutable caching strands browsers on stale copies
+                "wizard.html",
+                "loading.html"
             };
 
             for (const auto & a : llama_ui_get_assets()) {

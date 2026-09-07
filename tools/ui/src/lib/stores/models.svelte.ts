@@ -47,6 +47,9 @@ class ModelsStore {
 
 	models = $state<ModelOption[]>([]);
 	routerModels = $state<ApiModelDataEntry[]>([]);
+	/** True once routerModels reflects at least one successful fetch - gates
+	 *  "no model" UI so it cannot flash during the first load (review #26). */
+	routerModelsFetched = $state(false);
 	loading = $state(false);
 	updating = $state(false);
 	error = $state<string | null>(null);
@@ -344,6 +347,7 @@ class ModelsStore {
 				const response = await ModelsService.listRouter();
 
 				this.routerModels = response.data;
+				this.routerModelsFetched = true;
 				this.models = this.buildModelOptions(response);
 
 				await this.fetchModalitiesForLoadedModels();
@@ -414,6 +418,7 @@ class ModelsStore {
 		try {
 			const response = await ModelsService.listRouter();
 			this.routerModels = response.data;
+			this.routerModelsFetched = true;
 			await this.fetchModalitiesForLoadedModels();
 
 			const visible = this.getVisibleModels();
@@ -421,8 +426,9 @@ class ModelsStore {
 				this.selectModelById(visible[0].id);
 			}
 		} catch (error) {
+			// keep the last known list: one transient /models failure must not
+			// flip the UI into a sticky "no model is loaded" state (review #26)
 			console.warn('Failed to fetch router models:', error);
-			this.routerModels = [];
 		}
 	}
 
@@ -796,7 +802,19 @@ class ModelsStore {
 
 		const status = data.status;
 
-		this.setRouterModelStatus(model, status);
+		const failed =
+			status === ServerModelStatus.FAILED ||
+			(status === ServerModelStatus.UNLOADED && (data.exit_code ?? 0) !== 0);
+
+		// carry the failure detail onto the row so the chat banner can surface
+		// it; a new load attempt clears it
+		this.setRouterModelStatus(
+			model,
+			status,
+			failed
+				? { failed: true, exit_code: data.exit_code, error_tail: data.error_tail }
+				: { failed: undefined, exit_code: undefined, error_tail: undefined }
+		);
 
 		if (status === ServerModelStatus.LOADING) {
 			if (data.progress) this.loadProgress.set(model, data.progress);
@@ -807,10 +825,6 @@ class ModelsStore {
 		if (status === ServerModelStatus.LOADED) {
 			void this.updateModelModalities(model);
 		}
-
-		const failed =
-			status === ServerModelStatus.FAILED ||
-			(status === ServerModelStatus.UNLOADED && (data.exit_code ?? 0) !== 0);
 
 		if (failed) {
 			this.rejectStatus(model, new Error(`Model failed: ${this.toDisplayName(model)}`));
@@ -834,15 +848,19 @@ class ModelsStore {
 	/**
 	 * Update one model row status in place, reassigning to trigger reactivity.
 	 */
-	private setRouterModelStatus(modelId: string, status: ServerModelStatus): void {
+	private setRouterModelStatus(
+		modelId: string,
+		status: ServerModelStatus,
+		extra?: Partial<ApiModelStatus>
+	): void {
 		const idx = this.routerModels.findIndex((m) => m.id === modelId);
 		if (idx === -1) return;
 
 		const current = this.routerModels[idx];
-		if (current.status.value === status) return;
+		if (current.status.value === status && !extra?.failed && !current.status.failed) return;
 
 		const next = [...this.routerModels];
-		next[idx] = { ...current, status: { ...current.status, value: status } };
+		next[idx] = { ...current, status: { ...current.status, value: status, ...extra } };
 		this.routerModels = next;
 	}
 
@@ -1006,6 +1024,7 @@ class ModelsStore {
 		this.statusWaiters.clear();
 		this.models = [];
 		this.routerModels = [];
+		this.routerModelsFetched = false;
 		this.loading = false;
 		this.updating = false;
 		this.error = null;
@@ -1030,6 +1049,7 @@ export const modelsStore = new ModelsStore();
 
 export const modelOptions = () => modelsStore.models;
 export const routerModels = () => modelsStore.routerModels;
+export const routerModelsFetched = () => modelsStore.routerModelsFetched;
 export const modelsLoading = () => modelsStore.loading;
 export const modelsUpdating = () => modelsStore.updating;
 export const modelsError = () => modelsStore.error;

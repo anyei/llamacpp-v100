@@ -4,7 +4,7 @@
 	import { browser } from '$app/environment';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { AlertTriangle, Network, Plus, X } from '@lucide/svelte';
+	import { AlertTriangle, Network, Plus, Power, X } from '@lucide/svelte';
 	import { toast } from 'svelte-sonner';
 	import { ActionIcon } from '$lib/components/app';
 	import { Badge } from '$lib/components/ui/badge';
@@ -14,6 +14,8 @@
 	import { ROUTES } from '$lib/constants';
 	import { FleetService } from '$lib/services/fleet.service';
 	import { fleetStore } from '$lib/stores/fleet.svelte';
+	import { modelsStore } from '$lib/stores/models.svelte';
+	import { isRouterMode } from '$lib/stores/server.svelte';
 	import { formatFileSize } from '$lib/utils';
 	import FleetDeviceCard from './FleetDeviceCard.svelte';
 	import FleetWorkerLogs from './FleetWorkerLogs.svelte';
@@ -55,6 +57,31 @@
 		return path.split('/').pop() || path;
 	});
 
+	// shell-pasteable reconstruction of the serve's exact launch command:
+	// env gates one per line, then the argv (see body["launch"] server-side)
+	let launchText = $derived.by(() => {
+		const launch = status?.launch;
+		if (!launch || (!launch.env?.length && !launch.cmd?.length)) return null;
+		const quote = (t: string) =>
+			/[^A-Za-z0-9_@%+=:,./-]/.test(t) ? `'${t.replace(/'/g, `'\\''`)}'` : t;
+		const lines = (launch.env ?? []).map((e) => {
+			const i = e.indexOf('=');
+			return e.slice(0, i + 1) + quote(e.slice(i + 1)) + ' \\';
+		});
+		if (launch.cmd?.length) lines.push(launch.cmd.map(quote).join(' '));
+		return lines.join('\n');
+	});
+
+	async function copyLaunchCommand() {
+		if (!launchText) return;
+		try {
+			await navigator.clipboard.writeText(launchText);
+			toast.success('Launch command copied');
+		} catch {
+			toast.error('Clipboard unavailable');
+		}
+	}
+
 	// fleet-wide totals across the pipeline devices: worker-CPU devices contribute
 	// RAM + cpu layers, everything else (local GPUs, GPU workers) VRAM + gpu layers
 	let fleetTotals = $derived.by(() => {
@@ -68,7 +95,7 @@
 			hasLayers: false
 		};
 		for (const device of devices) {
-			if (device.worker_is_cpu) {
+			if (device.is_cpu ?? device.worker_is_cpu) {
 				t.ramFree += device.memory_free_mib;
 				t.ramTotal += device.memory_total_mib;
 				t.cpuLayers += device.n_layers ?? 0;
@@ -139,6 +166,33 @@
 	let includeEndpoint = $state<string | null>(null);
 	let showIncludeDialog = $state(false);
 	let isReloading = $state(false);
+
+	// ROUTER mode only: the fleet serve is a router child, so it can be unloaded
+	// from here (same store path as the model selector's unload). Prefer the model
+	// this page's data was proxied from - with several loaded models the first
+	// listed id can be a different serve than the one on screen
+	let unloadTarget = $derived(
+		isRouterMode()
+			? (fleetStore.status?.router_model ?? modelsStore.loadedModelIds[0] ?? null)
+			: null
+	);
+	let showUnloadDialog = $state(false);
+	let isUnloading = $state(false);
+
+	async function handleUnloadConfirm() {
+		showUnloadDialog = false;
+		if (!unloadTarget) return;
+
+		isUnloading = true;
+
+		try {
+			await modelsStore.unloadModel(unloadTarget);
+		} catch {
+			// unloadModel already surfaces the error toast
+		} finally {
+			isUnloading = false;
+		}
+	}
 
 	function requestInclude(endpoint: string) {
 		includeEndpoint = endpoint;
@@ -215,6 +269,7 @@
 
 	onMount(() => {
 		fleetStore.startPolling();
+		modelsStore.fetch().catch(() => {}); // populate loadedModelIds for the unload control
 	});
 
 	onDestroy(() => {
@@ -253,6 +308,30 @@
 						<span class="text-xs text-muted-foreground">
 							{formatFileSize(status.model.size_bytes)}
 						</span>
+					{/if}
+
+					{#if status.speculative && status.speculative.type !== 'none'}
+						<Badge
+							class="text-xs"
+							title={`speculation: ${status.speculative.type}${status.speculative.draft_model ? ` · drafter ${status.speculative.draft_model}` : ''}${status.speculative.n_max != null ? ` · n_max ${status.speculative.n_max}` : ''}`}
+						>
+							{status.speculative.type.replace(/^draft-/, '')}{status.speculative.draft_device
+								? ` @ ${status.speculative.draft_device}`
+								: ''}
+						</Badge>
+					{/if}
+
+					{#if unloadTarget}
+						<Button
+							variant="outline"
+							size="sm"
+							class="h-6 px-2 text-[10px]"
+							disabled={isUnloading}
+							onclick={() => (showUnloadDialog = true)}
+						>
+							<Power class="h-3 w-3 {isUnloading ? 'animate-spin' : ''}" />
+							Unload
+						</Button>
 					{/if}
 				{/if}
 			{/if}
@@ -455,6 +534,32 @@
 				</div>
 			{/if}
 
+			{#if launchText}
+				<details class="rounded-md border bg-card">
+					<summary
+						class="cursor-pointer select-none px-3 py-2 text-xs text-muted-foreground hover:text-foreground"
+					>
+						Launch command — the exact argv + env gates of this serve
+					</summary>
+
+					<div class="border-t px-3 py-2">
+						<div class="mb-2 flex justify-end">
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-6 px-2 text-[10px]"
+								onclick={copyLaunchCommand}
+							>
+								Copy
+							</Button>
+						</div>
+
+						<pre
+							class="overflow-x-auto font-mono text-xs leading-relaxed whitespace-pre-wrap break-all select-all">{launchText}</pre>
+					</div>
+				</details>
+			{/if}
+
 			{#if !status && !fleetStore.error}
 				<div class="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
 					Fetching fleet status…
@@ -585,6 +690,17 @@
 </div>
 
 <FleetWorkerLogs bind:open={logsOpen} endpoint={logsEndpoint} />
+
+<DialogConfirmation
+	bind:open={showUnloadDialog}
+	title="Unload model"
+	description={`Unload ${unloadTarget ?? ''}? The serve stops, all fleet workers free their shares (worker processes and disk caches stay), and in-flight requests are dropped.`}
+	confirmText="Unload"
+	variant="destructive"
+	icon={Power}
+	onConfirm={handleUnloadConfirm}
+	onCancel={() => (showUnloadDialog = false)}
+/>
 
 <DialogConfirmation
 	bind:open={showIncludeDialog}

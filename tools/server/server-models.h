@@ -82,8 +82,10 @@ struct server_model_meta {
     json loaded_info; // info to be reflected via /v1/models endpoint ; if in DOWNLOADING state, it should contain download progress info
     json progress; // reflect load or download progress info, if any
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
+    std::vector<std::string> error_tail; // last output lines of a failed child, for the UI/wizard error surface
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    json gguf_meta; // offline gguf header facts (size, arch, moe, mtp, kv/token) for the launch wizard
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     bool is_ready() const {
@@ -134,12 +136,32 @@ private:
     // proxy_request forwards a POST carrying an X-Conversation-Id. best effort: a stale entry just
     // makes the child answer not found and the client recovers. owns its lock, one mutex per struct
     struct conv_model_tracker {
-        void remember(const std::string & conv_id, const std::string & model) {
+        // returns the ticket of this registration, 0 when nothing was registered. a stop
+        // (forget) invalidates every ticket parked for the conversation; a concurrent
+        // same-conversation request must NOT - it only refreshes the routing model
+        uint64_t remember(const std::string & conv_id, const std::string & model) {
             if (conv_id.empty() || model.empty()) {
-                return;
+                return 0;
             }
             std::lock_guard<std::mutex> lock(mu);
-            map[conv_id] = model;
+            uint64_t ticket = next_ticket++;
+            auto & e = map[conv_id];
+            e.model = model;
+            e.tickets.insert(ticket);
+            // parked tickets are single-use (consumed by alive); the cap defends against
+            // a caller path that registers but never reaches its alive check
+            while (e.tickets.size() > 16) {
+                e.tickets.erase(e.tickets.begin());
+            }
+            return ticket;
+        }
+
+        // single-use: consumes the ticket. false means a stop erased the conversation
+        // while this request was parked in the model load wait
+        bool alive(const std::string & conv_id, uint64_t ticket) {
+            std::lock_guard<std::mutex> lock(mu);
+            auto it = map.find(conv_id);
+            return it != map.end() && it->second.tickets.erase(ticket) > 0;
         }
 
         std::optional<std::string> lookup(const std::string & conv_id) {
@@ -151,7 +173,7 @@ private:
             if (it == map.end()) {
                 return std::nullopt;
             }
-            return it->second;
+            return it->second.model;
         }
 
         void forget(const std::string & conv_id) {
@@ -163,8 +185,13 @@ private:
         }
 
       private:
-        std::mutex                                   mu;
-        std::unordered_map<std::string, std::string> map;
+        struct entry_t {
+            std::string model;
+            std::set<uint64_t> tickets;
+        };
+        std::mutex                               mu;
+        uint64_t                                 next_ticket = 1;
+        std::unordered_map<std::string, entry_t> map;
     };
 
     common_preset_context ctx_preset;
@@ -200,6 +227,11 @@ public:
     //   - if a model is not running, it will be added or updated according to the source
     void load_models();
 
+    // launch wizard: the live models-dir list (comma-joined), settable at
+    // runtime from the UI; persisted under the llama cache dir
+    std::string get_models_dirs();
+    void set_models_dirs(const std::string & dirs);
+
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
 
@@ -213,6 +245,11 @@ public:
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
+        // launch-wizard overlay: extra argv tokens appended after the preset's
+        // rendered args (later flags win), and extra KEY=VALUE env entries for
+        // the child (gates like GGML_META_*); one-shot, not persisted
+        std::vector<std::string> extra_args;
+        std::vector<std::string> extra_env;
     };
 
     // load and unload model instances
@@ -227,6 +264,7 @@ public:
         int exit_code = 0; // only valid if status == UNLOADED
         json loaded_info = nullptr;
         json progress = nullptr;
+        std::vector<std::string> log_tail = {}; // last child output lines, kept when the exit was a failure
     };
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint
@@ -249,7 +287,7 @@ public:
     bool ensure_model_ready(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
@@ -312,6 +350,24 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+    // launch wizard: hardware + fleet discovery snapshot (router never inits
+    // CUDA - GPUs come from an nvidia-smi subprocess, workers from beacons)
+    server_http_context::handler_t get_wizard_hw;
+    server_http_context::handler_t get_wizard_sweeps;
+    server_http_context::handler_t get_wizard_dirs;
+    server_http_context::handler_t get_wizard_placements;
+    server_http_context::handler_t post_wizard_placement_generate;
+    server_http_context::handler_t post_wizard_placement_remove;
+    server_http_context::handler_t post_wizard_dirs;
+    // TASKS #94: named per-model launch configs, persisted in the cache dir
+    server_http_context::handler_t get_wizard_configs;
+    server_http_context::handler_t post_wizard_configs;
+    server_http_context::handler_t del_wizard_configs;
+    // fleet visibility in router mode: the fleet machinery lives in the CHILD
+    // serving the current model - forward to the loading child first (live
+    // per-worker load progress), else the most recently used running one
+    server_http_context::handler_t get_router_fleet_status;
+    server_http_context::handler_t get_router_fleet_worker_log;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

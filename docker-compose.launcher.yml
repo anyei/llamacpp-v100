@@ -1,0 +1,62 @@
+# Launch wizard / model router (docs/launcher-wizard-plan.md).
+#
+# Router mode = llama-server with NO model argument. The wizard lives at
+# http://<host>:<port>/wizard.html ; the normal chat UI is at / and serves
+# whichever model the wizard launched. Model dirs can be left unset - the
+# wizard's "Model sources" screen suggests mounted storage, and the list
+# persists in the launcher-cache volume across restarts.
+#
+#   MODELS_DIR=/mnt/files PORT=8399 docker compose -f docker-compose.launcher.yml up -d
+#
+# Optional:
+#   COORD_IMAGE=llamacpp-local-v100:<tag>       pin an image (default :latest)
+#   MODELS_DIRS_FLAG="--models-dir /models"     pin dirs from the CLI (beats the UI list)
+#
+# wizard.html is embedded in llamacpp-local-v100 images >= 64c68933b. For a
+# dev tree, override the image and add back the /srcbin + /ui mounts with
+# --path /ui (see git history of this file for the dev layout).
+
+services:
+  llama-launcher:
+    container_name: llama-launcher
+    image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
+    restart: unless-stopped
+    network_mode: host
+    # the image's baked-in HEALTHCHECK probes :8080; the launcher listens on PORT
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8399}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${MODELS_DIR:-/mnt/files}:/models:ro
+      # the host's whole /mnt tree, so any drive is addable as a model source
+      # without recreating the container; rslave propagation makes drives
+      # mounted on the host AFTER startup appear inside too
+      - type: bind
+        source: /mnt
+        target: /mnt
+        read_only: true
+        bind:
+          propagation: rslave
+      - launcher-cache:/root/.cache
+    entrypoint: /app/llama-server
+    # no implicit loads: picking a model in the chat UI (or any OpenAI-compat
+    # request naming one) must NOT start a multi-minute load next to a
+    # production serve - launches go through the wizard / POST /models/load.
+    # Re-enable with MODELS_AUTOLOAD_FLAG=--models-autoload.
+    command: >
+      --host ${HOST:-0.0.0.0}
+      --port ${PORT:-8399}
+      ${MODELS_AUTOLOAD_FLAG:---no-models-autoload}
+      ${MODELS_DIRS_FLAG:-}
+
+volumes:
+  launcher-cache:

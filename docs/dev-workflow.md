@@ -134,7 +134,7 @@ the whole RPC feature batch was developed this way):
 # CPU loop (arg parsing, RPC protocol, anything backend-agnostic):
 docker run -d --name llama-devcpu --network host \
   -v "$PWD":/src:ro -v /path/to/work:/work \
-  -v /mnt/models/ollama37-k80/.ollama/custom-models:/models:ro \
+  -v "$MODELS_DIR":/models:ro \
   ubuntu:24.04 sleep infinity
 docker exec llama-devcpu bash -c 'apt-get update -qq && apt-get install -y -qq build-essential cmake git'
 docker exec llama-devcpu bash -c 'cmake -S /src -B /work/build-cpu -DCMAKE_BUILD_TYPE=Release \
@@ -157,13 +157,9 @@ throwaway — the real gate before commit is still the production image build (�
 
 ## 2. Models & data
 
-Models live at:
-
-```
-/mnt/models/ollama37-k80/.ollama/custom-models/
-```
-
-Mount it **read-only** into the container at `/models`. The workhorses this session:
+Models live in the host models directory — referred to as `$MODELS_DIR` in
+every command below (set it to wherever your GGUFs are). Mount it
+**read-only** into the container at `/models`. The workhorses this session:
 
 | Model | File (basename) | Notes |
 |---|---|---|
@@ -185,7 +181,7 @@ The image entrypoint dispatches subcommands: `cli`, `perplexity`, `server`, `ben
 ```bash
 docker run --rm --gpus all \
   -e CUDA_VISIBLE_DEVICES=0 \
-  -v /mnt/models/ollama37-k80/.ollama/custom-models:/models:ro \
+  -v "$MODELS_DIR":/models:ro \
   --entrypoint /app/llama llamacpp-local-v100:<tag> cli \
   -m "/models/<MODEL>.gguf" \
   -ngl 99 --no-mmap -c 4096 -n 128 --temp 0 --seed 1 -st -v \
@@ -372,7 +368,7 @@ docker build -f .devops/cuda.Dockerfile --target full -t llamacpp-local-v100:myt
 # Fast correctness canary: Qwen PPL, feature ON vs OFF (same image)
 docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 \
   -e LLAMA_SSD_STREAM_BUFFER=1 -e LLAMA_SSD_STREAM_GPU=1 \
-  -v /mnt/models/ollama37-k80/.ollama/custom-models:/models:ro \
+  -v "$MODELS_DIR":/models:ro \
   -v .../wikitext-2-raw:/corpus:ro \
   --entrypoint /app/llama llamacpp-local-v100:mytag perplexity \
   -m "/models/Qwen3.6-35B-A3B-UD-Q4_K_XL-MTP.gguf" -ngl 99 --no-mmap \
@@ -381,7 +377,7 @@ docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 \
 # Perf read with the streaming stats (note -v)
 docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES=0 -e GGML_SSD_STREAM_DEBUG=1 \
   -e LLAMA_SSD_STREAM_BUFFER=1 -e LLAMA_SSD_STREAM_GPU=1 -e LLAMA_SSD_STREAM_VRAM_BUDGET=14000 \
-  -v /mnt/models/ollama37-k80/.ollama/custom-models:/models:ro \
+  -v "$MODELS_DIR":/models:ro \
   --entrypoint /app/llama llamacpp-local-v100:mytag cli \
   -m "/models/<MODEL>" -ngl 99 --no-mmap -c 4096 -n 96 --temp 0 --seed 1 -st -v \
   -p "..." </dev/null 2>&1 | grep -aE "GPU cache hit=|miss-path|CUDA0 compute buffer|Prompt:"

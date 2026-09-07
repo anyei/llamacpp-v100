@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "speculative.h"
 
 #include "ggml.h"
 
@@ -12,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -121,10 +123,16 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // maximal-coupling verification rng (#138): independent from both target
+    // and draft sampling so acceptance decisions do not perturb either stream
+    uint32_t speculative_seed = 0;
+    std::mt19937 speculative_rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+        speculative_rng.seed(speculative_seed);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -299,10 +307,13 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
         rbudget = common_reasoning_budget_init(
             vocab,
-            params.reasoning_budget_start,
+            {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            REASONING_BUDGET_IDLE,
+            params.reasoning_budget_warn,
+            params.reasoning_budget_warn_at);
 
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
@@ -310,8 +321,19 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
-    if (params.has_logit_bias()) {
-        samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), params.logit_bias.size(), params.logit_bias.data()));
+    // logit bias: user biases + model suppress tokens (-INFINITY)
+    {
+        std::vector<llama_logit_bias> merged = params.logit_bias;
+
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            merged.push_back({ suppress[i], -INFINITY });
+        }
+
+        if (!merged.empty()) {
+            samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
+        }
     }
 
     if (params.mirostat == 0) {
@@ -401,6 +423,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    // keep verifier randomness independent from both target and draft sampling
+    const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -409,6 +433,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .speculative_seed = */ speculative_seed,
+        /* .speculative_rng  = */ std::mt19937(speculative_seed),
     };
 
     return result;
@@ -453,6 +479,17 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
+
+        // if done, replay end sequence which may contain a grammar trigger
+        const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
+        if (gsmpl->grmr && !accept_grammar && is_done) {
+            const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+            if (end_seq) {
+                for (const llama_token end_token : *end_seq) {
+                    llama_sampler_accept(gsmpl->grmr, end_token);
+                }
+            }
+        }
     }
 
     if (gsmpl->grmr && accept_grammar) {
@@ -481,6 +518,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .speculative_seed = */ gsmpl->speculative_seed,
+        /* .speculative_rng  = */ gsmpl->speculative_rng,
     };
 }
 
@@ -658,6 +697,94 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(dists.size() == draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        // residual sampling needs the target distribution after every constraint
+        const llama_token fallback = common_sampler_sample(gsmpl, ctx, idxs[i], true);
+        const auto & q = dists[i];
+        GGML_ASSERT(q.ids.size() == q.probs.size());
+
+        std::unordered_map<llama_token, float> q_probs;
+        q_probs.reserve(q.ids.size());
+        for (size_t j = 0; j < q.ids.size(); ++j) {
+            q_probs[q.ids[j]] += q.probs[j];
+        }
+        const auto q_prob = [&](llama_token id) {
+            const auto it = q_probs.find(id);
+            return it == q_probs.end() ? 0.0f : it->second;
+        };
+
+        auto * p = common_sampler_get_candidates(gsmpl, false);
+        float p_draft = 0.0f;
+        const float q_draft = q_prob(draft[i]);
+        for (size_t j = 0; j < p->size; ++j) {
+            if (p->data[j].id == draft[i]) {
+                p_draft = p->data[j].p;
+                break;
+            }
+        }
+
+        if (q_draft > 0.0f && uniform(gsmpl->speculative_rng) * q_draft <= p_draft) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: sample the clamped residual max(0, p - q) and stop
+        std::vector<float> residual(p->size);
+        float residual_sum = 0.0f;
+        for (size_t j = 0; j < p->size; ++j) {
+            residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
+            residual_sum += residual[j];
+        }
+
+        llama_token id = fallback;
+        if (residual_sum > 0.0f) {
+            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
+            id = p->data[sample(gsmpl->speculative_rng)].id;
+        }
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, dists, grammar_first);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

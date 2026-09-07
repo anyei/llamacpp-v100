@@ -28,6 +28,10 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: EAGLE3gnorm_before_residual = true\n", __func__);
     }
 
+    // eagle3 norm_before_fc (optional, default false)
+    // compatible with eagle3.1 (e.g. nvidia/gpt-oss-120b-Eagle3-v3)
+    ml.get_key(LLM_KV_NORM_BEFORE_FC, hparams.norm_before_fc, false);
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -52,6 +56,11 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
 
     // Feature fusion layer: projects 3 target layers to draft hidden size
     fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
+
+    // RMSNorm on the fused target features (input to fc), only when norm_before_fc is set.
+    if (hparams.norm_before_fc) {
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd_inp}, 0);
+    }
 
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -130,6 +139,12 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
 
     cur = build_inp_embd_enc();
 
+    // RMSNorm on the fused target features before fc
+    if (hparams.norm_before_fc) {
+        cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "enc_input_norm", -1);
+    }
+
     // Feature fusion layer
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
@@ -159,7 +174,10 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // 1. Token embeddings (e.g.from eagle3's own tok_embd for Llama 3.3 70B, or target model for Llama 3.1 8B)
     // 2. g_embeddings from encoder
     auto * tok_embd = model.tok_embd;
-    if (model.tok_embd == nullptr) {
+    if (tok_embd == nullptr && cparams.other_tok_embd_mirror != nullptr) {
+        tok_embd = cparams.other_tok_embd_mirror; // draft-device mirror (#12)
+    }
+    if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
@@ -292,6 +310,9 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // lm_head - projects to draft vocabulary
     // if the draft has no own output projection, inherit the target model's lm_head
     auto * output = model.output;
+    if (output == nullptr && cparams.other_output_mirror != nullptr) {
+        output = cparams.other_output_mirror; // draft-device mirror (#12)
+    }
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);

@@ -21,7 +21,8 @@ with MTP speculation is higher (~81 t/s — see the README benchmarks).
 |---|---|---|
 | All GPUs in one machine | single process, `-sm tensor` + NCCL — do NOT use RPC | 47.8 t/s (27B, nospec) — the ceiling reference |
 | Model fits one machine, second box idle | leave it idle, or serve another model on it | — |
-| Model does NOT fit one machine | pipeline between boxes: `-sm layer --rpc worker:port` | 32.3 vs 33.2 t/s in-process (27B, 1 local + 1 RPC GPU) → ~3%/token + network RTT |
+| Model does NOT fit one machine (dense) | pipeline between boxes: `-sm layer --rpc worker:port` | 32.3 vs 33.2 t/s in-process (27B, 1 local + 1 RPC GPU) → ~3%/token + network RTT |
+| MoE does NOT fit one machine | expert-parallel, owner group + dual-role (§2b, #70): `./run-ep-fleet-hy3.sh` | hy3 182.5 GB: **5.06-5.22 t/s** EP vs 2.74 layer; V4 86.7 GB: 5.14-5.33 EP vs 4.79 layer |
 | Second box has multiple NVLinked GPUs | TP island: worker runs `--tensor-parallel`, coordinator pipelines to it | 33.3 t/s (27B entirely on a remote 2-GPU island — pessimal case) |
 | Second box has no GPU (CPU + RAM only) | CPU worker: `cpu.Dockerfile --target rpc-worker` (§1b) | 35B-A3B MoE: 7.4-10.4 t/s by CPU; 0.6B: ~20 t/s; ~2-4% network tax (§3b) |
 | Need max context, model fits | offload tail layers to remote box (frees local VRAM for KV) | pipeline cost only |
@@ -45,10 +46,10 @@ gives you a wire protocol; this fork built a serving fleet on top of it** —
 remote devices are treated as a *population* with measured speeds, link
 qualities, caches and lifecycles, not as GPUs that happen to be far away.
 
-| Area | Upstream mainline | This fork (proto 4.2 -> 4.9) |
+| Area | Upstream mainline | This fork (proto 4.2 -> 4.12) |
 |---|---|---|
 | Topologies | layer pipeline | + in-process tensor-parallel (meta backend), **expert-parallel** (meta-over-RPC, attention owner, star reduce - §2b), TP islands (§2/§4), KV annex |
-| Wire | blocking round trips | async + events (pipeline engages), worker-to-worker fenced pulls, fused boundary command (one message per worker per MoE layer), uid-keyed graph cache (16 B/subgraph steady state) |
+| Wire | blocking round trips | async + events (pipeline engages), worker-to-worker fenced pulls, fused boundary command (one message per worker per MoE layer), uid-keyed graph cache (16 B/subgraph steady state), boundary fusion (`GGML_META_BCAST_FUSE`) + opt-in f16 boundary payloads (proto 4.12, `GGML_RPC_WIRE_F16`) |
 | Load path | full re-stream each load; cache serves unverified entries | verified content-addressed cache (atomic write + re-hash on read), `--model-dir` local sourcing, slice provenance (§0.1b) - cold 40 min -> warm minutes, `-ts`-change-proof |
 | Fleet ops | static `--rpc` list | discovery beacons, bandwidth scoring + `--rpc-auto-weight`, capacity gate, fleet UI/API, preflight bench, worker log/restart/include (§2) |
 | Failure | run dies with the worker | CUDA-error containment (drops one connection, not the worker), journal + surgical re-provision (~2 min), `--rpc-reload` re-split over survivors (§6) |
@@ -398,13 +399,13 @@ decides whether distribution helps or hurts.
 
 | | `-sm layer` (pipeline) | `-sm tensor` (tensor-parallel) | `-sm tensor` + EP (expert-parallel) |
 |---|---|---|---|
-| Each device holds | whole layers | a slice of *every* tensor | attention on ONE member, expert slices on the rest |
+| Each device holds | whole layers | a slice of *every* tensor | attention on the OWNER GROUP (local GPUs, layer-interleaved; may also hold expert shares = dual-role, #70), expert slices on the rest |
 | Per-token comms | activations at each stage boundary (KB) | an AllReduce **every layer** | one reduce per MoE boundary (star/fused) |
 | Composition law | **SUM** of stage times (+ hops) | max + per-layer reduce | **max over contacted workers** (#28) |
 | Scales by adding boxes | worse (more stages) single-stream; helps capacity/throughput | only inside a box | capacity + batch throughput; single-stream is latency-bound |
 | Good across a network? | **yes** (Ethernet-friendly) | **NO** — AllReduce/layer over Ethernet is ~100x too slow | yes — the reduce is a small k-vector sum, not a GEMM reduce |
 | Use when | model/KV doesn't fit one box; tail-offload for context | ≥2 NVLinked GPUs in **one** box | a MoE whose **experts** fit no single box |
-| Measured here | CPU fleet 1.2-2.0 t/s (35B); law: best-single-box wins if it fits | 2x V100 in-box: 108 t/s (35B), 47.8 (27B) — the ceiling | V4 86.7 GB RAM-resident on the fleet: 2.4-2.7 t/s single-stream |
+| Measured here | CPU fleet 1.2-2.0 t/s (35B); hy3 182.5 GB lean fleet 2.74; law: best-single-box wins if it fits | 2x V100 in-box: 108 t/s (35B), 47.8 (27B) — the ceiling | V4 86.7 GB lean-3 roster: **5.14-5.33 t/s** (2026-07-22 record); hy3 182.5 GB dual-role owner group: **5.06-5.22 t/s** vs its 2.74 layer baseline (2026-07-23, ts 21,21,46,50,27) |
 
 ```
  -sm layer (pipeline)          -sm tensor (in-box TP)      -sm tensor + EP (cross-box)
@@ -447,31 +448,41 @@ island; only the island's boundary activations cross the network.
 ### Spin-up — `-sm tensor` + expert-parallel (a MoE across the fleet)
 
 The flagship distributed mode (TASKS.md #28; design in
-`docs/expert-parallel-plan.md`). Attention/KV/router live on ONE member
-(`LLAMA_META_ATTN_OWNER`, a local V100), the routed experts are segmented
-across the members (`LLAMA_META_EP_ONLY`). This is how the 86.7 GB
-DeepSeek-V4-Flash runs RAM-resident across boxes that individually hold none of
-it:
+`docs/expert-parallel-plan.md`; owner GROUP + dual-role: #70). Attention/KV/
+router live on the OWNER GROUP (`LLAMA_META_ATTN_OWNER=0,1` — comma list of
+local GPUs, layers interleaved `il % n_owners`, attention syncs stay on
+NVLink), the routed experts are segmented across the members
+(`LLAMA_META_EP_ONLY`). Owners may ALSO carry expert shares in leftover VRAM
+(dual-role). This is how 86.7 GB DeepSeek-V4-Flash and 182.5 GB hy3 run
+RAM-resident across boxes that individually hold none of them:
 
 ```bash
 # env selects the EP shape; --device lists the meta members in -ts order
-LLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=0 \
-llama-server -m DeepSeek-V4-Flash.gguf \
-  --rpc 10.5.5.11:50052,10.5.5.15:50054 \
-  --device CUDA0,RPC0,RPC1 -sm tensor -ts 0,3,2 \
-  -ngl 99 --no-mmap -c 4096 -ub 256 -b 256
+LLAMA_META_EP_ONLY=1 LLAMA_META_ATTN_OWNER=0,1 LLAMA_META_ALLOW_MULTI_LOCAL=1 \
+llama-server -m hy3-1M-MTP-Q4_K_M.gguf \
+  --rpc 127.0.0.1:50053,10.5.5.11:50052,10.5.5.15:50055 \
+  --device CUDA0,CUDA1,RPC0,RPC2,RPC3 -sm tensor -ts 18,18,52,50,27 \
+  -ngl 99 --no-mmap --rpc-reload -c 4096 -ub 256 -b 256
 
-# ready-made (hand -ts):        ./run-ep-fleet-deepseek.sh
-# ready-made (auto-weighted):   EP_AUTO_WEIGHT=--rpc-auto-weight ./run-ep-fleet-deepseek.sh
+# ready-made (V4, single owner):   ./run-ep-fleet-deepseek.sh
+# ready-made (hy3, dual-role):     ./run-ep-fleet-hy3.sh   (MTP=1 for spec decode)
 ```
 
-- `-ts 0,3,2` gives the attention owner a **0** expert share (it owns attention
-  instead); `--rpc-auto-weight` sizes the rest by score, capped by memory.
-- **Exactly ONE local GPU** (the attention owner). A second local GPU as an
-  expert member corrupts the reduce and is rejected at load (TASKS.md #48).
-  Got two local GPUs? Use them via single-box `-sm tensor -ngl 99 -ncmoe N` —
-  that's *faster* for a model whose experts fit CPU RAM+NVMe (V4: 3.54 vs
-  ~2.5 t/s), since EP single-stream is latency-bound anyway.
+- `-ts` shares are EXPERT BYTES (GiB works). `18,18,...` = dual-role owners
+  (18 GiB of experts each at VRAM bandwidth — measured hy3 3.5-3.8 -> 4.6-4.8
+  t/s vs CPU-only experts); `0,0,...` = attention-only owners. CAPACITY-FIT
+  every share: member footprint = slice + residual mirror (hy3 1.9 / GLM 3.4
+  GiB) + ~1.5 GiB compute; an oversized share aborts the worker (#68b).
+  Auto-weight is NOT yet owner-group aware (#70) — pin -ts by hand and run
+  with `LLAMA_FLEET_CAPACITY_CHECK=0` (the gate predates dedicated sizing).
+- **Always pass `--rpc-reload` on EP loads** (#72): a batched-placement
+  manifest miss fails the endpoint by design; only the reload/surgical
+  machinery re-provisions it — without the flag the load wedges silently at
+  100% or the first decode fails with compute status -3.
+- The old one-local-GPU limit (#48) is RETIRED: the owner-group A/B is
+  byte-identical to single-owner (#70). For a model whose experts fit local
+  RAM+NVMe, single-box `-sm tensor -ngl 99 -ncmoe N` is still faster (V4:
+  9.8 vs ~5 t/s) — EP is for models that exceed the box.
 - **Single-stream is latency-bound, not compute-bound** (#28 attribution): a
   token pays one round trip per MoE boundary, so **fewer computing members is
   faster** single-stream (adding a fast V100 expert member *lowered* single-
@@ -718,7 +729,14 @@ Everything here is automatic — no new flags on the happy path:
   all-workers-dead degrades to local-only (loudly), and a load that cannot
   succeed yet (fleet-sized model, no workers) retries every 10s. Same
   process, HTTP endpoints and queue throughout — no orchestrator needed.
-  Together: a fully self-healing fleet with no manual intervention.
+  Requests that arrive during the reload window are HELD, not raced: every
+  handler acquires a pre-task ctx guard in `create_response()` (released
+  once its tasks are posted), and the reload drains those guards before
+  destroying the model, then releases them when serving resumes (fixed
+  2026-07-29: HTTP threads tokenizing against the mid-reload model were a
+  use-after-free — exit 139 whenever traffic raced a recovery; the same
+  guard also gates router idle-sleep teardown). Together: a fully
+  self-healing fleet with no manual intervention.
 - **Restart policy**: give workers `restart: always`; the coordinator's
   weight cache handshake (`SET_TENSOR_HASH`) makes reconnect loads cheap.
 
@@ -735,9 +753,13 @@ Everything here is automatic — no new flags on the happy path:
   (task 13 closed): quality validated by perplexity, but temp-0 outputs can
   diverge from single-GPU runs (MoE-router-amplified reduction noise) — do
   not gate MLA tensor/island setups on byte-exactness.
-- No *runtime* fault tolerance: a worker that dies mid-session aborts the
-  coordinator (load-time degradation exists — see `--rpc-skip-unavailable`
-  in §6). No auth/TLS:
+- Runtime fault tolerance EXISTS (task 29, closed 2026-07-15): a worker that
+  dies mid-session is recovered by surgical re-provision (default-on;
+  `LLAMA_RPC_NO_SURGICAL` to opt out) or a full `--rpc-reload` re-split that
+  drops the dead endpoint, and a discovered worker can join later via the
+  fleet UI / `POST /fleet/reload` (exit-42 reload). A failed endpoint is
+  poisoned rather than aborting the coordinator. Residual gaps are tracked
+  as TASKS.md #72 (load-path robustness cluster). No auth/TLS:
   private networks only — and workers now also connect to each other, so
   the whole worker set must share the trusted network.
 - **GTX 16xx workers (TU116/117)**: those cards are cc 7.5 WITHOUT tensor

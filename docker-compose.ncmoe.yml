@@ -28,10 +28,10 @@
 
 services:
   llama-ncmoe:
-    container_name: llama-ncmoe
+    container_name: llama-laguna-s-2.1-ncmoe
     image: ${COORD_IMAGE:-llamacpp-local-v100:latest}
     volumes:
-      - ${MODELS_DIR:-/mnt/models/ollama37-k80/.ollama/custom-models}:/models:ro
+      - ${MODELS_DIR:-/mnt/files/Laguna-S-2.1}:/models:ro
     ports:
       - "${NCMOE_PORT:-8099}:8080"
     deploy:
@@ -45,14 +45,16 @@ services:
       - CUDA_VISIBLE_DEVICES=${NCMOE_GPUS:-0,1}
     entrypoint: /app/llama-server
     command: >
-      -m /models/${NCMOE_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
-      -ngl 99
-      -ncmoe ${NCMOE_LAYERS:-20}
+      -m /models/${NCMOE_MODEL:-Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf}
+      -ngl 30
+      -sm tensor
+      -ts 0.5,0.5
+      -ncmoe ${NCMOE_LAYERS:-13}
       -t ${NCMOE_THREADS:-10}
       -c ${NCMOE_CTX:-8192}
-      --no-warmup
       --host 0.0.0.0
       --port 8080
       -np ${NCMOE_PARALLEL:-1}
       -fit off
+      --no-mmap
     restart: always

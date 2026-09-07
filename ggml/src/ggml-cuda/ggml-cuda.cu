@@ -97,6 +97,22 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+// Scoped error containment (TASKS.md #136): bounded, optional computes (the
+// load-time device bench) arm this around their graph so a CUDA failure throws
+// to their boundary instead of aborting a whole model load. Exposed through the
+// backend reg proc address table as ggml_backend_error_contain_push/_pop.
+static thread_local int g_cuda_error_contain_scope = 0;
+
+static void ggml_backend_cuda_error_contain_push(void) {
+    g_cuda_error_contain_scope++;
+}
+
+static void ggml_backend_cuda_error_contain_pop(void) {
+    if (g_cuda_error_contain_scope > 0) {
+        g_cuda_error_contain_scope--;
+    }
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -113,7 +129,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
         const char * env = getenv("GGML_CUDA_ERROR_CONTAIN");
         return env != nullptr && atoi(env) != 0;
     }();
-    if (contain) {
+    if (contain || g_cuda_error_contain_scope > 0) {
         (void) cudaGetLastError(); // clear the sticky error state where possible
         throw std::runtime_error(std::string(GGML_CUDA_NAME " error: ") + msg + " (" + stmt + ")");
     }
@@ -1906,6 +1922,51 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // ids may carry the skip sentinel (a negative id = this lane uses no expert), whose
+    // dst rows no kernel writes - zero dst first so they cannot surface recycled garbage
+    // (a NaN there would survive being multiplied by a zero gating weight).
+    // GGML_CUDA_MMID_NO_DST_ZERO=1 skips it to measure its cost; only valid where no
+    // sentinel can appear (i.e. expert placement off).
+    {
+        static const bool no_dst_zero = getenv("GGML_CUDA_MMID_NO_DST_ZERO") != nullptr;
+        if (!no_dst_zero) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+        }
+    }
+
+    // TASKS #75 diagnostic (GGML_CUDA_CHECK_IDS=1): bounds-check the expert ids at the
+    // point of use. An id outside [0, src0->ne[2]) is what turns a placement bug into an
+    // illegal memory access; reports the node, device and offending value.
+    {
+        static const bool ids_check = getenv("GGML_CUDA_CHECK_IDS") != nullptr;
+        // the sync D2H copy is illegal while a CUDA graph is capturing (graphs stay
+        // default-on for quantized MoE decode) - skip instead of aborting the very
+        // decode this diagnostic exists to debug; set GGML_CUDA_DISABLE_GRAPHS=1
+        // for full coverage
+        cudaStreamCaptureStatus ids_capture = cudaStreamCaptureStatusNone;
+        if (ids_check) {
+            CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &ids_capture));
+        }
+        if (ids_check && ids_capture == cudaStreamCaptureStatusNone && ids != nullptr && ids->type == GGML_TYPE_I32) {
+            const int64_t n_ids = ggml_nelements(ids);
+            std::vector<int32_t> h_ids(n_ids);
+            CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, n_ids*sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, ctx.stream()));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            for (int64_t p = 0; p < n_ids; p++) {
+                if (h_ids[p] < -1 || h_ids[p] >= src0->ne[2]) {
+                    static int n_bad = 0;
+                    if (n_bad++ < 16) {
+                        GGML_LOG_ERROR("CHECK_IDS: device %d node '%s' ids '%s' [%" PRId64 "] = %d "
+                                       "outside [0, %" PRId64 ") - OOB expert index\n",
+                                       ggml_cuda_get_device(), dst->name, ids->name, p, h_ids[p], src0->ne[2]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -1972,7 +2033,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02);
+                if (expert_to_use < 0) {
+                    continue; // skip sentinel: this lane uses no expert
+                }
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -1982,7 +2046,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    // with skip sentinels fewer rows than lanes are used; the buffers are sized for the
+    // maximum, and rows that stay unused keep the zeros written to dst below
+    const int64_t ne_rows_used = (int64_t) ids_to_sorted_host.size();
+    GGML_ASSERT(ne_rows_used <= ne_get_rows);
+    ids_to_sorted_host.resize(ne_get_rows, 0);
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
@@ -2538,6 +2606,17 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// #140: trace the per-compute capture decision (value-parsed). One line per
+// graph compute + the first differing node on a property change - the
+// instrument for "why does this graph not capture/replay".
+static bool ggml_cuda_graph_trace_enabled() {
+    static const bool en = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_TRACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return en;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2587,17 +2666,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+        if (ggml_cuda_graph_trace_enabled()) {
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu UID-REUSE\n", graph_key, (unsigned long long) cgraph->uid);
+        }
         return false;
     }
 
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
-    if ((int)graph->node_props.size() != cgraph->n_nodes) {
+    const int prev_n_nodes = (int) graph->node_props.size();
+    if (prev_n_nodes != cgraph->n_nodes) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    int first_diff = -1;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -2610,9 +2694,25 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool diff = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        if (res || diff) {
             graph->node_props[i] = prop;
             res = true;
+        }
+        if (diff && first_diff < 0) {
+            first_diff = i;
+        }
+    }
+
+    if (res && ggml_cuda_graph_trace_enabled()) {
+        if (prev_n_nodes != cgraph->n_nodes) {
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu SIZE %d -> %d\n",
+                    graph_key, (unsigned long long) cgraph->uid, prev_n_nodes, cgraph->n_nodes);
+        } else if (first_diff >= 0) {
+            const ggml_tensor * t = cgraph->nodes[first_diff];
+            fprintf(stderr, "GRAPH_TRACE upd key=%p uid=%llu DIFF node %d/%d op=%s name=%s\n",
+                    graph_key, (unsigned long long) cgraph->uid, first_diff, cgraph->n_nodes,
+                    ggml_op_name(t->op), t->name);
         }
     }
 
@@ -3947,7 +4047,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
+            // TASKS #75 diagnostic: GGML_CUDA_NO_CONCURRENT_STREAMS=1 keeps every node on
+            // the main stream (isolates cross-stream ordering bugs from everything else)
+            static const bool no_concurrent = getenv("GGML_CUDA_NO_CONCURRENT_STREAMS") != nullptr;
+            if (!no_concurrent && stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
@@ -4082,6 +4185,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                // TASKS #75 diagnostic (GGML_CUDA_SYNC_NODES=1): synchronize after every
+                // node so a faulting kernel is named at its own launch instead of poisoning
+                // the context and surfacing somewhere unrelated. Compute only - unlike
+                // CUDA_LAUNCH_BLOCKING it leaves the weight upload at full speed.
+                {
+                    static const bool sync_nodes = getenv("GGML_CUDA_SYNC_NODES") != nullptr;
+                    if (sync_nodes) {
+                        const cudaError_t err_sync = cudaStreamSynchronize(cuda_ctx->stream());
+                        if (err_sync != cudaSuccess) {
+                            GGML_LOG_ERROR("SYNC_NODES: device %d FAULTED at node %d '%s' (%s): %s\n",
+                                           cuda_ctx->device, i, node->name, ggml_op_name(node->op),
+                                           cudaGetErrorString(err_sync));
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (node->src[s] != nullptr) {
+                                    GGML_LOG_ERROR("SYNC_NODES:   src[%d] '%s' (%s) ne=[%" PRId64 ",%" PRId64
+                                                   ",%" PRId64 ",%" PRId64 "] data=%p\n",
+                                                   s, node->src[s]->name, ggml_type_name(node->src[s]->type),
+                                                   node->src[s]->ne[0], node->src[s]->ne[1], node->src[s]->ne[2],
+                                                   node->src[s]->ne[3], node->src[s]->data);
+                                }
+                            }
+                            GGML_ABORT("SYNC_NODES: first faulting node reported above");
+                        }
+                    }
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -4171,10 +4300,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    bool graph_compatible   = false;
+    bool properties_changed = false;
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4197,6 +4328,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+
+    if (ggml_cuda_graph_trace_enabled()) {
+        fprintf(stderr, "GRAPH_TRACE cmp ctx=%p key=%p uid=%llu n=%d en=%d compat=%d changed=%d warm=%d inst=%d use=%d cap=%d\n",
+                (void *) cuda_ctx, graph_key, (unsigned long long) cgraph->uid, cgraph->n_nodes,
+                graph->is_enabled(), graph_compatible, properties_changed, graph->warmup_complete,
+                graph->instance != nullptr, use_cuda_graph, cuda_graph_update_required);
     }
 #endif // USE_CUDA_GRAPH
 
@@ -4861,6 +4999,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -4899,6 +5038,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -5399,6 +5539,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_error_contain_push") == 0) {
+        return (void *)ggml_backend_cuda_error_contain_push;
+    }
+    if (strcmp(name, "ggml_backend_error_contain_pop") == 0) {
+        return (void *)ggml_backend_cuda_error_contain_pop;
     }
     return nullptr;
 }

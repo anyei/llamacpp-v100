@@ -686,6 +686,14 @@ export { default as ChatScreenForm } from './ChatScreen/ChatScreenForm.svelte';
 export { default as ChatScreenServerError } from './ChatScreen/ChatScreenServerError.svelte';
 
 /**
+ * ChatScreenModelLoading component
+ *
+ * Prominent banner while a router-managed model is loading (server-reported
+ * status via /models/sse), with the load progress when available.
+ */
+export { default as ChatScreenModelLoading } from './ChatScreen/ChatScreenModelLoading.svelte';
+
+/**
  * Stream resume status indicator. Shows a small "Reconnecting to the stream..."
  * banner with a spinner while `chatStore.streamConnectionState` is `resuming`,
  * i.e. after a dropped connection is reattaching to the live SSE replay buffer.

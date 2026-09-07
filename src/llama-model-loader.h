@@ -78,6 +78,11 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool use_direct_io = false;
     bool check_tensors;
+
+    // TASKS #75: when set, routed-expert weights of placed layers are read with
+    // their dim-2 expert chunks PERMUTED (hottest-first) so the meta buffer
+    // receives an already-permuted logical tensor (docs/expert-placement-plan.md §2b)
+    const struct llama_expert_placement * expert_placement = nullptr;
     bool no_alloc;
 
     llama_files files;
@@ -85,6 +90,10 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+
+    // byte ranges, per source file, that init_mappings() must not pull in eagerly: gather tables
+    // the model reads a few percent of. set under LLAMA_MMAP_RANDOM only, sorted by offset.
+    std::map<uint16_t, std::vector<std::pair<size_t, size_t>>> mmap_no_prefetch;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
@@ -126,8 +135,7 @@ struct llama_model_loader {
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
+        llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,

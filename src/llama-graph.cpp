@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-expert-placement.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1359,6 +1360,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    expert_tables    (params.expert_tables),
+    expert_mask      (params.expert_mask),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -1709,6 +1712,17 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_swiglu(ctx0, cur);
                 cb(cur, "ffn_swiglu", il);
             } break;
+        case LLM_FFN_SWIGLU_OAI_MOE:
+            if (gate && type_gate == LLM_FFN_PAR) {
+                // same alpha/limit constants as gpt-oss
+                const float alpha = 1.702f;
+                const float limit = 7.0f;
+                cur = ggml_swiglu_oai(ctx0, cur, tmp, alpha, limit);
+                cb(cur, "ffn_swiglu_oai", il);
+                type_gate = LLM_FFN_SEQ;
+            } else {
+                GGML_ABORT("LLM_FFN_SWIGLU_OAI_MOE requires a parallel gate");
+            } break;
         case LLM_FFN_GEGLU:
             {
                 cur = ggml_geglu(ctx0, cur);
@@ -1909,6 +1923,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // TASKS #84 probe 2 (LLAMA_EXPERT_MASK): restrict routing to a per-layer
+    // allowed-expert budget. -INF rides the SELECTION scores only - gating
+    // weights still gather from the unbiased probs of the (allowed) selected
+    // experts, so allowed-expert math is untouched.
+    if (expert_mask != nullptr && il >= 0) {
+        ggml_tensor * m = expert_mask->tensor_for(il);
+        if (m != nullptr) {
+            selection_probs = ggml_add(ctx0, selection_probs, m);
+            cb(selection_probs, "ffn_moe_probs_budget", il);
+        }
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
@@ -1916,6 +1942,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // TASKS #75 hot-expert placement: this layer's routed experts are split by
+    // WHOLE EXPERT across meta members. Remap global expert ids to member-LOCAL
+    // slots for the expert GEMMs, and build the per-pair ownership mask that
+    // zeroes non-owned contributions after weight normalization (each member
+    // computes non-owned pairs against its local slot 0 - finite garbage whose
+    // gating weight the mask sets to 0). docs/expert-placement-plan.md §2c.
+    ggml_tensor * exp_mask_rows = nullptr;
+    ggml_tensor * exp_ids_local = nullptr;
+    if (expert_tables != nullptr && il >= 0 && (size_t) il < expert_tables->remap.size() &&
+            expert_tables->remap[il] != nullptr) {
+        ggml_tensor * remap = expert_tables->remap[il]; // I32 [n_expert]
+        ggml_tensor * mask  = expert_tables->mask [il]; // F32 [n_expert]
+        GGML_ASSERT(remap->ne[0] == n_expert && mask->ne[0] == n_expert);
+
+        const int64_t n_ids = selected_experts->ne[0]*selected_experts->ne[1];
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_ids);
+
+        // member-local ids for the expert GEMMs (get_rows on an I32 src stays I32).
+        // NOT applied to selected_experts yet - the gating-weight gather below must
+        // read probs by ORIGINAL expert id.
+        ggml_tensor * ids_rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, remap, 1, n_expert), ids_flat);
+        ggml_tensor * msk_rows = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mask, 1, n_expert), ids_flat);
+        // TASKS #75 gate 4: under GGML_META_DEBUG, pin the flat ownership gathers as
+        // graph outputs so the meta backend's audit readback at graph end sees this
+        // graph's values (unpinned cells are recycled by the allocator once consumed)
+        static const bool expert_audit = getenv("GGML_META_DEBUG") != nullptr;
+        if (expert_audit) {
+            ggml_set_output(ids_rows);
+            ggml_set_output(msk_rows);
+        }
+        ggml_tensor * ids_local = ggml_reshape_2d(ctx0, ids_rows, selected_experts->ne[0], selected_experts->ne[1]);
+        cb(ids_local, "ffn_moe_ids_local", il);
+
+        // ownership mask rows [1, n_expert_used, n_tokens]; the mask table is
+        // PARTIAL (member masks sum to ones), so this product chain derives
+        // PARTIAL and reaches the existing AllReduce boundary
+        exp_mask_rows = ggml_reshape_3d(ctx0, msk_rows, 1, selected_experts->ne[0], selected_experts->ne[1]);
+        cb(exp_mask_rows, "ffn_moe_exp_mask", il);
+
+        exp_ids_local = ids_local;
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -1955,6 +2023,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    // TASKS #75: apply the ownership mask AFTER weight normalization (norm_w must
+    // see identical mirrored weights on every member) and switch the expert GEMMs
+    // to member-local ids. weights becomes PARTIAL (mirrored x PARTIAL mask), so
+    // the expert weighted-sum reaches the existing AllReduce boundary.
+    if (exp_mask_rows != nullptr) {
+        weights = ggml_mul(ctx0, weights, exp_mask_rows);
+        cb(weights, "ffn_moe_weights_masked", il);
+        selected_experts = exp_ids_local;
     }
 
     //call early so that topk-moe can be used
@@ -2109,7 +2187,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
+        // TASKS #75: the placed name tags this node PARTIAL in the meta split
+        // derivation (see handle_bin_bcast) - member masks zero non-owned lanes,
+        // so the member sum of this product is the logical value
+        cb(experts, exp_mask_rows != nullptr ? "ffn_moe_weighted_placed" : "ffn_moe_weighted", il);
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2668,7 +2749,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

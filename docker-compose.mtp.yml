@@ -41,10 +41,15 @@ services:
       - LLAMA_DECODE_GRAPH_CACHE_TOKENS=64
       # meta-backend compute-container ring; must cover the cached graphs above
       - GGML_META_MAX_GRAPHS=8
+      # post-merge (601ad05a9) upstream enables CUDA graphs on Volta by default;
+      # the MTP draft/verify shape churn makes re-capture a ~5% net LOSS here
+      # (measured 75-78 t/s off vs 70-73 on) - keep them off for spec decode
+      - GGML_CUDA_DISABLE_GRAPHS=1
 #      --rope-scaling yarn
 #      --rope-scale 1.4441
 #      --yarn-orig-ctx 262144
     command: >
+      --server
       -m /models/Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf
       --mmproj /models/qwen3.6-27b-mmproj-f16.gguf 
       --host 0.0.0.0

@@ -17,6 +17,8 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_placement;
+struct llama_expert_placement_tables;
 
 // available models
 enum llm_type {
@@ -127,13 +129,16 @@ enum llm_type {
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_80B_A3B, // Qwen3 Next
+    LLM_TYPE_A3B,     // Qwen3.8 Flash Next
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
+    LLM_TYPE_118B_A8B,  // Laguna-S-2
     LLM_TYPE_120B_A12B, // Nemotron 3 Super
     LLM_TYPE_122B_A10B, // Qwen3.5
     LLM_TYPE_196B_A11B, // Step3.5-Flash
     LLM_TYPE_230B_A10B, // Minimax M2
+    LLM_TYPE_428B_A23B, // Minimax M3
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
@@ -219,6 +224,9 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+    // qwen4exp: separate embed/hidden fusion (fc_hid applies per HC branch)
+    struct ggml_tensor * fc_embd               = nullptr;
+    struct ggml_tensor * fc_hid                = nullptr;
 };
 
 struct llama_layer {
@@ -336,6 +344,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -515,6 +528,28 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // MSA
+    struct ggml_tensor * index_q_proj = nullptr;
+    struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_norm = nullptr;
+    struct ggml_tensor * index_k_norm = nullptr;
+
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -603,12 +638,26 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+
+    // dspark
+    struct ggml_tensor * dspark_markov_w1   = nullptr;
+    struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_conf_proj   = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    struct ggml_tensor * dflash_selector_prev   = nullptr;
+    struct ggml_tensor * dflash_selector_next   = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -636,6 +685,11 @@ struct llama_model {
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+
+    // TASKS #75: hot-expert placement (LLAMA_META_EXPERT_PLACEMENT=<json>, tensor-split
+    // meta configs only); null = uniform contiguous split (today's behavior)
+    std::shared_ptr<llama_expert_placement> expert_placement;
+    std::shared_ptr<llama_expert_placement_tables> expert_tables;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
@@ -673,6 +727,22 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // ask the kernel to start reading the rows a gather is about to take out of a host-mapped
+    // tensor, so the faults overlap instead of serializing one NVMe latency at a time.
+    //
+    // does nothing unless the tensor was nominated by gather_tables() and really is read out of
+    // a mapping. off, and for anything else (offloaded tensors, --load-mode none, non-POSIX
+    // hosts), this is one empty-vector test.
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+
+    // tensors that stay host-resident and are read by sparse row gathers rather than streamed
+    // once. under LLAMA_MMAP_RANDOM these get the random-access advice and the batched readahead
+    // of prefetch_rows(); every other tensor keeps the loader's sequential behaviour.
+    //
+    // nominated by the model, not guessed from size: a big host-resident tensor read in full,
+    // such as token_embd on a CPU-only run, wants the readahead this takes away.
+    virtual std::vector<const struct ggml_tensor *> gather_tables() const { return {}; }
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

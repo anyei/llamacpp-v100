@@ -17,7 +17,9 @@ export function formatFileSize(bytes: number | unknown): string {
 	if (typeof bytes !== 'number') return 'Unknown';
 	if (bytes === 0) return '0 Bytes';
 
-	const k = 1024;
+	// decimal units to match how model sizes are published (#97: a 162 GB model
+	// must not read "150.75 GB" - that number is GiB mislabeled)
+	const k = 1000;
 	const sizes = ['Bytes', 'KB', 'MB', 'GB'];
 	const i = Math.floor(Math.log(bytes) / Math.log(k));
 

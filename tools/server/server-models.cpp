@@ -8,14 +8,20 @@
 #include "preset.h"
 #include "download.h"
 #include "http.h"
+#include "gguf.h"
+#include "ggml-rpc.h"
+#include "subproc.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <optional>
-#include <sheredom/subprocess.h>
+#include <map>
+#include <set>
+#include <deque>
 
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <numeric>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -25,6 +31,7 @@
 #include <chrono>
 #include <queue>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <sstream>
 #include <cstring>
@@ -49,43 +56,24 @@ extern char **environ;
 #define CHILD_ADDR "127.0.0.1"
 
 struct server_subproc {
-    std::optional<subprocess_s> sproc; // empty while in DOWNLOADING state
+    common_subproc sproc; // not yet spawned while in DOWNLOADING state
     std::atomic<bool> stopped{false}; // set to cancel a download or signal child process exit
 
-    subprocess_s & get() {
-        GGML_ASSERT(sproc.has_value() && "subprocess not initialized");
-        return sproc.value();
-    }
-
     bool is_alive() {
-        return sproc.has_value() && subprocess_alive(&sproc.value());
+        return sproc.alive();
     }
 
     void request_exit() {
-        if (sproc.has_value()) {
-            FILE * stdin_file = subprocess_stdin(&sproc.value());
-            if (stdin_file) {
-                fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-                fflush(stdin_file);
-            }
+        FILE * stdin_file = sproc.stdin_file();
+        if (stdin_file) {
+            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
+            fflush(stdin_file);
         }
         stopped.store(true, std::memory_order_relaxed);
     }
 
     void terminate() {
-        if (!sproc.has_value()) {
-            return;
-        }
-#if defined(_WIN32)
-        if (sproc->hProcess == NULL) {
-            return;
-        }
-#else
-        if (sproc->child <= 0) {
-            return;
-        }
-#endif
-        subprocess_terminate(&sproc.value());
+        sproc.terminate();
     }
 };
 
@@ -211,6 +199,126 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     }
 }
 
+// offline gguf HEADER read (no tensor data, no backend init - safe on the
+// router, which must never touch the GPU). Feeds the launch wizard's sizing
+// and badges via GET /models. Returns null on any failure.
+static json server_model_read_gguf_meta(const std::string & path) {
+    gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (g == nullptr) {
+        return json();
+    }
+    json meta;
+    // resolved local path, so the wizard can reference sibling files
+    // (mmproj/draft speculation) by their real location instead of
+    // assuming a /models mount
+    meta["path"] = path;
+    std::error_code ec;
+    const auto fsize = std::filesystem::file_size(path, ec);
+    if (!ec) {
+        uint64_t total = (uint64_t) fsize;
+        // shard set: the wizard sees only the -00001- member; size must cover
+        // the whole set (split naming is <prefix>-%05d-of-%05d.gguf)
+        const size_t sh = path.find("-00001-of-");
+        if (sh != std::string::npos && path.size() >= sh + 15) {
+            const int n_split = atoi(path.substr(sh + 10, 5).c_str());
+            const std::string prefix = path.substr(0, sh);
+            int n_found = 1;
+            for (int i = 2; i <= n_split; i++) {
+                char tail[64];
+                snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
+                const auto ssize = std::filesystem::file_size(prefix + tail, ec);
+                if (ec) {
+                    continue; // missing shard: report what is present
+                }
+                total += (uint64_t) ssize;
+                n_found++;
+            }
+            meta["n_shards"] = n_found;
+        }
+        meta["size_bytes"] = total;
+    }
+    // reasoning support: templates that open/mention think blocks respond to
+    // --reasoning-budget and the effort/enable_thinking kwargs (some default
+    // to maximum-effort thinking and eat token budgets uncontrolled)
+    const int64_t k_tmpl = gguf_find_key(g, "tokenizer.chat_template");
+    if (k_tmpl >= 0 && gguf_get_kv_type(g, k_tmpl) == GGUF_TYPE_STRING) {
+        const std::string tmpl = gguf_get_val_str(g, k_tmpl);
+        meta["has_reasoning"] = tmpl.find("<think>")          != std::string::npos ||
+                                tmpl.find("</think>")         != std::string::npos ||
+                                tmpl.find("enable_thinking")  != std::string::npos ||
+                                tmpl.find("reasoning_effort") != std::string::npos;
+    }
+    const int64_t k_arch = gguf_find_key(g, "general.architecture");
+    if (k_arch >= 0 && gguf_get_kv_type(g, k_arch) == GGUF_TYPE_STRING) {
+        const std::string arch = gguf_get_val_str(g, k_arch);
+        meta["arch"] = arch;
+        auto get_u32 = [&](const char * suffix, uint32_t def) -> uint32_t {
+            const int64_t k = gguf_find_key(g, (arch + suffix).c_str());
+            return k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, k) : def;
+        };
+        const uint32_t n_layer = get_u32(".block_count", 0);
+        meta["block_count"]  = n_layer;
+        if (arch == "dflash") {
+            // TASKS #88: classify the drafter kind - a DSpark drafter is a
+            // dflash-arch gguf carrying the semi-autoregressive markov head;
+            // pairing it as plain dflash would run the wrong spec type with
+            // the head silently ignored
+            meta["drafter_kind"]   = gguf_find_tensor(g, "markov_w1.weight") >= 0 ? "dspark" : "dflash";
+            meta["spec_block_size"] = get_u32(".block_size", 0);
+        }
+        meta["n_ctx_train"]  = get_u32(".context_length", 0);
+        meta["n_expert"]     = get_u32(".expert_count", 0);
+        // MTP head: the nextn KV alone can lie - stripped-head exports keep it
+        // (the IQ2XXS chat-v2 keeper) and the wizard then offers speculation the
+        // model cannot serve. The head is real only if its defining tensor
+        // (nextn.eh_proj) actually shipped.
+        bool has_nextn  = false;
+        bool has_trunk0 = false;
+        for (int64_t i = 0, n = gguf_get_n_tensors(g); i < n && !(has_nextn && has_trunk0); i++) {
+            const char * tn = gguf_get_tensor_name(g, i);
+            // any .nextn. tensor marks an MTP block - qwen35-class heads carry
+            // nextn.eh_proj, qwen4exp heads nextn.fc_embd/fc_hid (#149)
+            has_nextn  = has_nextn  || strstr(tn, ".nextn.") != nullptr;
+            has_trunk0 = has_trunk0 || (strncmp(tn, "blk.0.", 6) == 0 && strstr(tn, ".nextn.") == nullptr);
+        }
+        meta["has_mtp"] = has_nextn;
+        // extracted MTP head files (#124) carry the TARGET's arch; the missing
+        // trunk is what marks them as drafter-only
+        meta["mtp_head_only"] = has_nextn && !has_trunk0;
+        // KV bytes per context token at f16, the wizard's sizing input
+        // (same estimate the fleet capacity gate uses; MLA models cache one
+        // shared latent per layer and no V)
+        const double ts_f16 = 2.0;
+        const uint32_t kv_lora_rank = get_u32(".attention.kv_lora_rank", 0);
+        double kv_per_tok = 0.0;
+        if (kv_lora_rank > 0) {
+            kv_per_tok = (double) n_layer * (kv_lora_rank + get_u32(".rope.dimension_count", 0)) * ts_f16;
+        } else {
+            const uint32_t n_head = get_u32(".attention.head_count", 1);
+            const uint32_t n_embd = get_u32(".embedding_length", 0);
+            const uint32_t len_k  = get_u32(".attention.key_length",   n_head > 0 ? n_embd / n_head : 0);
+            const uint32_t len_v  = get_u32(".attention.value_length", n_head > 0 ? n_embd / n_head : 0);
+            double hckv_sum = 0.0;
+            const int64_t k_hckv = gguf_find_key(g, (arch + ".attention.head_count_kv").c_str());
+            if (k_hckv >= 0 && gguf_get_kv_type(g, k_hckv) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(g, k_hckv) == GGUF_TYPE_UINT32) {
+                const uint32_t * a = (const uint32_t *) gguf_get_arr_data(g, k_hckv);
+                const size_t an = std::min<size_t>(gguf_get_arr_n(g, k_hckv), n_layer);
+                for (size_t i = 0; i < an; ++i) {
+                    hckv_sum += a[i];
+                }
+            } else {
+                hckv_sum = (double) n_layer * get_u32(".attention.head_count_kv", n_head);
+            }
+            kv_per_tok = hckv_sum * (len_k + len_v) * ts_f16;
+        }
+        meta["kv_bytes_per_token_f16"] = (uint64_t) kv_per_tok;
+    }
+    gguf_free(g);
+    return meta;
+}
+
 void server_model_meta::update_caps() {
     try {
         common_params params;
@@ -230,6 +338,11 @@ void server_model_meta::update_caps() {
             multimodal = { false, false };
         } else {
             multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+        }
+        // wizard metadata: header-only gguf read of the resolved local path
+        // (skipped for not-yet-downloaded cache models)
+        if (!params.model.path.empty() && std::filesystem::exists(params.model.path)) {
+            gguf_meta = server_model_read_gguf_meta(params.model.path);
         }
     } catch (const std::exception & e) {
         LOG_WRN("failed to initialize common_params for multimodal capability detection: %s\n", e.what());
@@ -251,6 +364,19 @@ server_models::server_models(
               base_preset(ctx_preset.load_from_args(argc, argv)) {
     // clean up base preset
     unset_reserved_args(base_preset, true);
+    // launch wizard: dirs added through the UI persist across restarts; a CLI
+    // --models-dir always wins over the persisted list
+    if (base_params.models_dir.empty()) {
+        try {
+            std::ifstream f(std::filesystem::path(fs_get_cache_directory()) / "router-models-dirs.txt");
+            if (f.good()) {
+                std::getline(f, base_params.models_dir);
+                if (!base_params.models_dir.empty()) {
+                    SRV_INF("restored models dirs from cache: %s\n", base_params.models_dir.c_str());
+                }
+            }
+        } catch (...) {}
+    }
     // set binary path
     try {
         bin_path = get_server_exec_path().string();
@@ -334,16 +460,74 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
     sse.broadcast(std::move(result));
 }
 
+std::string server_models::get_models_dirs() {
+    std::lock_guard<std::mutex> lk(mutex);
+    return base_params.models_dir;
+}
+
+void server_models::set_models_dirs(const std::string & dirs) {
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        base_params.models_dir = dirs;
+    }
+    try {
+        const std::string cache = fs_get_cache_directory();
+        fs_create_directory_with_parents(cache);
+        std::ofstream f(std::filesystem::path(cache) / "router-models-dirs.txt");
+        f << dirs;
+        if (!f.good()) {
+            SRV_WRN("failed to persist models dirs under %s\n", cache.c_str());
+        }
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to persist models dirs: %s\n", e.what());
+    }
+    load_models();
+}
+
 void server_models::load_models() {
-    // Phase 1: load presets from all sources - pure I/O, no lock needed
+    // Phase 1: load presets from all sources - pure I/O, no lock needed,
+    // except models_dir which set_models_dirs() mutates under the lock -
+    // snapshot it first (every caller enters with the lock released)
+    std::string models_dir;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        models_dir = base_params.models_dir;
+    }
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
     SRV_INF("Loaded %zu cached model presets\n", cached_models.size());
     // 2. local models from --models-dir
     common_presets local_models;
-    if (!base_params.models_dir.empty()) {
-        local_models = ctx_preset.load_from_models_dir(base_params.models_dir);
-        SRV_INF("Loaded %zu local model presets from %s\n", local_models.size(), base_params.models_dir.c_str());
+    if (!models_dir.empty()) {
+        // comma-separated list of dirs; on a name collision the EARLIER dir wins.
+        // Overlapping sources (e.g. a dir and its own subdir both listed) reach
+        // the same gguf under different names - dedup by model path too.
+        std::set<std::string> seen_paths;
+        for (const auto & dir : string_split<std::string>(models_dir, ',')) {
+            if (dir.empty()) {
+                continue;
+            }
+            try {
+                common_presets dir_models = ctx_preset.load_from_models_dir(dir);
+                SRV_INF("Loaded %zu local model presets from %s\n", dir_models.size(), dir.c_str());
+                for (auto & it : dir_models) {
+                    if (local_models.count(it.first) > 0) {
+                        SRV_WRN("duplicate model name '%s' in %s - keeping the earlier dir's entry\n",
+                                it.first.c_str(), dir.c_str());
+                        continue;
+                    }
+                    std::string path;
+                    if (it.second.get_option("LLAMA_ARG_MODEL", path) && !seen_paths.insert(path).second) {
+                        SRV_WRN("duplicate model path '%s' via %s - keeping the earlier source's entry\n",
+                                path.c_str(), dir.c_str());
+                        continue;
+                    }
+                    local_models[it.first] = std::move(it.second);
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("skipping models dir %s: %s\n", dir.c_str(), e.what());
+            }
+        }
     }
     // 3. custom-path models from presets
     common_preset global = {};
@@ -456,6 +640,7 @@ void server_models::load_models() {
                 /* loaded_info   */ {},
                 /* progress      */ {},
                 /* exit_code     */ 0,
+                /* error_tail    */ {},
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                 /* multimodal    */ mtmd_caps{false, false},
                 // /* need_download */ false,
@@ -608,6 +793,7 @@ void server_models::load_models() {
             }
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
+            inst.meta.error_tail.clear();
             inst.meta.update_args(ctx_preset, bin_path);
             inst.meta.update_caps();
         }
@@ -629,6 +815,7 @@ void server_models::load_models() {
                     /* loaded_info   */ {},
                     /* progress      */ {},
                     /* exit_code     */ 0,
+                    /* error_tail    */ {},
                     /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                     /* multimodal    */ mtmd_caps{false, false},
                     // /* need_download */ false,
@@ -709,18 +896,6 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         }
     }
     return std::nullopt;
-}
-
-// helper to convert vector<string> to char **
-// pointers are only valid as long as the original vector is valid
-static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & vec) {
-    std::vector<char *> result;
-    result.reserve(vec.size() + 1);
-    for (const auto & s : vec) {
-        result.push_back(const_cast<char*>(s.c_str()));
-    }
-    result.push_back(nullptr);
-    return result;
 }
 
 std::vector<server_model_meta> server_models::get_all_meta() {
@@ -833,6 +1008,20 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
 
+        // wizard overlay: appended argv wins over the preset's flags. env
+        // overrides must REPLACE inherited entries: execve keeps duplicates
+        // in order and glibc getenv returns the first match, so an appended
+        // override of a variable already in the router's environment would
+        // silently lose to it
+        child_args.insert(child_args.end(), opts.extra_args.begin(), opts.extra_args.end());
+        for (const auto & kv : opts.extra_env) {
+            const std::string key = kv.substr(0, kv.find('=') + 1); // "NAME=" - validated upstream
+            child_env.erase(std::remove_if(child_env.begin(), child_env.end(),
+                    [&](const std::string & e) { return e.rfind(key, 0) == 0; }),
+                    child_env.end());
+            child_env.push_back(kv);
+        }
+
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
@@ -845,15 +1034,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
         inst.meta.args = child_args; // save for debugging
 
-        std::vector<char *> argv = to_char_ptr_array(child_args);
-        std::vector<char *> envp = to_char_ptr_array(child_env);
-
         // TODO @ngxson : maybe separate stdout and stderr in the future
         //                so that we can use stdout for commands and stderr for logging
         int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-        inst.subproc->sproc.emplace();
-        int result = subprocess_create_ex(argv.data(), options, envp.data(), &inst.subproc->get());
-        if (result != 0) {
+        if (!inst.subproc->sproc.create(child_args, options, child_env)) {
             throw std::runtime_error("failed to spawn server instance");
         }
     }
@@ -867,12 +1051,26 @@ void server_models::load(const std::string & name, const load_options & opts) {
         stop_timeout = inst.meta.stop_timeout,
         child_mode = opts.mode
     ]() {
-        FILE * stdin_file = subprocess_stdin(&child_proc->get());
-        FILE * stdout_file = subprocess_stdout(&child_proc->get()); // combined stdout/stderr
+        FILE * stdin_file = child_proc->sproc.stdin_file();
+        FILE * stdout_file = child_proc->sproc.stdout_file(); // combined stdout/stderr
 
+        // rolling tail of child output, surfaced in the status when the exit is a failure
+        std::deque<std::string> log_tail;
+        // #136c: the FIRST fatal-error lines (e.g. "CUDA error: ...") scroll out of the
+        // 12-line tail under a long abort stack trace - capture them separately so the
+        // error surface names the actual failure, not just the trailing frames.
+        std::vector<std::string> log_head;
+        size_t head_room        = 0; // lines still to capture after the trigger
+        size_t lines_since_head = 0; // lines seen from the trigger line on (incl. it)
         std::thread log_thread([&]() {
             // read stdout/stderr and forward to main server log
             // also handle status report from child process
+            auto is_fatal_line = [](const std::string & s) {
+                return s.find("CUDA error")       != std::string::npos ||
+                       s.find("ggml_abort")       != std::string::npos ||
+                       s.find("GGML_ASSERT")      != std::string::npos ||
+                       s.find("terminate called") != std::string::npos;
+            };
             std::vector<char> vec_buf(128 * 1024); // large buffer for storing info
             char * buffer = vec_buf.data();
             if (stdout_file) {
@@ -881,6 +1079,22 @@ void server_models::load(const std::string & name, const load_options & opts) {
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
                         this->handle_child_state(name, str);
+                    } else {
+                        while (!str.empty() && (str.back() == '\n' || str.back() == '\r')) str.pop_back();
+                        if (!str.empty()) {
+                            log_tail.push_back(str);
+                            if (log_tail.size() > 12) log_tail.pop_front();
+                            if (log_head.empty() && is_fatal_line(str)) {
+                                head_room = 6;
+                            }
+                            if (head_room > 0) {
+                                log_head.push_back(str);
+                                head_room--;
+                            }
+                            if (!log_head.empty()) {
+                                lines_since_head++;
+                            }
+                        }
                     }
                 }
             } else {
@@ -942,18 +1156,27 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
 
         // get the exit code
-        int exit_code = 0;
-        subprocess_join(&child_proc->get(), &exit_code);
-        subprocess_destroy(&child_proc->get());
+        int exit_code = child_proc->sproc.join();
 
         // update status and exit code
         if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
             // instance will be cleaned up on next load_models() call
         } else {
-            this->update_status(name, {
-                SERVER_MODEL_STATUS_UNLOADED,
-                exit_code
-            });
+            update_status_args args;
+            args.status    = SERVER_MODEL_STATUS_UNLOADED;
+            args.exit_code = exit_code;
+            if (exit_code != 0) {
+                // #136c: prepend the head lines that already scrolled out of the tail
+                if (!log_head.empty() && lines_since_head > log_tail.size()) {
+                    const size_t n_keep = std::min(log_head.size(), lines_since_head - log_tail.size());
+                    args.log_tail.assign(log_head.begin(), log_head.begin() + n_keep);
+                    if (lines_since_head - log_tail.size() > log_head.size()) {
+                        args.log_tail.push_back("[...]");
+                    }
+                }
+                args.log_tail.insert(args.log_tail.end(), log_tail.begin(), log_tail.end());
+            }
+            this->update_status(name, args);
         }
         SRV_INF("instance name=%s exited with status %d\n", name.c_str(), exit_code);
     });
@@ -1038,6 +1261,7 @@ void server_models::update_status(const std::string & name, const update_status_
         auto & meta = it->second.meta;
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
+        meta.error_tail  = args.log_tail;
         if (!args.loaded_info.is_null()) {
             meta.loaded_info = args.loaded_info;
         }
@@ -1052,6 +1276,9 @@ void server_models::update_status(const std::string & name, const update_status_
         };
         if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
             data["exit_code"] = args.exit_code;
+            if (!args.log_tail.empty()) {
+                data["error_tail"] = args.log_tail;
+            }
         }
         if (!args.loaded_info.is_null()) {
             data["info"] = args.loaded_info;
@@ -1210,7 +1437,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     return true;
 }
 
-server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
+server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -1236,7 +1463,10 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             req.headers,
             req.body,
             req.files,
-            req.should_stop,
+            // a detached request belongs to a replay session that outlives the client socket:
+            // it reaches the child even when the downstream died during the load wait, the
+            // session buffer is the recipient and DELETE remains the stop
+            detached ? std::function<bool()>([]() { return false; }) : req.should_stop,
             base_params.timeout_read,
             base_params.timeout_write
             );
@@ -1507,13 +1737,9 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     // resolve alias to canonical model name
     name = meta->name;
-    if (models_autoload) {
-        models.ensure_model_ready(name);
-    } else {
-        if (!meta->is_running()) {
-            res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
-            return false;
-        }
+    if (!models_autoload && !meta->is_running()) {
+        res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
+        return false;
     }
     return true;
 }
@@ -1566,7 +1792,32 @@ static std::optional<server_model_meta> resolve_child_for_conv(
     return std::nullopt;
 }
 
+// canonicalized path if it sits under a scanned models dir or /root/.cache, else empty
+static std::string canon_inside_roots(const std::string & models_dirs, const std::string & path) {
+    std::error_code ec;
+    const std::string canon = std::filesystem::weakly_canonical(path, ec).string();
+    if (canon.empty()) {
+        return std::string();
+    }
+    std::vector<std::string> roots = string_split<std::string>(models_dirs, ',');
+    roots.push_back("/root/.cache");
+    for (const auto & root : roots) {
+        if (root.empty()) {
+            continue;
+        }
+        const std::string rc = std::filesystem::weakly_canonical(root, ec).string();
+        if (!rc.empty() && canon.rfind(rc + "/", 0) == 0) {
+            return canon;
+        }
+    }
+    return std::string();
+}
+
 void server_models_routes::init_routes() {
+    if (!common_subproc::is_supported()) {
+        throw std::runtime_error("subprocess is not enabled on this build");
+    }
+
     this->get_router_props = [this](const server_http_req & req) {
         std::string name = req.get_param("model");
         if (name.empty()) {
@@ -1602,6 +1853,9 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
+        if (autoload) {
+            models.ensure_model_ready(name);
+        }
         return models.proxy_request(req, method, name, false);
     };
 
@@ -1615,12 +1869,23 @@ void server_models_routes::init_routes() {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
-        // to it without polling, keyed on the exact conv id from the header
+        // to it without polling, keyed on the exact conv id from the header. registered before
+        // the load wait so a stop issued while the model loads can erase the entry and cancel
+        // this request instead of leaving an orphan generation
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
-        if (!conv_id.empty()) {
-            models.conv_models.remember(conv_id, name);
+        uint64_t ticket = models.conv_models.remember(conv_id, name);
+        bool waited = autoload && models.ensure_model_ready(name);
+        if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
+            SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
+                    conv_id.c_str(), name.c_str());
+            res_err(error_res, format_error_response(
+                    "request cancelled by a stop while the model was loading", ERROR_TYPE_INVALID_REQUEST));
+            return error_res;
         }
-        return models.proxy_request(req, method, name, true); // update last usage for POST request only
+        // a session request that waited for a load detaches from the client socket: the
+        // client may have dropped during the wait (page reload) and the session buffer must
+        // still receive the generation for a later resume
+        return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
@@ -1636,8 +1901,730 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.load(meta->name);
+        // launch-wizard overlay (optional): raw argv tokens + KEY=VALUE env
+        server_models::load_options opts;
+        for (const auto & a : json_value(body, "extra_args", json::array())) {
+            if (!a.is_string()) {
+                res_err(res, format_error_response("extra_args entries must be strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::string tok = a.get<std::string>();
+            // appended argv wins over the preset's rendered flags, and the
+            // router owns the child's binding: an overridden --port leaves
+            // inst.meta.port stale and every proxy hits the wrong socket
+            if (tok == "--port" || tok == "--host") {
+                res_err(res, format_error_response("extra_args must not set --port/--host - the router owns the child's binding", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            opts.extra_args.push_back(tok);
+        }
+        for (const auto & e : json_value(body, "extra_env", json::array())) {
+            if (!e.is_string()) {
+                res_err(res, format_error_response("extra_env entries must be strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::string kv = e.get<std::string>();
+            if (kv.find('=') == std::string::npos || kv.rfind("LLAMA_SERVER_", 0) == 0) {
+                res_err(res, format_error_response("extra_env entries must be KEY=VALUE and must not touch LLAMA_SERVER_*", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            opts.extra_env.push_back(kv);
+        }
+        models.load(meta->name, opts);
         res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    // pick the child whose fleet state the UI should see: a loading child wins
+    // (its /fleet/status carries the live per-worker load progress), else the
+    // most recently used running one
+    auto fleet_proxy_target = [this]() -> std::string {
+        std::string target;
+        int64_t best = -1;
+        for (const auto & m : models.get_all_meta()) {
+            if (m.status == SERVER_MODEL_STATUS_LOADING) {
+                return m.name;
+            }
+            if (m.is_running() && m.last_used > best) {
+                best = m.last_used;
+                target = m.name;
+            }
+        }
+        return target;
+    };
+
+    this->get_router_fleet_status = [this, fleet_proxy_target](const server_http_req & req) {
+        const std::string target = fleet_proxy_target();
+        if (target.empty()) {
+            auto res = std::make_unique<server_http_res>();
+            res_ok(res, json{{"model", nullptr}, {"devices", json::array()}});
+            return res;
+        }
+        // buffered child fetch instead of the streaming proxy so the router can
+        // stamp its own model id into the payload - the page then acts (unload)
+        // on the exact model whose fleet data it is showing (review #25)
+        auto meta = models.get_meta(target);
+        if (!meta.has_value() || !meta->is_running()) {
+            auto res = std::make_unique<server_http_res>();
+            res_ok(res, json{{"model", nullptr}, {"devices", json::array()}});
+            return res;
+        }
+        httplib::Client cli(CHILD_ADDR, meta->port);
+        cli.set_read_timeout(5, 0);
+        httplib::Headers headers;
+        for (const auto & [k, v] : req.headers) {
+            headers.emplace(k, v);
+        }
+        std::string path = req.path;
+        if (!req.query_string.empty()) {
+            path += '?' + req.query_string;
+        }
+        auto res = std::make_unique<server_http_res>();
+        auto r = cli.Get(path.c_str(), headers);
+        if (!r) {
+            res_err(res, format_error_response("child fleet status unreachable", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res->status = r->status;
+        if (r->has_header("Content-Type")) {
+            res->content_type = r->get_header_value("Content-Type");
+        }
+        res->data = r->body;
+        if (r->status == 200) {
+            try {
+                json j = json::parse(r->body);
+                j["router_model"] = target;
+                res->data = j.dump();
+            } catch (...) {
+                // non-JSON child response - forward untouched
+            }
+        }
+        return res;
+    };
+
+    this->get_router_fleet_worker_log = [this, fleet_proxy_target](const server_http_req & req) {
+        const std::string target = fleet_proxy_target();
+        if (target.empty()) {
+            auto res = std::make_unique<server_http_res>();
+            res_err(res, format_error_response("no model is running", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return models.proxy_request(req, "GET", target, false);
+    };
+
+    this->get_wizard_hw = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json hw;
+        // RAM (Linux)
+#ifdef __linux__
+        {
+            std::ifstream mi("/proc/meminfo");
+            std::string k; uint64_t v; std::string unit;
+            uint64_t total = 0, avail = 0;
+            while (mi >> k >> v >> unit) {
+                if (k == "MemTotal:")     total = v / 1024;
+                if (k == "MemAvailable:") avail = v / 1024;
+            }
+            hw["ram_total_mib"] = total;
+            hw["ram_avail_mib"] = avail;
+        }
+#endif
+        // models dirs free space (comma-separated list supported)
+        {
+            json dirs = json::array();
+            for (const auto & dir : string_split<std::string>(models.get_models_dirs(), ',')) {
+                if (dir.empty()) continue;
+                std::error_code ec;
+                const auto sp = std::filesystem::space(dir, ec);
+                dirs.push_back({{"path", dir},
+                                {"free_mib", ec ? 0 : (uint64_t) (sp.available / (1024*1024))}});
+            }
+            hw["models_dirs"] = dirs;
+            if (!dirs.empty()) {
+                hw["models_dir_free_mib"] = dirs[0]["free_mib"]; // back-compat
+            }
+        }
+        // GPUs via nvidia-smi subprocess: the router itself must never create
+        // a CUDA context (see the no-device-enumeration rule in server.cpp)
+        {
+            json gpus = json::array();
+#ifndef _WIN32
+            FILE * p = popen("nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null", "r");
+            if (p != nullptr) {
+                char line[512];
+                while (fgets(line, sizeof(line), p) != nullptr) {
+                    std::string l(line);
+                    std::vector<std::string> f;
+                    size_t pos = 0, c;
+                    while ((c = l.find(',', pos)) != std::string::npos) {
+                        f.push_back(l.substr(pos, c - pos));
+                        pos = c + 1;
+                    }
+                    f.push_back(l.substr(pos));
+                    if (f.size() >= 3) {
+                        auto trim = [](std::string x){ x.erase(0, x.find_first_not_of(" \t\n")); x.erase(x.find_last_not_of(" \t\n")+1); return x; };
+                        try {
+                            gpus.push_back({{"name", trim(f[0])},
+                                            {"total_mib", std::stoull(trim(f[1]))},
+                                            {"free_mib",  std::stoull(trim(f[2]))}});
+                        } catch (...) {}
+                    }
+                }
+                pclose(p);
+            }
+#endif
+            hw["gpus"] = gpus;
+        }
+        // RPC worker beacons: one 1.5 s multicast listen (network only)
+        {
+            json discovered = json::array();
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            if (reg != nullptr) {
+                typedef int (*discover_t)(const char *, int, void (*)(const char *, const char *, void *), void *);
+                auto discover_fn = (discover_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_discover");
+                if (discover_fn != nullptr) {
+                    const std::string group = params.rpc_discover_group;
+                    discover_fn(group.empty() ? nullptr : group.c_str(), /*timeout_ms=*/ 1500,
+                        [](const char * ep, const char * payload, void * ud) {
+                            auto * arr = (json *) ud;
+                            json e = {{"endpoint", ep}, {"payload", std::string(payload)}};
+                            // beacons are space-separated k=v pairs
+                            std::istringstream ss(payload);
+                            std::string tok;
+                            while (ss >> tok) {
+                                const size_t eq = tok.find('=');
+                                if (eq == std::string::npos) continue;
+                                const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+                                try { e[k] = std::stod(v); if (v.find('.') == std::string::npos) e[k] = (int64_t) std::stoll(v); }
+                                catch (...) { e[k] = v; }
+                            }
+                            arr->push_back(std::move(e));
+                        }, &discovered);
+                }
+            }
+            // merge with recently-seen beacons: a single 1.5 s window routinely
+            // misses a worker whose beacon period straddles it, which made the
+            // wizard's fleet capacity (and its fit badges) flicker between
+            // calls. Keep every worker seen in the last 90 s, refreshed by
+            // newer sightings; age_ms lets the UI flag stale entries.
+            {
+                static std::mutex               beacon_mtx;
+                static std::map<std::string, std::pair<json, int64_t>> beacon_seen;
+                const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::lock_guard<std::mutex> lock(beacon_mtx);
+                for (auto & e : discovered) {
+                    beacon_seen[e["endpoint"].get<std::string>()] = { e, now };
+                }
+                json merged = json::array();
+                for (auto it = beacon_seen.begin(); it != beacon_seen.end(); ) {
+                    if (now - it->second.second > 90 * 1000) {
+                        it = beacon_seen.erase(it);
+                        continue;
+                    }
+                    json e = it->second.first;
+                    e["age_ms"] = now - it->second.second;
+                    merged.push_back(std::move(e));
+                    ++it;
+                }
+                // #116: per-device inventory (desc/type/memory) for the fleet
+                // selector - ephemeral probes (the #47 pattern), cached 60 s per
+                // endpoint so rescans stay cheap; a failed re-probe keeps the
+                // stale inventory another cycle instead of hammering a dead box
+                if (reg != nullptr) {
+                    typedef int (*probe_devices_t)(const char *, int, ggml_backend_rpc_device_probe_info *, int);
+                    static probe_devices_t probe_fn = (probe_devices_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_probe_devices");
+                    static std::map<std::string, std::pair<json, int64_t>> probe_cache;
+                    if (probe_fn != nullptr) {
+                        for (auto & e : merged) {
+                            const std::string ep = e["endpoint"].get<std::string>();
+                            auto pit = probe_cache.find(ep);
+                            if (pit == probe_cache.end() || now - pit->second.second > 60 * 1000) {
+                                ggml_backend_rpc_device_probe_info infos[16];
+                                const int n = probe_fn(ep.c_str(), 800, infos, 16);
+                                if (n >= 0) {
+                                    json devs = json::array();
+                                    for (int i = 0; i < n; i++) {
+                                        devs.push_back({{"desc",      std::string(infos[i].desc)},
+                                                        {"is_cpu",    infos[i].is_cpu != 0},
+                                                        {"free_mib",  infos[i].free_mem  / (1024ull*1024)},
+                                                        {"total_mib", infos[i].total_mem / (1024ull*1024)}});
+                                    }
+                                    probe_cache[ep] = { devs, now };
+                                } else if (pit != probe_cache.end()) {
+                                    pit->second.second = now;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            e["devices"] = probe_cache[ep].first;
+                        }
+                    }
+                }
+                hw["discovered"] = merged;
+            }
+        }
+        res_ok(res, hw);
+        return res;
+    };
+
+    // #122: enumerate #75 expert-placement artifacts (JSONs carrying
+    // "member_shares") from the models dirs + the launcher cache, for the
+    // wizard's EP placement picker
+    this->get_wizard_placements = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json out = json::array();
+        std::vector<std::string> roots = string_split<std::string>(models.get_models_dirs(), ',');
+        roots.push_back("/root/.cache");
+        std::set<std::string> seen; // nested models dirs reach the same files - dedupe by canonical path
+        for (const auto & root : roots) {
+            if (root.empty()) {
+                continue;
+            }
+            std::error_code ec;
+            for (auto it = std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec);
+                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) {
+                    break;
+                }
+                if (it.depth() > 2) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(ec)) {
+                    continue;
+                }
+                const std::filesystem::path p = it->path();
+                if (p.extension() != ".json") {
+                    continue;
+                }
+                const std::string canon = std::filesystem::weakly_canonical(p, ec).string();
+                if (!canon.empty() && !seen.insert(canon).second) {
+                    continue;
+                }
+                const uint64_t sz = (uint64_t) std::filesystem::file_size(p, ec);
+                if (sz > 64ull*1024*1024) {
+                    continue;
+                }
+                std::ifstream f(p);
+                std::string head(4096, '\0');
+                f.read(&head[0], head.size());
+                const bool is_artifact = head.find("\"member_shares\"") != std::string::npos;
+                // a raw #74 profile (roster-agnostic histogram) carries counts+n_expert
+                const bool is_profile  = !is_artifact &&
+                    head.find("\"counts\"") != std::string::npos && head.find("\"n_expert\"") != std::string::npos;
+                if (!is_artifact && !is_profile) {
+                    continue;
+                }
+                json e = {{"path", p.string()}, {"name", p.filename().string()}, {"size_bytes", sz},
+                          {"kind", is_artifact ? "artifact" : "profile"},
+                          {"mtime", (int64_t) std::filesystem::last_write_time(p, ec).time_since_epoch().count()}};
+                try {
+                    std::ifstream full(p);
+                    json j = json::parse(full);
+                    e["model"]   = j.value("model", "");
+                    e["n_layer"] = j.value("n_layer", 0);
+                    if (is_artifact) {
+                        e["members"] = j.value("member_shares", json::array()).size();
+                    } else {
+                        e["tokens"]  = j.value("tokens_profiled", 0);
+                    }
+                } catch (...) {}
+                out.push_back(std::move(e));
+            }
+        }
+        // newest first: fresh generations must surface within the picker's row cap
+        std::sort(out.begin(), out.end(), [](const json & a, const json & b) {
+            return a.value("mtime", (int64_t) 0) > b.value("mtime", (int64_t) 0);
+        });
+        res_ok(res, json{{"placements", out}});
+        return res;
+    };
+
+    // #123: derive a placement artifact from a #74 profile for an arbitrary
+    // roster - the profile is roster-agnostic; only this derivation is not.
+    // Mirrors scripts/expert-placement.py exactly (largest-remainder member
+    // counts, hottest-first permutation with (-count, id) tie-break) so the
+    // two generators are interchangeable.
+    this->post_wizard_placement_generate = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string prof_path = json_value(body, "profile", std::string());
+        std::vector<double> shares;
+        for (const auto & v : json_value(body, "ts", json::array())) {
+            if (v.is_number()) {
+                shares.push_back(v.get<double>());
+            }
+        }
+        double total = 0.0;
+        for (double s : shares) {
+            if (!(s >= 0.0) || !std::isfinite(s)) {
+                res_err(res, format_error_response("ts entries must be finite and non-negative", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            total += s;
+        }
+        if (shares.empty() || total <= 0.0) {
+            res_err(res, format_error_response("ts must contain at least one nonzero share", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string prof_canon = canon_inside_roots(models.get_models_dirs(), prof_path);
+        if (prof_canon.empty()) {
+            res_err(res, format_error_response("profile path is outside the scanned roots", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json prof;
+        try {
+            std::ifstream f(prof_canon);
+            prof = json::parse(f);
+        } catch (...) {
+            res_err(res, format_error_response("cannot read profile json", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!prof.contains("counts") || !prof.contains("n_expert") || !prof.contains("n_layer")) {
+            res_err(res, format_error_response("not a #74 profile (needs counts/n_expert/n_layer)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!prof["n_layer"].is_number_integer() || !prof["n_expert"].is_number_integer() || !prof["counts"].is_array()) {
+            res_err(res, format_error_response("profile n_layer/n_expert/counts have the wrong types", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const int n_layer  = prof["n_layer"].get<int>();
+        const int n_expert = prof["n_expert"].get<int>();
+        const json & counts = prof["counts"];
+        if (n_layer <= 0 || n_expert <= 0 || (int) counts.size() < n_layer) {
+            res_err(res, format_error_response("profile n_layer/n_expert do not match the counts table", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<double> fracs;
+        fracs.reserve(shares.size());
+        for (double s : shares) {
+            fracs.push_back(s / total);
+        }
+        // largest-remainder rounding, ties by member order (stable) - matches the script
+        std::vector<int>    cnt(fracs.size());
+        std::vector<double> frac_part(fracs.size());
+        int rem = n_expert;
+        for (size_t j = 0; j < fracs.size(); j++) {
+            const double b = fracs[j] * n_expert;
+            cnt[j]       = (int) std::floor(b);
+            frac_part[j] = b - cnt[j];
+            rem         -= cnt[j];
+        }
+        std::vector<size_t> order(fracs.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return frac_part[a] > frac_part[b]; });
+        for (int k = 0; k < rem && k < (int) order.size(); k++) {
+            cnt[order[k]]++;
+        }
+        json perms = json::array();
+        json cpl   = json::array();
+        for (int il = 0; il < n_layer; il++) {
+            const json & row = counts[il];
+            if (!row.is_array() || (int) row.size() != n_expert) {
+                res_err(res, format_error_response("counts row " + std::to_string(il) + " does not have n_expert entries", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::vector<double> c;
+            c.reserve(n_expert);
+            for (const auto & v : row) {
+                if (!v.is_number()) {
+                    res_err(res, format_error_response("counts row " + std::to_string(il) + " has a non-numeric entry", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                c.push_back(v.get<double>());
+            }
+            double lsum = 0.0;
+            for (double x : c) {
+                lsum += x;
+            }
+            if (lsum == 0.0) {
+                perms.push_back(nullptr);
+                cpl.push_back(nullptr);
+                continue;
+            }
+            std::vector<int> perm(n_expert);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::sort(perm.begin(), perm.end(), [&](int a, int b) { return c[a] != c[b] ? c[a] > c[b] : a < b; });
+            perms.push_back(perm);
+            cpl.push_back(cnt);
+        }
+        json out = {
+            {"model",          prof.value("model", json())},
+            {"n_layer",        n_layer},
+            {"n_expert",       n_expert},
+            {"source_profile", {{"path", prof_canon}, {"sha256_16", ""}, {"tokens", prof.value("tokens_profiled", json())}}},
+            {"member_shares",  fracs},
+            {"counts_per_layer", cpl},
+            {"perm",           perms},
+        };
+        // name from the profile stem + the requested shares; write beside the
+        // profile when its dir is writable, else the launcher cache
+        std::string ts_name;
+        for (size_t j = 0; j < shares.size(); j++) {
+            ts_name += (j ? "-" : "") + std::to_string((int) std::llround(shares[j]));
+        }
+        const std::filesystem::path pp(prof_canon);
+        const std::string base = pp.stem().string() + "-place-" + ts_name + ".json";
+        std::vector<std::filesystem::path> candidates = { pp.parent_path() / base };
+        std::error_code ec;
+        std::filesystem::create_directories("/root/.cache/placements", ec);
+        candidates.push_back(std::filesystem::path("/root/.cache/placements") / base);
+        std::string written;
+        for (const auto & cand : candidates) {
+            std::ofstream of(cand);
+            if (!of) {
+                continue;
+            }
+            of << out.dump();
+            if (of.good()) {
+                written = cand.string();
+                break;
+            }
+        }
+        if (written.empty()) {
+            res_err(res, format_error_response("cannot write the artifact (profile dir and /root/.cache both unwritable)", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res_ok(res, json{{"placement", {{"path", written}, {"name", base}, {"model", out["model"]},
+                                        {"members", fracs.size()}, {"n_layer", n_layer}, {"kind", "artifact"}}}});
+        return res;
+    };
+
+    // #123: delete a generated placement artifact. Refuses paths outside the
+    // scanned roots and anything not carrying the artifact schema - raw
+    // profiles (no "member_shares") are structurally undeletable here.
+    this->post_wizard_placement_remove = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string path = json_value(body, "path", std::string());
+        std::error_code ec;
+        const std::string canon = canon_inside_roots(models.get_models_dirs(), path);
+        if (canon.empty()) {
+            res_err(res, format_error_response("path is outside the scanned roots", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        {
+            std::ifstream f(canon);
+            std::string head(4096, '\0');
+            f.read(&head[0], head.size());
+            if (head.find("\"member_shares\"") == std::string::npos) {
+                res_err(res, format_error_response("not a placement artifact - refusing to delete", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        if (!std::filesystem::remove(canon, ec) || ec) {
+            res_err(res, format_error_response("delete failed", ERROR_TYPE_SERVER));
+            return res;
+        }
+        res_ok(res, json{{"removed", canon}});
+        return res;
+    };
+
+    this->get_wizard_dirs = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json dirs = json::array();
+        for (const auto & d : string_split<std::string>(models.get_models_dirs(), ',')) {
+            if (!d.empty()) dirs.push_back(d);
+        }
+        // mounted filesystems as pick-one suggestions: real storage only, with
+        // free space and a shallow .gguf count so the UI can rank them
+        json mounts = json::array();
+#ifdef __linux__
+        {
+            static const std::set<std::string> good_fs = {
+                "ext4","ext3","xfs","btrfs","zfs","nfs","nfs4","cifs","9p",
+                "virtiofs","ntfs","ntfs3","exfat","vfat","fuseblk"
+            };
+            std::ifstream mt("/proc/mounts");
+            std::string dev, mp, fs, rest;
+            std::set<std::string> seen;
+            while (mt >> dev >> mp >> fs && std::getline(mt, rest)) {
+                if (good_fs.count(fs) == 0 && fs.rfind("fuse.", 0) != 0) continue;
+                // /proc/mounts octal-escapes spaces
+                string_replace_all(mp, "\\040", " ");
+                if (mp.rfind("/proc",0)==0 || mp.rfind("/sys",0)==0 || mp.rfind("/dev",0)==0 ||
+                    mp.rfind("/run",0)==0  || mp.rfind("/boot",0)==0 || mp.rfind("/etc",0)==0 ||
+                    mp.rfind("/usr",0)==0  || mp.rfind("/lib",0)==0  || mp.rfind("/bin",0)==0 ||
+                    mp.rfind("/sbin",0)==0 || mp.rfind("/root",0)==0 ||
+                    mp.rfind("/srcbin",0)==0 || mp.rfind("/ui",0)==0) continue;
+                if (!seen.insert(mp).second) continue;
+                std::error_code ec;
+                // the nvidia container toolkit bind-mounts single FILES; only
+                // directories are model-source candidates
+                if (!std::filesystem::is_directory(mp, ec) || ec) continue;
+                const auto sp = std::filesystem::space(mp, ec);
+                if (ec) continue;
+                int ggufs = 0, scanned = 0;
+                for (auto it = std::filesystem::directory_iterator(mp, ec);
+                     !ec && it != std::filesystem::directory_iterator(); ++it) {
+                    if (++scanned > 500) break;
+                    if (it->is_regular_file(ec) && it->path().extension() == ".gguf") ggufs++;
+                }
+                struct stat st{};
+                const uint64_t dev = ::stat(mp.c_str(), &st) == 0 ? (uint64_t) st.st_dev : 0;
+                mounts.push_back({{"path", mp}, {"fstype", fs}, {"dev", dev},
+                                  {"free_mib",  (uint64_t)(sp.available/(1024*1024))},
+                                  {"total_mib", (uint64_t)(sp.capacity /(1024*1024))},
+                                  {"gguf_count", ggufs}});
+            }
+            // scaffolding filter: a mount point that merely HOSTS other mounts
+            // (e.g. /mnt itself, whose stats are the rootfs) is not a storage
+            // suggestion; and bind aliases of the same device collapse to the
+            // entry with the most ggufs (shortest path on ties)
+            json filtered = json::array();
+            for (const auto & a : mounts) {
+                const std::string apath = a["path"].get<std::string>();
+                const std::string ap = apath == "/" ? "/" : apath + "/";
+                bool drop = false;
+                for (const auto & b : mounts) {
+                    if (a == b) continue;
+                    const std::string bp = b["path"].get<std::string>();
+                    if (bp.rfind(ap, 0) == 0) { drop = true; break; } // a is an ancestor mount
+                    if (a["dev"] == b["dev"] && a["dev"].get<uint64_t>() != 0) {
+                        const int ag = a["gguf_count"], bg = b["gguf_count"];
+                        if (bg > ag || (bg == ag && bp.size() < apath.size())) { drop = true; break; }
+                    }
+                }
+                if (!drop) {
+                    json e = a; e.erase("dev");
+                    filtered.push_back(std::move(e));
+                }
+            }
+            mounts = std::move(filtered);
+        }
+#endif
+        res_ok(res, {{"dirs", dirs}, {"mounts", mounts}});
+        return res;
+    };
+
+    this->post_wizard_dirs = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        std::vector<std::string> dirs;
+        json report = json::array();
+        for (const auto & d : json_value(body, "dirs", json::array())) {
+            const std::string dir = d.get<std::string>();
+            if (dir.empty() || dir.find(',') != std::string::npos) {
+                res_err(res, format_error_response("directory paths must be non-empty and must not contain commas", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::error_code ec;
+            const bool ok = std::filesystem::is_directory(dir, ec) && !ec;
+            report.push_back({{"path", dir}, {"exists", ok}});
+            dirs.push_back(dir);
+        }
+        std::string joined;
+        for (const auto & d : dirs) {
+            joined += (joined.empty() ? "" : ",") + d;
+        }
+        models.set_models_dirs(joined);
+        res_ok(res, {{"success", true}, {"dirs", report}});
+        return res;
+    };
+
+    // TASKS #94: named per-model launch configs. Stored as a JSON array in
+    // <cache>/wizard-configs.json (the same launcher-cache volume as the saved
+    // dirs, so configs survive restarts and image rolls). Entry:
+    // {id, model, title, created_ms, config:{...opaque wizard state blob...}}
+    static std::mutex wizard_configs_mtx;
+    static const auto wizard_configs_path = []() {
+        return std::filesystem::path(fs_get_cache_directory()) / "wizard-configs.json";
+    };
+    static const auto wizard_configs_load = []() -> json {
+        std::ifstream f(wizard_configs_path());
+        if (!f.good()) return json::array();
+        try {
+            json j = json::parse(f);
+            return j.is_array() ? j : json::array();
+        } catch (const std::exception &) { return json::array(); }
+    };
+    static const auto wizard_configs_save = [](const json & arr) {
+        const auto path = wizard_configs_path();
+        const auto tmp  = path.string() + ".tmp";
+        std::ofstream f(tmp);
+        f << arr.dump(2);
+        f.close();
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+    };
+
+    this->get_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string model = req.get_param("model");
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json out = json::array();
+        for (const auto & e : all) {
+            if (model.empty() || json_value(e, "model", std::string()) == model) {
+                out.push_back(e);
+            }
+        }
+        res_ok(res, {{"configs", out}});
+        return res;
+    };
+
+    this->post_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        const std::string model = json_value(body, "model", std::string());
+        const std::string title = json_value(body, "title", std::string());
+        if (model.empty() || title.empty() || !body.contains("config")) {
+            res_err(res, format_error_response("model, title and config are required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json entry = {
+            {"id",         std::to_string(ggml_time_us())},
+            {"model",      model},
+            {"title",      title},
+            {"created_ms", ggml_time_ms()},
+            {"config",     body["config"]},
+        };
+        all.push_back(entry);
+        wizard_configs_save(all);
+        res_ok(res, {{"success", true}, {"entry", entry}});
+        return res;
+    };
+
+    this->del_wizard_configs = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string id = req.get_param("id");
+        if (id.empty()) {
+            res_err(res, format_error_response("id is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(wizard_configs_mtx);
+        json all = wizard_configs_load();
+        json kept = json::array();
+        bool removed = false;
+        for (const auto & e : all) {
+            if (json_value(e, "id", std::string()) == id) { removed = true; continue; }
+            kept.push_back(e);
+        }
+        if (removed) wizard_configs_save(kept);
+        res_ok(res, {{"success", removed}});
+        return res;
+    };
+
+    this->get_wizard_sweeps = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json sweeps = json::object();
+        for (const auto & dir : string_split<std::string>(models.get_models_dirs(), ',')) {
+            if (dir.empty()) continue;
+            std::ifstream f(std::filesystem::path(dir) / "sweeps.json");
+            if (!f.good()) continue;
+            try {
+                const json part = json::parse(f);
+                for (auto it = part.begin(); it != part.end(); ++it) {
+                    if (!sweeps.contains(it.key())) {
+                        sweeps[it.key()] = it.value();
+                    }
+                }
+            } catch (const std::exception & e) { LOG_WRN("sweeps.json in %s parse failed: %s\n", dir.c_str(), e.what()); }
+        }
+        res_ok(res, sweeps);
         return res;
     };
 
@@ -1667,6 +2654,9 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+                if (!meta.error_tail.empty()) {
+                    status["error_tail"] = meta.error_tail;
+                }
             }
 
             // pi coding agent multimodal compatibility
@@ -1694,8 +2684,34 @@ void server_models_routes::init_routes() {
                 {"source",        server_model_source_to_string(meta.source)},
                 {"can_remove",    meta.source == SERVER_MODEL_SOURCE_CACHE},
                 // {"need_download", meta.need_download},
-                // TODO: add other fields, may require reading GGUF metadata
             };
+
+            // launch-wizard fields: offline gguf header facts + a filename
+            // classification so the UI can hide projector/draft files from
+            // the launchable list and pair them with their targets
+            if (!meta.gguf_meta.is_null()) {
+                model_info["metadata"] = meta.gguf_meta;
+            }
+            {
+                std::string lname = meta.name;
+                std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+                // metadata-first: a draft-ish NAME must not hide a real target
+                // model; real drafters are identified by their header (drafter
+                // arch, or an MTP head file without a trunk). The name substring
+                // only classifies files whose metadata is unreadable.
+                const json & gm = meta.gguf_meta;
+                const std::string arch = gm.is_null() ? std::string() : gm.value("arch", std::string());
+                const bool meta_draft = arch.find("dflash") != std::string::npos ||
+                                        arch.find("eagle3") != std::string::npos ||
+                                        (!gm.is_null() && gm.value("mtp_head_only", false));
+                model_info["kind"] = lname.find("mmproj") != std::string::npos ? "mmproj"
+                                   : meta_draft ? "draft"
+                                   : arch == "clip" ? "mmproj"
+                                   : !arch.empty() ? "model"
+                                   : lname.find("draft")  != std::string::npos ||
+                                     lname.find("dflash") != std::string::npos ? "draft"
+                                   : "model";
+            }
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {
@@ -1813,7 +2829,7 @@ void server_models_routes::init_routes() {
     };
 
     this->router_stream_get = [this](const server_http_req & req) {
-        // GET /v1/stream/<conv_id>?from=N. resolve the owning child from the conv_id -> model
+        // GET /v1/stream?conv_id=<id>&from=N. resolve the owning child from the conv_id -> model
         // map, 404 when nothing maps
         auto res = std::make_unique<server_http_res>();
         std::string conv_id = req.get_param("conv_id");
@@ -1823,13 +2839,24 @@ void server_models_routes::init_routes() {
         }
         std::optional<server_model_meta> owner = resolve_child_for_conv(models, conv_id);
         if (!owner.has_value()) {
-            res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
+            // a registered conv whose model is still loading earns a retry: the session appears
+            // once the load ends and the pending request reaches the child
+            auto tracked = models.conv_models.lookup(conv_id);
+            auto meta = tracked.has_value() ? models.get_meta(*tracked) : std::nullopt;
+            bool transient = meta.has_value() && (meta->status == SERVER_MODEL_STATUS_LOADING ||
+                                                  meta->status == SERVER_MODEL_STATUS_DOWNLOADING ||
+                                                  meta->status == SERVER_MODEL_STATUS_DOWNLOADED);
+            if (transient) {
+                res_err(res, format_error_response("Stream owner model is loading, retry later", ERROR_TYPE_UNAVAILABLE));
+            } else {
+                res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
+            }
             return res;
         }
         std::string from = req.get_param("from");
-        std::string child_path = "/v1/stream/" + encode_qs(conv_id);
+        std::string child_path = "/v1/stream?conv_id=" + encode_qs(conv_id);
         if (!from.empty()) {
-            child_path += "?from=" + from;
+            child_path += "&from=" + from;
         }
         SRV_TRC("proxying stream resume to model %s on port %d, path=%s\n",
                 owner->name.c_str(), owner->port, child_path.c_str());
@@ -1909,7 +2936,7 @@ void server_models_routes::init_routes() {
     };
 
     this->router_stream_delete = [this](const server_http_req & req) {
-        // DELETE /v1/stream/<conv_id>. resolve the owning child via the map and forward only to
+        // DELETE /v1/stream?conv_id=<id>. resolve the owning child via the map and forward only to
         // it, evict_and_cancel is idempotent on the child
         auto res = std::make_unique<server_http_res>();
         std::string conv_id = req.get_param("conv_id");
@@ -1917,7 +2944,7 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("Missing conversation id in path", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        std::string child_path = "/v1/stream/" + encode_qs(conv_id);
+        std::string child_path = "/v1/stream?conv_id=" + encode_qs(conv_id);
         auto owner = resolve_child_for_conv(models, conv_id);
         if (owner.has_value()) {
             httplib::Client cli(CHILD_ADDR, owner->port);
@@ -1926,6 +2953,11 @@ void server_models_routes::init_routes() {
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             auto resp = cli.Delete(child_path.c_str());
             (void) resp; // the child logs its own miss when the session is unknown there
+        } else if (auto tracked = models.conv_models.lookup(conv_id); tracked.has_value()) {
+            // the entry exists but its model is still loading: the forget below erases it,
+            // which cancels the request parked in proxy_post before the generation starts
+            SRV_INF("router stop for conv_id=%s while model name=%s is loading, cancelling the pending request\n",
+                    conv_id.c_str(), tracked->c_str());
         } else {
             SRV_WRN("router stop for unknown conv_id=%s, no owning child in the conv map\n",
                     conv_id.c_str());
@@ -1943,53 +2975,6 @@ void server_models_routes::init_routes() {
 //
 // server_http_proxy
 //
-
-// simple implementation of a pipe
-// used for streaming data between threads
-template<typename T>
-struct pipe_t {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<T> queue;
-    std::atomic<bool> writer_closed{false};
-    std::atomic<bool> reader_closed{false};
-    void close_write() {
-        writer_closed.store(true, std::memory_order_relaxed);
-        cv.notify_all();
-    }
-    void close_read() {
-        reader_closed.store(true, std::memory_order_relaxed);
-        cv.notify_all();
-    }
-    bool read(T & output, const std::function<bool()> & should_stop) {
-        std::unique_lock<std::mutex> lk(mutex);
-        constexpr auto poll_interval = std::chrono::milliseconds(500);
-        while (true) {
-            if (!queue.empty()) {
-                output = std::move(queue.front());
-                queue.pop();
-                return true;
-            }
-            if (writer_closed.load()) {
-                return false; // clean EOF
-            }
-            if (should_stop()) {
-                close_read(); // signal broken pipe to writer
-                return false; // cancelled / reader no longer alive
-            }
-            cv.wait_for(lk, poll_interval);
-        }
-    }
-    bool write(T && data) {
-        std::lock_guard<std::mutex> lk(mutex);
-        if (reader_closed.load()) {
-            return false; // broken pipe
-        }
-        queue.push(std::move(data));
-        cv.notify_one();
-        return true;
-    }
-};
 
 static std::string to_lower_copy(const std::string & value) {
     std::string lowered(value.size(), '\0');
@@ -2100,7 +3085,7 @@ server_http_proxy::server_http_proxy(
         ) {
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
-    auto pipe = std::make_shared<pipe_t<msg_t>>();
+    auto pipe = std::make_shared<server_pipe<msg_t>>();
 
     if (scheme == "https") {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT

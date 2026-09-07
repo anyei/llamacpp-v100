@@ -19,6 +19,9 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    // non-blocking: true when at least one byte (or EOF/error, which a
+    // subsequent recv reports loudly) is waiting to be read
+    bool recv_ready();
 
     socket_ptr accept();
 

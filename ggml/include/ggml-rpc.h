@@ -10,8 +10,22 @@ extern "C" {
 // fused hyper-connections) - the op enum shifted on the wire, so pre-merge
 // workers must be rejected. patch tracks upstream's op-enum fingerprint and
 // is enforced at HELLO (a mismatch decodes graphs to the wrong ops).
+// minor 12: f16 boundary payloads in GRAPH_FUSED (flags 8/16 - SET data
+// arrives f16-compressed / FETCH response returns f16). Opt-in via
+// GGML_RPC_WIRE_F16 on the coordinator; per-connection fallback keeps
+// minor<=11 workers on f32.
+// minor 13: q8_0 boundary payloads (flags 32/64, GGML_RPC_WIRE_Q8; ~3.76x
+// cut vs f32, block size 32 - non-multiple sizes fall back to f16/f32).
+// Same per-connection degradation: q8_0 -> f16 -> f32 by server minor.
+// minor 15: upstream 5.0.0 absorption (their tensor_memset, #25912).
+// RPC_CMD_MEMSET_TENSOR is appended at the FORK ladder tail so every
+// deployed 4.x worker keeps its command ids; upstream's id differs and
+// upstream peers are rejected on the major anyway. The client sends
+// MEMSET only to minor>=15 workers and falls back to a zero-fill
+// set_tensor otherwise. No ggml op-enum shift in this merge (fingerprint
+// unchanged). Minor 14 (zero short replies) unchanged.
 #define RPC_PROTO_MAJOR_VERSION    4
-#define RPC_PROTO_MINOR_VERSION    11
+#define RPC_PROTO_MINOR_VERSION    16
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
@@ -36,6 +50,9 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 // cache. NULL name clears the hint. Every serve is hash-verified, so a wrong or stale
 // hint degrades to streaming, never to corruption.
 GGML_BACKEND_API void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset);
+// TASKS #103: announce the model identity of the upcoming load; workers scope
+// their tensor cache per model (folder, manifest, eviction preference)
+GGML_BACKEND_API void ggml_backend_rpc_session_model(const char * model_id);
 
 // model_dir (optional, TASKS.md #26): directory of local GGUF files indexed by tensor-content
 // hash at startup; SET_TENSOR_HASH cache misses are then served from local disk instead of
@@ -90,6 +107,19 @@ GGML_BACKEND_API void ggml_backend_rpc_reset_failed_endpoints(void);
 
 // probe whether an RPC device's endpoint accepts connections right now
 GGML_BACKEND_API bool ggml_backend_rpc_dev_reachable(ggml_backend_dev_t dev);
+
+// one-shot per-device inventory of a worker over an EPHEMERAL connection (never a
+// compute socket): description, worker-RAM flag (the "CPU|" desc convention, #30)
+// and free/total memory per device. Returns the count written (<= max_devices),
+// -1 when the endpoint is unreachable. Wizard fleet selector (#116).
+struct ggml_backend_rpc_device_probe_info {
+    char     desc[128];
+    int32_t  is_cpu;
+    uint64_t free_mem;
+    uint64_t total_mem;
+};
+GGML_BACKEND_API int ggml_backend_rpc_probe_devices(const char * endpoint, int timeout_ms,
+                                                    struct ggml_backend_rpc_device_probe_info * out, int max_devices);
 
 // surgical re-provision of a restarted worker (TASKS.md #29c refinement)
 GGML_BACKEND_API bool         ggml_backend_rpc_dev_failed(ggml_backend_dev_t dev);

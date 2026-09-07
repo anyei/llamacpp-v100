@@ -19,6 +19,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
+#  include <poll.h>
 #  include <unistd.h>
 #endif
 #include <chrono>
@@ -31,9 +32,6 @@
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -483,8 +481,13 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
         ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
 #endif
         if (n < 0) {
-            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
-                           bytes_sent, size_to_send);
+#ifndef _WIN32
+            if (errno == EINTR) { // see recv_data - interrupted != dead peer
+                continue;
+            }
+#endif
+            GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu, errno=%d %s)\n",
+                           bytes_sent, size_to_send, errno, strerror(errno));
             return false;
         }
         bytes_sent += (size_t)n;
@@ -503,8 +506,17 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
-            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                           bytes_recv, size_to_recv);
+#ifndef _WIN32
+            // TASKS #114b: a signal interrupting a blocking recv is NOT a dead
+            // peer - treating EINTR as fatal closed a healthy compute socket
+            // mid-serve (clean FIN to the coordinator -> fence cascade -> full
+            // reload). Retry; only real errors fail, and they name errno now.
+            if (errno == EINTR) {
+                continue;
+            }
+#endif
+            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu, errno=%d %s)\n",
+                           bytes_recv, size_to_recv, errno, strerror(errno));
             return false;
         }
         if (n == 0) {
@@ -569,6 +581,22 @@ bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
+bool socket_t::recv_ready() {
+    if (pimpl->use_rdma) {
+        return true; // no cheap readiness probe - claim ready, callers take the exact path
+    }
+#ifdef _WIN32
+    WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
+    int r = WSAPoll(&pfd, 1, 0);
+#else
+    struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
+    int r = poll(&pfd, 1, 0);
+#endif
+    // HUP/ERR count as ready: the next recv fails loudly instead of the
+    // caller deferring forever on a dead connection
+    return r > 0 && pfd.revents != 0;
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
@@ -596,6 +624,34 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
     return ret == 0;
+}
+
+// TASKS #104: stateful firewalls silently drop idle connections (a healthy
+// worker was declared dead mid-prompt after an idle gap). Keepalive probes
+// keep long-lived compute sockets visible: first probe after 60s idle, then
+// every 10s, dead after 3 misses (~90s to detect a truly dead peer - well
+// under the 10-min fence ceiling). Best-effort: failure is logged, not fatal.
+static bool set_keepalive(sockfd_t sockfd) {
+    int flag = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *)&flag, sizeof(int)) != 0) {
+        return false;
+    }
+#ifndef _WIN32
+    int idle = 60, intvl = 10, cnt = 3;
+#if defined(TCP_KEEPIDLE)
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,  (char *)&idle,  sizeof(int));
+#elif defined(TCP_KEEPALIVE)
+    // macOS spells the idle-time option TCP_KEEPALIVE
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPALIVE, (char *)&idle,  sizeof(int));
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, (char *)&intvl, sizeof(int));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,   (char *)&cnt,   sizeof(int));
+#endif
+#endif
+    return true;
 }
 
 // IPv4 resolution via getaddrinfo: gethostbyname returns a pointer into a
@@ -630,6 +686,9 @@ socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
+    }
+    if (!set_keepalive(client_socket_fd)) {
+        GGML_LOG_ERROR("Failed to set SO_KEEPALIVE (continuing)\n");
     }
     if (!set_no_delay(client_socket_fd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
@@ -674,6 +733,9 @@ socket_ptr socket_t::connect(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
+    }
+    if (!set_keepalive(sockfd)) {
+        GGML_LOG_ERROR("Failed to set SO_KEEPALIVE (continuing)\n");
     }
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");

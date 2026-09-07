@@ -21,8 +21,11 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
+#include <thread>
 #include <deque>
 #include <optional>
 #include <exception>
@@ -30,6 +33,22 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+
+#ifndef _WIN32
+extern char ** environ; // launch-command env capture in get_fleet_status
+#else
+static char ** environ = nullptr; // no env capture on Windows
+#endif
+
+static json speculative_info(const common_params & params); // TASKS #100
+
+// spec tree (#132) counters: armed rounds, branches taken, tokens banked beyond
+// what a plain rejection would have banked
+static struct {
+    std::atomic<uint64_t> rounds_armed{0};
+    std::atomic<uint64_t> taken{0};
+    std::atomic<uint64_t> tok_extra{0};
+} spec_tree_stats;
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -43,6 +62,11 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// how long an HTTP thread waits out a teardown hold (--rpc-reload/sleep) before
+// giving up with a 503; a healthy reload finishes within one model load, a
+// wedged one (all workers down) holds the ctx forever
+constexpr int CTX_GUARD_HOLD_TIMEOUT_MS = 30000;
 
 // env LLAMA_SPEC_TIMING: coarse per-phase timing of the speculative decode loop
 struct server_spec_timing {
@@ -61,6 +85,54 @@ struct server_spec_timing {
 };
 static server_spec_timing g_spec_timing;
 
+// #137 / code-review finding #13: the spec-tree roster gate must see the SECONDARY
+// drafter too. LLAMA_SPEC_DRAFT2* is registered AFTER spec_tree_active is resolved and
+// its type lives in a separate params copy, so a gate reading only
+// params_base.speculative.types let an unsupported drafter2 (eagle3) silently arm the
+// tree and then corrupt its unhealed deferred state on the first branch take.
+// An unknown type name maps to _COUNT, which the gate treats as unsupported (it also
+// avoids common_speculative_types_from_names, which THROWS on an unknown name).
+static std::vector<common_speculative_type> spec_tree_roster_types(const common_params & params_base) {
+    std::vector<common_speculative_type> types = params_base.speculative.types;
+
+    const char * d2_path = getenv("LLAMA_SPEC_DRAFT2");
+    if (d2_path == nullptr || *d2_path == '\0') {
+        return types;
+    }
+
+    const char * d2_type_s = getenv("LLAMA_SPEC_DRAFT2_TYPE");
+    types.push_back(common_speculative_type_from_name(
+                d2_type_s != nullptr && *d2_type_s != '\0' ? d2_type_s : "draft-simple"));
+
+    return types;
+}
+
+// TASKS #89: a split model's on-disk size is the SUM of its shard set -
+// stat'ing only the -00001- member undercounts every sharded model (the
+// fleet loading page showed shard-1-only sizes and bogus percentages)
+static size_t model_size_on_disk(const std::string & path) {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return 0;
+    }
+    uint64_t total = (uint64_t) sz;
+    const size_t sh = path.find("-00001-of-");
+    if (sh != std::string::npos && path.size() >= sh + 15) {
+        const int n_split = atoi(path.substr(sh + 10, 5).c_str());
+        const std::string prefix = path.substr(0, sh);
+        for (int i = 2; i <= n_split; i++) {
+            char tail[64];
+            snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
+            const auto ssz = std::filesystem::file_size(prefix + tail, ec);
+            if (!ec) {
+                total += (uint64_t) ssz;
+            }
+        }
+    }
+    return (size_t) total;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -69,7 +141,11 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    if (common_speculative_tree_enabled()) {
+        // spec tree (#132): the branch rows add up to n_max more output rows per slot
+        n_outputs_per_seq += common_speculative_n_max(&params.speculative);
+    }
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
@@ -186,6 +262,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    common_memory mem;
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -194,9 +272,33 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // PEARL post-verify draft-ahead (#108, LLAMA_SPEC_PEARL=1): drafted on a worker
+    // thread during the target's verify decode, assuming full acceptance; token 0
+    // doubles as the pre-verification of the sampled token
+    llama_tokens spec_draft_ahead;
+    llama_tokens spec_ahead_prompt;
+    int32_t      spec_ahead_n_past = -1;
+    bool         spec_ahead_live   = false; // this round's dft restore is owned by the worker
+
+    // `spec_draft` currently holds tokens the target already accepted, kept only to be re-evaluated
+    // after a checkpoint restore [TAG_SPEC_AVOID_DRAFT_REEVAL]. They are not a draft: they are
+    // accepted by construction and must not enter the acceptance statistics.
+    bool spec_replay = false;
+
+    // spec tree (#132, LLAMA_SPEC_TREE=1): one alt branch per verify round - the drafter's
+    // runner-up at draft position 0 plus the shared continuation, on a spare sequence.
+    // Continuation reuse is exact for anchor-conditioned block drafters and merely
+    // conservative otherwise; verification remains the arbiter either way.
+    bool                 spec_tree_on   = false;            // gate resolved at init (env + drafter type)
+    llama_seq_id         seq_branch     = -1;               // this slot's spare branch sequence
+    llama_token          spec_tree_alt  = LLAMA_TOKEN_NULL; // armed branch root, NULL = not armed
+    llama_pos            spec_tree_pos0 = -1;               // position of this round's anchor (sampled) token
+    std::vector<int32_t> spec_tree_i_batch;                 // logits rows: [alt, cont..., last=bonus source]
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -275,10 +377,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        common_context_seq_rm(ctx_tgt, id, -1, -1);
-        if (ctx_dft) {
-            common_context_seq_rm(ctx_dft, id, -1, -1);
-        }
+        mem.seq_rm(id, -1, -1);
 
         prompt.clear();
     }
@@ -313,6 +412,19 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    void update_spec_stats(size_t n_accepted, int n_max) {
+        n_draft_accepted   += n_accepted;
+        n_draft_verif_steps += 1;
+
+        if (n_accepted_per_pos.empty()) {
+            n_accepted_per_pos.resize(n_max, 0);
+        }
+
+        for (size_t i = 0; i < n_accepted && i < n_accepted_per_pos.size(); ++i) {
+            n_accepted_per_pos[i]++;
+        }
+    }
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -328,8 +440,13 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_draft_ahead.clear();
+            spec_ahead_prompt.clear();
+            spec_ahead_n_past = -1;
+            spec_ahead_live   = false;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -461,7 +578,7 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    void handle_last_sampled_token(server_batch & batch, int32_t * spec_tree_budget = nullptr) {
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -487,6 +604,61 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true);
+            }
+
+            // spec tree (#132): arm one alt branch on the spare sequence - a duplicated
+            // anchor row plus [alt, continuation...] rows parallel to the main draft
+            // positions. The prefix is exposed to the branch seq via seq_cp; main draft
+            // rows stay on the slot seq only, so the branches cannot contaminate each
+            // other. Replay rounds carry no fresh draft and are never armed.
+            spec_tree_alt = LLAMA_TOKEN_NULL;
+            spec_tree_i_batch.clear();
+            // branch rows draw on a shared per-round budget (review #14): the batch must
+            // keep room for every remaining slot's main anchor+draft rows, which assert
+            // on overflow below rather than failing gracefully like br_ok
+            const int32_t n_rows_branch = 1 + (int32_t) spec_draft.size();
+            // LLAMA_SPEC_TREE_CONF (value-parsed float, default 1.0 = arm whenever an alt
+            // exists): only pay the branch rows when the drafter's own probability for its
+            // top pick at position 0 is BELOW the threshold - confident rounds skip the
+            // wide-row cost, shaky rounds (the ones alt1 rescues) still arm. A missing
+            // capture (-1) arms unconditionally.
+            static const float spec_tree_conf = [] {
+                const char * v = getenv("LLAMA_SPEC_TREE_CONF");
+                const float f = v != nullptr ? (float) atof(v) : 0.0f;
+                return f > 0.0f && f <= 1.0f ? f : 1.0f;
+            }();
+            if (spec_tree_on && seq_branch >= 0 && !spec_replay && !spec_draft.empty() &&
+                spec_tree_budget && *spec_tree_budget >= n_rows_branch &&
+                common_speculative_get_conf(id, 0, spec_draft.size()) < spec_tree_conf) {
+                const llama_token alt = common_speculative_get_alt1(id, 0, spec_draft.size());
+                if (alt != LLAMA_TOKEN_NULL && alt != spec_draft[0]) {
+                    const llama_pos pos_a = prompt.tokens.pos_next(); // anchor (sampled) position
+                    auto * mem_tgt = llama_get_memory(ctx_tgt);
+                    llama_memory_seq_rm(mem_tgt, seq_branch, -1, -1);       // stale-cell safety
+                    // full-sequence copy: at arm time (pre-decode) the slot seq holds exactly
+                    // the prefix, and full copies are the only form dsv4 (V4/DSA) supports
+                    llama_memory_seq_cp(mem_tgt, id, seq_branch, -1, -1);
+
+                    bool br_ok = true;
+                    br_ok &= batch.add(seq_branch, sampled, pos_a, false);  // duplicated anchor row
+                    llama_pos pos_b = pos_a + 1;
+                    spec_tree_i_batch.push_back(batch.size());
+                    br_ok &= batch.add(seq_branch, alt, pos_b++, true);
+                    for (size_t i = 1; i < spec_draft.size(); i++) {
+                        spec_tree_i_batch.push_back(batch.size());
+                        br_ok &= batch.add(seq_branch, spec_draft[i], pos_b++, true);
+                    }
+
+                    if (br_ok) {
+                        spec_tree_alt  = alt;
+                        spec_tree_pos0 = pos_a;
+                        *spec_tree_budget -= n_rows_branch;
+                    } else {
+                        // batch full - disarm cleanly; nothing consumes the partial rows
+                        spec_tree_i_batch.clear();
+                        llama_memory_seq_rm(mem_tgt, seq_branch, -1, -1);
+                    }
+                }
             }
         }
 
@@ -690,13 +862,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        common_context_seq_rm(ctx_tgt, other.id,     -1, -1);
-        common_context_seq_cp(ctx_tgt, id, other.id, -1, -1);
-
-        if (ctx_dft) {
-            common_context_seq_rm(ctx_dft, other.id,     -1, -1);
-            common_context_seq_cp(ctx_dft, id, other.id, -1, -1);
-        }
+        mem.seq_rm(other.id,     -1, -1);
+        mem.seq_cp(id, other.id, -1, -1);
 
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
@@ -1016,6 +1183,24 @@ static uint64_t fleet_model_weight_bytes(const std::string & path) {
     return total;
 }
 
+// parse LLAMA_META_ATTN_OWNER - a single index or a comma list (owner GROUP,
+// TASKS #70); returns the member indices that hold the dedicated attention
+static std::vector<int> fleet_attn_owner_list(const char * env) {
+    std::vector<int> ret;
+    for (const char * p = env; p != nullptr && *p != '\0';) {
+        char * end;
+        const long v = strtol(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        if (v >= 0) {
+            ret.push_back((int) v);
+        }
+        p = *end == ',' ? end + 1 : end;
+    }
+    return ret;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1059,6 +1244,20 @@ public:
             int32_t     n_layers;
         };
         std::vector<dev_layers_t> layer_map; // refreshed on every successful load
+        // TASKS.md #97: per-device buffer composition (bytes), refreshed with layer_map
+        struct dev_mem_t {
+            size_t model   = 0;
+            size_t context = 0;
+            size_t compute = 0;
+        };
+        std::map<std::string, dev_mem_t> mem_breakdown; // device name -> composition
+        // #133: drafter contexts' buffer composition (primary + secondary), so devices
+        // that only host a drafter still get a truthful card
+        std::map<std::string, dev_mem_t> mem_breakdown_draft;
+        std::vector<std::string>         drafter_dev_names; // devices any drafter context computes on
+        // #131b: measured local-device speed (same bench the workers publish);
+        // cached per device name across loads - the bench costs seconds
+        std::map<std::string, std::pair<float,float>> local_scores; // name -> {bw_gbps, mm_gflops}
         struct beacon_t {
             std::string payload;
             int64_t     t_last_ms;
@@ -1176,11 +1375,13 @@ public:
                 rec.t_last_growth_ms = t_now;
                 rec.last_done_mib    = done_mib;
             }
-            // same expected-share rule as the loading page: attention owners and
-            // shareless devices have no measurable target. 97% is optimistic for
-            // whole-model shares (CPU-kept tensors like token_embd never arrive) -
-            // those are settled at load end from t_last_growth_ms instead.
-            const double expected_mib = p.attn_owner || p.split_frac <= 0.0 ? 0.0
+            // same expected-share rule as the loading page: shareless devices have
+            // no measurable target (a PURE attention owner has split_frac 0; a
+            // MIXED-role owner with an expert share is tracked like any member).
+            // 97% is optimistic for whole-model shares (CPU-kept tensors like
+            // token_embd never arrive) - those are settled at load end from
+            // t_last_growth_ms instead.
+            const double expected_mib = p.split_frac <= 0.0 ? 0.0
                 : p.split_frac * (double) fleet.load_model_bytes / (1024.0 * 1024.0);
             if (expected_mib > 0.0 && done_mib >= 0.97 * expected_mib) {
                 rec.t_ready_ms = t_now;
@@ -1206,6 +1407,9 @@ private:
 
     common_params params_base;
 
+    // spec tree (#132): resolved at load (env + draft-simple-only roster + no PEARL)
+    bool spec_tree_active = false;
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -1217,11 +1421,19 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+    common_speculative_init_result_ptr spec_init2; // #132 second drafter (LLAMA_SPEC_DRAFT2), env-gated
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // PEARL (#108) draft-ahead worker; joined before any ctx_dft use and on teardown
+    struct spec_ahead_thread {
+        std::thread th;
+        void join() { if (th.joinable()) th.join(); }
+        ~spec_ahead_thread() { join(); }
+    } spec_ahead;
 
     bool add_bos_token = true;
 
@@ -1256,7 +1468,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // a PEARL worker still running here (reload after a decode error) would
+        // use spec/ctx_dft after the resets below free them
+        spec_ahead.join();
+
         spec.reset();
+        spec_init2.reset();
         spec_init.reset();
 
         ctx_dft   = nullptr;
@@ -1455,13 +1672,7 @@ private:
             }
         }
 
-        size_t model_bytes = 0;
-        {
-            std::ifstream f(params_base.model.path, std::ios::binary | std::ios::ate);
-            if (f.good()) {
-                model_bytes = (size_t) f.tellg();
-            }
-        }
+        const size_t model_bytes = model_size_on_disk(params_base.model.path); // TASKS #89: shard-set sum
 
         typedef const char * (*dev_endpoint_t)(ggml_backend_dev_t);
         typedef bool (*worker_is_cpu_t)(ggml_backend_dev_t);
@@ -1481,12 +1692,9 @@ private:
         // EP dedicated-attention owner: LLAMA_META_ATTN_OWNER=<j> indexes the meta
         // device's members (the tensor-mode device list), which is this same order.
         // That member holds attention/KV/router and takes no expert share.
-        int attn_owner_idx = -1;
+        std::vector<int> attn_owners;
         if (params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            const char * env = getenv("LLAMA_META_ATTN_OWNER");
-            if (env != nullptr) {
-                attn_owner_idx = atoi(env);
-            }
+            attn_owners = fleet_attn_owner_list(getenv("LLAMA_META_ATTN_OWNER"));
         }
 
         std::lock_guard<std::mutex> lock(fleet.mutex);
@@ -1508,8 +1716,22 @@ private:
                 split_sum > 0.0 ? splits[i] / split_sum : 0.0,
                 layers[i],
                 ep != nullptr && worker_is_cpu_fn != nullptr && worker_is_cpu_fn(devs[i]),
-                (int) i == attn_owner_idx,
+                std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end(),
                 (int64_t) (free_mem / (1024 * 1024)),
+            });
+        }
+
+        // #131a: CPU expert-offload holder (ncmoe/--cpu-moe buft overrides) - a plan
+        // row so the loading page never presents the -ts fractions as the whole
+        // story; the exact byte shares replace the plan once the model is ready
+        if (!params_base.tensor_buft_overrides.empty()) {
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            size_t cpu_free = 0, cpu_total = 0;
+            if (cpu != nullptr) {
+                ggml_backend_dev_memory(cpu, &cpu_free, &cpu_total);
+            }
+            fleet.load_plan.push_back({
+                "CPU", "", 0.0, -1, false, false, (int64_t) (cpu_free / (1024 * 1024)),
             });
         }
     }
@@ -1708,6 +1930,18 @@ private:
         }
 
         SRV_ERR("%s", "an RPC worker connection was lost - reloading in-process across the reachable workers (--rpc-reload)\n");
+        // block new pre-task work and drain HTTP threads out of the model
+        // (tokenize/template reads) before destroying it - they were
+        // use-after-free crashing (exit 139) when requests raced the reload.
+        // If a thread outlasts the window, do NOT free the model under it
+        // (that IS the use-after-free): drop the hold and re-arm so the next
+        // update_slots retries once the slow reader has drained.
+        if (!queue_tasks.ctx_hold_begin(15000)) {
+            queue_tasks.ctx_hold_end();
+            rpc_reload_pending = true;
+            fleet.reload_active.store(false);
+            return;
+        }
         handle_sleeping_state(true); // destroy the model; buffers on live workers are freed remotely
 
         for (int attempt = 1;; attempt++) {
@@ -1804,6 +2038,7 @@ private:
             std::this_thread::sleep_for(std::chrono::seconds(10));
         }
         sleeping = false;
+        queue_tasks.ctx_hold_end();
         fleet.reload_active.store(false);
         SRV_INF("%s", "in-process reload complete - resuming serving\n");
     }
@@ -2012,6 +2247,39 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // spec tree (#132): reserve one spare branch sequence per slot. Supported rosters:
+        // draft-simple (mirror heal = token re-decode), dspark/dflash (heal = the
+        // encode+inject path over the branch rows, whose accept() carries no state), and
+        // since #137 draft-mtp, whose process_rows override rebuilds the accepted-count-
+        // indexed verify_h/pending_h from the branch rows before accept() reads them.
+        // eagle3 still keeps unhealed deferred state and stays excluded. No PEARL.
+        spec_tree_active = false;
+        if (common_speculative_tree_enabled()) {
+            bool roster_ok = false;
+            for (const auto t : spec_tree_roster_types(params_base)) {
+                if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                    roster_ok = true;
+                } else if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+                    roster_ok = false;
+                    break;
+                }
+            }
+            const bool pearl_on = getenv("LLAMA_SPEC_PEARL") != nullptr && atoi(getenv("LLAMA_SPEC_PEARL")) != 0;
+            if (!params_base.kv_unified) {
+                // branch prefix sharing needs ranged seq_cp, which split KV buffers do not support
+                SRV_WRN("%s", "LLAMA_SPEC_TREE requires --kv-unified - tree disabled\n");
+            } else if (roster_ok && !pearl_on) {
+                spec_tree_active = true;
+                params_base.n_seq_extra = params_base.n_parallel;
+                SRV_INF("spec tree enabled: %d branch seq(s) reserved\n", params_base.n_seq_extra);
+            } else {
+                SRV_WRN("%s", "LLAMA_SPEC_TREE set but roster is not simple/dspark/dflash-only (or PEARL is on) - tree disabled\n");
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -2157,6 +2425,63 @@ private:
             }
         }
 
+        // #132 (experimental, env-gated): SECOND drafter with its own model + context,
+        // registered behind the primary in the priority-fallback dispatch (later impls
+        // only draft sequences the earlier ones left empty).
+        //   LLAMA_SPEC_DRAFT2=<gguf path>       - the second drafter's model file
+        //   LLAMA_SPEC_DRAFT2_TYPE=<type name>  - e.g. draft-mtp, draft-simple (default draft-simple)
+        //   LLAMA_SPEC_DRAFT2_DEVICE=<dev,...>  - optional pin, e.g. RPC0 for a remote worker
+        if (spec) {
+            const char * d2_path = getenv("LLAMA_SPEC_DRAFT2");
+            if (d2_path && *d2_path) {
+                const char * d2_type_s = getenv("LLAMA_SPEC_DRAFT2_TYPE");
+                const auto d2_types = common_speculative_types_from_names({ std::string(d2_type_s && *d2_type_s ? d2_type_s : "draft-simple") });
+                if (d2_types.empty() || d2_types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+                    SRV_WRN("LLAMA_SPEC_DRAFT2_TYPE '%s' not recognized - second drafter disabled\n", d2_type_s ? d2_type_s : "");
+                } else {
+                    try {
+                        common_params params_base2 = params_base;
+                        params_base2.speculative.types            = d2_types;
+                        params_base2.speculative.draft.mparams.path = d2_path;
+                        const char * d2_dev = getenv("LLAMA_SPEC_DRAFT2_DEVICE");
+                        if (d2_dev && *d2_dev) {
+                            params_base2.speculative.draft.devices.clear();
+                            for (const auto & name : string_split<std::string>(std::string(d2_dev), ',')) {
+                                auto * dev = ggml_backend_dev_by_name(name.c_str());
+                                if (dev) {
+                                    params_base2.speculative.draft.devices.push_back(dev);
+                                } else {
+                                    SRV_WRN("drafter2: unknown device '%s' - skipped\n", name.c_str());
+                                }
+                            }
+                        }
+
+                        common_params params_dft2 = common_base_params_to_speculative(params_base2);
+                        spec_init2 = common_speculative_init_from_params(params_dft2, model_tgt, ctx_tgt);
+                        if (spec_init2 == nullptr || spec_init2->model() == nullptr || spec_init2->context() == nullptr) {
+                            SRV_WRN("drafter2: failed to load '%s' - second drafter disabled\n", d2_path);
+                            spec_init2.reset();
+                        } else {
+                            common_params_speculative sp2 = params_base2.speculative;
+                            sp2.draft.ctx_tgt = ctx_tgt;
+                            sp2.draft.ctx_dft = spec_init2->context();
+                            if (common_speculative_add_drafter(spec.get(), sp2, d2_types[0], params_base.n_parallel)) {
+                                SRV_INF("drafter2: '%s' (%s) registered behind the primary%s%s\n",
+                                        d2_path, d2_type_s ? d2_type_s : "draft-simple",
+                                        d2_dev && *d2_dev ? " on " : "", d2_dev && *d2_dev ? d2_dev : "");
+                            } else {
+                                SRV_WRN("%s", "drafter2: type not supported by add_drafter - second drafter disabled\n");
+                                spec_init2.reset();
+                            }
+                        }
+                    } catch (const std::exception & e) {
+                        SRV_WRN("drafter2: init failed: %s - second drafter disabled\n", e.what());
+                        spec_init2.reset();
+                    }
+                }
+            }
+        }
+
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
@@ -2175,11 +2500,15 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+            slot.spec_tree_on = spec_tree_active;
+            slot.seq_branch   = spec_tree_active ? (llama_seq_id) (params_base.n_parallel + i) : -1;
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -2263,6 +2592,106 @@ private:
                         dev != nullptr ? ggml_backend_dev_name(dev) : "?",
                         llama_model_device_n_layers(model_tgt, i),
                     });
+                }
+            }
+            // TASKS.md #97: per-device composition so the fleet UI can answer
+            // "what fills this device" (weights / KV / compute)
+            fleet.mem_breakdown.clear();
+            // #131a: host-pinned buffer types report their GPU as the device while the
+            // bytes live in system RAM (ncmoe/--cpu-moe expert offload) - attribute
+            // host buffers to "CPU" so the roster tells the truth about residency
+            auto breakdown_holder = [](ggml_backend_buffer_type_t buft) -> std::string {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (ggml_backend_buft_is_host(buft) ||
+                    dev == nullptr ||
+                    ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    return "CPU";
+                }
+                return ggml_backend_dev_name(dev);
+            };
+            if (ctx_tgt != nullptr) {
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+                    auto & rec = fleet.mem_breakdown[breakdown_holder(buft)];
+                    rec.model   += mb.model;
+                    rec.context += mb.context;
+                    rec.compute += mb.compute;
+                }
+            }
+
+            // #133: drafter contexts' composition + the devices they compute on, so a
+            // worker hosting only drafters still appears (and truthfully) in the roster
+            fleet.mem_breakdown_draft.clear();
+            fleet.drafter_dev_names.clear();
+            for (llama_context * cd : { ctx_dft, spec_init2 ? spec_init2->context() : nullptr }) {
+                if (cd == nullptr) {
+                    continue;
+                }
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(cd)) {
+                    const std::string name = breakdown_holder(buft);
+                    auto & rec = fleet.mem_breakdown_draft[name];
+                    rec.model   += mb.model;
+                    rec.context += mb.context;
+                    rec.compute += mb.compute;
+                    if (mb.model > 0 &&
+                        std::find(fleet.drafter_dev_names.begin(), fleet.drafter_dev_names.end(), name) == fleet.drafter_dev_names.end()) {
+                        fleet.drafter_dev_names.push_back(name);
+                    }
+                }
+            }
+
+            // #131b: measured speed for LOCAL devices (workers publish theirs already).
+            // Same bench the workers run; cached per device name - reloads skip it.
+            // #136: kill switch LLAMA_FLEET_LOCAL_BENCH=0 (unset = on) + auto-skip of
+            // pressured devices - a missing score row must never cost a load.
+            const bool local_bench = [] {
+                const char * env = getenv("LLAMA_FLEET_LOCAL_BENCH");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            // resolve via proc address like every other RPC hook here - a direct call
+            // fails to link under GGML_BACKEND_DL (the cpu.Dockerfile worker build)
+            typedef bool (*benchmark_t)(ggml_backend_dev_t, float *, float *);
+            static const benchmark_t benchmark_fn = [] {
+                ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+                return reg != nullptr
+                    ? (benchmark_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_benchmark_device")
+                    : (benchmark_t) nullptr;
+            }();
+            if (model_tgt != nullptr && local_bench && benchmark_fn != nullptr) {
+                std::vector<ggml_backend_dev_t> bench_devs;
+                for (int32_t i = 0, n_dev = llama_model_n_devices(model_tgt); i < n_dev; ++i) {
+                    bench_devs.push_back(llama_model_get_device(model_tgt, i));
+                }
+                bench_devs.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+                for (ggml_backend_dev_t dev : bench_devs) {
+                    if (dev == nullptr) {
+                        continue;
+                    }
+                    const char * name = ggml_backend_dev_name(dev);
+                    // RPC devices report their own worker-side score
+                    if (strncmp(name, "RPC", 3) == 0 || fleet.local_scores.count(name) > 0) {
+                        continue;
+                    }
+                    // meta devices are composite (members carry the scores); benching one
+                    // segfaults in the bench's raw-tensor alloc (#136, pre-existing #131b bug)
+                    if (strncmp(name, "Meta(", 5) == 0) {
+                        continue;
+                    }
+                    // bench working set: 64 MiB f32 matrix + compute buf; skip devices
+                    // another serve holds near-full instead of risking their state (#136)
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                    if (free_mem > 0 && free_mem < 192u * 1024 * 1024) {
+                        SRV_WRN("skipping local bench for %s: %zu MiB free < 192 MiB working set\n",
+                                name, free_mem / (1024 * 1024));
+                        continue;
+                    }
+                    float bw = 0.0f, fl = 0.0f;
+                    if (benchmark_fn(dev, &bw, &fl)) {
+                        fleet.local_scores[name] = { bw, fl };
+                        SRV_INF("local device score: %s = %.1f GB/s, %.1f GFLOPS\n", name, bw, fl);
+                    } else {
+                        SRV_WRN("local bench failed for %s - no score row (see log above)\n", name);
+                    }
                 }
             }
         }
@@ -2418,6 +2847,8 @@ private:
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* reasoning_warn_at     */ params_base.sampling.reasoning_budget_warn_at,
+                /* reasoning_warn_msg    */ params_base.sampling.reasoning_budget_warn_message,
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
@@ -2481,7 +2912,7 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
-            float sim_best = 0;
+            float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -2490,6 +2921,7 @@ private:
 
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
                     continue;
                 }
 
@@ -2497,26 +2929,30 @@ private:
 
                 // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
+                    SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
                     continue;
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                const size_t lcp_len = tokens.get_common_prefix(task.tokens);
+                const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
                 // select the current slot if the criteria match
-                if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
-                    sim_best = sim_cur;
+                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                    f_sim_best = f_sim_cur;
 
                     ret = &slot;
                 }
             }
 
             if (ret != nullptr) {
-                const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            sim_best, slot_prompt_similarity, f_keep);
+                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                            f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -3638,6 +4074,10 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        // called from error catches - a live PEARL worker must finish before
+        // slot state is torn down under it
+        spec_ahead.join();
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3791,6 +4231,10 @@ private:
     }
 
     void pre_decode() {
+        // PEARL: the context shift below mirrors seq_rm/seq_add onto ctx_dft - a
+        // draft-ahead worker surviving into this tick must be done first
+        spec_ahead.join();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3832,13 +4276,8 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
-                common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
-
-                if (ctx_dft) {
-                    common_context_seq_rm (ctx_dft, slot.id, n_keep            , n_keep + n_discard);
-                    common_context_seq_add(ctx_dft, slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
-                }
+                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3869,6 +4308,16 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // PEARL post-verify overlap (#108) - opt-in, off by default
+        static const bool spec_pearl = [] {
+            const char * e = std::getenv("LLAMA_SPEC_PEARL");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+
+        // the previous round's draft-ahead worker is normally joined before acceptance;
+        // error paths can skip that - never touch spec/ctx_dft with it live
+        spec_ahead.join();
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3895,7 +4344,36 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
-                    if (!slot.spec_draft.empty()) {
+                    // PEARL (#108): adopt the draft-ahead window when the assumed prefix held -
+                    // the previous round fully accepted and the sampled token matches the
+                    // drafter's continuation (its token 0 doubles as the pre-verification)
+                    bool adopted = false;
+                    if (spec_pearl && slot.spec_draft.empty() && !slot.spec_draft_ahead.empty()) {
+                        if ((int32_t) slot.prompt.n_tokens() == slot.spec_ahead_n_past + 1 &&
+                            slot.sampled == slot.spec_draft_ahead[0] &&
+                            slot.spec_draft_ahead.size() > 1) {
+                            slot.spec_draft.assign(slot.spec_draft_ahead.begin() + 1, slot.spec_draft_ahead.end());
+                            if ((int32_t) slot.spec_draft.size() > n_draft_max) {
+                                slot.spec_draft.resize(n_draft_max);
+                            }
+                            // this is a real draft: the drafting-list stats increment does not see it
+                            slot.n_draft_total += slot.spec_draft.size();
+                            adopted = true;
+
+                            if (trace > 0) {
+                                SLT_INF(slot, "PEARL: adopted %zu draft-ahead tokens\n", slot.spec_draft.size());
+                            }
+                        } else if (trace > 0) {
+                            SLT_INF(slot, "PEARL: discarded draft-ahead (n_tokens=%d vs n_past+1=%d, sampled=%d vs ahead0=%d, n_ahead=%zu)\n",
+                                    (int) slot.prompt.n_tokens(), slot.spec_ahead_n_past + 1,
+                                    slot.sampled, slot.spec_draft_ahead[0], slot.spec_draft_ahead.size());
+                        }
+                        slot.spec_draft_ahead.clear();
+                        slot.spec_ahead_n_past = -1;
+                        slot.spec_ahead_live   = false;
+                    }
+
+                    if (!slot.spec_draft.empty() && !adopted) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
@@ -3914,16 +4392,33 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
+                        // PEARL (#108): an adopted round never enters the drafting iterate
+                        // below, so capture the target checkpoint here - a partial rejection
+                        // of the adopted draft restores it against this round's positions
+                        if (adopted) {
+                            const bool use_ckpt_tgt =
+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                               (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && slot.spec_draft.size() > llama_n_rs_seq(ctx_tgt));
+                            if (use_ckpt_tgt) {
+                                slot.spec_ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+                        }
 
-                        drafting.push_back(&slot);
+                        if (!adopted) {
+                            common_speculative_get_draft_params(spec.get(), slot.id) = {
+                                /* .drafting = */ true,
+                                /* .n_max    = */ n_draft_max,
+                                /* .n_past   = */ slot.prompt.n_tokens(),
+                                /* .id_last  = */ slot.sampled,
+                                /* .prompt   = */ &slot.spec_prompt,
+                                /* .result   = */ &slot.spec_draft,
+                                /* .dists    = */ &slot.spec_dists,
+                                /* .temperature = */ slot.task->params.sampling.temp,
+                                /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
+                            };
+
+                            drafting.push_back(&slot);
+                        }
                     }
                 }
             }
@@ -3934,6 +4429,59 @@ private:
             const int64_t t0 = ggml_time_us();
             common_speculative_draft(spec.get());
             g_spec_timing.t_draft += ggml_time_us() - t0;
+        }
+
+        // PEARL (#108): launch the NEXT window's drafting on a worker thread, overlapped
+        // with the target's verify decode. Launched BEFORE the draft-context restore:
+        // the just-drafted tokens are still in ctx_dft, so the drafter continues
+        // contiguously from draft.back(). The worker performs the dft-side restore
+        // itself; joined in decode() before the process() mirror touches ctx_dft.
+        if (spec_pearl && spec && trace > 0) {
+            static bool once = false;
+            if (!once) {
+                once = true;
+                LOG_INF("PEARL: gate - ctx_dft=%s separate=%s dft_rm_type=%d (need %d)\n",
+                        ctx_dft ? "yes" : "no", ctx_dft != ctx_tgt ? "yes" : "no",
+                        (int) ctx_dft_seq_rm_type, (int) COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+            }
+        }
+        // draft-ahead requires an INDEPENDENT drafter: feature-conditioned drafters
+        // (dspark/dflash/eagle3/mtp) consume the target's hidden states, which do not
+        // exist yet for the next window - measured "Invalid input batch" 500s on the
+        // dspark serve. The pre-verify arm is the PEARL piece that fits those (v2).
+        const bool spec_pearl_capable =
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != params_base.speculative.types.end();
+
+        // collect the ahead slots here; the worker LAUNCHES only after the
+        // checkpoint iterate below, so no main-thread ctx_dft mutation of this
+        // round can race it (empty-draft slots' restores ride the worker too)
+        std::vector<server_slot *> pearl_ahead;
+        std::vector<std::pair<llama_seq_id, llama_pos>> pearl_restores;
+        if (spec_pearl && spec_pearl_capable && spec && ctx_dft && ctx_dft != ctx_tgt &&
+            ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            iterate(drafting, [&](server_slot & slot) {
+                if (slot.spec_draft.empty()) {
+                    return;
+                }
+                slot.spec_draft_ahead.clear();
+                slot.spec_ahead_prompt = slot.spec_prompt;
+                slot.spec_ahead_prompt.push_back(slot.sampled);
+                slot.spec_ahead_prompt.insert(slot.spec_ahead_prompt.end(), slot.spec_draft.begin(), slot.spec_draft.end() - 1);
+                slot.spec_ahead_n_past = (int32_t) slot.spec_ahead_prompt.size();
+                slot.spec_ahead_live   = true;
+
+                common_speculative_get_draft_params(spec.get(), slot.id) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ slot.get_n_draft_max(),
+                    /* .n_past   = */ slot.spec_ahead_n_past,
+                    /* .id_last  = */ slot.spec_draft.back(),
+                    /* .prompt   = */ &slot.spec_ahead_prompt,
+                    /* .result   = */ &slot.spec_draft_ahead,
+                };
+
+                pearl_ahead.push_back(&slot);
+            });
         }
 
         const int64_t t_ckpt_0 = ggml_time_us();
@@ -3948,12 +4496,22 @@ private:
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-            if (ctx_dft) {
-                if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                }
+            // PEARL: the ahead worker owns this round's dft restore for its slots
+            if (ctx_dft && !slot.spec_ahead_live) {
+                if (!pearl_ahead.empty()) {
+                    // a worker will own ctx_dft this round: defer to it. The PEARL
+                    // gate means PART rm type, so this is a plain seq_rm
+                    GGML_ASSERT(!use_ckpt_dft);
+                    pearl_restores.push_back({slot.id, ckpt.pos_max + 1});
+                } else {
+                    if (use_ckpt_dft) {
+                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    }
 
-                common_context_seq_rm(ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
+                }
             }
 
             if (!draft.empty()) {
@@ -3986,9 +4544,54 @@ private:
 
         g_spec_timing.t_ckpt += ggml_time_us() - t_ckpt_0;
 
+        // PEARL (#108): launch the draft-ahead worker now that every main-thread
+        // ctx_dft mutation of this round has run or been deferred to it; the
+        // overlap target is the batch build + the target's verify decode
+        if (!pearl_ahead.empty()) {
+            auto * spec_ptr  = spec.get();
+            auto * ctx_dft_l = ctx_dft;
+            const int trace_l = trace;
+
+            spec_ahead.join();
+            spec_ahead.th = std::thread([spec_ptr, ahead = std::move(pearl_ahead), restores = std::move(pearl_restores), ctx_dft_l, trace_l]() {
+                common_speculative_draft(spec_ptr);
+
+                for (auto * s : ahead) {
+                    if (trace_l > 0) {
+                        LOG_INF("PEARL: ahead drafted %zu tokens for slot %d (n_past=%d)\n",
+                                s->spec_draft_ahead.size(), s->id, s->spec_ahead_n_past);
+                    }
+                    common_speculative_get_draft_params(spec_ptr, s->id).drafting = false;
+
+                    // the per-round dft restore, taken over from the checkpoint iterate
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), s->id, s->spec_ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", s->id);
+                    }
+                }
+                // non-ahead drafting slots' restores, deferred so they never race the draft
+                for (const auto & r : restores) {
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft_l), r.first, r.second, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", r.first);
+                    }
+                }
+            });
+        }
+
+        // spec tree (#132): branch rows share the batch with every slot's main
+        // anchor+draft rows - budget them up front so a fully-armed round cannot
+        // starve a later slot's main rows into the add_ok assert (review #14)
+        int32_t spec_tree_budget = 0;
+        if (spec_tree_active) {
+            int32_t n_main = 0;
+            iterate(generating, [&](server_slot & slot) {
+                n_main += 1 + (int32_t) slot.spec_draft.size();
+            });
+            spec_tree_budget = std::max(0, (int32_t) llama_n_batch(ctx_tgt) - (int32_t) batch.size() - n_main);
+        }
+
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, &spec_tree_budget);
         });
 
         // process in chunks of params.n_batch
@@ -4024,6 +4627,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // PEARL: everything below may mutate ctx_dft (mem mirrors, cache-reuse
+                    // shifts, checkpoint restores) - the draft-ahead worker decodes the same
+                    // context. Prompt work is the overlap's end for this round.
+                    spec_ahead.join();
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -4158,13 +4766,8 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            common_context_seq_rm (ctx_tgt, slot.id, head_p, head_c);
-                                            common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            if (ctx_dft) {
-                                                common_context_seq_rm (ctx_dft, slot.id, head_p, head_c);
-                                                common_context_seq_add(ctx_dft, slot.id, head_c, head_c + n_match, kv_shift);
-                                            }
+                                            slot.mem.seq_rm (slot.id, head_p, head_c);
+                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -4336,10 +4939,7 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft, slot.id, p0, -1);
-                    }
+                    slot.mem.seq_rm(slot.id, p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -4560,6 +5160,11 @@ private:
         g_spec_timing.t_decode += ggml_time_us() - t_decode_0;
         g_spec_timing.report();
 
+        // PEARL: the overlap ends with the target decode. Joining before ANY
+        // result handling means the error paths below (prompt_clear, throw,
+        // retry) can never free or mutate spec/ctx_dft under a live worker
+        spec_ahead.join();
+
         metrics.on_decoded(slots);
 
         typedef bool (*rpc_any_failed_t)(void);
@@ -4645,10 +5250,47 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        // spec tree (#132): strip branch-seq rows before the drafter mirror - the draft
+        // context's sequence space does not include the branch ids, and the branch rows
+        // are target-verify-only by design
+        std::vector<llama_token>    mtok;
+        std::vector<llama_pos>      mpos;
+        std::vector<int32_t>        mnseq;
+        std::vector<llama_seq_id *> mseqp;
+        std::vector<llama_seq_id>   mseq;
+        std::vector<int8_t>         mlog;
+        std::vector<int32_t>        morig; // mirror row -> decoded-batch row, for extraction reads
+        llama_batch batch_mirror = batch_view;
+        if (spec_tree_active) {
+            const int32_t n = batch_view.n_tokens;
+            mtok.reserve(n); mpos.reserve(n); mnseq.reserve(n); mseq.reserve(n); mlog.reserve(n); morig.reserve(n);
+            for (int32_t i = 0; i < n; ++i) {
+                if (batch_view.seq_id[i][0] >= (llama_seq_id) params_base.n_parallel) {
+                    continue;
+                }
+                mtok.push_back(batch_view.token[i]);
+                mpos.push_back(batch_view.pos[i]);
+                mnseq.push_back(1);
+                mseq.push_back(batch_view.seq_id[i][0]);
+                mlog.push_back(batch_view.logits ? batch_view.logits[i] : 0);
+                morig.push_back(i);
+            }
+            mseqp.resize(mseq.size());
+            for (size_t i = 0; i < mseq.size(); ++i) {
+                mseqp[i] = &mseq[i];
+            }
+            batch_mirror.n_tokens = (int32_t) mtok.size();
+            batch_mirror.token    = mtok.data();
+            batch_mirror.pos      = mpos.data();
+            batch_mirror.n_seq_id = mnseq.data();
+            batch_mirror.seq_id   = mseqp.data();
+            batch_mirror.logits   = mlog.data();
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!common_speculative_process(spec.get(), batch_mirror, spec_tree_active ? morig.data() : nullptr)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -4693,6 +5335,12 @@ private:
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
+                }
+            }
+            // spec tree (#132): branch logits rows are sampled by these indices too (review #14)
+            for (auto & i : slot.spec_tree_i_batch) {
+                if (!is_inside_view(i)) {
+                    throw std::runtime_error(string_format("spec-tree batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
                 }
             }
         });
@@ -4797,6 +5445,9 @@ private:
             slot.print_timings_tg();
         });
 
+        // PEARL: the draft-ahead worker must finish before acceptance may touch ctx_dft
+        spec_ahead.join();
+
         // speculative decoding - main model sample and accept
         const int64_t t_accept_0 = ggml_time_us();
         iterate(slots, [&](server_slot & slot) {
@@ -4815,16 +5466,135 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // maximal-coupling verification (#138 inc 3): only when the draft carries
+                // proposal dists AND the context can roll back a partial acceptance
+                // directly - checkpoint-class targets re-verify via restore+replay, and
+                // replaying residual-sampled rounds is a separate decision
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                auto accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                slot.spec_dists.size() == slot.spec_draft.size()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                // LLAMA_SPEC_ALT_STATS (#132): on a rejection, score the drafter's runner-up
+                // choices at the rejected position. Replay rounds re-verify already-accepted
+                // tokens and carry no fresh draft, so they must not be scored.
+                if (n_rollback > 0 && !slot.spec_replay) {
+                    common_speculative_alt_stats_verify(slot.id, accepted.size() - 1, accepted.back());
+                }
+
+                // LLAMA_SPEC_DUMP=<path> (#132): append one record per fresh verify round
+                // (anchor_pos;draft_tokens;accepted_tokens). Temp-0 streams from the same
+                // target align position-wise across serves, so two drafters' predictions can
+                // be joined offline without dual-draft-model plumbing.
+                if (!slot.spec_replay) {
+                    static FILE * spec_dump_f = [] {
+                        const char * p = getenv("LLAMA_SPEC_DUMP");
+                        return p ? fopen(p, "a") : (FILE *) nullptr;
+                    }();
+                    if (spec_dump_f) {
+                        const llama_pos pos0 = slot.prompt.tokens.pos_next() - (llama_pos) n_draft - 1;
+                        fprintf(spec_dump_f, "%d;", (int) pos0);
+                        for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                            fprintf(spec_dump_f, i ? ",%d" : "%d", slot.spec_draft[i]);
+                        }
+                        fprintf(spec_dump_f, ";");
+                        for (size_t i = 0; i < accepted.size(); ++i) {
+                            fprintf(spec_dump_f, i ? ",%d" : "%d", accepted[i]);
+                        }
+                        fprintf(spec_dump_f, "\n");
+                        fflush(spec_dump_f);
+                    }
+                }
+
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+
+                // spec tree (#132): a first-position rejection whose target sample equals the
+                // armed alt continues along the branch rows instead of ending the round. The
+                // sampler chain is already in the correct state (prefix + alt accepted by the
+                // main walk); the branch rows supply the logits for the continuation samples.
+                //
+                // Two acceptance mechanics, matching the context's rollback class:
+                //  - direct targets: KV surgery grafts the branch cells + process_rows heals
+                //    the drafter's mirrored/injected state;
+                //  - checkpoint targets (dsv4/V4, SWA, recurrent): the existing restore+replay
+                //    path re-decodes the extended `accepted` next round, rebuilding target KV
+                //    and drafter state by construction - the replay was paid anyway, so the
+                //    branch tokens ride it for free.
+                if (slot.spec_tree_alt != LLAMA_TOKEN_NULL) {
+                    spec_tree_stats.rounds_armed++;
+                    if (accepted.size() == 1 && accepted.back() == slot.spec_tree_alt) {
+                        const size_t n = slot.spec_draft.size();
+                        GGML_ASSERT(slot.spec_tree_i_batch.size() == n);
+
+                        std::vector<llama_token> br = { accepted.back() };
+                        size_t n_keep = 1; // branch cells accepted: alt + matched continuations
+                        size_t j = 1;
+                        while (true) {
+                            const llama_token tok = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_tree_i_batch[j - 1], false);
+                            common_sampler_accept(slot.smpl.get(), tok, true);
+                            br.push_back(tok);
+                            if (j >= n || tok != slot.spec_draft[j]) {
+                                break; // final token: continuation mismatch, or the bonus after a full match
+                            }
+                            n_keep++;
+                            j++;
+                        }
+
+                        if (!use_ckpt_tgt) {
+                            // KV surgery: drop the rejected main draft cells (target + drafter via
+                            // the wrapper), graft the accepted branch cells into the slot sequence
+                            auto * mem_tgt = llama_get_memory(slot.ctx_tgt);
+                            slot.mem.seq_rm(slot.id, slot.spec_tree_pos0 + 1, -1);
+                            llama_memory_seq_cp(mem_tgt, slot.seq_branch, slot.id,
+                                                slot.spec_tree_pos0 + 1, slot.spec_tree_pos0 + 1 + (llama_pos) n_keep);
+
+                            // heal the drafter: its mirror/injection covered the (rejected) main
+                            // draft rows at these positions; rebuild from the accepted branch rows.
+                            // note: row indices assume the round decoded in a single batch view -
+                            // the same assumption the spec sampling path itself makes.
+                            if (slot.ctx_dft && n_keep > 0) {
+                                const std::vector<int32_t> rows(slot.spec_tree_i_batch.begin(),
+                                                                slot.spec_tree_i_batch.begin() + n_keep);
+                                if (!common_speculative_process_rows(spec.get(), batch.batch, slot.id, rows)) {
+                                    SLT_WRN(slot, "%s", "spec tree: drafter heal failed - drafter state may drift\n");
+                                }
+                            }
+                        }
+
+                        spec_tree_stats.taken++;
+                        spec_tree_stats.tok_extra += (uint64_t) (br.size() - 1); // vs the 1 token a plain rejection banks
+
+                        if (trace > 0) {
+                            SLT_INF(slot, "spec tree: branch taken (%s), %zu token(s) banked (alt + %zu continuation + final)\n",
+                                    use_ckpt_tgt ? "replay" : "graft", br.size(), n_keep - 1);
+                        }
+
+                        accepted = std::move(br);
+                    }
+
+                    if ((spec_tree_stats.rounds_armed & 63) == 0) {
+                        SRV_INF("SPEC_TREE: armed %" PRIu64 ", taken %" PRIu64 " (%.3f), extra tokens %" PRIu64 "\n",
+                                (uint64_t) spec_tree_stats.rounds_armed, (uint64_t) spec_tree_stats.taken,
+                                spec_tree_stats.rounds_armed ? (double) spec_tree_stats.taken / spec_tree_stats.rounds_armed : 0.0,
+                                (uint64_t) spec_tree_stats.tok_extra);
+                    }
+
+                    // the branch sequence is single-round scratch: clear it before the
+                    // checkpoint path's early return can skip this cleanup
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.seq_branch, -1, -1);
+                    slot.spec_tree_alt = LLAMA_TOKEN_NULL;
+                    slot.spec_tree_i_batch.clear();
+                }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -4833,24 +5603,31 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
+                        // this is a real verification of a real draft: account for it here, because the
+                        // restore path returns before the statistics below. without this, every partial
+                        // acceptance counts as zero accepted tokens, which is every partial acceptance
+                        // when the target's context cannot roll back (SWA, recurrent).
+                        slot.update_spec_stats(accepted.size() - 1, common_speculative_n_max(&params_base.speculative));
+
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
+
+                        // the accepted tokens are kept only to be re-evaluated on the next iteration; they
+                        // are not a draft and must not be counted again when they come back through here
+                        slot.spec_replay = true;
 
                         const auto & ckpt = slot.spec_ckpt;
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        {
-                            ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                            common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
-                        }
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                            common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
                         }
+
+                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
@@ -4866,6 +5643,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const int64_t t_now = ggml_time_us();
@@ -4874,16 +5652,14 @@ private:
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
-            // update how many tokens out of those tested were accepted
-            slot.n_draft_accepted += ids.size() - 1;
-            slot.n_draft_verif_steps += 1;
+            // update how many tokens out of those tested were accepted. a replay carries tokens the target
+            // already accepted, so it is accepted 100% by construction -- counting it would report the
+            // acceptance of the re-evaluation, not of the draft.
+            if (!slot.spec_replay) {
+                slot.update_spec_stats(ids.size() - 1, common_speculative_n_max(&params_base.speculative));
+            }
 
-            if (slot.n_accepted_per_pos.empty()) {
-                slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
-            }
-            for (size_t i = 0; i < ids.size() - 1 && i < slot.n_accepted_per_pos.size(); ++i) {
-                slot.n_accepted_per_pos[i]++;
-            }
+            slot.spec_replay = false;
 
             // add accepted tokens to the prompt
             slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
@@ -4892,10 +5668,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
-            if (slot.ctx_dft) {
-                common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
-            }
+            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -5014,10 +5787,22 @@ struct server_res_generator : server_res_spipe {
     server_response_reader rd;
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
-        // fast path in case sleeping is disabled
-        bypass_sleep |= sleep_idle_seconds < 0;
+        GGML_UNUSED(sleep_idle_seconds);
         if (!bypass_sleep) {
-            queue_tasks.wait_until_no_sleep();
+            // subsumes wait_until_no_sleep(): wakes idle-sleep AND holds off a
+            // concurrent --rpc-reload/sleep teardown for the pre-task window
+            // (the handler reads model/vocab until rd.post_tasks()). Needed
+            // even with idle-sleep disabled - the reload path was segfaulting
+            // HTTP threads mid-tokenize (use-after-free on the vocab).
+            // The hold wait is bounded: a wedged reload retry loop (all workers
+            // down) holds the ctx indefinitely, and untimed waits here consumed
+            // the whole HTTP pool - starving even the bypass routes. Throwing
+            // reaches ex_wrapper as a 503 (handlers create the response before
+            // their own try blocks).
+            if (!rd.ctx_guard_acquire(CTX_GUARD_HOLD_TIMEOUT_MS)) {
+                throw server_unavailable_exception(
+                        "model is being reloaded (a worker connection was lost) - retry later");
+            }
         }
     }
     void ok(const json & response_data) {
@@ -5578,6 +6363,7 @@ void server_routes::init_routes() {
 
         // copy the mutex-guarded state up front
         std::map<std::string, int32_t> layer_map;
+        std::map<std::string, server_context_impl::fleet_state_t::dev_mem_t> mem_breakdown;
         std::map<std::string, server_context_impl::fleet_state_t::beacon_t> beacons;
         std::string load_stage;
         std::string load_model_name;
@@ -5590,11 +6376,18 @@ void server_routes::init_routes() {
         size_t  perf_window_n = 0;
         int64_t perf_n_tokens = 0;
         double  perf_t_gen_ms = 0.0;
+        std::map<std::string, server_context_impl::fleet_state_t::dev_mem_t> mem_breakdown_draft;
+        std::vector<std::string> drafter_dev_names;
+        std::map<std::string, std::pair<float,float>> local_scores;
         {
             std::lock_guard<std::mutex> lock(fleet.mutex);
             for (const auto & d : fleet.layer_map) {
                 layer_map[d.name] = d.n_layers;
             }
+            mem_breakdown       = fleet.mem_breakdown;
+            mem_breakdown_draft = fleet.mem_breakdown_draft;
+            drafter_dev_names   = fleet.drafter_dev_names;
+            local_scores        = fleet.local_scores;
             beacons          = fleet.discovered;
             load_stage       = fleet.load_stage;
             load_model_name  = fleet.load_model_name;
@@ -5626,17 +6419,28 @@ void server_routes::init_routes() {
         std::set<std::string> pipeline_eps;
         json devices = json::array();
         if (ready) {
+            // #131a: truthful shares - total model bytes across ALL holders (incl CPU bufts)
+            size_t model_bytes_total = 0;
+            for (const auto & mb : mem_breakdown) {
+                model_bytes_total += mb.second.model;
+            }
+            auto model_frac_of = [&](const std::string & name) -> json {
+                auto it = mem_breakdown.find(name);
+                return (model_bytes_total > 0 && it != mem_breakdown.end())
+                    ? json((double) it->second.model / (double) model_bytes_total) : json(nullptr);
+            };
+            auto is_drafter_dev = [&](const std::string & name) {
+                return std::find(drafter_dev_names.begin(), drafter_dev_names.end(), name) != drafter_dev_names.end();
+            };
+            std::set<std::string> emitted;
             const std::vector<ggml_backend_dev_t> devs = fleet_device_list(params);
             double ts_sum = 0.0;
             for (size_t i = 0; i < devs.size() && i < llama_max_devices(); ++i) {
                 ts_sum += params.tensor_split[i];
             }
-            int attn_owner_idx = -1;
+            std::vector<int> attn_owners;
             if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-                const char * ao = getenv("LLAMA_META_ATTN_OWNER");
-                if (ao != nullptr) {
-                    attn_owner_idx = atoi(ao);
-                }
+                attn_owners = fleet_attn_owner_list(getenv("LLAMA_META_ATTN_OWNER"));
             }
             for (size_t i = 0; i < devs.size(); ++i) {
                 ggml_backend_dev_t dev = devs[i];
@@ -5691,6 +6495,9 @@ void server_routes::init_routes() {
                     {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
                     {"is_rpc",           is_rpc},
                     {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)},
+                    // RAM-backed, worker or local - the UI's RAM/VRAM totals key
+                    {"is_cpu",           (is_rpc && procs.dev_worker_is_cpu != nullptr && procs.dev_worker_is_cpu(dev)) ||
+                                         (!is_rpc && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)},
                     {"reachable",        reachable},
                     {"failed",           failed},
                     {"health",           health},
@@ -5698,16 +6505,37 @@ void server_routes::init_routes() {
                     {"memory_free_mib",  free_mem  / (1024 * 1024)},
                     {"memory_total_mib", total_mem / (1024 * 1024)},
                     {"split_frac",       ts_sum > 0.0 && i < llama_max_devices() ? json(params.tensor_split[i] / ts_sum) : json(nullptr)},
-                    {"attn_owner",       (int) i == attn_owner_idx},
+                    {"model_frac",       model_frac_of(ggml_backend_dev_name(dev))},
+                    {"role",             is_drafter_dev(ggml_backend_dev_name(dev)) ? "target+drafter" : "target"},
+                    {"attn_owner",       std::find(attn_owners.begin(), attn_owners.end(), (int) i) != attn_owners.end()},
                     {"n_layers",         nullptr},
                     {"stats",            nullptr},
                     {"score",            nullptr},
                     {"timing",           nullptr},
                     {"init_ms",          init_ms_of(is_rpc ? ep : ggml_backend_dev_name(dev))},
                 };
+                emitted.insert(ggml_backend_dev_name(dev));
+                if (!is_rpc) {
+                    auto sit = local_scores.find(ggml_backend_dev_name(dev));
+                    if (sit != local_scores.end()) {
+                        d["score"] = { {"bw_gbps", sit->second.first}, {"mm_gflops", sit->second.second} };
+                    }
+                }
                 auto lit = layer_map.find(ggml_backend_dev_name(dev));
                 if (lit != layer_map.end()) {
                     d["n_layers"] = lit->second;
+                }
+                auto mit = mem_breakdown.find(ggml_backend_dev_name(dev));
+                if (mit != mem_breakdown.end()) {
+                    d["memory_breakdown"] = {
+                        {"model_mib",   mit->second.model   / (1024 * 1024)},
+                        {"context_mib", mit->second.context / (1024 * 1024)},
+                        {"compute_mib", mit->second.compute / (1024 * 1024)},
+                    };
+                }
+                auto dmit = mem_breakdown_draft.find(ggml_backend_dev_name(dev));
+                if (dmit != mem_breakdown_draft.end()) {
+                    d["drafter_model_mib"] = dmit->second.model / (1024 * 1024);
                 }
                 if (is_rpc) {
                     pipeline_eps.insert(ep);
@@ -5747,6 +6575,89 @@ void server_routes::init_routes() {
                     }
                 }
                 devices.push_back(std::move(d));
+            }
+
+            // #131a: CPU-offload holder row - under ncmoe/eplocal the CPU holds real model
+            // bytes (mem_breakdown catches every buffer type) but is absent from the
+            // target's device list; give it a truthful card
+            // #133: devices that host ONLY a drafter (e.g. a remote worker pinned via
+            // --spec-draft-device) get a role="drafter" card
+            {
+                std::vector<std::string> extra;
+                for (const auto & mb : mem_breakdown) {
+                    if (mb.second.model > 0 && emitted.count(mb.first) == 0) {
+                        extra.push_back(mb.first);
+                    }
+                }
+                for (const auto & name : drafter_dev_names) {
+                    if (emitted.count(name) == 0 &&
+                        std::find(extra.begin(), extra.end(), name) == extra.end()) {
+                        extra.push_back(name);
+                    }
+                }
+                for (const auto & name : extra) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+                    const char * ep     = dev != nullptr && procs.dev_endpoint != nullptr ? procs.dev_endpoint(dev) : nullptr;
+                    const bool   is_rpc = ep != nullptr;
+                    size_t free_mem = 0, total_mem = 0;
+                    if (dev != nullptr) {
+                        fleet_dev_memory_cached(dev, is_rpc, &free_mem, &total_mem);
+                    }
+                    const bool holds_target = mem_breakdown.count(name) > 0 && mem_breakdown.at(name).model > 0;
+                    json d = {
+                        {"name",             name},
+                        {"description",      dev != nullptr ? ggml_backend_dev_description(dev) : "buffer host"},
+                        {"endpoint",         is_rpc ? json(ep) : json(nullptr)},
+                        {"is_rpc",           is_rpc},
+                        {"worker_is_cpu",    is_rpc && procs.dev_worker_is_cpu != nullptr && dev != nullptr && procs.dev_worker_is_cpu(dev)},
+                        // the #131a CPU-offload holder row lands here: local, RAM-backed
+                        {"is_cpu",           (is_rpc && procs.dev_worker_is_cpu != nullptr && dev != nullptr && procs.dev_worker_is_cpu(dev)) ||
+                                             (!is_rpc && dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)},
+                        {"reachable",        true},
+                        {"failed",           false},
+                        {"health",           "healthy"},
+                        {"failure_count",    nullptr},
+                        {"memory_free_mib",  free_mem  / (1024 * 1024)},
+                        {"memory_total_mib", total_mem / (1024 * 1024)},
+                        {"split_frac",       nullptr},
+                        {"model_frac",       model_frac_of(name)},
+                        {"role",             holds_target ? (is_drafter_dev(name) ? "target+drafter" : "target")
+                                                          : "drafter"},
+                        {"attn_owner",       false},
+                        {"n_layers",         nullptr},
+                        {"stats",            nullptr},
+                        {"score",            nullptr},
+                        {"timing",           nullptr},
+                        {"init_ms",          nullptr},
+                    };
+                    if (is_rpc) {
+                        std::string payload;
+                        for (const auto & [bep, b] : beacons) {
+                            if (bep == ep) { payload = b.payload; break; }
+                        }
+                        if (auto score = fleet_worker_score(ep, payload, false)) {
+                            d["score"] = { {"bw_gbps", score->first}, {"mm_gflops", score->second} };
+                        }
+                    } else {
+                        auto sit = local_scores.find(name);
+                        if (sit != local_scores.end()) {
+                            d["score"] = { {"bw_gbps", sit->second.first}, {"mm_gflops", sit->second.second} };
+                        }
+                    }
+                    auto mit = mem_breakdown.find(name);
+                    if (mit != mem_breakdown.end()) {
+                        d["memory_breakdown"] = {
+                            {"model_mib",   mit->second.model   / (1024 * 1024)},
+                            {"context_mib", mit->second.context / (1024 * 1024)},
+                            {"compute_mib", mit->second.compute / (1024 * 1024)},
+                        };
+                    }
+                    auto dmit = mem_breakdown_draft.find(name);
+                    if (dmit != mem_breakdown_draft.end()) {
+                        d["drafter_model_mib"] = dmit->second.model / (1024 * 1024);
+                    }
+                    devices.push_back(std::move(d));
+                }
             }
         }
 
@@ -5799,6 +6710,48 @@ void server_routes::init_routes() {
             {"devices",    std::move(devices)},
             {"discovered", std::move(discovered)},
         };
+        // the exact launch command of THIS serve: process argv + the LLAMA_*/GGML_*
+        // env gates. Immutable for the process lifetime, so captured once. Behind a
+        // router the /fleet/status proxy hits the child, i.e. this is the real fleet
+        // command including wizard/launcher-injected flags, not the preset alone.
+        {
+            static const json launch = [] {
+                json cmd = json::array();
+#ifdef __linux__
+                std::ifstream f("/proc/self/cmdline", std::ios::binary);
+                std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                for (size_t pos = 0; pos < all.size();) {
+                    const size_t end = all.find('\0', pos);
+                    cmd.push_back(all.substr(pos, end - pos));
+                    pos = (end == std::string::npos ? all.size() : end + 1);
+                }
+                // /fleet/status is reachable without a key while loading - never echo secrets
+                for (size_t i = 0; i + 1 < cmd.size(); i++) {
+                    if (cmd[i] == "--api-key" || cmd[i] == "--api-key-file") {
+                        cmd[i + 1] = "<redacted>";
+                    }
+                }
+#endif
+                json env = json::array();
+                for (char ** e = environ; e != nullptr && *e != nullptr; e++) {
+                    const std::string kv(*e);
+                    // LLAMA_SERVER_* is router->child plumbing, not user config
+                    if (kv.rfind("LLAMA_SERVER_", 0) == 0) continue;
+                    if (kv.rfind("LLAMA_", 0) == 0 || kv.rfind("GGML_", 0) == 0) {
+                        // secret-shaped values must not reach clients; TOKENS (count vars) is not TOKEN
+                        const std::string name = kv.substr(0, kv.find('='));
+                        const bool secret = name.find("KEY")      != std::string::npos
+                                         || name.find("SECRET")   != std::string::npos
+                                         || name.find("PASSWORD") != std::string::npos
+                                         || (name.find("TOKEN") != std::string::npos && name.find("TOKENS") == std::string::npos);
+                        env.push_back(secret ? name + "=<redacted>" : kv);
+                    }
+                }
+                return cmd.empty() && env.empty() ? json(nullptr)
+                     : json({{"cmd", std::move(cmd)}, {"env", std::move(env)}});
+            }();
+            body["launch"] = launch;
+        }
         {
             const fleet_preflight_result pf = fleet_preflight_get();
             body["preflight"] = pf.valid
@@ -5833,15 +6786,13 @@ void server_routes::init_routes() {
         }
         if (ready) {
             // the model's file size never changes for a given load - stat it once
-            static const size_t model_bytes = [&]() -> size_t {
-                std::ifstream f(params.model.path, std::ios::binary | std::ios::ate);
-                return f.good() ? (size_t) f.tellg() : 0;
-            }();
+            static const size_t model_bytes = model_size_on_disk(params.model.path); // TASKS #89: shard-set sum
             body["fleet_admin"]  = params.fleet_admin && !params.api_keys.empty();
             body["split_mode"]   = params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer"
                                  : params.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : "none";
             body["n_gpu_layers"] = params.n_gpu_layers;
             body["model"]        = { {"path", params.model.path}, {"size_bytes", model_bytes} };
+            body["speculative"]  = speculative_info(params);
         } else {
             body["fleet_admin"]  = false;
             // from the load-plan snapshot (model thread), NOT from params - the
@@ -6321,6 +7272,7 @@ void server_routes::init_routes() {
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
+            { "speculative",                 speculative_info(params) },
         };
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
@@ -6834,6 +7786,41 @@ void server_routes::init_routes() {
     };
 }
 
+// TASKS #100: the active speculation stack, shown wherever a loaded model is
+// named (router model rows, /props). type "none" = target-only serve.
+static json speculative_info(const common_params & params) {
+    const auto & spec = params.speculative;
+    std::string type = common_speculative_type_name_str(spec.types);
+    if (type.rfind("none,", 0) == 0) {
+        type = type.substr(5);
+    }
+    json j = {
+        {"type", type},
+    };
+    if (spec.has_dft()) {
+        std::string base = spec.draft.mparams.path;
+        const size_t slash = base.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            base = base.substr(slash + 1);
+        }
+        j["draft_model"] = base;
+        j["n_max"]       = spec.draft.n_max;
+        j["conf_min"]    = spec.draft.conf_min;
+        j["entropy_max"] = spec.draft.entropy_max;
+        std::string devs;
+        for (ggml_backend_dev_t d : spec.draft.devices) {
+            if (d == nullptr) {
+                continue;
+            }
+            devs += (devs.empty() ? "" : ",") + std::string(ggml_backend_dev_name(d));
+        }
+        if (!devs.empty()) {
+            j["draft_device"] = devs;
+        }
+    }
+    return j;
+}
+
 json server_routes::get_model_info() const {
     return json {
         {"id",       meta->model_name},
@@ -6851,6 +7838,7 @@ json server_routes::get_model_info() const {
             {"n_params",    meta->model_n_params},
             {"size",        meta->model_size},
             {"ftype",       meta->model_ftype},
+            {"speculative", speculative_info(params)},
         }},
     };
 }

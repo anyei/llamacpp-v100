@@ -362,6 +362,15 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+    GGML_ASSERT(tensor != nullptr);
+    return (reinterpret_cast<uintptr_t>(tensor->data) % alignment) == 0 &&
+           tensor->nb[1] % alignment == 0 &&
+           tensor->nb[2] % alignment == 0 &&
+           tensor->nb[3] % alignment == 0;
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
@@ -969,6 +978,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+    static constexpr int qk = QK2_0;
+    static constexpr int qr = QR2_0;
+    static constexpr int qi = QI2_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
     static constexpr int qr = QR4_0;
@@ -1355,7 +1371,18 @@ struct ggml_cuda_concurrent_event {
                     continue;
                 }
 
+                // a src reached through a view carries the dependency of the tensor that
+                // actually writes the memory - look the src up by its root, or a producer
+                // in another branch stays invisible and the two run unordered
+                const ggml_tensor * src_root = tensor->src[i];
+                while (src_root->view_src != nullptr) {
+                    src_root = src_root->view_src;
+                }
+
                 auto it = stream_mapping.find(tensor->src[i]);
+                if (it == stream_mapping.end() && src_root != tensor->src[i]) {
+                    it = stream_mapping.find(src_root);
+                }
 
                 if (it == stream_mapping.end()) {
                     continue;

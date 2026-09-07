@@ -87,12 +87,24 @@
 			.chip.stream { background: #60a5fa33; color: #60a5fa; }
 			.chip.wait { background: #8883; }
 			details.meta > summary { cursor: pointer; font-size: 11px; opacity: 0.6; }
+			details.launch { margin: -0.75rem 0 1.25rem; }
+			details.launch > summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+			details.launch > pre {
+				font-size: 0.7rem; line-height: 1.5; color: var(--fg);
+				background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem;
+				padding: 0.6rem 0.75rem; margin: 0.35rem 0 0;
+				white-space: pre-wrap; word-break: break-all; user-select: all;
+			}
 </style>
 	</head>
 	<body>
 		<main>
 			<h1><span class="dot"></span>Loading model across the fleet</h1>
 			<p class="sub" id="model">The UI will open automatically when the model is ready.</p>
+			<details class="launch" id="launch" hidden>
+				<summary>launch command</summary>
+				<pre id="launch-cmd"></pre>
+			</details>
 
 			<div class="stage" id="stage">Initializing…</div>
 			<div class="track"><div id="bar"></div></div>
@@ -106,6 +118,7 @@
 			const prev = Object.create(null);
 			const MiB = 1024 * 1024;
 			let inFlight = false; // don't stack fetches if the server stalls
+			let renderedLaunch = false;
 
 			function esc(s) {
 				return String(s).replace(/[&<>"]/g, (c) =>
@@ -135,9 +148,10 @@
 			}
 
 			function fmtBytes(n) {
-				if (n >= 1024 * MiB) return (n / (1024 * MiB)).toFixed(2) + ' GB';
-				if (n >= MiB) return (n / MiB).toFixed(1) + ' MB';
-				if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+				// decimal units to match published model sizes (#97)
+				if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GB';
+				if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+				if (n >= 1e3) return (n / 1e3).toFixed(0) + ' KB';
 				return n + ' B';
 			}
 
@@ -160,6 +174,8 @@
 				}
 			}
 
+			let goneTicks = 0;
+
 			async function tick() {
 				if (inFlight) return;
 				inFlight = true;
@@ -174,9 +190,43 @@
 					inFlight = false;
 				}
 
-				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading') {
+				if (!d.server_state) {
+					// the load vanished (child exited or was stopped): /fleet/status
+					// drops server_state entirely - do not idle here forever
+					if (++goneTicks >= 3) {
+						document.getElementById('stage').innerHTML =
+							'no load in flight — it finished, failed, or was stopped · <a href="./">back to the dashboard</a>';
+					}
+					return;
+				}
+				goneTicks = 0;
+				if (d.server_state && d.server_state !== 'loading' && d.server_state !== 'reloading' &&
+						d.server_state !== 'waiting-capacity') {
 					location.href = './'; // ready/sleeping — the real UI is served now
 					return;
+				}
+				if (d.server_state === 'waiting-capacity' && d.capacity) {
+					// keep the loading page: the serve is alive, waiting for fleet RAM
+					// (a worker is down/restarting) - show what it needs vs has
+					document.getElementById('stage').textContent =
+						'waiting for fleet capacity: ' +
+						Math.round((d.capacity.available_mib || 0) / 1024) + ' GiB pooled of ' +
+						Math.round((d.capacity.required_mib || 0) / 1024) + ' GiB needed — resumes when workers return';
+				}
+
+				// the exact serve command (argv + env gates) - immutable, render once
+				if (d.launch && !renderedLaunch) {
+					renderedLaunch = true;
+					const q = (t) => (/[^A-Za-z0-9_@%+=:,.\/-]/.test(t) ? "'" + t.replace(/'/g, "'\\''") + "'" : t);
+					const lines = (d.launch.env || []).map((e) => {
+						const i = e.indexOf('=');
+						return e.slice(0, i + 1) + q(e.slice(i + 1)) + ' \\';
+					});
+					if (Array.isArray(d.launch.cmd) && d.launch.cmd.length) {
+						lines.push(d.launch.cmd.map(q).join(' '));
+					}
+					document.getElementById('launch-cmd').textContent = lines.join('\n');
+					document.getElementById('launch').hidden = false;
 				}
 
 				// what is being loaded + how it will be split
@@ -190,15 +240,37 @@
 				}
 
 				const lp = d.load_progress || {};
-				document.getElementById('stage').textContent =
-					'Stage: ' + (lp.stage || '…') +
-					(typeof lp.value === 'number' ? '  ·  ' + Math.round(lp.value * 100) + '%' : '') +
-					(typeof lp.elapsed_ms === 'number' ? '  ·  ' + fmtDur(lp.elapsed_ms) + ' elapsed' : '');
-				document.getElementById('bar').style.width =
-					(typeof lp.value === 'number' ? Math.max(2, lp.value * 100) : 2) + '%';
-
 				const now = performance.now();
 				const workers = Array.isArray(d.load_workers) ? d.load_workers.slice() : [];
+
+				// #99: the stage value is the COORDINATOR's read/dispatch fraction - it hits
+				// 100% at file-EOF while slices are still in flight to slow workers. Cap the
+				// display at 99% and say what is actually happening until every sharing
+				// worker's own bar reads ready (same math as the rows below).
+				let wShare = 0, wReady = 0;
+				{
+					const modelMib0 = d.model && d.model.size_bytes ? d.model.size_bytes / MiB : 0;
+					for (const w of workers) {
+						if (!w.split_frac || modelMib0 <= 0) continue;
+						wShare++;
+						const expected = w.split_frac * modelMib0;
+						let doneMib = (w.weights_cached_mib || 0) + (w.weights_streamed_mib || 0);
+						if (!w.endpoint && w.free_start_mib != null && w.free_mib != null) {
+							doneMib = Math.max(doneMib, w.free_start_mib - w.free_mib);
+						}
+						if ((100 * doneMib) / expected >= 97) wReady++;
+					}
+				}
+				const finalizing = typeof lp.value === 'number' && lp.value >= 0.995 && wShare > 0 && wReady < wShare;
+				const shownPct = typeof lp.value === 'number'
+					? Math.min(finalizing ? 99 : 100, Math.round(lp.value * 100)) : null;
+				document.getElementById('stage').textContent =
+					'Stage: ' + (lp.stage || '…') +
+					(shownPct !== null ? '  ·  ' + shownPct + '%' : '') +
+					(finalizing ? '  ·  finalizing workers ' + wReady + '/' + wShare : '') +
+					(typeof lp.elapsed_ms === 'number' ? '  ·  ' + fmtDur(lp.elapsed_ms) + ' elapsed' : '');
+				document.getElementById('bar').style.width =
+					(shownPct !== null ? Math.max(2, shownPct) : 2) + '%';
 				// fastest first, more free memory breaking ties; unscored sink below,
 				// local devices (no endpoint) keep their pipeline position at the end
 				workers.sort((a, b) => {
@@ -226,7 +298,7 @@
 					// #56: progress vs expected share. RPC = cached+streamed bytes;
 					// local devices = VRAM delta from the load-start snapshot.
 					const modelMib = d.model && d.model.size_bytes ? d.model.size_bytes / MiB : 0;
-					const expected = w.attn_owner || !w.split_frac ? 0 : w.split_frac * modelMib;
+					const expected = !w.split_frac ? 0 : w.split_frac * modelMib; // mixed-role owners track their expert share
 					let doneMib = cachedMib + streamedMib;
 					if (!w.endpoint && w.free_start_mib != null && w.free_mib != null) {
 						doneMib = Math.max(doneMib, w.free_start_mib - w.free_mib);
@@ -258,13 +330,20 @@
 						: '';
 					// #57: one primary badge line; everything else behind <details>
 					const badges = [];
-					if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
-					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% share</span>');
+					if (w.attn_owner && w.split_frac) badges.push('<span class="badge score">attention owner + ' + Math.round(w.split_frac * 100) + '% experts</span>');
+					else if (w.attn_owner) badges.push('<span class="badge score">attention owner</span>');
+					// #131a: the CPU expert-offload holder has no -ts fraction; and GPU -ts
+					// fractions are a VRAM plan, not where the whole model lives
+					else if (w.name === 'CPU' && !w.split_frac) badges.push('<span class="badge">expert offload (RAM)</span>');
+					else if (w.split_frac != null) badges.push('<span class="badge">' + Math.round(w.split_frac * 100) + '% VRAM share</span>');
 					if (cachedMib > 0) badges.push('<span class="badge score">' + (cachedMib / 1024).toFixed(1) + ' GiB cached</span>');
 					if (streamedMib > 0) badges.push('<span class="badge">' + (streamedMib / 1024).toFixed(1) + ' GiB streamed</span>');
 					// #63: coordinator-measured init time (load start -> share placed)
 					if (w.init_ms != null) badges.push('<span class="badge score">init ' + fmtDur(w.init_ms) + '</span>');
 					const detail = [
+						// local devices: memory summary (delta from the load-start snapshot)
+						!w.endpoint && w.free_start_mib != null && w.free_mib != null
+							? ((w.free_start_mib - w.free_mib) / 1024).toFixed(1) + ' GiB used since load start' : null,
 						w.score ? w.score.bw_gbps.toFixed(1) + ' GB/s' : null,
 						w.n_layers != null ? w.n_layers + ' layers' : null,
 						w.free_mib != null ? (w.free_mib / 1024).toFixed(1) + ' GiB free' : null,

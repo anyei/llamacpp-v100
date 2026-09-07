@@ -224,6 +224,9 @@ extern "C" {
     // must be collected before any other blocking call on the same backend.
     typedef bool   (*ggml_backend_boundary_fused_send_t)(ggml_backend_t backend, struct ggml_tensor * set_tensor, const void * set_data, size_t set_size, struct ggml_cgraph ** cgraphs, int n_graphs, const struct ggml_tensor * fetch_tensor, size_t fetch_size);
     typedef bool   (*ggml_backend_boundary_fused_recv_t)(ggml_backend_t backend, void * data, size_t size);
+    // non-blocking: true when the pending fused read's bytes have started to
+    // arrive (a recv now completes at wire speed instead of waiting on the peer)
+    typedef bool   (*ggml_backend_boundary_fused_ready_t)(ggml_backend_t backend);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -420,11 +423,65 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
     // surgical re-provision of a RESTARTED RPC worker at the same endpoint: re-create
     // its member buffers, replay their weight journal (worker-cache hash replay) and
     // rebase the shadow registrations - the model keeps serving without a reload.
     // Returns false when anything cannot be restored (caller should fully reload).
     GGML_API bool ggml_backend_meta_reprovision_endpoint(const char * endpoint);
+
+    // forward the thread count to member backends that accept it (the in-process
+    // CPU expert member, #118): the meta backend hides its members from the
+    // scheduler-facing set_n_threads collection. No-op on non-meta backends.
+    GGML_API void ggml_backend_meta_set_n_threads(ggml_backend_t backend, int n_threads);
+
+    // local-draft support (TASKS #71): enumerate a meta device's member devices,
+    // and fetch member j's shadow of a meta-hosted tensor when that member holds a
+    // FULL copy (mirrored, or dedicated-on-j). Returns NULL when the tensor is not
+    // meta-hosted, the member has no shadow, or the member's slice is not the whole
+    // tensor. The returned tensor lives in the member's plain backend buffer and can
+    // be used as a graph src by a scheduler that does not contain the meta backend.
+    GGML_API size_t               ggml_backend_meta_dev_n_members(ggml_backend_dev_t dev);
+    GGML_API ggml_backend_dev_t   ggml_backend_meta_dev_member   (ggml_backend_dev_t dev, size_t j);
+    GGML_API bool                 ggml_backend_meta_tensor_is_meta_hosted(const struct ggml_tensor * tensor);
+    GGML_API struct ggml_tensor * ggml_backend_meta_tensor_full_shadow(const struct ggml_tensor * tensor, size_t j);
+
+    // remap every meta-hosted tensor referenced by the graph (node srcs, view
+    // sources AND leaf entries) to the first listed member's full local shadow.
+    // Returns false - after logging the offending tensor - if any referenced
+    // meta tensor has no full copy on any of the given members.
+    GGML_API bool ggml_backend_meta_graph_localize(struct ggml_cgraph * gf, const size_t * members, size_t n_members);
+
+    // TASKS #75 (hot-expert placement): write one MEMBER's shadow of a meta-buffer
+    // tensor directly. Needed for tensors whose per-member CONTENTS differ (the
+    // expert ownership mask / id-remap tables): a plain meta set_tensor writes all
+    // members identically (MIRRORED) or divides the values (PARTIAL), neither of
+    // which can express per-member data.
+    GGML_API void ggml_backend_meta_tensor_set_member(
+        struct ggml_tensor * tensor, size_t member, const void * data, size_t offset, size_t size);
+
+    // TASKS #71 (replication inc-0): register a host copy of one layer's
+    // expert->member ownership (member_of[e] = meta member index, -1 = none)
+    // so the meta backend can attribute routed experts to members at gather
+    // time (GGML_META_ZL_STATS counters; later the dynamic leg skip).
+    // nullptr/0 clears the layer's entry.
+    GGML_API void ggml_backend_meta_set_expert_ownership(
+        int32_t il, const int32_t * member_of, size_t n_expert);
+
+    // TASKS #71 (replication inc-0): note one layer's routed expert ids for the
+    // current decode token, captured at COMPUTE time (eval callback) - the meta
+    // gather consults these for the ZL counters (gather-time reads of the topk
+    // tensor see ring-recycled bytes). nullptr/0 clears.
+    GGML_API void ggml_backend_meta_note_routed_ids(
+        int32_t il, const int32_t * ids, size_t k);
+
+    // TASKS #84 (GGML_META_UNION_STATS): batch variant - note ALL lanes of a
+    // verify/multi-token graph's routed ids ([k, n_tok] flattened, lane-major).
+    // Token 0 keeps the single-token semantics above for the ZL counters; the
+    // meta gather consults the full batch for the expert-union counters.
+    GGML_API void ggml_backend_meta_note_routed_ids_batch(
+        int32_t il, const int32_t * ids, size_t k, size_t n_tok);
 
     //
     // Utils

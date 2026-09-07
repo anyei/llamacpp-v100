@@ -226,8 +226,7 @@ bool common_ssd_streaming_init(common_params & params) {
     params.cb_eval           = common_ssd_streaming_cb;
     params.cb_eval_user_data = nullptr;
     // the director manages residency itself: do not prefault the whole file
-    params.use_mmap = true;
-    params.use_mlock = false;
+    params.load_mode = LLAMA_LOAD_MODE_MMAP;
 
     LOG_INF("%s: SSD streaming director enabled (budget %zu MiB)\n", __func__, st.budget_bytes / (1024*1024));
     return true;

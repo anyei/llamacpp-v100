@@ -19,6 +19,7 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+    bool     mtp_fused = false; // #140: DECODER_MTP graph unrolls the draft chain in-graph
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -53,7 +54,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
-    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<bool> embeddings_layer_inp; // [n_layer() + 1] extract input embeddings for layer; slot n_layer = output of the final layer
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
@@ -62,4 +63,11 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // draft-device mirrors of ctx_other tensors the DFlash/EAGLE3 draft graph
+    // reads (lm_head / tok_embd). Created at context init when the target's
+    // copies live in a buffer this context's scheduler cannot address (the
+    // meta tensor-split device, or a device outside this model's list).
+    ggml_tensor * other_output_mirror   = nullptr;
+    ggml_tensor * other_tok_embd_mirror = nullptr;
 };

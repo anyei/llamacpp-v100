@@ -108,15 +108,19 @@
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
-			{@const itemHref = isSearchOnMobile ? ROUTES.SEARCH : item.route}
-			{@const itemOnClick = item.route
+			{@const itemHref = item.externalHref ? undefined : isSearchOnMobile ? ROUTES.SEARCH : item.route}
+			{@const itemOnClick = item.externalHref
 				? () => {
-						onNewChat?.();
-						goto(item.route!);
+						window.location.href = item.externalHref!;
 					}
-				: isSearchOnMobile
-					? undefined
-					: onSearchClick}
+				: item.route
+					? () => {
+							onNewChat?.();
+							goto(item.route!);
+						}
+					: isSearchOnMobile
+						? undefined
+						: onSearchClick}
 			{@const itemTransition = {
 				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
@@ -157,14 +161,18 @@
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && isMobile.current}
-			{@const itemOnClick = item.route
+			{@const itemOnClick = item.externalHref
 				? () => {
-						onNewChat?.();
-						goto(item.route!);
+						window.location.href = item.externalHref!;
 					}
-				: isSearchOnMobile
-					? undefined
-					: onSearchClick}
+				: item.route
+					? () => {
+							onNewChat?.();
+							goto(item.route!);
+						}
+					: isSearchOnMobile
+						? undefined
+						: onSearchClick}
 			{@const itemTransition = {
 				duration: ICON_STRIP_TRANSITION_DURATION,
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,

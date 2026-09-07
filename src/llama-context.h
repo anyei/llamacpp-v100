@@ -116,6 +116,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_fused(bool fused);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -287,6 +288,9 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
+    // TASKS #84 probe 2: per-layer routing-budget mask (LLAMA_EXPERT_MASK)
+    std::unique_ptr<llama_expert_mask> expert_mask;
+
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
@@ -332,6 +336,9 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
+
+    // TASKS #74: per-layer expert-selection histogram (LLAMA_EXPERT_PROFILE=<path>)
+    std::unique_ptr<struct llama_expert_profile> expert_profile;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
@@ -392,8 +399,22 @@ private:
 
     ggml_backend_sched_t active_sched() const { return sched_active != nullptr ? sched_active : sched.get(); }
 
+    // TASKS #71 stage 1 (LLAMA_META_LOCAL_DRAFT=1): the MTP draft context runs on
+    // the meta device's IN-PROCESS members only - its scheduler has no meta backend
+    // and graph_localize() remaps meta-hosted weight srcs to a local member's full
+    // shadow, so drafting stops paying fleet boundaries.
+    bool                mtp_local = false;
+    ggml_backend_dev_t  mtp_meta_dev = nullptr;
+    std::vector<size_t> mtp_local_members; // member indices of in-process (non-RPC) devices
+
+    bool graph_localize(ggml_cgraph * gf);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // draft-device mirrors of ctx_other tensors (see cparams.other_*_mirror)
+    ggml_context_ptr        mirror_other_ctx;
+    ggml_backend_buffer_ptr mirror_other_buf;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

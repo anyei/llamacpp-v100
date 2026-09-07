@@ -158,6 +158,16 @@ enum rpc_cmd {
     RPC_CMD_GET_MANIFEST,
     RPC_CMD_SET_TENSOR_HASH_BATCH,
     RPC_CMD_SET_TENSOR_HASH_DATA,
+    // proto 4.15 (upstream 5.0 absorption): raw byte-range memset on a tensor.
+    // Appended at the fork ladder tail so deployed 4.x workers keep their
+    // command ids; upstream assigns this a different id and is rejected on
+    // the major at HELLO. Client-side gated on server minor >= 15.
+    RPC_CMD_MEMSET_TENSOR,
+    // proto 4.16 (TASKS #103): the coordinator announces the model identity of
+    // the load session; the worker scopes its cache dir, manifest and eviction
+    // preference by it (per-model folders - collision/poison isolation).
+    // No response, like SET_TENSOR. Client-gated on server minor >= 16.
+    RPC_CMD_SESSION_MODEL,
     RPC_CMD_COUNT,
 };
 
@@ -260,6 +270,13 @@ struct rpc_msg_free_buffer_req {
 
 struct rpc_msg_buffer_clear_req {
     uint64_t remote_ptr;
+    uint8_t value;
+};
+
+struct rpc_msg_memset_tensor_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
     uint8_t value;
 };
 
@@ -371,9 +388,11 @@ struct rpc_msg_graph_recompute_uid_req {
     uint64_t uid;
 };
 
-// server-side per-device cap on cached uid-keyed graphs (proto 4.3). The client
-// tracks at most half of this, so a uid the client remembers is always cached
-// server-side; eviction on either side only costs a re-send, never a failure.
+// server-side per-device cap on cached uid-keyed graphs (proto 4.3). Each
+// client context tracks at most 1/8 of this (room for peers sharing the
+// device) and eviction is LRU (review #18), so a uid a client actively
+// recomputes stays cached; a genuine server-side miss still drops the
+// connection - reachable only past ~8 concurrently active contexts per device.
 #define RPC_GRAPH_UID_CACHE_CAP 512
 
 #pragma pack(pop)
@@ -604,11 +623,32 @@ struct ggml_backend_rpc_async_state {
     std::string endpoint;      // for failure attribution (set by get_socket)
     struct rpc_ep_stat * stat = nullptr; // per-endpoint counters (set with endpoint)
     // proto 4.10 manifest handshake (TASKS.md #62): every hash the worker can
-    // serve locally, fetched once per connection; known weight placements queue
+    // serve locally, fetched once per SCOPE (review #29: a model switch on a
+    // live socket re-announces and re-fetches); known weight placements queue
     // here and flush as ONE batched command instead of one offer RTT per tensor
     bool manifest_fetched = false;
+    std::string announced_model;
     std::unordered_set<uint64_t> manifest;
     std::vector<rpc_msg_set_tensor_hash_batch_entry> pending_batch;
+    // unified in-order FIFO of the responses outstanding on this socket: PING
+    // markers (empty responses) and fused FETCH payloads (proto 4.12/4.13 may
+    // compress them: fmt 0 = f32, 1 = f16, 2 = q8_0). The server answers in
+    // command order, so any read must process the FIFO head first; a FETCH
+    // consumed early to clear the line is decoded to f32 and stashed until its
+    // fused_recv. This replaces the single fused_fetch_fmt slot, whose contract
+    // (the pending fetch is always the very next read) the #71 deferred gather
+    // breaks by design.
+    // zero_ok (proto 4.14): this fetch was sent with the zero-short-reply flag,
+    // so a 1-byte ZERO marker response is legal (stashed as logical_size zeros)
+    // owner = the ggml_backend_t that sent the FETCH (nullptr for pings): two
+    // meta members sharing this socket recv out of send order under expert
+    // deferral, so a stashed payload must be claimed by its owner, not by
+    // whoever pops first
+    struct rpc_pending_rsp { uint8_t kind; uint8_t fmt; uint8_t zero_ok; uint64_t logical_size; const void * owner; }; // kind 0 = ping, 1 = fetch
+    std::deque<rpc_pending_rsp> rsp_fifo;
+    struct rpc_fetch_stashed { const void * owner; std::vector<uint8_t> payload; };
+    std::deque<rpc_fetch_stashed> fetch_stash; // early-read FETCH payloads, f32, send order per owner
+    uint64_t zero_replies = 0; // proto 4.14 ZERO short replies received (TASKS #71 inc-1)
 };
 
 static std::mutex g_rpc_async_reg_mutex;
@@ -816,8 +856,15 @@ static bool send_rpc_cmd_raw(socket_ptr sock, ggml_backend_rpc_async_state & st,
     return true;
 }
 
-static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state & st, uint64_t target) {
-    while (st.pings_done < target) {
+// caller must hold st.mutex. Read the response at the FIFO head off the stream:
+// a PING's empty response, or a FETCH payload decoded to f32 and stashed.
+static bool rpc_process_rsp_locked(socket_ptr sock, ggml_backend_rpc_async_state & st) {
+    if (st.rsp_fifo.empty()) {
+        return false; // accounting broke - nothing should be read here
+    }
+    const auto e = st.rsp_fifo.front();
+    st.rsp_fifo.pop_front();
+    if (e.kind == 0) {
         uint64_t size;
         if (!sock->recv_data(&size, sizeof(size))) {
             return false;
@@ -826,6 +873,68 @@ static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state
             return false; // stream out of sync - a PING response is always empty
         }
         st.pings_done++;
+        return true;
+    }
+    const int64_t  n_vals = (int64_t) (e.logical_size / sizeof(float));
+    const uint64_t expect = e.fmt == 2 ? ggml_row_size(GGML_TYPE_Q8_0, n_vals)
+                          : e.fmt == 1 ? e.logical_size / 2
+                          : e.logical_size;
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        return false;
+    }
+    if (e.zero_ok && out_size == 1) {
+        // proto 4.14 ZERO short reply: the member's contribution is bitwise
+        // zero - stash logical_size zeros without moving the payload
+        uint8_t marker;
+        if (!sock->recv_data(&marker, 1) || marker != 0x5A) {
+            return false;
+        }
+        st.fetch_stash.push_back({e.owner, std::vector<uint8_t>(e.logical_size)}); // zero-filled
+        if (st.zero_replies++ == 0) {
+            // stderr, not GGML_LOG_INFO: the engagement line must be visible at
+            // default serve verbosity (the -lv 1 fleet-load trap)
+            fprintf(stderr, "rpc: proto 4.14 zero short replies ACTIVE (first on %s)\n", st.endpoint.c_str());
+        }
+        return true;
+    }
+    if (out_size != expect) {
+        return false;
+    }
+    std::vector<uint8_t> payload(e.logical_size);
+    if (e.fmt != 0) {
+        std::vector<uint8_t> wire(expect);
+        if (!sock->recv_data(wire.data(), expect)) {
+            return false;
+        }
+        if (e.fmt == 2) {
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(wire.data(), (float *) payload.data(), n_vals);
+        } else {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) wire.data(), (float *) payload.data(), n_vals);
+        }
+    } else if (!sock->recv_data(payload.data(), e.logical_size)) {
+        return false;
+    }
+    st.fetch_stash.push_back({e.owner, std::move(payload)});
+    return true;
+}
+
+static bool rpc_drain_pings_locked(socket_ptr sock, ggml_backend_rpc_async_state & st, uint64_t target) {
+    while (st.pings_done < target) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// caller must hold st.mutex. Clear the line completely (pings AND outstanding
+// fetches) so the next command's response is the next read on the stream.
+static bool rpc_drain_all_locked(socket_ptr sock, ggml_backend_rpc_async_state & st) {
+    while (!st.rsp_fifo.empty()) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            return false;
+        }
     }
     return true;
 }
@@ -840,7 +949,7 @@ static bool rpc_batch_flush_locked(socket_ptr sock, ggml_backend_rpc_async_state
     }
     std::vector<rpc_msg_set_tensor_hash_batch_entry> batch;
     batch.swap(st.pending_batch); // before the send: send_rpc_cmd_raw re-enters the flush check
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    if (!rpc_drain_all_locked(sock, st)) {
         return false;
     }
     const uint64_t count = batch.size();
@@ -878,7 +987,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    if (!rpc_drain_all_locked(sock, st)) {
         return false;
     }
     const auto t_start = std::chrono::steady_clock::now();
@@ -910,6 +1019,8 @@ static uint64_t rpc_ping_async(socket_ptr sock) {
     bool status = send_rpc_cmd_raw(sock, st, RPC_CMD_PING, nullptr, 0);
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
+    } else {
+        st.rsp_fifo.push_back({0, 0, 0, 0, nullptr});
     }
     return ++st.pings_sent;
 }
@@ -923,6 +1034,7 @@ static void rpc_sync_pings(socket_ptr sock, uint64_t seq) {
     if (!status) {
         rpc_mark_failed(st.endpoint, __func__);
         st.pings_done = target; // never re-wait for pongs that will not arrive
+        st.rsp_fifo.clear();
     }
 }
 
@@ -1229,6 +1341,15 @@ static thread_local struct {
     bool     valid;
 } g_rpc_src_hint;
 
+// TASKS #103: process-wide model identity, sent once per socket right before
+// the manifest handshake so the worker scopes its cache per model. Set by the
+// loader (common_init_from_params) with the target gguf basename.
+static char g_rpc_session_model[100] = {0};
+
+void ggml_backend_rpc_session_model(const char * model_id) {
+    snprintf(g_rpc_session_model, sizeof(g_rpc_session_model), "%s", model_id ? model_id : "");
+}
+
 void ggml_backend_rpc_source_hint(const char * name, uint64_t base_offset) {
     static const bool disabled = getenv("GGML_RPC_NO_SRC_HINT") != nullptr;
     if (disabled || name == nullptr || name[0] == '\0') {
@@ -1303,12 +1424,34 @@ static void rpc_journal_record_set(ggml_backend_buffer_t buffer, const rpc_tenso
 static void rpc_manifest_ensure(socket_ptr sock) {
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (st.manifest_fetched || st.server_minor < 10) {
+    if (st.server_minor < 10) {
         return;
     }
-    st.manifest_fetched = true; // one attempt; on failure the load just streams
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent)) {
+    // review #29: one announce+manifest per SCOPE, not per socket - a second
+    // model loading over a live socket (a remote drafter after its target)
+    // re-announces so its tensors file under their own folder (#103 isolation)
+    const bool rescope = st.server_minor >= 16 && st.manifest_fetched &&
+                         st.announced_model != g_rpc_session_model;
+    if (st.manifest_fetched && !rescope) {
         return;
+    }
+    st.manifest_fetched = true; // one attempt per scope; on failure the load just streams
+    st.announced_model  = g_rpc_session_model;
+    if (rescope) {
+        // the old scope's entries would batch-place and hard-miss under the new
+        // one; cleared up front so a failed refetch degrades to streaming
+        st.manifest.clear();
+    }
+    if (!rpc_drain_all_locked(sock, st)) {
+        return;
+    }
+    // #103: announce the session model BEFORE the manifest so the response is
+    // scoped to this model's folder (+ flat legacy entries)
+    if (st.server_minor >= 16 && g_rpc_session_model[0] != '\0') {
+        if (!send_rpc_cmd_raw(sock, st, RPC_CMD_SESSION_MODEL,
+                              g_rpc_session_model, strlen(g_rpc_session_model))) {
+            return;
+        }
     }
     if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GET_MANIFEST, nullptr, 0)) {
         return;
@@ -1355,9 +1498,14 @@ static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor
             if (known) {
                 ast.pending_batch.push_back({ rpc_tensor, offset, hash });
                 flush_now = ast.pending_batch.size() >= 512;
-            } else {
-                ast.manifest.insert(hash); // the stream below makes the worker cache it
             }
+            // NOT inserted into the manifest on the stream path: the stream
+            // only reaches the worker's cache when it runs -c, so claiming it
+            // "known" made the next identical upload batch-place against
+            // nothing and hard-fail the endpoint. Multi-device endpoints hit
+            // this on every mirrored tensor (same bytes, one socket, twice) -
+            // those now stream once per device instead; the worker's own
+            // manifest still dedupes across loads.
         }
         if (ast.stat != nullptr) {
             (known ? ast.stat->weights_cached_bytes : ast.stat->weights_streamed_bytes)
@@ -1542,11 +1690,36 @@ static void ggml_backend_rpc_buffer_set_usage(ggml_backend_buffer_t buffer, enum
     }
 }
 
+static void ggml_backend_rpc_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    // proto 4.15 (upstream 5.0 tensor_memset): one small command instead of
+    // streaming a filled buffer. Views resolve to the root before serializing
+    // (view links do not survive the wire).
+    if (rpc_async_state(ctx->sock.get()).server_minor >= 15) {
+        size_t root_offset = offset;
+        const ggml_tensor * root = rpc_resolve_view(tensor, root_offset);
+        rpc_msg_memset_tensor_req request;
+        request.tensor = serialize_tensor(root);
+        request.offset = root_offset;
+        request.size   = size;
+        request.value  = value;
+        if (!send_rpc_cmd(ctx->sock, RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0)) {
+            rpc_mark_failed(rpc_async_state(ctx->sock.get()).endpoint, __func__);
+        }
+        return;
+    }
+    // pre-4.15 workers: stream a filled buffer through set_tensor. The memsets
+    // that reach here are infrequent cache clears (e.g. the dsv4 compressed-KV
+    // per-stream wipes), not hot-path traffic.
+    std::vector<uint8_t> data(size, value);
+    ggml_backend_rpc_buffer_set_tensor(buffer, tensor, data.data(), offset, size);
+}
+
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
     /* .init_tensor     = */ ggml_backend_rpc_buffer_init_tensor,
-    /* .memset_tensor   = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_rpc_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_rpc_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_rpc_buffer_get_tensor,
     /* .set_tensor_2d   = */ ggml_backend_rpc_buffer_set_tensor_2d,
@@ -1928,7 +2101,7 @@ static void ggml_backend_rpc_cpy_tensor_batch_async(int n_copies, ggml_backend_t
             locks.emplace_back(st.mutex);
             LOG_DBG("[w2w_batch] send k=%d dst=%s pings=%" PRIu64 "/%" PRIu64 " cmds=%" PRIu64 "\n",
                     k, pulls[k].dst_endpoint.c_str(), st.pings_done, st.pings_sent, st.cmds_sent);
-            if (!rpc_drain_pings_locked(pulls[k].sock_dst, st, st.pings_sent) ||
+            if (!rpc_drain_all_locked(pulls[k].sock_dst, st) ||
                 !send_rpc_cmd_raw(pulls[k].sock_dst, st, RPC_CMD_COPY_FROM_REMOTE, pulls[k].input.data(), pulls[k].input.size())) {
                 rpc_mark_failed(pulls[k].dst_endpoint, __func__);
                 fast[k] = false;
@@ -2018,7 +2191,7 @@ static void ggml_backend_rpc_get_tensor_batch(int n_gets, ggml_backend_t * backe
             if (reqs[k].sock.get() != locked) {
                 locks.emplace_back(st.mutex);
                 locked  = reqs[k].sock.get();
-                sock_ok = rpc_drain_pings_locked(reqs[k].sock, st, st.pings_sent);
+                sock_ok = rpc_drain_all_locked(reqs[k].sock, st);
             }
             if (!sock_ok ||
                 !send_rpc_cmd_raw(reqs[k].sock, st, RPC_CMD_GET_TENSOR, &reqs[k].request, sizeof(reqs[k].request))) {
@@ -2090,6 +2263,28 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         }
         flags |= 2;
     }
+    // proto 4.12/4.13: compressed boundary payloads. Boundary values are F32
+    // activations; cutting their wire bytes attacks the measured ~68 ms/token
+    // of GbE byte time (BOUNDARY_STATS census 2026-07-27g). Lossy - opt-in,
+    // default off. q8_0 (WIRE_Q8, ~3.76x, needs minor 13 and n%32==0) wins
+    // over f16 (WIRE_F16, 2x, minor 12); anything else stays f32.
+    // value-parsed like GGML_RPC_TIMING: compose files pass NAME=0/empty through,
+    // and presence-gating made =0 a silent no-op (review #6)
+    static const bool wire_f16 = [] { const char * e = getenv("GGML_RPC_WIRE_F16"); return e != nullptr && atoi(e) != 0; }();
+    static const bool wire_q8  = [] { const char * e = getenv("GGML_RPC_WIRE_Q8");  return e != nullptr && atoi(e) != 0; }();
+    const uint8_t server_minor = rpc_async_state(sock.get()).server_minor;
+    const bool f16_ok = wire_f16 && server_minor >= 12;
+    const bool q8_ok  = wire_q8  && server_minor >= 13;
+    if (wire_f16 || wire_q8) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+            GGML_LOG_INFO("rpc: compressed boundary payloads %s (first fused endpoint %s, server proto 4.%d)\n",
+                          q8_ok ? "ACTIVE (q8_0)" : f16_ok ? "ACTIVE (f16)" : "requested but UNAVAILABLE",
+                          rpc_ctx->endpoint.c_str(), server_minor);
+        }
+    }
+    const int64_t qblck = ggml_blck_size(GGML_TYPE_Q8_0);
+
     rpc_tensor set_rt = {}, fetch_rt = {};
     uint64_t set_off = 0, fetch_off = 0;
     if (set_tensor != nullptr) {
@@ -2101,6 +2296,23 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         set_rt  = serialize_tensor(rpc_resolve_view(set_tensor, off));
         set_off = off;
         flags |= 1;
+        if (set_tensor->type == GGML_TYPE_F32 && set_size % sizeof(float) == 0) {
+            const int64_t n_vals = (int64_t) (set_size / sizeof(float));
+            if (q8_ok && n_vals % qblck == 0) {
+                flags |= 32; // SET payload rides as q8_0; the server dequantizes
+            } else if (f16_ok) {
+                flags |= 8;  // SET payload rides as f16; the server expands
+            }
+        }
+    }
+    uint8_t fetch_fmt = 0;
+    if (fetch_tensor != nullptr && fetch_tensor->type == GGML_TYPE_F32 && fetch_size % sizeof(float) == 0) {
+        const int64_t n_vals = (int64_t) (fetch_size / sizeof(float));
+        if (q8_ok && n_vals % qblck == 0) {
+            fetch_fmt = 2;
+        } else if (f16_ok) {
+            fetch_fmt = 1;
+        }
     }
     if (fetch_tensor != nullptr) {
         if (fetch_tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(fetch_tensor->buffer) ||
@@ -2111,6 +2323,18 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
         fetch_rt  = serialize_tensor(rpc_resolve_view(fetch_tensor, off));
         fetch_off = off;
         flags |= 4;
+        if (fetch_fmt == 2) {
+            flags |= 64; // FETCH response returns q8_0; the paired recv dequantizes
+        } else if (fetch_fmt == 1) {
+            flags |= 16; // FETCH response returns f16; the paired recv expands
+        }
+        // proto 4.14 (TASKS #71 inc-1): allow the ZERO short reply - a member
+        // whose contribution is bitwise zero (all mul_mat_id lanes sentinel
+        // under expert placement) answers with a 1-byte marker instead of the
+        // encoded payload
+        if (server_minor >= 14) {
+            flags |= 128;
+        }
     }
     if (flags == 0) {
         return false;
@@ -2124,11 +2348,27 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
     put(&rpc_ctx->device, sizeof(uint32_t));
     put(&flags, sizeof(flags));
     if (flags & 1) {
+        // the size field always carries the LOGICAL (f32) byte count; under
+        // flag 8 the wire payload is half that, under flag 32 it is
+        // ggml_row_size(Q8_0, n)
         uint64_t sz = set_size;
         put(&set_rt, sizeof(set_rt));
         put(&set_off, sizeof(set_off));
         put(&sz, sizeof(sz));
-        put(set_data, set_size);
+        if (flags & 32) {
+            const int64_t n_vals = (int64_t) (set_size / sizeof(float));
+            const size_t  base   = input.size();
+            input.resize(base + ggml_row_size(GGML_TYPE_Q8_0, n_vals));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, (const float *) set_data, input.data() + base,
+                                0, 1, n_vals, nullptr);
+        } else if (flags & 8) {
+            const size_t n_vals = set_size / sizeof(float);
+            const size_t base   = input.size();
+            input.resize(base + n_vals * sizeof(ggml_fp16_t));
+            ggml_fp32_to_fp16_row((const float *) set_data, (ggml_fp16_t *) (input.data() + base), (int64_t) n_vals);
+        } else {
+            put(set_data, set_size);
+        }
     }
     if (flags & 2) {
         uint32_t n_uids = (uint32_t) n_graphs;
@@ -2147,10 +2387,60 @@ static bool ggml_backend_rpc_boundary_fused_send(ggml_backend_t backend,
 
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    if (!rpc_drain_pings_locked(sock, st, st.pings_sent) ||
-        !send_rpc_cmd_raw(sock, st, RPC_CMD_GRAPH_FUSED, input.data(), input.size())) {
+    // drain only the LEADING ping responses: a deferred FETCH at the FIFO head
+    // must not be waited on here (the send does not read, and blocking on the
+    // fetch would undo the deferral this path exists to allow)
+    while (!st.rsp_fifo.empty() && st.rsp_fifo.front().kind == 0) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            return false;
+        }
+    }
+    if (!send_rpc_cmd_raw(sock, st, RPC_CMD_GRAPH_FUSED, input.data(), input.size())) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
         return false;
+    }
+    if (flags & 4) {
+        st.rsp_fifo.push_back({1, fetch_fmt, (uint8_t) ((flags & 128) ? 1 : 0), (uint64_t) fetch_size, (const void *) backend});
+    }
+    return true;
+}
+
+// TASKS #71 deferral v2: non-blocking readiness check for the pending fused
+// FETCH. True when its payload is already stashed, or when every response ahead
+// of it in the FIFO plus its own head has arrived - entries are consumed only
+// while the socket reports readable bytes, and once a head has arrived the tail
+// follows at wire speed, so the blocking reads inside cannot stall on the peer.
+// Failure modes return true: the paired fused_recv runs the loud failure path
+// instead of the caller deferring forever on a dead connection.
+static bool ggml_backend_rpc_boundary_fused_ready(ggml_backend_t backend) {
+    GGML_ASSERT(backend->iface.get_name == ggml_backend_rpc_name);
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return true;
+    }
+    ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto stashed_own = [&]() {
+        for (const auto & e : st.fetch_stash) {
+            if (e.owner == (const void *) backend) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (!stashed_own()) {
+        if (st.rsp_fifo.empty()) {
+            return true; // no fetch outstanding - accounting broke, fail in recv
+        }
+        if (!sock->recv_ready()) {
+            return false;
+        }
+        if (!rpc_process_rsp_locked(sock, st)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            return true;
+        }
     }
     return true;
 }
@@ -2166,14 +2456,34 @@ static bool ggml_backend_rpc_boundary_fused_recv(ggml_backend_t backend, void * 
     }
     ggml_backend_rpc_async_state & st = rpc_async_state(sock.get());
     std::lock_guard<std::mutex> lock(st.mutex);
-    uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size)) ||
-        out_size != size ||
-        !sock->recv_data(data, size)) {
+    // process the FIFO (leading pings, then the fetch) until THIS member's
+    // payload is stashed; entries owned by a co-hosted member stay stashed for
+    // their own fused_recv (deferral recvs out of send order across members)
+    auto find_own = [&]() {
+        auto it = st.fetch_stash.begin();
+        for (; it != st.fetch_stash.end(); ++it) {
+            if (it->owner == (const void *) backend) {
+                break;
+            }
+        }
+        return it;
+    };
+    auto it = find_own();
+    while (it == st.fetch_stash.end()) {
+        if (!rpc_process_rsp_locked(sock, st)) {
+            rpc_mark_failed(rpc_ctx->endpoint, __func__);
+            memset(data, 0, size); // deterministic instead of stale garbage
+            return false;
+        }
+        it = find_own();
+    }
+    if (it->payload.size() != size) {
         rpc_mark_failed(rpc_ctx->endpoint, __func__);
-        memset(data, 0, size); // deterministic instead of stale garbage
+        memset(data, 0, size);
         return false;
     }
+    memcpy(data, it->payload.data(), size);
+    st.fetch_stash.erase(it);
     return true;
 }
 
@@ -2388,8 +2698,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE_UID, input.data(), input.size());
             if (status) {
                 // client tracking cap must stay below the server cache cap so a
-                // remembered uid is never a server-side miss
-                constexpr size_t max_sent_uids = RPC_GRAPH_UID_CACHE_CAP/2;
+                // remembered uid is never a server-side miss. The server cache is
+                // shared by EVERY local context computing on that device (#132: dual
+                // drafters put two draft contexts on one worker), so the per-context
+                // cap must leave room for peers: /8 keeps the sum under the server
+                // cap for up to 8 sharing contexts. An evicted client uid merely
+                // re-uploads; a server-side miss kills the connection.
+                constexpr size_t max_sent_uids = RPC_GRAPH_UID_CACHE_CAP/8;
                 rpc_dev_ctx->sent_graph_uids.insert(cgraph->uid);
                 rpc_dev_ctx->sent_graph_uids_order.push_back(cgraph->uid);
                 if (rpc_dev_ctx->sent_graph_uids_order.size() > max_sent_uids) {
@@ -2579,12 +2894,21 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
+    bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     // proto 4.10 (TASKS.md #62)
     bool set_tensor_hash_batch(const std::vector<uint8_t> & input, rpc_msg_set_tensor_hash_batch_rsp & response);
     bool set_tensor_hash_data(const std::vector<uint8_t> & input);
     void manifest(std::vector<uint64_t> & hashes);
+    // proto 4.16 (TASKS #103): per-connection model identity - scopes the cache
+    // folder, the manifest and the eviction preference. Thread-local: each
+    // connection runs on its own thread.
+    void session_model(const std::string & id);
+    // catch-up run of the cache cap once the last client disconnects - live
+    // connections' folders are exempt from mid-serve trims, so idle is the one
+    // point everything is evictable (see rpc_cache_enforce_limit)
+    void cache_enforce_idle();
     bool set_tensor_hash2(const rpc_msg_set_tensor_hash2_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -2664,6 +2988,19 @@ private:
     struct stored_graph_cache {
         std::unordered_map<uint64_t, stored_graph> by_uid;
         std::deque<uint64_t>                       order;
+
+        // LRU refresh (review #18): eviction was pure insert-order FIFO, so a
+        // uid a client still actively recomputes could be evicted by other
+        // clients' inserts and the next recompute dropped the connection
+        void refresh(uint64_t uid) {
+            for (auto rit = order.rbegin(); rit != order.rend(); ++rit) {
+                if (*rit == uid) {
+                    order.erase(std::next(rit).base());
+                    order.push_back(uid);
+                    return;
+                }
+            }
+        }
     };
     std::vector<stored_graph_cache> stored_graph_caches;
 
@@ -2703,7 +3040,11 @@ bool rpc_server::wait_fence(uint64_t conn_id, uint64_t seq) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(10);
     while (conn_executed[conn_id] < seq) {
         if (conns_gone.count(conn_id) > 0) {
-            return false; // the gating connection died before reaching the fence
+            // named log: one dead connection cascades through every fence gated
+            // on it - without this line the cascade is invisible (#114b)
+            GGML_LOG_ERROR("[wait_fence] gating conn %llu died before seq %llu - failing this connection too\n",
+                           (unsigned long long) conn_id, (unsigned long long) seq);
+            return false;
         }
         if (fence_cv.wait_until(lock, deadline) == std::cv_status::timeout) {
             GGML_LOG_ERROR("[%s] timed out waiting for conn %" PRIu64 " to reach seq %" PRIu64 "\n",
@@ -2966,6 +3307,52 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     return true;
 }
 
+bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    const uint64_t tensor_size = ggml_nbytes(tensor);
+    if (request.offset > tensor_size || request.size > tensor_size - request.offset) {
+        GGML_LOG_ERROR("[%s] tensor region (offset=%" PRIu64 ", size=%" PRIu64 ") out of tensor bounds [0, %" PRIu64 ")\n",
+                       __func__, request.offset, request.size, tensor_size);
+        return false;
+    }
+
+    const uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const uint64_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+    if (request.tensor.data < buffer_start) {
+        GGML_LOG_ERROR("[%s] tensor data before buffer start\n", __func__);
+        return false;
+    }
+    const uint64_t data_offset = request.tensor.data - buffer_start;
+    if (data_offset > buffer_size ||
+        request.offset > buffer_size - data_offset ||
+        request.size > buffer_size - data_offset - request.offset) {
+        GGML_LOG_ERROR("[%s] tensor region out of buffer bounds\n", __func__);
+        return false;
+    }
+    if (tensor->buffer->iface.memset_tensor == nullptr) {
+        GGML_LOG_ERROR("[%s] memset not implemented by backend buffer\n", __func__);
+        return false;
+    }
+
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 ", value: %u\n",
+            __func__, (void *) tensor->buffer, tensor->data, request.offset, request.size, request.value);
+    ggml_backend_tensor_memset(tensor, request.value, request.offset, request.size);
+    return true;
+}
+
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
@@ -3033,11 +3420,73 @@ struct rpc_cache_entry {
 };
 
 // walk the cache dir once; returns total bytes, optionally collecting entries
+// TASKS #103: the announced model identity of the CURRENT connection's load
+// session. Sanitized on set; empty = legacy flat-dir behavior. Thread-local
+// because each connection has its own handler thread.
+static thread_local std::string t_rpc_session_model;
+
+// review #19: model folders any LIVE connection serves from must survive the
+// cache cap, which now also runs while clients are connected. Connections that
+// never announce a session model manifest the FLAT dir, so while any exist the
+// flat entries are protected the same way (see rpc_cache_enforce_limit).
+static std::mutex                            g_rpc_live_models_mutex;
+static std::unordered_multiset<std::string>  g_rpc_live_models;
+static std::atomic<int>                      g_rpc_live_legacy{0};
+
+// conn start/end bookkeeping for the live-model registry; runs on the
+// connection's own thread so t_rpc_session_model identifies its announcement
+static void rpc_live_session_open() {
+    g_rpc_live_legacy.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void rpc_live_session_close() {
+    std::lock_guard<std::mutex> lock(g_rpc_live_models_mutex);
+    if (!t_rpc_session_model.empty()) {
+        auto it = g_rpc_live_models.find(t_rpc_session_model);
+        if (it != g_rpc_live_models.end()) {
+            g_rpc_live_models.erase(it);
+        }
+    } else {
+        g_rpc_live_legacy.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+void rpc_server::session_model(const std::string & id) {
+    std::string s;
+    for (char c : id.substr(0, 96)) {
+        s += (isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-') ? c : '_';
+    }
+    if (s == "." || s == "..") {
+        s.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_live_models_mutex);
+        if (!t_rpc_session_model.empty()) {
+            auto it = g_rpc_live_models.find(t_rpc_session_model);
+            if (it != g_rpc_live_models.end()) {
+                g_rpc_live_models.erase(it);
+            }
+        } else {
+            g_rpc_live_legacy.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (!s.empty()) {
+            g_rpc_live_models.insert(s);
+        } else {
+            g_rpc_live_legacy.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    t_rpc_session_model = s;
+    if (!s.empty()) {
+        GGML_LOG_INFO("[cache] session model '%s' - cache scoped per model\n", s.c_str());
+    }
+}
+
 static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache_entry> * entries) {
     uint64_t total = 0;
     std::error_code ec;
-    for (auto it = fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
-         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+    // recursive: per-model subfolders (#103) count toward the same global cap
+    for (auto it = fs::recursive_directory_iterator(cache_dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (!it->is_regular_file(ec)) {
             continue;
         }
@@ -3053,6 +3502,19 @@ static uint64_t rpc_cache_dir_scan(const char * cache_dir, std::vector<rpc_cache
     return total;
 }
 
+// active client connections. The client trusts the manifest it fetched at
+// handshake for the whole (possibly 30-min) load, so entries under any LIVE
+// connection's folder are never evicted (see the live-model registry above);
+// everything else stays under the cap even while clients are connected
+// (review #19), with a final full trim once the last connection closes.
+static std::atomic<int> g_rpc_active_conns{0};
+
+// serializes the eviction scan+delete against manifest dir scans: the entry
+// conn check alone leaves a window where a coordinator reconnecting right as
+// the last conn closes is served a manifest whose entries the delete loop is
+// about to remove ("manifest went stale" endpoint hard-fail)
+static std::mutex g_rpc_cache_evict_mutex;
+
 static void rpc_cache_enforce_limit(const char * cache_dir) {
     static const long long limit_mib = []() {
         const char * env = getenv("GGML_RPC_CACHE_LIMIT_MIB");
@@ -3061,6 +3523,16 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     if (limit_mib <= 0) {
         return;
     }
+    const int     conns_at_start = g_rpc_active_conns.load(std::memory_order_relaxed);
+    const int64_t t_start_us     = ggml_time_us();
+    // mid-serve calls arrive once per slice save - a full dir scan each time is
+    // n^2 over a whole load. Rate-limit them; idle/startup runs always scan.
+    static std::atomic<int64_t> t_last_scan_us{0};
+    if (conns_at_start > 0 && t_start_us - t_last_scan_us.load(std::memory_order_relaxed) < 10 * 1000 * 1000) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rpc_cache_evict_mutex);
+    t_last_scan_us.store(ggml_time_us(), std::memory_order_relaxed);
     const uint64_t limit = (uint64_t) limit_mib * 1024ull * 1024ull;
     std::vector<rpc_cache_entry> entries;
     uint64_t total = rpc_cache_dir_scan(cache_dir, &entries);
@@ -3072,14 +3544,55 @@ static void rpc_cache_enforce_limit(const char * cache_dir) {
     entries.erase(std::remove_if(entries.begin(), entries.end(), [](const rpc_cache_entry & e) {
         return e.path.filename().string().rfind("modelidx-", 0) == 0;
     }), entries.end());
+    // review #19: never touch folders a live connection serves from (their
+    // manifests are long-lived); with an un-scoped connection live the flat dir
+    // is protected the same way. New connections manifest under
+    // g_rpc_cache_evict_mutex, so they observe a consistent post-delete state.
+    {
+        std::lock_guard<std::mutex> reg_lock(g_rpc_live_models_mutex);
+        if (!g_rpc_live_models.empty() || g_rpc_live_legacy.load(std::memory_order_relaxed) > 0) {
+            const fs::path root(cache_dir);
+            const bool protect_flat = g_rpc_live_legacy.load(std::memory_order_relaxed) > 0;
+            entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const rpc_cache_entry & e) {
+                const fs::path parent = e.path.parent_path();
+                if (parent == root) {
+                    return protect_flat;
+                }
+                return g_rpc_live_models.count(parent.filename().string()) > 0;
+            }), entries.end());
+        }
+    }
     std::error_code ec;
-    std::sort(entries.begin(), entries.end(), [](const rpc_cache_entry & a, const rpc_cache_entry & b) {
+    // #103 eviction preference: entries OUTSIDE the current session's model
+    // folder go first (oldest-first within each class) - the active model's
+    // folder is the last thing the cap touches
+    const std::string active_dir = t_rpc_session_model.empty()
+        ? std::string() : (fs::path(cache_dir) / t_rpc_session_model).string();
+    auto is_active = [&](const rpc_cache_entry & e) {
+        return !active_dir.empty() && e.path.parent_path().string() == active_dir;
+    };
+    std::sort(entries.begin(), entries.end(), [&](const rpc_cache_entry & a, const rpc_cache_entry & b) {
+        const bool aa = is_active(a), ab = is_active(b);
+        if (aa != ab) {
+            return !aa; // non-active evicts first
+        }
         return a.mtime < b.mtime;
     });
     size_t   n_evicted = 0;
     uint64_t freed     = 0;
     for (const rpc_cache_entry & e : entries) {
         if (total <= limit) {
+            break;
+        }
+        // a coordinator connected mid-eviction: its manifest is (or will be)
+        // waiting on the evict mutex - yield fast so the load is not stalled
+        if (g_rpc_active_conns.load(std::memory_order_relaxed) > conns_at_start) {
+            GGML_LOG_INFO("[rpc cache] eviction aborted - client connected mid-scan, deferring until idle\n");
+            break;
+        }
+        // mid-serve invocations (cache_store during a load) trim incrementally:
+        // each call gets a slice of deleting so the save path stays fast
+        if (conns_at_start > 0 && ggml_time_us() - t_start_us > 500 * 1000) {
             break;
         }
         if (fs::remove(e.path, ec) && !ec) {
@@ -3146,11 +3659,18 @@ void rpc_server::cache_store(uint64_t hash, const void * data, size_t size) {
     }
     char hash_str[17];
     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-    // save to cache_dir/hash_str via a temp file: a partial write (killed worker,
-    // full disk) must never land under the final name - an unverified truncated
-    // entry used to poison every later load of the tensor
-    fs::path cache_file = fs::path(cache_dir) / hash_str;
-    fs::path tmp_file   = fs::path(cache_dir) / (std::string(hash_str) + ".tmp");
+    // save via a temp file: a partial write (killed worker, full disk) must
+    // never land under the final name - an unverified truncated entry used to
+    // poison every later load of the tensor. #103: entries live under a
+    // per-model folder when the coordinator announced a session model
+    fs::path dir = fs::path(cache_dir);
+    if (!t_rpc_session_model.empty()) {
+        dir /= t_rpc_session_model;
+        std::error_code ec_mk;
+        fs::create_directories(dir, ec_mk);
+    }
+    fs::path cache_file = dir / hash_str;
+    fs::path tmp_file   = dir / (std::string(hash_str) + ".tmp");
     std::ofstream ofs(tmp_file, std::ios::binary);
     if (!ofs.is_open()) {
         // the cache dir can disappear at runtime (manual cleanup) - without this
@@ -3185,14 +3705,27 @@ void rpc_server::cache_store(uint64_t hash, const void * data, size_t size) {
     }
 }
 
+void rpc_server::cache_enforce_idle() {
+    if (cache_dir != nullptr) {
+        rpc_cache_enforce_limit(cache_dir);
+    }
+}
+
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     if (!cache_dir) {
         return false;
     }
     char hash_str[17];
     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+    // #103: the session's model folder first, then the flat legacy location
     fs::path cache_file = fs::path(cache_dir) / hash_str;
     std::error_code ec;
+    if (!t_rpc_session_model.empty()) {
+        fs::path scoped = fs::path(cache_dir) / t_rpc_session_model / hash_str;
+        if (fs::exists(scoped, ec)) {
+            cache_file = scoped;
+        }
+    }
     if (!fs::exists(cache_file, ec)) {
         return false;
     }
@@ -3494,19 +4027,35 @@ bool rpc_server::set_tensor_hash_data(const std::vector<uint8_t> & input) {
 // before serving starts and read-only afterwards, so no exec lock is needed
 void rpc_server::manifest(std::vector<uint64_t> & hashes) {
     if (cache_dir != nullptr) {
+        // never interleave with an in-flight eviction delete loop (see
+        // g_rpc_cache_evict_mutex): either eviction finished a file before we
+        // scan (we don't list it) or it aborts on our conn before deleting more
+        std::lock_guard<std::mutex> lock(g_rpc_cache_evict_mutex);
         std::error_code ec;
-        fs::directory_iterator end;
-        for (fs::directory_iterator it(cache_dir, ec); !ec && it != end; it.increment(ec)) {
-            const std::string name = it->path().filename().string();
-            if (name.size() != 16 || !it->is_regular_file(ec)) {
-                continue; // modelidx-*, *.tmp, foreign files
+        auto scan_flat = [&](const fs::path & dir) {
+            fs::directory_iterator end;
+            for (fs::directory_iterator it(dir, ec); !ec && it != end; it.increment(ec)) {
+                const std::string name = it->path().filename().string();
+                if (name.size() != 16 || !it->is_regular_file(ec)) {
+                    continue; // modelidx-*, *.tmp, subfolders, foreign files
+                }
+                char * endp = nullptr;
+                const uint64_t hash = strtoull(name.c_str(), &endp, 16);
+                if (endp == name.c_str() + 16) {
+                    hashes.push_back(hash);
+                }
             }
-            char * endp = nullptr;
-            const uint64_t hash = strtoull(name.c_str(), &endp, 16);
-            if (endp == name.c_str() + 16) {
-                hashes.push_back(hash);
+        };
+        // #103: with a session model announced, claim only that model's folder
+        // plus the flat legacy entries; other models' folders are NOT claimed
+        // (a cross-model hash collision must never place another model's bytes)
+        if (!t_rpc_session_model.empty()) {
+            fs::path scoped = fs::path(cache_dir) / t_rpc_session_model;
+            if (fs::is_directory(scoped, ec)) {
+                scan_flat(scoped);
             }
         }
+        scan_flat(cache_dir);
     }
     for (const auto & [hash, ref] : local_index) {
         hashes.push_back(hash);
@@ -3894,6 +4443,8 @@ bool rpc_server::graph_compute_uid(const std::vector<uint8_t> & input) {
         }
         it = cache.by_uid.emplace(uid, stored_graph{}).first;
         cache.order.push_back(uid);
+    } else {
+        cache.refresh(uid);
     }
     return deserialize_compute(device, input.data() + header, input.size() - header, it->second, __func__);
 }
@@ -3909,6 +4460,7 @@ bool rpc_server::graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & req
         GGML_LOG_ERROR("[%s] no cached graph for device %u uid %" PRIu64 "\n", __func__, device, request.uid);
         return false;
     }
+    cache.refresh(request.uid);
     if (it->second.owner_conn != current_conn) {
         // another connection replaced this uid's stored graph - recomputing it
         // would silently run the wrong graph (see graph_recompute)
@@ -3929,6 +4481,10 @@ bool rpc_server::graph_recompute_uid(const rpc_msg_graph_recompute_uid_req & req
 //           | if flags&2 (GRAPH): u64 uid  (recompute of a uid-cached graph)
 //           | if flags&4 (FETCH): rpc_tensor | u64 offset | u64 size |
 // response: | data[fetch size] |  (empty when no FETCH)
+// proto 4.12 modifiers: flags&8 - the SET payload is f16-compressed (size
+// still counts the LOGICAL f32 bytes; the wire carries size/2, expanded here);
+// flags&16 - the FETCH response returns f16 (size/2 bytes on the wire).
+// proto 4.13 modifiers: flags&32/&64 - same, q8_0 (row_size(Q8_0, n) bytes).
 // Failure semantics match the unfused commands: any error drops the connection.
 bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uint8_t> & response) {
     size_t pos = 0;
@@ -3972,7 +4528,21 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
             return false;
         }
-        if (pos + size > input.size()) {
+        // proto 4.12/4.13: payload may be f16 (flag 8) or q8_0 (flag 32);
+        // size is always the LOGICAL f32 byte count
+        const bool f16 = (flags & 8)  != 0;
+        const bool q8  = (flags & 32) != 0;
+        if ((f16 || q8) && (size % sizeof(float) != 0)) {
+            return false;
+        }
+        const int64_t  n_vals = (int64_t) (size / sizeof(float));
+        if (q8 && n_vals % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
+            return false;
+        }
+        const uint64_t wire_size = q8  ? ggml_row_size(GGML_TYPE_Q8_0, n_vals)
+                                 : f16 ? size / 2
+                                 : size;
+        if (pos + wire_size > input.size()) {
             return false;
         }
         ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
@@ -3980,8 +4550,19 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
             GGML_LOG_ERROR("[%s] invalid SET segment\n", __func__);
             return false;
         }
-        ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
-        pos += size;
+        if (f16 || q8) {
+            static thread_local std::vector<float> expand;
+            expand.resize(n_vals);
+            if (q8) {
+                ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(input.data() + pos, expand.data(), n_vals);
+            } else {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) (input.data() + pos), expand.data(), n_vals);
+            }
+            ggml_backend_tensor_set(tensor, expand.data(), offset, size);
+        } else {
+            ggml_backend_tensor_set(tensor, input.data() + pos, offset, size);
+        }
+        pos += wire_size;
     }
     if (flags & 2) { // GRAPH chain (uid recomputes, in order)
         uint32_t n_uids;
@@ -4005,13 +4586,65 @@ bool rpc_server::graph_fused(const std::vector<uint8_t> & input, std::vector<uin
         if (!take(&rt, sizeof(rt)) || !take(&offset, sizeof(offset)) || !take(&size, sizeof(size))) {
             return false;
         }
+        // proto 4.12/4.13: respond f16 (flag 16) or q8_0 (flag 64); size is
+        // the LOGICAL f32 byte count
+        const bool f16 = (flags & 16) != 0;
+        const bool q8  = (flags & 64) != 0;
+        if ((f16 || q8) && (size % sizeof(float) != 0)) {
+            return false;
+        }
+        const int64_t n_vals = (int64_t) (size / sizeof(float));
+        if (q8 && n_vals % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
+            return false;
+        }
         ggml_tensor * tensor = deserialize_tensor(ctx, &rt);
         if (!bounds_ok(&rt, tensor, offset, size)) {
             GGML_LOG_ERROR("[%s] invalid FETCH segment\n", __func__);
             return false;
         }
-        response.resize(size, 0);
-        ggml_backend_tensor_get(tensor, response.data(), offset, size);
+        // proto 4.14 (flag 128, TASKS #71 inc-1): a bitwise-zero payload (all
+        // of this member's mul_mat_id lanes carried the placement skip
+        // sentinel) answers as a 1-byte ZERO marker - no encode, ~payload->1B
+        // on the wire. Purely an optimization trigger: correctness never
+        // depends on the scan (a missed zero just ships normally).
+        const bool zero_ok = (flags & 128) != 0;
+        auto all_zero = [](const void * p, size_t n) -> bool {
+            const uint8_t * b = (const uint8_t *) p;
+            size_t i = 0;
+            for (; i + sizeof(uint64_t) <= n; i += sizeof(uint64_t)) {
+                uint64_t w;
+                memcpy(&w, b + i, sizeof(w));
+                if (w != 0) {
+                    return false;
+                }
+            }
+            for (; i < n; i++) {
+                if (b[i] != 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (f16 || q8) {
+            static thread_local std::vector<float> full;
+            full.resize(n_vals);
+            ggml_backend_tensor_get(tensor, full.data(), offset, size);
+            if (zero_ok && all_zero(full.data(), size)) {
+                response.assign(1, 0x5A);
+            } else if (q8) {
+                response.resize(ggml_row_size(GGML_TYPE_Q8_0, n_vals));
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, full.data(), response.data(), 0, 1, n_vals, nullptr);
+            } else {
+                response.resize(n_vals * sizeof(ggml_fp16_t));
+                ggml_fp32_to_fp16_row(full.data(), (ggml_fp16_t *) response.data(), n_vals);
+            }
+        } else {
+            response.resize(size, 0);
+            ggml_backend_tensor_get(tensor, response.data(), offset, size);
+            if (zero_ok && all_zero(response.data(), size)) {
+                response.assign(1, 0x5A);
+            }
+        }
     }
     return true;
 }
@@ -4116,7 +4749,12 @@ rpc_server::~rpc_server() {
 // (network RTT + coordinator-side). Answers "is the ~4-5ms boundary turnaround
 // compute, contention, or wire?" (TASKS.md #28 attribution). Off by default.
 static bool rpc_timing_enabled() {
-    static const bool on = getenv("GGML_RPC_TIMING") != nullptr;
+    // value-parsed: compose files pass GGML_RPC_TIMING= (empty) through, and
+    // presence-gating turned the per-connection dump flood on fleet-wide
+    static const bool on = [] {
+        const char * e = getenv("GGML_RPC_TIMING");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return on;
 }
 static std::mutex g_rpc_timing_mutex;
@@ -4136,6 +4774,7 @@ static const char * rpc_cmd_str(int cmd) {
         case RPC_CMD_SET_TENSOR_HASH2:     return "SET_TENSOR_HASH2";
         case RPC_CMD_SET_TENSOR_HASH_BATCH: return "SET_TENSOR_HASH_BATCH";
         case RPC_CMD_SET_TENSOR_HASH_DATA: return "SET_TENSOR_HASH_DATA";
+        case RPC_CMD_SESSION_MODEL:        return "SESSION_MODEL";
         case RPC_CMD_GET_MANIFEST:         return "GET_MANIFEST";
         case RPC_CMD_RESCORE:              return "RESCORE";
         case RPC_CMD_COPY_FROM_REMOTE:     return "COPY_FROM_REMOTE";    // W2W pull (butterfly)
@@ -4170,7 +4809,12 @@ static void rpc_timing_record(int cmd, int64_t t_recv, int64_t t_lock, int64_t t
     }
 }
 
-static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
+struct rpc_close_report {
+    int  last_cmd   = -1;    // last command received on this connection
+    bool in_handler = false; // true = the loop exited from inside a handler (silent failure path)
+};
+
+static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t conn_id, rpc_close_report & report) {
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -4211,9 +4855,12 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
     while (true) {
         // idle wait for the next command happens without the execution lock so
         // other connections keep making progress
+        report.in_handler = false;
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        report.last_cmd   = cmd;
+        report.in_handler = true;
         const int64_t t_recv = rpc_timing_enabled() ? ggml_time_us() : 0; // GGML_RPC_TIMING
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -4306,6 +4953,26 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
             response.valid     = g_worker_score_valid.load() ? 1 : 0;
             response.bw_gbps   = g_worker_score_bw.load();
             response.mm_gflops = g_worker_score_fl.load();
+            if (!send_msg(sock, &response, sizeof(response))) {
+                break;
+            }
+            server.mark_executed(conn_id);
+            continue;
+        }
+        if (cmd == RPC_CMD_GET_DEVICE_MEMORY) {
+            // pure device read - kept OFF the execution lock: fleet-status probes
+            // are ephemeral (the client abandons after its poll budget) and
+            // queueing them behind long lock holders piles up half-closed
+            // sockets, threads and fds on the worker until the compute
+            // connection collapses (TASKS #104)
+            rpc_msg_get_device_memory_req request;
+            if (!recv_msg(sock, &request, sizeof(request))) {
+                break;
+            }
+            rpc_msg_get_device_memory_rsp response;
+            if (!server.get_device_memory(request, response)) {
+                break;
+            }
             if (!send_msg(sock, &response, sizeof(response))) {
                 break;
             }
@@ -4467,6 +5134,19 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 }
                 break;
             }
+            case RPC_CMD_MEMSET_TENSOR: {
+                rpc_msg_memset_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.memset_tensor(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -4528,6 +5208,15 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 if (!server.set_tensor_hash_data(input)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_SESSION_MODEL: {
+                // no response; payload = model identity string (proto 4.16)
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                server.session_model(std::string((const char *) input.data(), input.size()));
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
@@ -4645,6 +5334,15 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 if (!server.graph_fused(input, response)) {
                     return;
                 }
+                // test hook (#71 deferral): delay the FETCH response so the
+                // client's readiness gate sees a straggler on loopback
+                static const int64_t debug_fused_delay_us = [] {
+                    const char * env = getenv("GGML_RPC_DEBUG_FUSED_DELAY_US");
+                    return env != nullptr ? (int64_t) atoll(env) : 0;
+                }();
+                if (!response.empty() && debug_fused_delay_us > 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(debug_fused_delay_us));
+                }
                 // a response exists only when the message carried a FETCH - a
                 // SET+GRAPH message is fire-and-forget like its unfused parts
                 if (!response.empty() && !send_msg(sock, response.data(), response.size())) {
@@ -4652,20 +5350,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
                 }
                 break;
             }
-            case RPC_CMD_GET_DEVICE_MEMORY: {
-                rpc_msg_get_device_memory_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
-                    return;
-                }
-                rpc_msg_get_device_memory_rsp response;
-                if (!server.get_device_memory(request, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
-                }
-                break;
-            }
+            // RPC_CMD_GET_DEVICE_MEMORY is handled above, without the execution lock
             case RPC_CMD_SET_SPLIT_STATES: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -4711,6 +5396,7 @@ static void rpc_serve_client_loop(rpc_server & server, socket_ptr sock, uint64_t
         }
         // fence progress: in lockstep with the client's sent-command counter
         server.mark_executed(conn_id);
+        report.in_handler = false;
         if (rpc_timing_enabled()) { // GGML_RPC_TIMING: lock-wait + exec+send, per cmd
             rpc_timing_record(cmd, t_recv, t_lock, ggml_time_us());
         }
@@ -4732,7 +5418,15 @@ static void rpc_timing_dump() {
 }
 
 static void rpc_serve_client(rpc_server & server, socket_ptr sock, uint64_t conn_id) {
-    rpc_serve_client_loop(server, sock, conn_id);
+    rpc_close_report report;
+    rpc_serve_client_loop(server, sock, conn_id, report);
+    if (report.in_handler) {
+        GGML_LOG_ERROR("Client connection %" PRIu64 " closing: handler for %s FAILED (silent handler exit - #115b)\n",
+                       conn_id, report.last_cmd >= 0 ? rpc_cmd_str(report.last_cmd) : "?");
+    } else if (report.last_cmd >= 0) {
+        GGML_LOG_INFO("Client connection %" PRIu64 " closing after %s (idle recv ended - peer closed or transport error)\n",
+                      conn_id, rpc_cmd_str(report.last_cmd));
+    }
     if (rpc_timing_enabled()) {
         rpc_timing_dump(); // per-connection close: short runs report without the 20k periodic
     }
@@ -4857,9 +5551,16 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         const uint64_t conn_id = next_conn_id++;
         // GGML_LOG so the lines reach the fleet log ring (rpc-server's log callback)
         GGML_LOG_INFO("Accepted client connection %" PRIu64 "\n", conn_id);
+        g_rpc_active_conns.fetch_add(1, std::memory_order_relaxed);
         std::thread([&server, client_socket, conn_id]() {
+            rpc_live_session_open();
             rpc_serve_client(server, client_socket, conn_id);
+            rpc_live_session_close();
             GGML_LOG_INFO("Client connection %" PRIu64 " closed\n", conn_id);
+            if (g_rpc_active_conns.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                // last client gone: catch up on the residual cache-cap trim
+                server.cache_enforce_idle();
+            }
         }).detach();
     }
     rpc_transport_shutdown();
@@ -5073,6 +5774,54 @@ bool ggml_backend_rpc_dev_memory_ephemeral(ggml_backend_dev_t dev, int timeout_m
     return true;
 }
 
+// one-shot device inventory for the wizard fleet selector (#116) - same ephemeral
+// discipline as above: never the compute socket, no failed-endpoint marking.
+// Memory is queried before desc per device so a worker predating GET_DEVICE_DESC
+// (its serve loop closes on unknown commands) still yields the earlier devices.
+int ggml_backend_rpc_probe_devices(const char * endpoint, int timeout_ms,
+                                   ggml_backend_rpc_device_probe_info * out, int max_devices) {
+    if (endpoint == nullptr || out == nullptr || max_devices <= 0) {
+        return -1;
+    }
+    if (!ggml_backend_rpc_endpoint_reachable(endpoint, timeout_ms)) {
+        return -1;
+    }
+    auto sock = rpc_connect_ephemeral(endpoint);
+    if (sock == nullptr) {
+        return -1;
+    }
+    rpc_ephemeral_guard guard{ sock.get() };
+    rpc_msg_device_count_rsp count_rsp;
+    if (!send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &count_rsp, sizeof(count_rsp))) {
+        return -1;
+    }
+    const int n = std::min((int) count_rsp.device_count, max_devices);
+    for (int i = 0; i < n; i++) {
+        ggml_backend_rpc_device_probe_info & info = out[i];
+        std::memset(&info, 0, sizeof(info));
+        rpc_msg_get_device_memory_req mem_req;
+        mem_req.device = (uint32_t) i;
+        rpc_msg_get_device_memory_rsp mem_rsp;
+        if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &mem_req, sizeof(mem_req), &mem_rsp, sizeof(mem_rsp))) {
+            return i;
+        }
+        info.free_mem  = mem_rsp.free_mem;
+        info.total_mem = mem_rsp.total_mem;
+        rpc_msg_get_device_desc_req desc_req = { (uint32_t) i };
+        rpc_msg_get_device_desc_rsp desc_rsp;
+        if (send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_DESC, &desc_req, sizeof(desc_req), &desc_rsp, sizeof(desc_rsp))) {
+            desc_rsp.desc[sizeof(desc_rsp.desc) - 1] = '\0';
+            const char * d = desc_rsp.desc;
+            if (std::strncmp(d, "CPU|", 4) == 0) {
+                info.is_cpu = 1;
+                d += 4;
+            }
+            snprintf(info.desc, sizeof(info.desc), "%s", d);
+        }
+    }
+    return n;
+}
+
 bool ggml_backend_rpc_shutdown_worker(const char * endpoint) {
     if (endpoint == nullptr) {
         return false;
@@ -5162,11 +5911,22 @@ bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, 
         return false;
     }
     // CPU-class devices: bench with all cores, like real serving
+    // #136: fetch the backend's scoped error containment (CUDA implements it) so a
+    // faulted/poisoned device costs only its score row, never the whole process.
+    typedef void (*error_contain_t)(void);
+    error_contain_t contain_push = nullptr;
+    error_contain_t contain_pop  = nullptr;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg != nullptr) {
         auto set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (set_n_threads_fn != nullptr) {
             set_n_threads_fn(backend, std::max(1u, std::thread::hardware_concurrency()));
+        }
+        contain_push = (error_contain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_error_contain_push");
+        contain_pop  = (error_contain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_error_contain_pop");
+        if (contain_push == nullptr || contain_pop == nullptr) {
+            contain_push = nullptr;
+            contain_pop  = nullptr;
         }
     }
 
@@ -5193,21 +5953,36 @@ bool ggml_backend_rpc_benchmark_device(ggml_backend_dev_t dev, float * bw_gbps, 
         ggml_backend_free(backend);
         return false;
     }
-    // fill with 0x3c bytes: 0x3c3c3c3c is a small normal f32 (~0.011), avoiding
-    // both denormal stalls and all-zero fast paths
-    ggml_backend_buffer_clear(buf, 0x3c);
-
-    bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS; // warmup
-    int  reps = 0;
-    const auto t0 = std::chrono::steady_clock::now();
+    bool   ok        = false;
+    int    reps      = 0;
     double elapsed_s = 0.0;
-    while (ok && reps < 64) {
-        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-        reps++;
-        elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (elapsed_s > 0.25) {
-            break;
+    if (contain_push) {
+        contain_push();
+    }
+    try {
+        // fill with 0x3c bytes: 0x3c3c3c3c is a small normal f32 (~0.011), avoiding
+        // both denormal stalls and all-zero fast paths
+        ggml_backend_buffer_clear(buf, 0x3c);
+
+        ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS; // warmup
+        const auto t0 = std::chrono::steady_clock::now();
+        while (ok && reps < 64) {
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            reps++;
+            elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (elapsed_s > 0.25) {
+                break;
+            }
         }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("%s: bench failed on device %s: %s\n", __func__, ggml_backend_dev_name(dev), e.what());
+        ok = false;
+    } catch (...) {
+        GGML_LOG_ERROR("%s: bench failed on device %s\n", __func__, ggml_backend_dev_name(dev));
+        ok = false;
+    }
+    if (contain_pop) {
+        contain_pop();
     }
     if (ok && reps > 0 && elapsed_s > 0.0) {
         const double bytes = (double) n * n * sizeof(float) * chain * reps;
@@ -5669,6 +6444,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_source_hint") == 0) {
         return (void *)ggml_backend_rpc_source_hint;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_session_model") == 0) {
+        return (void *)ggml_backend_rpc_session_model;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_rescore_worker") == 0) {
         return (void *)ggml_backend_rpc_rescore_worker;
     }
@@ -5689,6 +6467,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_memory_ephemeral") == 0) {
         return (void *)ggml_backend_rpc_dev_memory_ephemeral;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_probe_devices") == 0) {
+        return (void *)ggml_backend_rpc_probe_devices;
     }
     if (std::strcmp(name, "ggml_backend_rpc_dev_failed") == 0) {
         return (void *)ggml_backend_rpc_dev_failed;
@@ -5716,6 +6497,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_boundary_fused_recv") == 0) {
         return (void *)ggml_backend_rpc_boundary_fused_recv;
+    }
+    if (std::strcmp(name, "ggml_backend_boundary_fused_ready") == 0) {
+        return (void *)ggml_backend_rpc_boundary_fused_ready;
     }
     // fleet introspection + worker ops (proto 4.7, TASKS.md #35)
     if (std::strcmp(name, "ggml_backend_rpc_log_append") == 0) {

@@ -2,7 +2,8 @@
 # (docs/distributed-inference-plan.md; CPU-worker domain, 2026-07-09.)
 #
 # Build the image ON THE WORKER BOX from this tree (no CUDA needed):
-#   docker build -f .devops/cpu.Dockerfile --target rpc-worker -t llamacpp-cpu:rpc-worker .
+#   docker build -f .devops/cpu.Dockerfile --target rpc-worker -t llamacpp-cpu:rpc-worker-latest .
+# (or pull the current one: 10.5.5.1:5000/llamacpp-cpu:rpc-worker-latest)
 #
 # Then:  docker compose -f docker-compose.rpc-worker-cpu.yml up -d
 #
@@ -20,7 +21,7 @@
 services:
   llama-rpc-worker-cpu:
     container_name: llama-rpc-worker-cpu
-    image: ${WORKER_IMAGE:-llamacpp-cpu:rpc-worker}
+    image: ${WORKER_IMAGE:-llamacpp-cpu:rpc-worker-latest}
     network_mode: host              # direct sockets; see security note
     volumes:
       - ./cache-rpc:/cache

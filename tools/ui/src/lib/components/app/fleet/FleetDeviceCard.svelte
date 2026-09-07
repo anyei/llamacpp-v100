@@ -67,7 +67,20 @@
 		device.memory_total_mib > 0 ? (memoryUsedMib / device.memory_total_mib) * 100 : 0
 	);
 
+	// #131a roster truth: prefer the MEASURED model-bytes share (covers CPU-offload
+	// modes where -ts fractions lie about where the model actually lives); fall back
+	// to the planned split fraction when the measurement is absent
 	let splitPercent = $derived(
+		typeof device.model_frac === 'number'
+			? Math.round(device.model_frac * 100)
+			: typeof device.split_frac === 'number'
+				? Math.round(device.split_frac * 100)
+				: null
+	);
+	let shareIsMeasured = $derived(typeof device.model_frac === 'number');
+	// "% experts" must come from the EP expert distribution, not the total-weights
+	// share - a pure attention owner has model_frac > 0 but zero experts
+	let expertPercent = $derived(
 		typeof device.split_frac === 'number' ? Math.round(device.split_frac * 100) : null
 	);
 
@@ -128,7 +141,7 @@
 		: 'bg-muted/30'} {device.failed ? 'border-destructive/50' : ''}"
 >
 	<div class="flex items-start justify-between gap-2">
-		<div class="min-w-0">
+		<div class="min-w-0 flex-1">
 			<div class="flex items-center gap-2">
 				<KindIcon class="h-4 w-4 shrink-0 text-muted-foreground" aria-label={kindLabel} />
 
@@ -143,14 +156,14 @@
 				</div>
 			</div>
 
-			<p class="truncate text-xs text-muted-foreground">{device.description}</p>
+			<p class="text-xs text-muted-foreground" title={device.description}>{device.description}</p>
 
 			{#if device.endpoint}
 				<p class="truncate font-mono text-[10px] text-muted-foreground">{device.endpoint}</p>
 			{/if}
 		</div>
 
-		<div class="flex shrink-0 flex-wrap justify-end gap-1">
+		<div class="flex shrink-0 gap-1">
 			<Badge variant={device.is_rpc ? 'secondary' : 'outline'} class="text-[10px]">
 				{device.is_rpc ? 'RPC' : 'Local'}
 			</Badge>
@@ -158,7 +171,12 @@
 			{#if device.worker_is_cpu}
 				<Badge variant="tertiary" class="text-[10px]">CPU (RAM)</Badge>
 			{/if}
+		</div>
+	</div>
 
+	<!-- secondary facts on their own row so the name/description stay readable -->
+	{#if siblingCount != null || device.score || device.init_ms != null || device.timing || rank}
+		<div class="flex flex-wrap gap-1">
 			{#if siblingCount != null && siblingCount > 1 && siblingIndex != null}
 				<Badge
 					variant="outline"
@@ -170,8 +188,20 @@
 			{/if}
 
 			{#if device.score}
-				<Badge variant="outline" class="text-[10px]">
+				<Badge variant="outline" class="text-[10px]" title="measured memory bandwidth (worker --score / local bench)">
 					{device.score.bw_gbps.toFixed(1)} GB/s
+				</Badge>
+			{/if}
+
+			{#if device.role && device.role !== 'target'}
+				<Badge
+					variant="outline"
+					class="text-[10px]"
+					title={device.role === 'drafter'
+						? 'hosts a speculative drafter only - no target layers'
+						: 'hosts target layers AND a speculative drafter'}
+				>
+					{device.role}
 				</Badge>
 			{/if}
 
@@ -201,7 +231,7 @@
 				<Badge variant="tertiary" class="text-[10px]">slowest</Badge>
 			{/if}
 		</div>
-	</div>
+	{/if}
 
 	<div class="space-y-1">
 		<div class="flex justify-between text-[10px] text-muted-foreground">
@@ -218,14 +248,39 @@
 				style="width: {memoryUsedPercent.toFixed(1)}%"
 			></div>
 		</div>
+
+		{#if device.memory_breakdown}
+			{@const mb = device.memory_breakdown}
+			{@const knownMib = mb.model_mib + mb.context_mib + mb.compute_mib}
+			{@const otherMib = Math.max(0, memoryUsedMib - knownMib)}
+			<div
+				class="text-[10px] text-muted-foreground"
+				title="buffer composition from the server's allocation records; 'other' = occupancy the allocator does not account for (CUDA/runtime overhead, co-resident processes)"
+			>
+				weights {(mb.model_mib / 1024).toFixed(1)} · KV {(mb.context_mib / 1024).toFixed(1)} · compute
+				{(mb.compute_mib / 1024).toFixed(1)}
+				{device.drafter_model_mib ? ` · drafter ${(device.drafter_model_mib / 1024).toFixed(1)}` : ''}
+				{otherMib > 512 ? ` · other ${(otherMib / 1024).toFixed(1)}` : ''} GiB
+			</div>
+		{:else if device.drafter_model_mib}
+			<div class="text-[10px] text-muted-foreground" title="speculative drafter weights hosted on this device">
+				drafter {(device.drafter_model_mib / 1024).toFixed(1)} GiB
+			</div>
+		{/if}
 	</div>
 
 	{#if device.attn_owner || device.n_layers != null || splitPercent !== null}
 		<p class="text-xs text-muted-foreground">
 			{[
-				device.attn_owner ? 'attention owner' : null,
+				device.attn_owner && expertPercent
+					? `attention owner + ${expertPercent}% experts`
+					: device.attn_owner
+						? 'attention owner'
+						: null,
 				device.n_layers != null ? `${device.n_layers} layers` : null,
-				!device.attn_owner && splitPercent !== null ? `${splitPercent}%` : null
+				(!device.attn_owner || !expertPercent) && splitPercent !== null
+					? `${splitPercent}%${shareIsMeasured ? ' of weights' : ' planned'}`
+					: null
 			]
 				.filter(Boolean)
 				.join(' · ')}

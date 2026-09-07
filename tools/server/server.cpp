@@ -61,6 +61,10 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
             // treat invalid_argument as invalid request (400)
             error = ERROR_TYPE_INVALID_REQUEST;
             message = e.what();
+        } catch (const server_unavailable_exception & e) {
+            // ctx guard timed out against a teardown hold (--rpc-reload) (503)
+            error = ERROR_TYPE_UNAVAILABLE;
+            message = e.what();
         } catch (const std::exception & e) {
             // treat other exceptions as server error (500)
             error = ERROR_TYPE_SERVER;
@@ -87,6 +91,11 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+#ifndef _WIN32
+    // Ignore SIGPIPE so the server does not crash if an MCP child exits while we are writing to its stdin
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     // own arguments required by this example
     common_params params;
@@ -157,6 +166,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         params.model_alias.insert(model_name);
     }
 
+    // note: this is guaranteed to out-live ctx_http and tools
+    server_mcp mcp_mgr;
+
     // struct that contains llama context and inference
     server_context ctx_server;
 
@@ -214,12 +226,25 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        // fleet UI/loading page against the router: forward to the active child
+        routes.get_fleet_status            = models_routes->get_router_fleet_status;
+        routes.get_fleet_worker_log        = models_routes->get_router_fleet_worker_log;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+        ctx_http.get ("/wizard/hw",            ex_wrapper(models_routes->get_wizard_hw));
+        ctx_http.get ("/wizard/sweeps",        ex_wrapper(models_routes->get_wizard_sweeps));
+        ctx_http.get ("/wizard/dirs",          ex_wrapper(models_routes->get_wizard_dirs));
+        ctx_http.get ("/wizard/placements",    ex_wrapper(models_routes->get_wizard_placements));
+        ctx_http.post("/wizard/placements/generate", ex_wrapper(models_routes->post_wizard_placement_generate));
+        ctx_http.post("/wizard/placements/remove",   ex_wrapper(models_routes->post_wizard_placement_remove));
+        ctx_http.post("/wizard/dirs",          ex_wrapper(models_routes->post_wizard_dirs));
+        ctx_http.get ("/wizard/configs",       ex_wrapper(models_routes->get_wizard_configs));
+        ctx_http.post("/wizard/configs",       ex_wrapper(models_routes->post_wizard_configs));
+        ctx_http.del ("/wizard/configs",       ex_wrapper(models_routes->del_wizard_configs));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
@@ -269,10 +294,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
-    // resumable streaming, the conversation_id is the session identity end to end. router and
-    // child wire different handlers under the same paths: a child binds the local session
-    // factories, the router binds proxies that resolve the owning child through the
-    // conv_id -> model map
+    // resumable streaming: a child binds the local session factories, the router binds
+    // proxies that resolve the owning child, see server-stream.h
     server_http_context::handler_t stream_get_h;
     server_http_context::handler_t streams_lookup_h;
     server_http_context::handler_t stream_delete_h;
@@ -285,12 +308,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         streams_lookup_h = server_stream_make_lookup_handler();
         stream_delete_h  = server_stream_make_delete_handler();
     }
-    ctx_http.get ("/v1/stream/:conv_id",       ex_wrapper(stream_get_h));
-    // POST /v1/streams/lookup with body {"conversation_ids": [...]}. you can only ask for ids
-    // you already own (the WebUI passes the convs visible in its sidebar). the server never
-    // lists ids it has not been asked about, so a random caller cannot enumerate live sessions
+    ctx_http.get ("/v1/stream",                ex_wrapper(stream_get_h));
     ctx_http.post("/v1/streams/lookup",        ex_wrapper(streams_lookup_h));
-    ctx_http.del ("/v1/stream/:conv_id",       ex_wrapper(stream_delete_h));
+    ctx_http.del ("/v1/stream",                ex_wrapper(stream_delete_h));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -331,17 +351,28 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.post("/cors-proxy",      ex_wrapper(res_403));
     }
 
-    // EXPERIMENTAL built-in tools
-    if (!params.server_tools.empty()) {
+    try {
+        mcp_mgr.start(params);
+    } catch (const std::exception & e) {
+        SRV_ERR("MCP starting failed: %s\n", e.what());
+        return 1;
+    }
+
+    if (!params.server_tools.empty() || !mcp_mgr.empty()) {
         try {
-            tools.setup(params.server_tools);
+            tools.setup(params.server_tools, mcp_mgr);
         } catch (const std::exception & e) {
             SRV_ERR("tools setup failed: %s\n", e.what());
             return 1;
         }
         ctx_http.get ("/tools",           ex_wrapper(tools.handle_get));
         ctx_http.post("/tools",           ex_wrapper(tools.handle_post));
-        warn_names.push_back("built-in tools (experimental)");
+        if (!params.server_tools.empty()) {
+            warn_names.push_back("built-in tools (experimental)");
+        }
+        if (!mcp_mgr.empty()) {
+            warn_names.push_back("MCP servers (experimental)");
+        }
     } else {
         ctx_http.get ("/tools",           ex_wrapper(res_403));
         ctx_http.post("/tools",           ex_wrapper(res_403));
@@ -383,7 +414,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     if (is_router_server) {
         SRV_INF("%s", "starting server in router mode. models will be automatically loaded on-demand\n");
 
-        clean_up = [&models_routes]() {
+        clean_up = [&models_routes, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
@@ -391,6 +422,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 models_routes->stopping.store(true); // maybe redundant, but just to be safe
                 models_routes->models.unload_all();
             }
+            mcp_mgr.shutdown();
             llama_backend_free();
         };
 
@@ -406,17 +438,19 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 // important to disconnect any SSE clients
                 models_routes->stopping.store(true);
             }
+            mcp_mgr.shutdown();
             ctx_http.stop();
         };
 
     } else {
         // setup clean up function, to be called before exit
-        clean_up = [&ctx_http, &ctx_server]() {
+        clean_up = [&ctx_http, &ctx_server, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
             ctx_http.stop();
             ctx_server.terminate();
+            mcp_mgr.shutdown();
             llama_backend_free();
         };
 
@@ -449,6 +483,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         SRV_INF("%s", "model loaded\n");
 
         shutdown_handler = [&](int) {
+            mcp_mgr.shutdown();
             // this will unblock start_loop()
             ctx_server.terminate();
         };

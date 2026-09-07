@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-expert-placement.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -29,6 +30,7 @@ add_library(llama
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
+            llama-memory-hybrid-idx.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
@@ -49,7 +51,7 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

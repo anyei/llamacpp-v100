@@ -119,18 +119,36 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
-    // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * inpSA = inpL;
+    // TASKS #71 LP pair fusion (docs/lp-pair-fusion-plan.md): run consecutive
+    // layer PAIRS from the SAME residual input and sum their deltas
+    // (out = a_out + b_out - x0). Lossy by design (layer b's router sees x0
+    // instead of layer a's output) - the quality gates own the decision.
+    // LLAMA_LP_PAIRS=1 enables; LLAMA_LP_SYNC_EDGE=k keeps the first/last k
+    // layers sequential (default 2; the last layer must stay sequential for
+    // the inp_out_ids gating).
+    static const bool lp_pairs = [] {
+        const char * e = getenv("LLAMA_LP_PAIRS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const int lp_edge = [] {
+        const char * e = getenv("LLAMA_LP_SYNC_EDGE");
+        const int v = e != nullptr ? atoi(e) : 2;
+        return v < 1 ? 1 : v;
+    }();
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+    auto build_layer = [&](int il, ggml_tensor * layer_inp,
+                           ggml_tensor ** out_moe = nullptr, ggml_tensor ** out_mirror = nullptr) -> ggml_tensor * {
+        ggml_tensor * inpSA = layer_inp;
+        ggml_tensor * lcur;
+
+        lcur = build_norm(layer_inp, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(lcur, "attn_norm", il);
 
         // self-attention
         {
             ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head, n_head, n_head_kv, il);
+            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], lcur, n_embd_head, n_head, n_head_kv, il);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -142,35 +160,35 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            cur = build_attn(inp_attn,
+            lcur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-            cb(cur, "attn_out", il);
+            cb(lcur, "attn_out", il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+            lcur  = ggml_get_rows(ctx0,  lcur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        ggml_tensor * ffn_inp = ggml_add(ctx0, lcur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        lcur = build_norm(ffn_inp, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+        cb(lcur, "ffn_norm", il);
 
         if (model.layers[il].ffn_gate_inp == nullptr) {
             // dense FFN (leading dense blocks)
-            cur = build_ffn(cur,
+            lcur = build_ffn(lcur,
                     model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
                     model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                     nullptr,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_dense_out", il);
+            cb(lcur, "ffn_dense_out", il);
         } else {
             // MoE routed experts (sigmoid gating + expert selection bias)
-            ggml_tensor * moe_out = build_moe_ffn(cur,
+            ggml_tensor * moe_out = build_moe_ffn(lcur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
                     model.layers[il].ffn_gate_exps,
@@ -189,7 +207,7 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert (always active, no gate)
-            ggml_tensor * sh_out = build_ffn(cur,
+            ggml_tensor * sh_out = build_ffn(lcur,
                     model.layers[il].ffn_up_shexp,   nullptr, model.layers[il].ffn_up_shexp_s,
                     model.layers[il].ffn_gate_shexp, nullptr, model.layers[il].ffn_gate_shexp_s,
                     model.layers[il].ffn_down_shexp, nullptr, model.layers[il].ffn_down_shexp_s,
@@ -197,15 +215,71 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(sh_out, "ffn_shared_out", il);
 
-            cur = ggml_add(ctx0, moe_out, sh_out);
-            cb(cur, "ffn_out", il);
+            // LP pair mode: hand back the PARTIAL expert sum and the MIRRORED
+            // remainder separately so the pair can merge partials FIRST (the
+            // walker's standard one-partial + mirrored-adds shape). cvec is
+            // not applied on this path.
+            if (out_moe != nullptr) {
+                *out_moe    = moe_out;
+                *out_mirror = ggml_add(ctx0, sh_out, ffn_inp);
+                return nullptr;
+            }
+
+            lcur = ggml_add(ctx0, moe_out, sh_out);
+            cb(lcur, "ffn_out", il);
         }
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
+        lcur = ggml_add(ctx0, lcur, ffn_inp);
+        lcur = build_cvec(lcur, il);
+        cb(lcur, "l_out", il);
 
-        inpL = cur;
+        return lcur;
+    };
+
+    for (int il = 0; il < n_layer; ) {
+        // pair only strictly inside the sync edges; both members of a pair must
+        // be MoE blocks (pairing a leading dense block buys nothing). A member
+        // steered by a control vector must stay unpaired: the fused shape has
+        // no per-member residual to add the vector to, and silently dropping
+        // it steered only the edge layers
+        const bool cvec_here = il + 1 < n_layer &&
+            (cvec->tensor_for(il) != nullptr || cvec->tensor_for(il + 1) != nullptr);
+        const bool pair_ok = lp_pairs && !cvec_here &&
+            il >= lp_edge && il + 1 < n_layer - lp_edge &&
+            model.layers[il].ffn_gate_inp != nullptr &&
+            model.layers[il + 1].ffn_gate_inp != nullptr;
+        if (lp_pairs && cvec_here) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("LLAMA_LP_PAIRS: control vector active - steered layers run unpaired\n");
+                warned = true;
+            }
+        }
+        if (pair_ok) {
+            ggml_tensor * x0 = inpL;
+            ggml_tensor * moe_a = nullptr, * mir_a = nullptr;
+            ggml_tensor * moe_b = nullptr, * mir_b = nullptr;
+            build_layer(il,     x0, &moe_a, &mir_a);
+            build_layer(il + 1, x0, &moe_b, &mir_b);
+            // out = x0 + da + db = (moe_a + moe_b) + (mir_a + mir_b - x0):
+            // the two expert PARTIALs sum first (member-side exact), then one
+            // mirrored remainder joins - the delayed-reduce walker's standard
+            // shape, so the pair shares ONE expert boundary. The x0 subtract
+            // lives in the mirrored domain (mir_* = sh + attn + x0 each carry
+            // x0 once too many).
+            ggml_tensor * moe_pair = ggml_add(ctx0, moe_a, moe_b);
+            cb(moe_pair, "lp_moe_pair", il);
+            ggml_tensor * mir_pair = ggml_sub(ctx0, ggml_add(ctx0, mir_a, mir_b), x0);
+            cb(mir_pair, "lp_mir_pair", il);
+            cur = ggml_add(ctx0, moe_pair, mir_pair);
+            cb(cur, "lp_pair_out", il);
+            inpL = cur;
+            il += 2;
+        } else {
+            inpL = build_layer(il, inpL);
+            cur  = inpL;
+            il += 1;
+        }
     }
 
     cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);

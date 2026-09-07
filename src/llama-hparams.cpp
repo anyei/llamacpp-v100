@@ -180,6 +180,16 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
     return val;
 }
 
+uint32_t llama_hparams::n_embd_k_idx(uint32_t il) const {
+    if (!indexer_kv || indexer_head_size == 0) {
+        return 0; // arch without a MSA indexer
+    }
+    if (il < n_layer_dense_lead) {
+        return 0; // leading dense layers carry no indexer
+    }
+    return indexer_head_size; // 128
+}
+
 uint32_t llama_hparams::n_embd_r() const {
     if (wkv_head_size != 0) {
         // for RWKV models
@@ -201,7 +211,13 @@ uint32_t llama_hparams::n_embd_r() const {
     // TODO: maybe support other convolution strides than 1
     // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
     // Corresponds to Mamba's conv_states size
-    return (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
+    const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
+
+    // qwen4exp's PLE dilated conv history deliberately does not share this row: the Meta backend
+    // splits cache_r_l by head and cannot view one sub-range of a split axis, so a second history
+    // packed behind the first is unaddressable under -sm tensor. it lives in cache_ple_r_l instead,
+    // mirrored, because the whole PLE module is mirrored
+    return n_conv;
 }
 
 uint32_t llama_hparams::n_embd_s() const {
@@ -229,6 +245,23 @@ bool llama_hparams::is_recr(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+uint32_t llama_hparams::ple_conv_state() const {
+    if (ple_n_heads == 0 || ple_conv_kernel == 0) {
+        return 0;
+    }
+
+    // dilation equals the n-gram size, matching the reference module
+    return (ple_conv_kernel - 1) * ple_ngram_size * dsv4_hc_mult * n_embd;
+}
+
+bool llama_hparams::is_ple(uint32_t il) const {
+    if (il < n_layer_all) {
+        return is_ple_impl[il];
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
 uint32_t llama_hparams::n_pos_per_embd() const {
     return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
 }
@@ -246,6 +279,14 @@ bool llama_hparams::is_mla() const {
            (n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0));
 
     return n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0;
+}
+
+bool llama_hparams::is_indexer_full(uint32_t il) const {
+    if (il < n_layer()) {
+        return is_indexer_full_impl[il];
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer: %u)\n", __func__, il, n_layer());
 }
 
 uint32_t llama_hparams::n_embd_head_k_mla() const {
