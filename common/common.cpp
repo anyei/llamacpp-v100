@@ -1678,6 +1678,16 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.moe_cache_mib     = params.moe_cache_mib;
+    cparams.moe_cache_reserve_mib = params.moe_cache_reserve_mib;
+    if (params.moe_cache_mib != 0 && params.moe_cache_reserve_mib == 0 && params.speculative.has_dft()) {
+        // the draft model loads AFTER the cache sizes itself: keep its weights (+ context) out of the budget
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(params.speculative.draft.mparams.path, ec);
+        if (!ec) {
+            cparams.moe_cache_reserve_mib = 3072 + (int32_t) (sz / (1024*1024)) + 512;
+        }
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

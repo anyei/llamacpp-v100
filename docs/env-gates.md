@@ -62,6 +62,26 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 | `LLAMA_SSD_STREAM_GPU_PROTECTED_PCT` | 0-100 | 80 | Protected-segment size for the VRAM SLRU. |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | count | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload to the GPU. **Not needed for GPU landing** - streamed-expert matmuls auto-offload at batch-1 when `LLAMA_SSD_STREAM_GPU=1`. |
 
+## 2b. MoE expert cache (TASKS #151, docs/moe-cache-plan.md)
+
+Hot CPU-resident routed experts kept in per-layer VRAM slot pools on the layer's router device; a
+GPU chain computes cached lanes, the stock CPU chain the rest, both through the negative-id skip
+sentinel; a miss is never fetched for the current token. CLI: `--moe-cache off|N|auto` (N = MiB
+total for the slots, split evenly across cached layers; env alias `LLAMA_ARG_MOE_CACHE`). Any mode
+but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Serve-safe.
+
+| Env | Type | Default | Meaning |
+|---|---|---|---|
+| `LLAMA_MOE_CACHE_RESERVE_MB` | MiB | 3072 (+ draft model size + 512 when a draft model is configured) | VRAM kept free of the cache on its device; a fixed `--moe-cache N` above free-minus-reserve is CLAMPED with a warning, `auto` = free-minus-reserve. |
+| `LLAMA_MOE_CACHE_MAX_BATCH` | count | 8 | Nodes wider than this (prompt processing) stay on the stock path; MTP/ngram verify batches up to 8 use the cache. |
+| `LLAMA_MOE_CACHE_INSERTS` | count | 2 | Max uploads scheduled per layer per decode step. |
+| `LLAMA_MOE_CACHE_STEP_MB` | MiB | 96 | Max upload bytes scheduled per decode step over all layers (PCIe share of the fill worker). |
+| `LLAMA_MOE_CACHE_HOT_USES` | count | 4 | Slots with more resident hits than this are evicted last (heat halves every 64 steps). |
+| `LLAMA_MOE_CACHE_STATS` | count | 0 | Log `moe-cache: step N hit/fills/evict/resident` every N steps (INFO, needs `-v`/`-lv`). |
+| `LLAMA_MOE_CACHE_STATIC` | count | 0 | Gate instrument: pre-fill experts [0, N) of every layer at create. |
+| `LLAMA_MOE_CACHE_FORCE_CPU` | bool | off | Gate instrument: allocate the pools on the host buffer type (CPU-only byte-identity wiring gate). |
+| `LLAMA_MOE_CACHE_DEBUG` | bool | off | Per-layer eligibility reasons and pool sizes at create; counters at teardown. |
+
 ## 3. Speculative decoding / MTP (tasks 1, 20)
 
 | Gate | Type | Default | What it does |

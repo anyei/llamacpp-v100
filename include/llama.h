@@ -355,6 +355,8 @@ extern "C" {
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
+        int32_t  moe_cache_mib;     // MoE expert cache VRAM budget in MiB (0 = off, -1 = auto) [EXPERIMENTAL]
+        int32_t  moe_cache_reserve_mib; // VRAM kept free of the cache on its device (0 = 3072); a budget above free-minus-reserve is clamped
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

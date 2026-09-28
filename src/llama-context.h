@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+class  llama_moe_cache; // TASKS #151
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -357,6 +358,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // TASKS #151: MoE expert cache; declared after the backends so it is freed first
+    std::unique_ptr<llama_moe_cache> moe_cache;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

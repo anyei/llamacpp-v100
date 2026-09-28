@@ -3317,6 +3317,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-cache"}, "off|N|auto",
+        "cache the hottest CPU-resident MoE experts in VRAM: off, N MiB per device, or auto (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off" || value == "0") {
+                params.moe_cache_mib = 0;
+                return;
+            }
+            if (value == "auto") {
+                params.moe_cache_mib = -1;
+            } else {
+                const int v = std::stoi(value);
+                if (v <= 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_cache_mib = v;
+            }
+            // the slot copies need the canonical expert layout (repacked bytes are not readable by the device kernels)
+            params.no_extra_bufts = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

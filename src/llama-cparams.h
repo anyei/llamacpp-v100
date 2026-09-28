@@ -48,6 +48,9 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+
+    int32_t moe_cache_mib; // TASKS #151 MoE expert cache: VRAM MiB (0 = off, -1 = auto)
+    int32_t moe_cache_reserve_mib;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

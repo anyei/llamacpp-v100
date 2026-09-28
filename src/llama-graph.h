@@ -22,6 +22,7 @@ struct llama_layer;
 struct llama_memory_context_i;
 
 struct llama_expert_placement_tables; // TASKS #75
+class  llama_moe_cache;               // TASKS #151
 struct llama_expert_mask;             // TASKS #84 probe 2
 
 class llama_kv_cache_context;
@@ -716,6 +717,9 @@ struct llm_graph_params {
     // TASKS #84 probe 2: per-layer routing-budget mask (null = unmasked)
     const llama_expert_mask * expert_mask = nullptr;
 
+    // TASKS #151: MoE expert cache (null = off); a different cache is a different graph
+    const llama_moe_cache * moe_cache = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -755,6 +759,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (moe_cache != other.moe_cache) {
             return false;
         }
 
@@ -858,6 +866,9 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
+    // TASKS #151: (layer, flat routed ids) of every cache-engaged MoE layer, read back after compute
+    std::vector<std::pair<int, ggml_tensor *>> t_moe_cache_ids;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -947,6 +958,7 @@ struct llm_graph_context {
 
     const llama_expert_placement_tables * expert_tables = nullptr;
     const llama_expert_mask             * expert_mask   = nullptr; // TASKS #84 probe 2
+    const llama_moe_cache               * moe_cache     = nullptr; // TASKS #151
 
     llm_graph_result * res;
 

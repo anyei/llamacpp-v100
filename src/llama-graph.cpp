@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-expert-placement.h"
+#include "llama-moe-cache.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1203,6 +1204,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_moe_cache_ids.clear();
 
     params = {};
 
@@ -1361,6 +1363,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     expert_tables    (params.expert_tables),
+    moe_cache        (params.moe_cache),
     expert_mask      (params.expert_mask),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -2040,6 +2043,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // TASKS #151 MoE expert cache: dual chain. ids_cpu carries the skip sentinel on
+    // cached lanes, ids_gpu on uncached ones, so every lane is computed once and
+    // the two down outputs add. Engaged only for the plain gated-SiLU shape the
+    // GPU chain mirrors below (docs/moe-cache-plan.md section 5).
+    const llama_moe_cache_layer * mcl = nullptr;
+    ggml_tensor * ids_gpu = nullptr;
+    ggml_tensor * ids_cpu = selected_experts;
+    if (moe_cache != nullptr && exp_ids_local == nullptr && !weight_before_ffn &&
+            gate_exps != nullptr && gate_up_exps == nullptr &&
+            up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+            up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
+            type_op == LLM_FFN_SILU && (loras == nullptr || loras->empty()) &&
+            n_tokens <= moe_cache->max_batch()) {
+        mcl = moe_cache->lookup(up_exps);
+    }
+    if (mcl != nullptr) {
+        const int64_t n_ids = selected_experts->ne[0]*selected_experts->ne[1];
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_ids);
+        ggml_tensor * g = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mcl->gpu_table, 1, mcl->n_expert), ids_flat);
+        ggml_tensor * c = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, mcl->cpu_table, 1, mcl->n_expert), ids_flat);
+        ids_gpu = ggml_reshape_2d(ctx0, g, selected_experts->ne[0], selected_experts->ne[1]);
+        ids_cpu = ggml_reshape_2d(ctx0, c, selected_experts->ne[0], selected_experts->ne[1]);
+        cb(ids_gpu, "ffn_moe_cache_ids_gpu", il);
+        cb(ids_cpu, "ffn_moe_cache_ids_cpu", il);
+        // the routing observation: kept alive to graph end, copied out by the context
+        ggml_set_output(ids_flat);
+        res->t_moe_cache_ids.emplace_back(il, ids_flat);
+    }
+    ggml_tensor * chain_inp = cur;
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2071,7 +2104,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, ids_cpu, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2084,7 +2117,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, ids_cpu, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2173,8 +2206,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, ids_cpu, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+
+    if (mcl != nullptr) {
+        // GPU chain over the slot pools, mirroring the gated-SiLU path above
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcl->up_c,   chain_inp, ids_gpu);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcl->gate_c, chain_inp, ids_gpu);
+        cb(up_g,   "ffn_moe_cache_up",   il);
+        cb(gate_g, "ffn_moe_cache_gate", il);
+
+        ggml_tensor * act_g = nullptr;
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        if (limit > 1e-6f) {
+            up_g = ggml_clamp(ctx0, up_g, -limit, limit);
+            if (arch == LLM_ARCH_DEEPSEEK4) {
+                gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
+                act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
+            } else {
+                ggml_tensor * ga = ggml_silu(ctx0, gate_g);
+                ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
+                act_g = ggml_mul(ctx0, ga, up_g);
+            }
+        } else {
+            act_g = ggml_swiglu_split(ctx0, gate_g, up_g);
+        }
+        cb(act_g, "ffn_moe_cache_act", il);
+
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcl->down_c, act_g, ids_gpu);
+        cb(down_g, "ffn_moe_cache_down", il);
+
+        experts = ggml_add(ctx0, experts, down_g);
+        cb(experts, "ffn_moe_cache_merged", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

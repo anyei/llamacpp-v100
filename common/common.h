@@ -545,6 +545,9 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    int32_t moe_cache_mib = 0; // --moe-cache: 0 = off, -1 = auto, N = MiB per device (TASKS #151)
+    int32_t moe_cache_reserve_mib = 0; // VRAM kept free of the cache (0 = 3072 + the draft model's size when one is configured)
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

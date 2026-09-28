@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-moe-cache.h"
 
 #include "ggml.h"
 #include "ggml-ssd-stream.h"
@@ -582,6 +583,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.moe_cache_mib         = params.moe_cache_mib;
+    cparams.moe_cache_reserve_mib = params.moe_cache_reserve_mib;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -855,6 +858,28 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+
+        // TASKS #151: the expert cache is created after the reserve, so the KV and
+        // compute buffers already hold their VRAM when `auto` sizes the pools; the
+        // graphs are then reserved once more with the cache chain in them
+        if (cparams.moe_cache_mib != 0) {
+            llama_moe_cache_params mp;
+            mp.budget_mib  = cparams.moe_cache_mib;
+            if (cparams.moe_cache_reserve_mib > 0) { mp.reserve_mib = cparams.moe_cache_reserve_mib; }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_RESERVE_MB")) { mp.reserve_mib = std::max(0, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_MAX_BATCH")) { mp.max_batch   = std::max(1, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_STATIC"))    { mp.static_fill = std::max(0, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_FORCE_CPU")) { mp.force_cpu   = atoi(e) != 0; }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_DEBUG"))     { mp.debug       = atoi(e) != 0; }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_INSERTS"))   { mp.inserts     = std::max(0, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_STEP_MB"))   { mp.step_mib    = std::max(1, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_HOT_USES"))  { mp.hot_uses    = std::max(0, atoi(e)); }
+            if (const char * e = getenv("LLAMA_MOE_CACHE_STATS"))     { mp.stats_every = std::max(0, atoi(e)); }
+            moe_cache = llama_moe_cache::create(model, mp);
+            if (moe_cache) {
+                sched_reserve();
+            }
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -2244,6 +2269,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // TASKS #151: residency changes only land here, with no graph in flight
+    if (moe_cache) {
+        synchronize();
+        moe_cache->step();
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2441,6 +2472,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        // TASKS #151: copy out this graph's routed ids for the cache policy
+        if (moe_cache) {
+            moe_cache->observe(active_sched(), res->t_moe_cache_ids);
         }
 
         // extract logits
@@ -3005,6 +3041,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs     =*/ n_outputs,
         /*.expert_tables =*/ model.expert_tables.get(),
         /*.expert_mask   =*/ expert_mask.get(),
+        /*.moe_cache     =*/ moe_cache.get(),
         /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -4052,6 +4089,8 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.moe_cache_mib               =*/ 0,
+        /*.moe_cache_reserve_mib       =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

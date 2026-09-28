@@ -450,9 +450,12 @@ zero-code phase 0 that uses A's binary as the oracle for "what is the prize on t
 21626 free, pools q4_K 11655 slots / q5_1 5367 / q8_0 680 / q5_K 311 = 18.0 GB, `[moe-cache]
 enabled`, 28.9 GiB VRAM used). Probe: coherent (code + arithmetic read), decode 18.4 t/s cold,
 21.0 warm, 18.2 after a topic switch, 20.8 back on the warm topic; prompt 23-25 t/s (the #150
-prefill class is present in their build too). Missing for a real A/B: the `--moe-cache off` arm
-on the same binary (2-min restart) - the phase-0 measurement of section 7. Add
-`GGML_CUDA_MOE_CACHE_STATS=200` to the compose environment to get hit-rate lines while running.
+prefill class is present in their build too). **A/B DONE (user go, same evening): cache OFF (`--moe-cache off --no-repack`) = 13.8 / 13.9 /
+14.2 / 14.0 t/s on the same four requests; cache ON = 18.4 / 21.0 / 18.2 / 20.8 -> +33% cold,
++50% warm on Flash-Next on ONE V100 with 18 GB of cache.** Prompt processing 23-25 t/s in both
+arms. That is about 2x the section-4 estimate: the CPU expert path on this box costs more than
+the pure bandwidth model (71 ms/token at 14 t/s), so the cache's prize is larger. Serve
+restored to cache-on with `GGML_CUDA_MOE_CACHE_STATS=200` for hit-rate lines.
 
 Corrected launch for an isolated cache A/B on Flash-Next (their doc, section "Benchmarking",
 adapted to Volta; no MTP head because theirs rejects our export):
@@ -485,3 +488,407 @@ keep the 3 GiB reserve: KV (q8_0/turbo3) took ~2.6 GiB in their log, fine.
    own, but on Flash-Next it is blocked by #150).
 5. CLI surface: mirror TheTom's `--moe-cache off|on|soft|auto|N` for wizard familiarity, or the
    smaller `off|N|auto`.
+
+## 10. Decisions 2026-09-07 (user answers to section 9)
+
+1. **Targets, in order: Qwen3.8-Flash-Next -> Ling-3.0-flash -> GLM-5.2.**
+   - Flash-Next: section 4 geometry (71.7 GiB experts, 3.1-3.6 MB/expert, ~1.5 GB/token).
+   - Ling-3.0-flash Q4_K_M (X99 `/home/anyei/server/models/Ling-3.0-flash/Ling-3.0-flash/`, 2 shards,
+     72.4 GiB): arch bailingmoe3, 43 blocks (2 leading dense = 41 MoE), 512 experts, top-8 with
+     GROUP routing (8 groups, 4 used), sigmoid gating (func 2), expert_weights_scale 2.5 + norm,
+     1 shared expert, n_embd 2560, n_ff_exp 768. Per expert: gate/up Q4_K 1.11 MB each + down Q6_K
+     1.61 MB = **3.83 MB**; **69.7 GiB of routed experts**; ~1.26 GB/token. Same class as
+     Flash-Next (slightly bigger experts, fewer per token). Design note: the group top-k runs
+     BEFORE `selected_experts` in `build_moe_ffn`, so the dual-chain hook (which starts at
+     `selected_experts`) is unaffected; the weights scale/norm apply after the down sum as today.
+   - GLM-5.2: only the UD-Q4_K_XL set exists locally (coordinator `/mnt/files/GLM-5.2`, 11 shards,
+     ~436 GB) - it does NOT fit the X99's 251 GB RAM. The X99 vehicle is the Q2_K_XL (227 GB,
+     used for Task 15/#55 streaming; recopy needed) or the SSD tier. Biggest expert share per
+     token of the three (TheTom: 209 GiB experts at IQ2_M, 14.5 -> 28 t/s with MTP on 4x3090),
+     so the largest expected gain, but capacity-borderline in RAM: plan it last, as decided.
+2. **Route = decided by code review.** Two independent reviews are running on (A) giveen's
+   in-kernel cache in TheTom's tree and (B) markldn's dual chain + its upstream ancestor
+   PR #27861: severity-ranked findings, quality scores, port cost into this fork. Rule: AAA ->
+   port; poor -> build (taking the proven pieces). Verdict lands in section 11.
+3. **Pool granularity: per-layer pools, sized from the profile, is the better choice here.**
+   Why: (a) heat differs per layer, not per shape - our #148 profile needs 244-367 of 512
+   experts per layer for 90% of selections (peak/mean 4-16x), so a per-layer budget weighted by
+   the profile captures most of what a shared pool would redistribute at runtime; (b) per-layer
+   pools keep the layer -> device mapping trivial (the slots live where the layer's router
+   lives) and remove the whole shape-census / pool-ordering / role-starvation bug class both
+   in-kernel forks hit (EC3 M1, giveen's "wait for as many visits as tensors" rule); (c) the
+   only thing lost is runtime migration of capacity between layers, which matters only if layer
+   heat drifts faster than a serve restart - measurable later, not needed for v1. Shared-shape
+   pools (EC3/giveen) are the right answer only when there is no profile and layers are
+   heterogeneous in count (Llama-4's 16-expert tensors) - not our case.
+4. **Pinning, in plain words** (the question was whether to ship it alone first): "pinning"
+   means page-locking the expert weights in host RAM so the GPU can DMA them directly. Unpinned
+   (default mmap) copies go through a driver bounce buffer at about half the PCIe speed. Today
+   the scheduler already copies used experts to the GPU for big prompt batches, so pinning
+   speeds up prefill on its own, cache or not (markldn measured +41%). Two facts make this a
+   non-question: with `--no-mmap` (your turboquant compose, several launcher configs) the
+   experts are ALREADY pinned - the loader puts CPU-overridden weights in CUDA pinned host
+   memory; and on Flash-Next prefill does not batch at all because of #150, so pinning shows
+   nothing there until that bug is fixed. Decision taken: no separate increment; pinning of
+   mmap'd experts is a ~60-line part of the cache increment, and the launcher default for cache
+   serves is `--no-mmap`.
+5. **CLI = `--moe-cache off|N|auto`** (N = MiB per device; env alias `LLAMA_ARG_MOE_CACHE`;
+   `auto` = free VRAM minus the reserve after KV and compute buffers, dormant when the routed
+   experts already fit). No `on`/`soft` modes.
+
+## 11. Code-review verdicts (2026-09-07, route decision per section 10.2)
+
+### 11.A giveen `--moe-cache` in TheTom/llama-cpp-turboquant @ 407f323 (CUDA provider + hooks, ~4.6k lines read in full)
+
+**Verdict: solid-but-not-AAA.** No defect found that corrupts output in the supported model
+(one scheduler thread per session). The hard protocol is right and tested: slot pins +
+generation counters, eviction never touches a copying or pinned slot, invalidation on every
+buffer-write path, "restore rows to the CPU mapping before the barrier" holds on every failure
+path including fused, hit rows use the STOCK GPU mmvq arithmetic (quality = `-ngl` offload, not
+a new kernel path), byte math range-checked, Volta-safe (dp4a only, explicit VOLTA branch).
+
+Majors (file:line in their tree):
+- M1 every CPU worker thread takes a global registry mutex on EVERY MUL_MAT_ID node
+  (`ggml_moe_cache_active()` ggml-backend.cpp:65-77 via `ggml_moe_cache_can_fuse` ggml-cpu.c:3276,
+  called from all threads in `try_fuse_ops`) - a 47-thread convoy 3x per MoE layer per token,
+  paid even with the cache off; workers and thread 0 can see different provider tables, a latent
+  barrier-count deadlock.
+- M2 budget latched once (`moe_cache_prepare_budget` :1247-1250, never re-probed); any fill error
+  or allocator OOM trims the device and it stays dead for the process lifetime (:1203-1206,
+  :3301-3340). A long-lived server loses the cache on the first big-prompt pool growth.
+- M3 one session per scheduler, VRAM split N ways, cold N times: `ggml_backend_sched_new` creates
+  a default session per scheduler (ggml-backend.cpp:2030-2040); OUR decode-graph cache creates a
+  scheduler per graph shape -> N budgets and N cold caches; also their session only scans
+  `ggml_backend_is_cuda` backends, and our scheduler list under the meta backend is {meta, CPU}
+  -> no session at all without a member-unwrap patch.
+- M4 structure: 3.4k-line accretion; ~600 lines of policy duplicated in
+  `ggml-moe-cache-common.h` (three copies to keep in sync); `query_fused` declared, documented
+  as implemented, assigned by nobody; header claims registration-time asserts that do not exist;
+  330/325/210-line functions; mode inferred from a byte field; 20 env vars overriding each other.
+- M5 collect = D2H + `cudaStreamSynchronize` + serial memcpy on thread 0 while 47 threads wait
+  at the next barrier (2-3 per layer); collect failure recomputes hit rows single-threaded.
+Minors: heat counter never decays (after warm-up the policy is plain LRU); the cpu-overlap
+auto-tuner times production decodes and never completes under MTP/-np>1; `cudaMalloc` + thread
+spawn under the session mutex; toy-shaped tests (256x128, 64 experts, Q4_0) that would not
+catch M1; release-build negative-id indexing hazard for our sentinel.
+
+Scores (1-5): concurrency 3, memory/lifetime 4, error handling 3, numerics 4, design 2,
+tests 3, perf design 3. Port cost into qwen4exp: drop-in files (moe-cache.cu/.cuh, API header,
+test) + hand-merge ggml-backend.cpp (18 hunks, incl. meta unwrap), ggml-cpu.c (9 hunks, ~450
+lines, our sentinel folds in), mmvq.cu (5 hunks), llama-context.cpp (6 hunks; decode-graph cache
+needs a shared-session API or must be disabled), CLI (9 trivial); fit.cpp optional (ours 981
+lines vs theirs 1601; on V100 `auto` is dormant anyway). **5-7 days without fit, 8-10 with, +2-3
+to fix M1-M3, plus permanent ownership of 3.4k lines we did not design.**
+Worth lifting regardless: the begin/plan/dispatch/collect/end contract with fallback-before-
+barrier; `moe_cache_invalidate_session` + `active_sources`; the overflow discipline; gathering
+slots with the stock `mul_mat_vec_q` + ids (no new kernel for the plain path); the CPU fused-
+SwiGLU matcher + `swiglu_masked`; the `GGML_CUDA_MOE_CACHE_FAIL` stage injection harness; the
+eligibility probe. Drop: the auto-tuner, per-scheduler sessions, undecayed heat, the default
+session in `sched_new`, the first-provider fallback, 15 of 20 env vars, the common header.
+
+### 11.B markldn/llama.cpp-qwen4exp-lru-async @ bf7cb1b (dual chain; ports upstream draft PR #27861)
+
+**Verdict: solid prototype, not AAA.** The graph shape is right and validated by 6+ testers
+(second mul_mat_id chain over slot tensors, get_rows remap, add of the two down outputs; the
+sum is exact by construction on the mmvq path), the worker completion protocol is right
+(pending -> todo -> batched tensor_set_async + one synchronize per backend -> done -> publish),
+the llama-level module is readable. But:
+
+Blockers for OUR use (file:line in their tree):
+- B1 process singleton, no teardown: `g_cache`/`g_init_done` (llama-moe-expert-cache.cpp:94-96,
+  :291-295), `by_up_src` keyed by raw model tensor pointers (:444), `llama_moe_cache_shutdown`
+  has ZERO callers, pinned pages never unregistered. Our server frees and reloads models
+  in-process (server-context.cpp:1493-1499) -> a reloaded model can alias the old keys, the
+  worker reads a munmapped mapping -> SIGSEGV; VRAM + pinned pages leak per reload.
+- B2 the load-bearing invariant "publish only after the copy, never while a graph runs" is NOT
+  enforced: `llama_moe_cache_step()` runs right after `graph_compute` returns from the ASYNC
+  sched call with `synchronize()` commented out (llama-context.cpp:2096-2102); the trailing
+  GPU split (last cached layer's get_rows + chain) is still queued while `flush_table`
+  rewrites `dev_table` on another stream -> a just-published expert computed on both chains,
+  a just-evicted one on neither, for the last cached layer. Fix = synchronize before step().
+Majors: the "async" worker is serialized behind `backend_mtx`, which is also held around the
+whole graph compute (gpu_lock, .cpp:616-626; llama-context.cpp:2580-2582) - so fills sit on the
+critical path (their own comment at llama-graph.cpp:2167-2169 retracts the HSA theory that
+justified the lock); ABBA deadlock between the graph thread (backend_mtx -> mc->mtx via the
+observer) and step() (mc->mtx -> backend_mtx) for two contexts on two threads; under `-sm layer`
+the chain nodes carry no WEIGHTS-usage source, so the scheduler assigns them to the NEXT
+layer's device at layer boundaries and copies the pool tensors across (inferred from sched
+rules, not run); unconditional cudaHostRegisterMapped pinning of every offloaded expert tensor
+(53 GB, no opt-out, device pointer unused = leftover of the first design; pinned file pages
+are unreclaimable); cache VRAM allocated before compute buffers with no fit/capacity awareness;
+duplicate dummy-slot ids are AVOIDED by the <= 5 token cap and a kernel patch, not fixed (mmq
+loses duplicate lanes silently, mmf still breaks at first match; F16/BF16 experts ungated).
+Minors: upload-bounds failure still publishes the slot; no expert-in-flight guard (the same
+expert can be scheduled into two slots once the lock goes); observer keyed on a name strstr
+(a second model or an MTP head pollutes the LRU); repack bufts unguarded; `-sm row` aborts in
+the worker; "bit-identical" claim is token-level on low-entropy prompts (cached lanes = CUDA
+q8_1 mmvq vs CPU Q8_K dot -> logits differ by construction); ~450 lines of DEAD first-design
+code (moe-lru.cu, two ggml ops with CPU/CUDA/meta dispatch); no tests at all; comments cite a
+private planning file.
+Scores (1-5): concurrency 2, memory/lifetime 2, numerics 3, error handling 3, design 2,
+tests 1, perf design 2. Port cost: faithful port + fixes **5-7 days**; building to the section 5
+shape **6-8 days** - the parts we would keep were never the hard part.
+Worth lifting: the graph shape (llama-graph.cpp:2207-2215, 2385-2415); init grouping by router
+buft (:308-332); the worker protocol + lamport-clock LRU with in-flight exclusion (:448-489,
+:523-576); whole-table flush per dirty layer (:190-200); upload_slice bounds check (fail the
+job instead of publishing); pinning as opt-in whole-mapping ReadOnly with unregister; the PR
+thread's measured LRU curve for Flash-Next (96 slots 87%, 128 -> 90%, 216 -> 95.6%, saturates
+~384) and nasone32's residual-overhead profile (dummy rows, syncs, H2D count) as our target list.
+
+### 11.C Route call (against the section 10.2 rule: AAA -> port, poor -> build)
+
+Neither candidate is AAA; neither is plainly poor. A is production-hardened in the protocol
+but structurally heavy and operationally brittle (M1-M3) and collides with our meta backend and
+decode-graph cache; B has the right shape and two blockers for our server plus a false design
+premise in the implementation. Port-with-fixes costs 5-7 (A, no fit, +2-3 for M1-M3) or 5-7 (B)
+days; building the section 5 design costs 6-8 and leaves us owning ~1.5k lines we designed
+instead of 3.4k (A) or a rewrite of 60% of 1k (B). **Recommendation: BUILD, on B's graph shape,
+with A's hardening ideas**, i.e. section 5 plus these hard requirements learned from the reviews:
+1. State per model (owned by `llama_model`, freed with it, pins unregistered), never a process
+   singleton; keys never raw tensor pointers across reloads.
+2. `ggml_backend_sched_synchronize` BEFORE `step()`; tables mutated only there; no lock around
+   graph compute; worker owns its backend + stream; expert-in-flight guard + per-step byte cap.
+3. Skip sentinel for both chains (no dummy slot, no duplicate ids); eligibility = quantized
+   types on the mmvq path, batch <= 8; F16/BF16 experts off.
+4. Pool buffers tagged `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` (or chain nodes pinned to the
+   layer's backend) so `-sm layer` keeps the chain on the layer's device.
+5. Pool allocation after `sched_reserve` (KV + compute first), budget re-probed on reserve,
+   degrade per layer on failure, never abort, never permanently dead.
+6. No global mutex on the CPU op path; the CPU node reads its host table via src[3] only.
+7. Gates: KL battery vs `-ncmoe` (byte identity is impossible by construction) + greedy
+   low-entropy read + coherence; failure-injection harness (lift A's FAIL stages); a
+   test-backend-ops case for the sentinel dual chain.
+**User confirmed 2026-09-07: BUILD.** Phase 0 measured the same evening (section 8): +33% cold /
++50% warm on Flash-Next, 1 V100 - the lane is worth building. Build log: section 12.
+
+## 12. Build log
+
+### 12.1 Increment 1 - module + dual-chain graph + static fill: GATE GREEN (2026-09-07)
+
+Code: `src/llama-moe-cache.{h,cpp}` (per-context cache; per-layer pools `[ne0, ne1, n_slots+1]`
+in the router's buffer type, tagged WEIGHTS; two I32 tables per layer: gpu = slot or SKIP,
+cpu = expert id or SKIP), `build_moe_ffn` hook (ids through `get_rows` on both tables; the
+CPU chain takes `ids_cpu`, a mirrored GPU chain over the slot tensors takes `ids_gpu`; the two
+down outputs add before the gating weights), context wiring (cache created BEFORE
+`sched_reserve` so reserved and decode graphs share topology; `step()` at decode entry after
+`synchronize()`), CLI `--moe-cache off|N|auto` (`LLAMA_ARG_MOE_CACHE`), cparams/llama.h field.
+Env instruments: `LLAMA_MOE_CACHE_DEBUG`, `LLAMA_MOE_CACHE_STATIC=K` (fill experts 0..K-1 per
+layer at create), `LLAMA_MOE_CACHE_FORCE_CPU` (pools on the host buft = CPU wiring gate),
+`LLAMA_MOE_CACHE_MAX_BATCH`. No CPU-op or CUDA changes: the existing negative-id skip sentinel
+does the lane split on both backends.
+
+Two traps found and fixed on the way: (1) the fork's `--fit` probe creates a context on a
+no-alloc model (no tensor data) -> the static fill segfaulted; a layer without data is now
+"not cacheable" (the probe measures only). (2) the CPU repack buffer (`CPU_REPACK`, 11.5 GB
+of Q4_K experts on an AVX2 host) is not a host buffer and its bytes are not the canonical
+layout -> only 1 of 40 layers qualified; `--moe-cache` now forces `--no-repack` like both
+forks. Per-layer skip reasons print under DEBUG.
+
+Gate (CPU build, host, Qwen3.6-35B-A3B UD-Q4_K_XL, `-ngl 0 -t 10`, 3 prompts x 32 greedy
+tokens, sha over content): `--moe-cache off -nr` **6a3cf5192354** == `--moe-cache 2048` empty
+tables (40 layers engaged, 2102 MiB) **6a3cf5192354** == `LLAMA_MOE_CACHE_STATIC=8`
+**6a3cf5192354** (8 experts per layer computed on the second chain). The repacked baseline
+also hashes 6a3cf5192354. `GGML_SCHED_DEBUG=2` shows the `ffn_moe_cache_*` nodes in the
+executed graph. Decode 8.3 t/s in all arms (no measurable graph overhead at this scale).
+
+### 12.2 Increment 2 - observation + LRU/admission + async fill worker: GATE GREEN (2026-09-07)
+
+Code: the graph registers each engaged layer's flat routed ids on `llm_graph_result`
+(`t_moe_cache_ids`, marked output); `decode()` copies them out asynchronously right after
+each ubatch's compute (same path as the logits); `step()` at the next decode entry (after
+`synchronize()`) publishes the worker's finished uploads (table write), consumes the
+observations (hits refresh recency and heat, misses count demand), admits at the first miss
+into a free slot or the second miss into a full pool, evicts LRU among slots not in flight and
+not hit this step (cold slots with <= `hot_uses` hits first, heat halved every 64 steps),
+clears the victim's table entry BEFORE any graph can run again, and hands `{layer, expert,
+slot}` jobs to one worker thread that uploads with `ggml_backend_tensor_set_async` on its own
+backend per device and synchronizes per batch. Caps: `inserts` per layer per step (2) and
+`step_mib` per step (96). Counters + `LLAMA_MOE_CACHE_STATS=N` line.
+
+Gate (CPU build, same vehicle, 3 prompts x 96 greedy tokens, cache 1024 MiB = 14 of 256
+experts per layer, no static fill): baseline `-nr` **6a3cf5192354** == dynamic cache
+**6a3cf5192354** over 292 steps with **14985 fills / 14482 evictions / 0 observations
+dropped**, hit rate 35-46% (39% final). Every upload and eviction raced a running decode and
+not one byte moved: the publish-after-sync protocol holds. Same-arithmetic (CPU) proof only;
+the V100 gate compares text and PPL, not bytes.
+
+### 12.3 V100 gate round 1 (X99, Flash-Next, 2026-09-07): correct, coherent, throttled
+
+Dev sm_70 bins shipped to the X99 (`/home/anyei/devbins151`, run inside the launcher image
+with `--entrypoint`), user's turboquant serve paused for the window and restarted after.
+Config: `-ngl 99 -ncmoe 48 -c 4096 -fa on -t 24`, mmap default, 3 prompts x 96 greedy tokens
+(chat, thinking off).
+
+| Leg | tg t/s (p0 / p1 / p2) | notes |
+|---|---|---|
+| `--moe-cache off` (repack default) | 14.04 / 14.40 / 14.87 | 6.6 GiB VRAM |
+| `--moe-cache off -nr` | 13.51 / 13.84 / 13.72 | the fair baseline (cache mode forces -nr) |
+| `--moe-cache 12000`, cold | 14.31 / 15.35 / 15.18 | 48 layers x 85 slots (17% of experts), 18.7 GiB VRAM |
+| same, warm (2nd pass) | 15.52 / 15.73 / 15.68 | hit 34-36% steady, resident 2563 of 4080 slots, in-flight 32 |
+| same, warm (3rd pass) | 15.18 / 15.72 / 15.66 | |
+
+Correctness: cache-cold and cache-warm outputs identical to each other (sha 82652eab8124);
+vs the CPU baseline the texts diverge at a near-tie wording choice ("divide the total distance
+by" vs "divide the distance by"), the class both forks document (GPU q8_1 mmvq vs CPU Q8_K dot);
+the train answer, the code and the sky explanation are correct and coherent in every leg.
+
+Diagnosis of the small gain (+10-15% vs -nr): the fill schedule was the limiter, not the
+mechanism. `step_mib=96` capped uploads at ~32 slabs per step for ALL layers (the counters show
+in-flight pinned at 32 every step) and the scheduling loop walked layers in order, so the byte
+budget went to the first ~30 layers while the tail layers never filled (resident 2563 = 63% of
+slots after 850 steps, evictions in the full front layers while free slots sat in the back).
+Fix (12.4): round-robin one upload per layer per round, `inserts` 4, `step_mib` 384.
+
+### 12.4 V100 gate round 2 - round-robin fill schedule: +20-25% (2026-09-07)
+
+Same box, config and prompts as 12.3; scheduler now round-robin over layers, `inserts` 4,
+`step_mib` 384 (CPU dynamic gate re-passed byte-identical first: sha 6a3cf5192354, hit 44%).
+
+| Leg (cache 12000 MiB, 85 slots/layer = 17% of experts) | tg t/s (p0 / p1 / p2) |
+|---|---|
+| cold (first pass) | 15.68 / 16.94 / 16.97 |
+| warm (2nd pass) | 16.46 / 17.06 / 16.98 |
+| warm (3rd pass) | 16.02 / 17.29 / 17.00 |
+
+Counters: hit **63.6% at step 150 -> 67.3% at step 750** (was 35%), resident 3946 of 4080 slots
+(pools full within ~150 steps), fills 53k / evictions 49k over 750 steps, 0 observations
+dropped. vs `-nr` baseline 13.5-13.8: **+20-25%**; vs the repack baseline 14.0-14.9: +12-18%.
+Outputs coherent; warm pass 2 reproduced the round-1 warm text exactly (sha 82652eab8124), the
+other passes differ at near-tie wording only.
+
+### 12.5 V100 gate round 3 - 18000 MiB, same budget as the turboquant run (2026-09-07)
+
+| Leg (cache 18000 MiB, 128 slots/layer = 25% of experts, 24.7 GiB VRAM) | tg t/s (p0 / p1 / p2) |
+|---|---|
+| cold | 16.67 / 18.30 / 18.60 |
+| warm (2nd pass) | 18.52 / 18.97 / 18.65 |
+| warm (3rd pass) | 17.81 / 19.00 / 18.62 |
+
+Hit **69.3% at step 150 -> 74.6% at step 750**, pools full (5989 of 6144 slots), 0 dropped.
+vs `-nr` baseline 13.5-13.8: **+30-38%**; vs repack baseline: +22-30%. The warm pass 2 output
+hashed identical to the CPU baseline (a3ec3a2719c4). Same box, same budget, same prompts as
+TheTom's build (18.4 cold / 21.0 warm, 83% hit): this design lands ~10% below it on day one.
+Remaining gap, in order of expected value: (1) their fused gate+up+SwiGLU GPU path (one kernel
+where we launch three), (2) their in-kernel overlap of CPU misses with GPU hits (we serialize
+the CPU split and the GPU chain), (3) shared-shape pools let capacity migrate to hot layers
+(75% vs 83% hit) - our answer is profile-weighted per-layer budgets from the #148 artifact,
+(4) CUDA graphs for the GPU splits.
+
+Status at the end of the build day: increments 1-2 complete and gated on CPU (byte-identical)
+and V100 (coherent, +30-38%); `auto` budget now sized after the KV/compute reserve (12.6);
+NOT done: PPL/KL quality battery vs `-ncmoe` (next, before any production roll), pinning of
+mmap'd experts, profile-weighted budgets, fused GPU chain, image build/roll, env-gates
+wizard exposure beyond the flag catalog. Tree uncommitted (user call).
+
+### 12.6 Cache created after the reserve (2026-09-07)
+
+`llama_context` now runs `sched_reserve()` first, creates the cache (so `auto` reads free VRAM
+with the KV and compute buffers already allocated), then reserves once more so the graphs carry
+the cache chain. CPU gate re-passed byte-identical (sha 6a3cf5192354). Cost: one extra reserve
+at startup when the cache is on.
+
+Reproduction kit (session scratchpad, not in the tree): `gate151.sh` (CPU byte gate: base
+`-nr` vs cache legs on Qwen3.6-35B-A3B at `-ngl 0`), `x99_gate.sh` / `x99_gate2.sh` (V100 legs
+with the dev bins in `/home/anyei/devbins151` on the X99 run via `--entrypoint` inside the
+launcher image; pauses and restores the user's turboquant container), `x99_probe.py`.
+
+### 12.7 V100 gate round 4 - cache + MTP drafter (2026-09-07)
+
+`--moe-cache 18000 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-Mtp-Q8_0.gguf
+-ngld 99 --spec-draft-n-max 3` (verify batches of 2-4 tokens go through the cache; max batch 8),
+29.5 GiB VRAM:
+
+| Pass | tg t/s (p0 / p1 / p2) |
+|---|---|
+| cold | 24.48 / 29.89 / 24.50 |
+| warm | 32.39 / 32.48 / 27.50 |
+| warm 2 | 30.14 / 34.23 / 26.70 |
+
+Hit 66.5% at step 150 (observations 1830 per step = 480 lanes x ~3.8 tokens: the verify
+batches are observed and cached), 0 dropped, coherent (cold and warm hashes equal the round-2
+cold and warm-2 outputs). Reference: the launcher-managed `-ncmoe 48` + MTP serve of 2026-08-27
+measured 25.2 t/s on counting and 21.8 on code without a cache.
+
+### 12.8 Rolled to the X99 launcher (2026-09-07, user order)
+
+Image `llamacpp-local-v100:58dacccec-151` (working tree at HEAD 58dacccec + the uncommitted
+#151 changes; wizard flag catalog regenerated, 328 flags) built, pushed as
+`127.0.0.1:5000/llamacpp-local-v100:58dacccec-151`, `:latest` re-pointed locally and in the
+registry; local tags pruned to current + rollback `41506e100`. X99: pulled the exact tag, the
+turboquant container `llama-tq-backend` stopped with its restart policy set to `no` (start it
+again with `docker start llama-tq-backend` if wanted), `llama-launcher` recreated on the new
+image (compose in /home/anyei/server/services/llamacpp-v100, host network, :8399, cache volume
+intact, 18 models scanned, health ok, wizard served). Serve loaded through
+`POST /models/load` for `Qwen3.8-Flash-Next-UD-Q4_K_XL` with
+`-ngl 99 -ncmoe 48 -c 32768 -fa on -t 40 --moe-cache 14000 --spec-type draft-mtp
+--spec-draft-model /models/Qwen3.8-FLash-Next/mtp-Qwen3.8-Flash-Next-Mtp-Q8_0.gguf -ngld 99
+--spec-draft-n-max 3 --cache-reuse 256`, env `LLAMA_MOE_CACHE_STATS=200`; 27.3 GiB VRAM.
+
+Probe through the router (greedy, thinking off, 160 tokens): code 27.1 t/s cold -> 32.8 warm,
+train problem 30.8 (correct), counting 37.0 at 100% draft acceptance; acceptance 82-100%;
+all outputs read coherent. Reference for the same shape without the cache (2026-08-27 launcher
+serve, `-ncmoe 48` + MTP n-max 3): 25.2 counting / 21.8 code.
+
+### 12.9 Production shape on the X99 launcher + wizard config (2026-09-07, late)
+
+Three findings from putting the serve into the wizard's shape:
+1. **17000 MiB is over the edge at 32k + MTP**: at rest 30.3-30.4 GiB, but real requests grow
+   the CUDA pools (a 6000-token generation of the user's reached 32.3 of 32.8 GiB) and a prompt
+   graph then fails with `ggml_backend_sched_alloc_splits: failed to reserve graph buffers` ->
+   HTTP 500 on that request (the serve survives). **15000 is the production budget** (28.3 GiB
+   at rest, ~2 GiB growth under use, ~2.5 GiB left).
+2. **The wizard's MTP-head template adds `LLAMA_SPEC_DRAFT_NO_PAD=1` and
+   `GGML_CUDA_DISABLE_GRAPHS=1`**; with them the same serve ran 20-25 t/s instead of 27-40.
+   docs/env-gates.md already calls NO_PAD a kill-switch (padding is the MTP win) and the user's
+   proven 76 t/s Qwen config removes both -> the saved config turns both off (`gateOff`).
+3. **The ncmoe template's `--load-mode none` costs ~20% decode on this dual-socket host**
+   (pinned host memory lands on one NUMA node, 40 threads read from both): at 15000, no-mmap
+   23.1 / 25.6 / 27.6 / 31.3 / 19.2 t/s vs mmap **28.2 / 31.8 / 33.7 / 38.6 / 23.4** on the same
+   five prompts, and the load takes 79 s vs 9 s -> the saved config cuts `--load-mode`
+   (`flagCut`). The cache's fill worker copies from pageable memory then; it keeps up (in-flight
+   stays bounded), so pinning stays a v2 item measured on its own.
+
+Saved wizard config: **id 277962759280 "Flash-Next ncmoe48 + MoE cache 15000 + MTP n3 (28-39
+t/s, 1 V100, 32k, mmap)"** (mode ncmoe, spec mtph nmax 3, ctx 32768, kv f16, cachereuse,
+flagSet `--n-cpu-moe 48 / --moe-cache 15000 / --threads 40`, gateOff NO_PAD + DISABLE_GRAPHS,
+flagCut `--load-mode`). The serve running now is exactly that shape (loaded via the API).
+
+Incident: an unload for one of these relaunches landed while the user had a ~6000-token
+generation running and killed it. Rule from now on: check the child's `/slots` for
+`is_processing` before any unload (the relaunch driver does).
+
+Steady-state numbers seen on this serve: the user's long generation ran at 22.3 t/s (17000
+budget, no-mmap, NO_PAD on); the corrected shape does 28-39 t/s on short prompts warm.
+
+### 12.10 The 262k-context OOM (user's serve, 2026-09-07 17:05) and the budget rule
+
+User's wizard serve: `-c 262000 -ctk q8_0 -ctv q8_0 --moe-cache 15000` + MTP head + p-min 0.8
+loaded with **86 MiB free** (the local bench skipped for that reason), then the first request
+died in `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 861 MiB ... out of memory`
+-> `Compute error` on every request. Measured with the same args at `--moe-cache 10000`:
+27490 MiB at rest, 28636 MiB after two requests (24-26 t/s cold).
+
+| Context (q8_0 KV, MTP head on) | Non-cache footprint | Safe `--moe-cache` (about 2.5 GiB left after pool growth) |
+|---|---|---|
+| 32768 | ~13.3 GiB | 15000 |
+| 262000 | ~17.1 GiB (KV 3.2 + indexer/state + bigger compute buffers) | **11000** |
+
+Rule: budget <= 32768 - footprint - ~3500 MiB. The cache allocates a fixed N blindly today;
+the next code increment adds a clamp to (free VRAM - reserve) with a warning so a too-large N
+degrades to a smaller cache instead of a dead serve (and `auto` must reserve the drafter's
+VRAM, which loads after the cache is sized). Serve left running at 10000 for the user.
+
+### 12.11 Budget clamp + drafter-aware reserve (2026-09-07, image 58dacccec-151b)
+
+`create()` now reads the pools' device free VRAM after the scheduler reserve and clamps a fixed
+`--moe-cache N` to free minus a reserve (WARN with the numbers), `auto` takes exactly that, and
+a budget of zero after the reserve logs and stays off. The reserve is 3072 MiB, raised in
+`common` by the draft model's file size + 512 MiB when a draft model is configured, because
+the drafter loads after the cache sizes itself (the user's 262k OOM of 12.10 would have clamped
+15000 to ~11000). `LLAMA_MOE_CACHE_RESERVE_MB` overrides; `llama_context_params.moe_cache_reserve_mib`
+carries it. CPU byte gate unchanged (6a3cf5192354).
+
+Rolled as image `58dacccec-151b` (2026-09-07 evening): on the user's 262k + MTP config with
+`--moe-cache 15000` the log reads `MoE cache budget 15000 MiB exceeds free 19420 MiB - reserve
+7528 MiB: clamped to 11892 MiB` (reserve = 3072 + 3944 draft file + 512); 29.3 GiB at rest,
+30.5 GiB after requests, 24-34 t/s, coherent. Rollback image: 58dacccec-151.
