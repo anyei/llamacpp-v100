@@ -868,6 +868,17 @@ llama_context::llama_context(
             if (cparams.moe_cache_reserve_mib > 0) { mp.reserve_mib = cparams.moe_cache_reserve_mib; }
             if (const char * e = getenv("LLAMA_MOE_CACHE_RESERVE_MB")) { mp.reserve_mib = std::max(0, atoi(e)); }
             if (const char * e = getenv("LLAMA_MOE_CACHE_MAX_BATCH")) { mp.max_batch   = std::max(1, atoi(e)); }
+            // nodes at least GGML_OP_OFFLOAD_MIN_BATCH tokens wide have their host-resident expert weights
+            // offloaded to the GPU by the sched, whose used-expert scan asserts on the chain's skip sentinels
+            {
+                const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+                const int offload_min = e ? atoi(e) : 32;
+                if (mp.max_batch >= offload_min) {
+                    LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_MAX_BATCH=%d reaches the sched offload width %d, clamped to %d\n",
+                            __func__, mp.max_batch, offload_min, std::max(0, offload_min - 1));
+                    mp.max_batch = std::max(0, offload_min - 1);
+                }
+            }
             if (const char * e = getenv("LLAMA_MOE_CACHE_STATIC"))    { mp.static_fill = std::max(0, atoi(e)); }
             if (const char * e = getenv("LLAMA_MOE_CACHE_FORCE_CPU")) { mp.force_cpu   = atoi(e) != 0; }
             if (const char * e = getenv("LLAMA_MOE_CACHE_DEBUG"))     { mp.debug       = atoi(e) != 0; }

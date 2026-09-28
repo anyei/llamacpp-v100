@@ -1,6 +1,6 @@
 # MoE expert cache (VRAM cache for CPU-resident experts) - investigation + proposal (TASKS #151)
 
-Status: **PROPOSAL 2026-09-07, awaiting the user's pick** (section 7 decision points). No code
+Status: **BUILT + ROLLED 2026-09-07 (sections 12.1-12.11); K80/Kepler battery 2026-09-27 found and FIXED the wide-node gather bug (section 12.12); V100 regate 2026-09-28 GREEN, image e117ee884-widefix, the V100 was never exposed (section 12.13); MAX_BATCH >= offload-width assert fixed by a clamp (12.14)**. Originally: PROPOSAL 2026-09-07 (section 7 decision points). No code
 written. Companion lanes: docs/ssd-streaming-plan.md (Task 15, the in-tree SSD tier + its
 single-GPU slot cache), docs/expert-profiling.md (#74 profiles = warm-start source),
 docs/expert-placement-plan.md (#75 skip sentinel + remap tables, reused here).
@@ -892,3 +892,121 @@ Rolled as image `58dacccec-151b` (2026-09-07 evening): on the user's 262k + MTP 
 `--moe-cache 15000` the log reads `MoE cache budget 15000 MiB exceeds free 19420 MiB - reserve
 7528 MiB: clamped to 11892 MiB` (reserve = 3072 + 3944 draft file + 512); 29.3 GiB at rest,
 30.5 GiB after requests, 24-34 t/s, coherent. Rollback image: 58dacccec-151.
+
+### 12.12 Kepler (K80, sm_37) battery + the wide-node gather fix (2026-09-27)
+
+Ask: a build for the coordinator's K80 and the quality check locally (X99 offline). Image
+`llamacpp-local-v100:e117ee884-kepler` (CUDA 11.8.0 / ubuntu22.04 / gcc-11, arch 37,
+PURGE_CUDA_COMPAT=1, 7 min). Vehicle Qwen3.6-35B-A3B-UD-Q4_K_XL (40 MoE layers x 256 experts
+top-8, 1856 KiB per expert slab), one K80 die, `-ngl 99 -ncmoe 40 -fa on -t 16 -nr`, budget
+6000 MiB = 82 slots/layer. Scripts and logs: `llama.cpp-work/151-kepler/`.
+
+Level 3 (17 greedy probes, thinking off): cache off 17/17; cache on 17/17 on two passes at
+83% hit; decode 16.0-16.9 t/s on vs 16.1-16.4 off = **speed-neutral on Kepler** (no dp4a).
+
+Level 1 (wikitext-2, -c 512 x 16, base = same binary cache off), the K80 facts first:
+`-ub 512` is NOT deterministic run-to-run (floors 0.000097 / 0.000187 mean KLD; the sched's
+>=32-token expert offload runs the generic dequant+cuBLAS path), `-ub 16` is exactly 0.
+Cache legs at -ub 16, static fill 64 experts/layer so the GPU chain carries ~25% of the lanes:
+
+| leg (pre-fix) | mean KLD | same-top | verdict |
+|---|---:|---:|---|
+| width 4 (cap 16) vs cache-off width-4 control 0.006038 / 97.2% | 0.005651 | 97.5% | clean |
+| width 8, DEFAULT cap 8 (hit 63%) vs control 0.005843 / 96.9% | 1.3914 | 57.4% | BROKEN |
+| width 16, cap 16 (hit 63%) vs floor 0 | 1.7279 | 53.4% | BROKEN |
+| no cache, 10 expert layers on the K80 at width 16 | 0.000405 | 99.3% | kernels sound |
+
+Root cause: `ggml_cuda_mul_mat_id` generic path (ggml-cuda.cu ~2015-2120). Skipped lanes
+(`expert_to_use < 0`) never set their `ids_from_sorted_host` entry, the vector was
+zero-initialised, and the final `get_rows_cuda(dst_sorted, ids_from_sorted, dst)` gather
+copied sorted row 0's OUTPUT into every skipped lane. mmvq (width 1) and mmvq-mmid (2-5) skip
+the sentinel correctly; on pre-Turing (`get_mmvq_mmid_max_batch_pascal_older`: q4_K/q5_K = 5,
+the V100 included [CORRECTED 2026-09-28: NOT the V100 - Volta takes the MMQ-id kernel below width 64, see 12.13]) widths 6-8 take the generic path. Exposure: cache nodes >= 6 wide = MTP
+n-max >= 5, ngram drafts up to 8, MAX_BATCH >= 6 with wide verify batches. The X99 production
+shape (MTP n-max 3 = 4-wide verify) escapes. Turing+ goes through MMQ (unverified here).
+
+Fix (user pick "fix 1", 2026-09-27, `ggml/src/ggml-cuda/ggml-cuda.cu`): `dst_sorted` gets one
+extra row, memset to zero, and `ids_from_sorted_host` is initialised to that row's index, so
+skipped lanes gather zeros. 7 lines. Image `llamacpp-local-v100:e117ee884-widefix-kepler`
+(5 min). Regate on the same K80 protocol:
+
+| leg (post-fix) | mean KLD | same-top | PPL ratio |
+|---|---:|---:|---:|
+| cache off, width 16, vs the pre-fix base | 0.000000 | 100.0% | 1.0009 (stock path untouched) |
+| width 8, DEFAULT cap 8 (control 0.005843 / 96.9%) | 0.005236 | 97.5% | 0.9985 |
+| width 16, cap 16 | 0.004502 | 97.4% | 0.9988 |
+| width 4 (mmvq path, untouched) | 0.005651 | 97.5% | 0.9982 (bit-identical to pre-fix) |
+| decode arm, cache on, 17 probes | 17/17 | - | 11-30 t/s, unchanged |
+
+Reading: widths 8 and 16 are now inside the width-controls band. The ~0.005 residual is the
+class of "25% of expert lanes computed on the GPU in every layer" (the 0.000405 control put
+whole layers on the GPU, 10 of 40); a CPU-only chain-logic control (pools forced onto the host
+with `-ngl 0`, base recomputed on the CPU, width 16, static 64) measured **exactly 0.000000 mean
+KLD (max 5.3e-5), 100% same-top**: the chain logic is bit-exact; the residual is arithmetic.
+
+Also found: (1) `LLAMA_MOE_CACHE_MAX_BATCH` >= 32 aborts (`GGML_ASSERT(id >= 0 && id <
+n_expert)` ggml-backend.cpp:1689, the sched's used-expert scan reads the sentinel) - clamp or
+skip, not fixed [FIXED 2026-09-28 by the clamp, see 12.14]; (2) on the K80 the legacy CUDA pool grows across chunks, so the pools turn
+that into an OOM: reserve 1024 died at chunk 2, the default 3072 at chunk 16, cache idle both
+times - keep the default reserve on Kepler, growth not chased; (3) `LLAMA_MOE_CACHE_FORCE_CPU`
+only applies when the router is on the host (with a GPU present the pools still land on it).
+
+### 12.13 V100 regate of the wide-node fix (2026-09-28, image e117ee884-widefix)
+
+Same protocol as 12.12 on the X99 (one V100 32 GB, Qwen3.6-35B-A3B Q4_K_XL staged in tmpfs,
+-ncmoe 40, cache 6000 MiB, static 64, -t 40; artifacts `llama.cpp-work/151-v100/x99/`). Two
+images: pre-fix 58dacccec-151b and the working-tree build e117ee884-widefix (fix 1 +
+PURGE_CUDA_COMPAT + regenerated FLAGS catalog). Mean KLD / same-top vs the pre-fix cache-off
+-ub 16 base (PPL 7.0950):
+
+| leg | pre-fix (151b) | post-fix (widefix) | control (cache off, same width) |
+|---|---:|---:|---:|
+| width 4, cap 16 | 0.005333 / 97.1% | 0.005333 / 97.1% | 0.005450 / 96.9% |
+| width 8, default cap 8 | 0.005364 / 97.2% | 0.005364 / 97.2% | 0.005598 / 97.2% |
+| width 16, cap 16 | 0.006053 / 97.3% | 0.006053 / 97.3% | - |
+| cache off, width 16, vs the pre-fix base | (base) | 0.000000 / 100% (max 5.1e-5) | - |
+| CPU chain control (-ngl 0, FORCE_CPU pools, width 16, own CPU base) | - | 0.000000 / 100% | - |
+| decode probes (17, greedy, 4k ctx) | - | 17/17 off, 17/17 on | - |
+
+Decode t/s (min/mean/max): cache off 33.6/47.9/74.4, cache on 28.1/58.9/82.5 (+23% mean; hit
+83% at step 1250, 6021 MiB of slots, 4 inserts/layer/step). 14/17 probe outputs byte-identical
+across the arms; the 3 long-form ones (binary search, planets, story) share their openings and
+diverge in wording only.
+
+Reading: the V100 never had the bug. `ggml_cuda_should_use_mmq` (mmq.cu) on Volta = fp16 MMA
+hardware without int8 MMA -> MMQ for `ne11 < MMQ_DP4A_MAX_BATCH_SIZE` (64), so mul_mat_id at
+widths 6-63 runs the MMQ-id kernel, which maps the skip sentinel correctly; the generic gather
+is reached only at width >= 64, which the cache chain cannot emit (MAX_BATCH >= 32 asserts,
+12.12). The K80 (cc 3.7, below DP4A) has no MMQ at all and fell into the generic path right
+above the mmvq-mmid limit. The 12.12 claim that the V100 shared the exposure at widths 6-8 was
+wrong: the fix is a no-op on the V100 for MMQ-supported expert quants (every current target)
+and matters on Kepler and on any generic-path case (unsupported quant type, f16/bf16 experts,
+FORCE_CUBLAS builds). Consequence: on the V100 the cache was never unsafe under MTP n-max >= 5
+or ngram drafts; that restriction was Kepler-only and is now fixed there too. The widefix
+image is bit-identical to 151b on the stock path and digit-identical on the cache legs = safe
+to roll; `:latest` was not re-pointed and no launcher was rolled (user call; the X99 launcher
+container is currently absent).
+
+### 12.14 MAX_BATCH clamp (2026-09-28)
+
+The `LLAMA_MOE_CACHE_MAX_BATCH >= 32` abort from 12.12 is the sched's op-offload path: a
+mul_mat_id node at least `GGML_OP_OFFLOAD_MIN_BATCH` tokens wide (default 32, env-parsed in
+ggml-cuda.cu) has its host-resident expert weights offloaded to the GPU, and the sched's
+used-expert scan (ggml-backend.cpp:1689) reads the node's ids to pick the experts to copy. The
+CPU chain's ids carry the skip sentinel for cached lanes, so the scan hits a negative id and
+asserts. Fix (src/llama-context.cpp): clamp `max_batch` to `GGML_OP_OFFLOAD_MIN_BATCH - 1`
+with a WARN. Not chosen: skipping negatives in the scan - fleet-shared code, and the assert is
+a legitimate guard; the chain simply must never own a node the sched offloads.
+
+Gate on the X99 V100 (dev build-cuda75 bins inside the widefix image, Qwen3.6-35B-A3B, base =
+image binary, cache off, -ub 64):
+
+| leg | binary | result |
+|---|---|---|
+| A: MAX_BATCH=64, -ub 64, cache on | image (no clamp) | `max batch 64`, then the assert at ggml-backend.cpp:1689 (trap reproduced) |
+| D: cache off, -ub 64 | dev | 0.000000 / 100% (dev libs == image on the stock path) |
+| B: MAX_BATCH=64, -ub 64, cache on | dev | WARN `reaches the sched offload width 32, clamped to 31`, `max batch 31`, 0.000000 / 100% (64-wide nodes stay on the stock path) |
+| C: MAX_BATCH=16, -ub 16, cache on | dev | 0.005717 / 97.6% vs the -ub 64 base (width band), hit 63.6% = chain still engages |
+
+Artifacts `llama.cpp-work/151-v100/x99-mb/`. Not in the rolled images yet (env-only trap; rides
+the next build).

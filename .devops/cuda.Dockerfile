@@ -91,6 +91,13 @@ RUN apt-get update \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
+# The base image's cuda-compat forward-compat libcuda outranks the host driver
+# in ldconfig order; on hosts whose driver branch that compat userland dropped
+# (Kepler: driver 470 vs compat 520) CUDA then enumerates ZERO devices while
+# nvidia-smi still works. Purge it for builds targeting such hosts.
+ARG PURGE_CUDA_COMPAT=0
+RUN if [ "$PURGE_CUDA_COMPAT" = "1" ]; then rm -rf /usr/local/cuda-*/compat && ldconfig; fi
+
 COPY --from=build /app/lib/ /app
 
 ### Full

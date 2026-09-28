@@ -2016,14 +2016,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    // lanes carrying the skip sentinel are never matched below and keep this default:
+    // the index of an extra all-zero row appended to dst_sorted, so the final gather
+    // writes zeros into them instead of copying sorted row 0's output
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, (int32_t) ne_get_rows);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
     std::vector<int32_t> tokens_per_expert(ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
-    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
+    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), (ne_get_rows + 1)*ne0*ts_dst_sorted);
+    CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr + ne_get_rows*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
@@ -2047,7 +2051,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
     // with skip sentinels fewer rows than lanes are used; the buffers are sized for the
-    // maximum, and rows that stay unused keep the zeros written to dst below
+    // maximum, and skipped lanes gather the zero row at index ne_get_rows
     const int64_t ne_rows_used = (int64_t) ids_to_sorted_host.size();
     GGML_ASSERT(ne_rows_used <= ne_get_rows);
     ids_to_sorted_host.resize(ne_get_rows, 0);

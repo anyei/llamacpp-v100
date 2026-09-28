@@ -99,6 +99,9 @@ ssh anyei@10.5.5.11 'cd ~/server/llama/llamacpp-v100 && \
 #   SUCCESSIVE RPC device names in endpoint order - put the RAM endpoint
 #   first in --rpc if RPC0 must be the 256GB device.
 #   Pulls via 10.5.6.1:5000 (see registry TRAP).
+#   TRAP (2026-09-28): X99 holds ONLY the registry-prefixed tags - a bare
+#   `docker run llamacpp-local-v100:<tag>` there tries Docker Hub (exit 125);
+#   always name `10.5.6.1:5000/llamacpp-local-v100:<tag>` in run/compose.
 
 Verify after recreate: `docker inspect llama-rpc-worker-cpu --format '{{.Config.Image}} {{.Config.Cmd}}'`
 (check image tag, `-p`, `-t`). Workers re-benchmark ~15-20 s before listening.

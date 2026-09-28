@@ -73,7 +73,7 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 | Env | Type | Default | Meaning |
 |---|---|---|---|
 | `LLAMA_MOE_CACHE_RESERVE_MB` | MiB | 3072 (+ draft model size + 512 when a draft model is configured) | VRAM kept free of the cache on its device; a fixed `--moe-cache N` above free-minus-reserve is CLAMPED with a warning, `auto` = free-minus-reserve. |
-| `LLAMA_MOE_CACHE_MAX_BATCH` | count | 8 | Nodes wider than this (prompt processing) stay on the stock path; MTP/ngram verify batches up to 8 use the cache. |
+| `LLAMA_MOE_CACHE_MAX_BATCH` | count | 8 | Nodes wider than this (prompt processing) stay on the stock path; MTP/ngram verify batches up to 8 use the cache. Values at or above `GGML_OP_OFFLOAD_MIN_BATCH` (default 32) are clamped to one below it with a warning: the sched offloads the expert weights of such nodes to the GPU and its used-expert scan cannot see the cache's skip sentinels. |
 | `LLAMA_MOE_CACHE_INSERTS` | count | 2 | Max uploads scheduled per layer per decode step. |
 | `LLAMA_MOE_CACHE_STEP_MB` | MiB | 96 | Max upload bytes scheduled per decode step over all layers (PCIe share of the fill worker). |
 | `LLAMA_MOE_CACHE_HOT_USES` | count | 4 | Slots with more resident hits than this are evicted last (heat halves every 64 steps). |
