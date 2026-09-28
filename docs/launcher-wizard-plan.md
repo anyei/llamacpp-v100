@@ -252,3 +252,28 @@ Remaining polish (none blocking):
   research/wizard-flag-matrix.md), #99 honest load bar, #100 spec badge,
   #101 ncmoe -ts balance, #102 best-defaults audit, #103 per-model worker
   cache folders.
+
+## 9. 2026-09-28 reconcile: gate catalog 125 rows + open UI items
+
+- GATES catalog regenerated from docs/env-gates.md: **125 gates** (95 at #78,
+  116 at the 2026-08-27 reconcile). The 17 rows the generator had been flagging
+  as unclassified since #151 landed (all `LLAMA_MOE_CACHE_*`,
+  `LLAMA_SPEC_PEARL/TREE/DRAFT2/ALT_STATS/DUMP`, `GGML_META_CHUNK_SYNC`,
+  `GGML_META_DEBUG_KVSUM`, `LLAMA_RPC_AUTO_WEIGHT_MIN_SHARE`) now carry the
+  class their doc row states (knobs = tune, instruments = diag); new rows
+  `LLAMA_MMAP_RANDOM` (tune) and `GGML_RPC_REPROVISION_VERIFY` (diag). FLAGS
+  catalog unchanged at 328 (`--moe-cache` was already in it).
+- Open wizard / fleet-UI items filed since #96, none built yet:
+  **#149** drafter matching pairs head files by version token
+  (`mtp-Qwen3.8-27B` matched every Qwen3.8-* target; the width assert at spec
+  init caught it). Server side is fixed (8cd5d4cd7: any `.nextn.` GGUF
+  classifies as an MTP head); the wizard's `draftMatches` remedy (same-dir
+  head first, then exact family, version token only as a whole name segment)
+  is not built. **#147** fleet UI roster misleading for ncmoe + PLE +
+  head-file serves (`n_layers 48` on a GPU that holds attention only, the
+  ~97 GiB PLE table counted as CPU model bytes, the nextn layer counted
+  nowhere). **#151** production shape on this UI = saved config "Flash-Next
+  ncmoe48 + MoE cache 15000 + MTP n3": gateOff `LLAMA_SPEC_DRAFT_NO_PAD` +
+  `GGML_CUDA_DISABLE_GRAPHS` (the MTP-head template adds both, -25% on that
+  serve) and flagCut `--load-mode` (the ncmoe template's `none` costs ~20% on
+  the dual-socket host) - both template defaults are candidates for a change.

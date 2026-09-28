@@ -130,7 +130,7 @@ Reads that generalize:
   curve between the two drafters is monotone, so its value is the live standby
   (under 1 t/s premium over the primary alone), plus per-workload switching.
 
-## 5. Post-guide updates (2026-08-25/26)
+## 5. Post-guide updates (2026-08-25 .. 2026-09-28)
 
 Landed after the sections above were written; the shapes there still hold.
 
@@ -158,3 +158,20 @@ Landed after the sections above were written; the shapes there still hold.
   DRAFT2 standby cost 0.83 t/s on the local V100 but -2 t/s on the X99 1-GPU
   shape, where it was CUT from the stored winner config (ngram-mod + MTP n2).
   Measure the premium on the serving box before keeping the standby.
+- **Head-file MTP drafter** (#143/#149, 2026-08-27): Qwen3.8-Flash-Next
+  (`qwen4exp`) carries no nextn layer in its target GGUF; the converter's
+  `--mtp` exports the head as `mtp-<model>.gguf` (reusing the target's
+  embeddings and lm_head) and it runs as `draft-mtp` via `--model-draft`.
+  The server classifies any GGUF with a `.nextn.` tensor as an MTP head; the
+  spec-init width assert rejects a head from another family (the wizard's
+  version-token matching once paired the 27B head with the Flash-Next target).
+  55-100% acceptance; production n-max 3. Any speculation on this recurrent
+  target takes the rollback snapshots, so weightless drafters (ngram) count
+  too (`rs_rollback` wiring).
+- **MTP + MoE expert cache** (#151, 2026-09-07 .. 09-28): the cache reserve
+  includes the draft model (`LLAMA_MOE_CACHE_RESERVE_MB` default 3072 + draft
+  size + 512) so `auto` no longer starves the drafter; verify batches up to
+  `LLAMA_MOE_CACHE_MAX_BATCH` (8) ride the cache chain. Production Flash-Next
+  shape = cache 15000 + MTP n3 at 32k. On the V100 the cache is safe at any
+  n-max (the 2026-09-27 "n-max <= 3 only" restriction was a Kepler-only
+  generic-gather bug, fixed in e117ee884-widefix).

@@ -16,6 +16,11 @@ memset appended at ladder tail, client gated on server_minor>=15).
 Weekly cadence intended; check `git log --oneline -5 upstream/master`.
 The upstream remote may need re-adding: `git remote add upstream
 https://github.com/ggml-org/llama.cpp.git` (https, not ssh).
+The next merge is a prerequisite for #152 (GLM-5.3 `glm5-next` PR 27773
+reuses Kimi-K3's KDA; the fork was ~934 commits behind on 2026-09-27). Check
+FIRST whether upstream already merged qwen4exp (PR 27742; #28136 PLE prefill =
+the likely #150 fix) and glm5-next - take upstream's files then and re-apply
+the fork deltas listed below instead of weaving the port.
 
 ## Conflict hotspots (fork-heavy files)
 
@@ -28,6 +33,18 @@ name tags — upstream renames of `ffn_moe_topk`/`ffn_moe_weighted` BREAK the
 name-tagged derivations and the profiler; grep for both after merge),
 `src/models/hy-v3.cpp` (LP lambda restructure), `tools/server/*` (router/wizard/
 fleet endpoints), `.devops/*.Dockerfile`.
+
+Added 2026-08..09: `src/models/qwen4exp.cpp` + `src/llama-memory-hybrid-idx.*`
++ `conversion/qwen4exp.py` (port of open PR 27742; fork deltas on top = `--mtp`
+head export, `rs_rollback` for weightless drafters on recurrent targets, the
+`.nextn.` head-file classifier in `tools/server/server-models.cpp`),
+`src/llama-mmap.*` + `src/llama-model.cpp` (`LLAMA_MMAP_RANDOM` gather-table
+advice), `src/llama-moe-cache.*` + the `build_moe_ffn` dual chain in
+`src/llama-graph.cpp` + `src/llama-context.cpp` (cache created after
+`sched_reserve`, MAX_BATCH clamp; #151), `ggml/src/ggml-cuda/ggml-cuda.cu`
+generic `mul_mat_id` (extra zero row for skipped sentinel lanes, #151),
+`ggml/src/ggml-backend.cpp` (sched graph-inputs capacity decoupled from the
+split heuristic, #148), `.devops/cuda.Dockerfile` (`PURGE_CUDA_COMPAT`).
 
 ## Name-tag contract check (easy silent breakage)
 

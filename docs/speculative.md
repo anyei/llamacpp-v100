@@ -127,6 +127,16 @@ See:
 
 - #25173
 
+### MTP head file (`draft-mtp` + `--model-draft`)
+
+`draft-mtp` normally uses the NextN/MTP head carried inside the target GGUF.
+Models whose head is exported separately (Qwen3.8-Flash-Next, `qwen4exp`) pass
+the head file as `--model-draft`: the converter's `--mtp` writes
+`mtp-<model>.gguf` (only the nextn slots; embeddings and lm_head are reused
+from the target), and the server treats any GGUF carrying a `.nextn.` tensor
+as an MTP head. The head must match the target family - spec init asserts on
+the embedding width. Fork specifics: `docs/dual-drafters.md`.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.

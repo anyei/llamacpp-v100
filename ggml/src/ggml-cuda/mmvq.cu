@@ -332,6 +332,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        // sm_70: the dp4a MMQ tile beats the multi-column MMVQ kernel from 6 columns up (TASKS #153)
+        return ne11 <= 5;
+    }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 

@@ -1,7 +1,8 @@
 # Architecture diagrams
 
 Visual companion to [distributed-inference-guide.md](distributed-inference-guide.md),
-[expert-parallel-plan.md](expert-parallel-plan.md) and [ssd-streaming-plan.md](ssd-streaming-plan.md).
+[expert-parallel-plan.md](expert-parallel-plan.md), [ssd-streaming-plan.md](ssd-streaming-plan.md)
+and [moe-cache-plan.md](moe-cache-plan.md).
 Each diagram answers one architectural question; measured numbers are from
 TASKS.md and are V100-fleet-specific (your hardware will differ, the *shapes* won't).
 GitHub renders the mermaid blocks natively.
@@ -14,7 +15,7 @@ The first question is always capacity: where do the weights fit?
 flowchart TD
     A{"model fits one box's VRAM?"} -->|yes| B["single box, -sm tensor or -sm layer<br/>(fastest: 35B on 2xV100 = 108 t/s;<br/>never distribute what fits - law #31.1)"]
     A -->|no| C{"fits VRAM + RAM of one box?"}
-    C -->|yes| D["-ngl 99 -ncmoe: experts in CPU RAM<br/>(V4 87GB on 46GB RAM box = 3.54 t/s<br/>with NVMe paging behind it)"]
+    C -->|yes| D["-ngl 99 -ncmoe: experts in CPU RAM<br/>(V4 87GB on 46GB RAM box = 3.54 t/s<br/>with NVMe paging behind it)<br/>+ --moe-cache N when VRAM is left over:<br/>hot experts in VRAM slots (diagram 10,<br/>Flash-Next 1xV100 +23-38% decode)"]
     C -->|no| E{"fits the fleet's pooled RAM+VRAM?"}
     E -->|yes| F["fleet: -sm layer + --rpc-auto-weight<br/>(V4 fewer-boxes run = 4.6 t/s)<br/>or EP -sm tensor for MoE batching"]
     E -->|no| G["--ssd-streaming: expert cache<br/>over NVMe (runnability, 1.5-3 t/s)<br/>or grow the fleet"]
@@ -285,6 +286,14 @@ of which plug into the same draft -> one-batch-verify round:
   even confidence-gated — off in production, lane parked. (PEARL
   post-verify draft-ahead, #108, is likewise built but excluded for feature
   drafters and off by default.)
+- **Head-file MTP drafters** (#143/#149, 2026-08-27): a model whose MTP head
+  is not carried in its target GGUF (Qwen3.8-Flash-Next) still runs
+  `draft-mtp` - the converter's `--mtp` exports the head as `mtp-<model>.gguf`
+  (reusing the target's embeddings and lm_head), passed as `--model-draft`.
+  The server classifies any GGUF carrying a `.nextn.` tensor as an MTP head,
+  and the width assert at spec init rejects a head from another family (the
+  wizard's version-token matching once cross-paired the 27B head, #149).
+  Flash-Next: 55-100% acceptance, `n-max 3` in production.
 
 ## 8. TP island (worker-side tensor parallel)
 
@@ -318,3 +327,48 @@ flowchart TD
 Hit rates beat projections (73% at 30 GB cache for V4-class routing skew);
 the regime is IO-bound runnability, not speed — the fleet (diagram 1) is the
 faster answer whenever pooled RAM exists.
+
+## 10. MoE expert cache (`--moe-cache`, single box, #151)
+
+For MoE models that fit VRAM + RAM (`-ngl 99 -ncmoe N`) with VRAM to spare:
+the hottest CPU-resident routed experts get VRAM slots and a second GPU
+`mul_mat_id` chain; the stock CPU chain keeps computing the misses. The two
+chains split every token's k experts through one skip sentinel (negative id),
+so a miss is never fetched on the current token's path - the law all three
+2026 forks converged on (docs/moe-cache-plan.md section 3).
+
+```mermaid
+flowchart TD
+    R["router top-k ids<br/>(GPU, as today)"] --> T["slot_ids = get_rows(dev_table, ids)<br/>(-1 = not resident)"]
+    T --> G["GPU chain: mmid(up_c/gate_c/down_c, slot_ids)<br/>sentinel lanes skipped, rows pre-zeroed"]
+    R --> C["CPU chain: stock host experts<br/>src[3] = host_table -> resident ids skipped"]
+    G --> A["experts = add(down_cpu, down_gpu)"]
+    C --> A
+    C -.->|"misses seen this step"| Q["per-layer miss list"]
+    Q --> P["between decodes: admission + LRU/heat victims,<br/>publish both tables, enqueue {layer, expert, slot}"]
+    P --> W["fill worker per device<br/>(bounded: INSERTS per layer, STEP_MB per step)"]
+    W -.->|"slot ready next step"| T
+```
+
+- **Static graph**: only buffer contents (tables, slots) change between
+  decodes, so the decode-graph cache and CUDA graphs are untouched. Nodes
+  wider than `LLAMA_MOE_CACHE_MAX_BATCH` (default 8; clamped below the sched's
+  `GGML_OP_OFFLOAD_MIN_BATCH` width) stay on the stock path - prompt
+  processing never pollutes the tables.
+- **Budget**: `--moe-cache N` MiB split evenly over cached layers, clamped to
+  free VRAM minus `LLAMA_MOE_CACHE_RESERVE_MB` (3072 + the draft model when
+  one is configured). Flash-Next on one V100: 15000 at 32k ctx, ~11000 at
+  262k; an oversized N used to OOM the first request, since 151b it clamps
+  with a warning.
+- **Measured** (Flash-Next, `-ncmoe 48`, X99 V100): +20-25% at 12000 MiB (hit
+  67%), +30-38% at 18000 (hit 75%); Qwen3.6-35B-A3B regate 2026-09-28 +23%
+  mean decode at 6000 (hit 83%). Production shape = cache 15000 + MTP n3 +
+  mmap (`--load-mode none` costs ~20% on the dual-socket host).
+- **Quality**: the cache logic is bit-exact (CPU-pool control 0.000000 KLD);
+  GPU legs sit ~0.005 KLD / 97% same-top from a CPU base = GPU-vs-CPU
+  arithmetic on the cached lanes, inside the batch-width band.
+- **Pre-Turing trap (fixed)**: the generic CUDA `mul_mat_id` gather copied
+  sorted row 0 into skipped lanes (KLD 1.4 at width 8 on a K80); fixed with
+  an extra zero row (image e117ee884-widefix). Volta runs MMQ-id below width
+  64 and was never exposed; the fix matters on Kepler, f16 experts, or
+  FORCE_CUBLAS builds.

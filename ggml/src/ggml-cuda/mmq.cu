@@ -330,6 +330,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        if (cc == GGML_CUDA_CC_VOLTA) {
+            // sm_70: dp4a MMQ saturates near 410 tok/s on a 27B but the dequant + cuBLAS route only
+            // passes it above ~160 columns (TASKS #153), not at MMQ_DP4A_MAX_BATCH_SIZE
+            return ne11 < 160;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 

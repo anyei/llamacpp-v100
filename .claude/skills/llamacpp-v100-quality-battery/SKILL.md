@@ -75,6 +75,21 @@ Verdict: EP/meta/wire stages add ~0.007 KLD over fork baseline = quality-neutral
 (no meta code in path) — kernel-level, V100 FA path prime suspect; PPL-neutral.
 Instrument: rerun the pair with `-fa off` both legs.
 
+## Reference numbers (#151 MoE-cache batteries, 2026-09-27/28, Qwen3.6-35B-A3B Q4_K_XL, base = cache off `-ub 16`)
+
+| Leg | mean KLD | top-1 | note |
+|---|---|---|---|
+| cache on, decode width 1 (K80 and V100) | probes 17/17 both arms | — | speed neutral on the K80 (no dp4a), +23% mean on the V100 (hit 83%) |
+| cache on, widths 4/8/16 (V100) | 0.0053-0.0061 | 97.1-97.3% | inside the cache-OFF width controls (0.0055-0.0056) |
+| cache on, widths 8/16 (K80, PRE-fix) | 1.39 / 1.73 | 57% / 53% | the generic `mul_mat_id` gather bug (structural) |
+| cache on, widths 8/16 (K80, e117ee884-widefix) | 0.0052 / 0.0045 | 97.5% / 97.4% | fixed |
+| CPU-pool control (`-ngl 0`, `FORCE_CPU`, width 16, own CPU base) | 0.000000 (max 5.3e-5) | 100% | the cache logic is bit-exact |
+
+Reading: ~0.005 KLD / ~97% top-1 against a CPU base is the batch-width floor on
+these GPUs (GPU-vs-CPU arithmetic on the cached 25% of lanes), NOT damage;
+anything near 1.0 is structural. Protocol + kits: TASKS #151,
+docs/moe-cache-plan.md 12.12-12.14, `llama.cpp-work/151-kepler/`, `151-v100/`.
+
 ## Kept assets
 
 - Upstream base: `/work/v4kl-upstream-base.dat` (keeper, 16×512, upstream c8e03ce81)
@@ -102,6 +117,13 @@ Instrument: rerun the pair with `-fa off` both legs.
    the gate was exercised.
 6. GPU legs need the serving GPUs free — coordinate the production serve
    window (unload → battery → relaunch with the exact captured args/env).
+7. K80 `-ub 512` PPL is non-deterministic run-to-run (the sched's >=32-token
+   expert-offload path); use `-ub 16` for byte/KL legs on pre-Turing GPUs.
+8. V100 KL legs take 1-2 min each (16x512, experts on 40 threads; whole
+   battery ~20 min) - stage the model in X99 tmpfs (`/dev/shm`, 126 GB; a
+   22.9 GB scp over the 10G takes ~50 s) and delete it after.
+9. The host python has no numpy (`gguf_dump` fails) - read GGUF headers with a
+   numpy-free scratch script.
 
 ## Extensions not yet run (for the "EP has something weird at scale" claim)
 

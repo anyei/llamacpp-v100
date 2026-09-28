@@ -42,8 +42,8 @@ docs/expert-placement-plan.md (#75 skip sentinel + remap tables, reused here).
 
 The user built `local/llama.cpp:turboquant` (TheTom fork, `feature/turboquant-kv-cache` @
 407f3237b, 2026-09-06) on the X99 and launched Flash-Next with `--moe-cache 18000 --fit on -ngl
-auto --no-mmap --spec-draft-model mtp-...` (compose at
-/home/anyei/server/services/llama-cpp-turboquant). The container died in a restart loop and
+auto --no-mmap --spec-draft-model mtp-...` (compose in the
+user's turboquant service dir on the coordinator). The container died in a restart loop and
 was stopped (exit 137 = docker stop). From its log, two problems, neither of them the cache
 mechanism itself (2 and 3 are one causal chain):
 
@@ -493,7 +493,7 @@ keep the 3 GiB reserve: KV (q8_0/turbo3) took ~2.6 GiB in their log, fine.
 
 1. **Targets, in order: Qwen3.8-Flash-Next -> Ling-3.0-flash -> GLM-5.2.**
    - Flash-Next: section 4 geometry (71.7 GiB experts, 3.1-3.6 MB/expert, ~1.5 GB/token).
-   - Ling-3.0-flash Q4_K_M (X99 `/home/anyei/server/models/Ling-3.0-flash/Ling-3.0-flash/`, 2 shards,
+   - Ling-3.0-flash Q4_K_M (X99 `$MODELS_DIR/Ling-3.0-flash/Ling-3.0-flash/`, 2 shards,
      72.4 GiB): arch bailingmoe3, 43 blocks (2 leading dense = 41 MoE), 512 experts, top-8 with
      GROUP routing (8 groups, 4 used), sigmoid gating (func 2), expert_weights_scale 2.5 + norm,
      1 shared expert, n_embd 2560, n_ff_exp 768. Per expert: gate/up Q4_K 1.11 MB each + down Q6_K
@@ -501,7 +501,7 @@ keep the 3 GiB reserve: KV (q8_0/turbo3) took ~2.6 GiB in their log, fine.
      Flash-Next (slightly bigger experts, fewer per token). Design note: the group top-k runs
      BEFORE `selected_experts` in `build_moe_ffn`, so the dual-chain hook (which starts at
      `selected_experts`) is unaffected; the weights scale/norm apply after the down sum as today.
-   - GLM-5.2: only the UD-Q4_K_XL set exists locally (coordinator `/mnt/files/GLM-5.2`, 11 shards,
+   - GLM-5.2: only the UD-Q4_K_XL set exists locally (coordinator `$MODELS_DIR/GLM-5.2`, 11 shards,
      ~436 GB) - it does NOT fit the X99's 251 GB RAM. The X99 vehicle is the Q2_K_XL (227 GB,
      used for Task 15/#55 streaming; recopy needed) or the SSD tier. Biggest expert share per
      token of the three (TheTom: 209 GiB experts at IQ2_M, 14.5 -> 28 t/s with MTP on 4x3090),
@@ -714,7 +714,7 @@ the V100 gate compares text and PPL, not bytes.
 
 ### 12.3 V100 gate round 1 (X99, Flash-Next, 2026-09-07): correct, coherent, throttled
 
-Dev sm_70 bins shipped to the X99 (`/home/anyei/devbins151`, run inside the launcher image
+Dev sm_70 bins shipped to the X99 (its `devbins151` dir, run inside the launcher image
 with `--entrypoint`), user's turboquant serve paused for the window and restarted after.
 Config: `-ngl 99 -ncmoe 48 -c 4096 -fa on -t 24`, mmap default, 3 prompts x 96 greedy tokens
 (chat, thinking off).
@@ -789,7 +789,7 @@ at startup when the cache is on.
 
 Reproduction kit (session scratchpad, not in the tree): `gate151.sh` (CPU byte gate: base
 `-nr` vs cache legs on Qwen3.6-35B-A3B at `-ngl 0`), `x99_gate.sh` / `x99_gate2.sh` (V100 legs
-with the dev bins in `/home/anyei/devbins151` on the X99 run via `--entrypoint` inside the
+with the dev bins in the X99's `devbins151` dir run via `--entrypoint` inside the
 launcher image; pauses and restores the user's turboquant container), `x99_probe.py`.
 
 ### 12.7 V100 gate round 4 - cache + MTP drafter (2026-09-07)
@@ -817,7 +817,7 @@ Image `llamacpp-local-v100:58dacccec-151` (working tree at HEAD 58dacccec + the 
 registry; local tags pruned to current + rollback `41506e100`. X99: pulled the exact tag, the
 turboquant container `llama-tq-backend` stopped with its restart policy set to `no` (start it
 again with `docker start llama-tq-backend` if wanted), `llama-launcher` recreated on the new
-image (compose in /home/anyei/server/services/llamacpp-v100, host network, :8399, cache volume
+image (the launcher compose in the `llamacpp-v100` service dir, host network, :8399, cache volume
 intact, 18 models scanned, health ok, wizard served). Serve loaded through
 `POST /models/load` for `Qwen3.8-Flash-Next-UD-Q4_K_XL` with
 `-ngl 99 -ncmoe 48 -c 32768 -fa on -t 40 --moe-cache 14000 --spec-type draft-mtp

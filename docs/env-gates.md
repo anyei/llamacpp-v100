@@ -60,7 +60,7 @@ Composes with the CPU tier above (RAM becomes the L2 victim tier).
 | `LLAMA_SSD_STREAM_VRAM_POOLS` | count | auto | Override the number of expert-slice classes the budget is split across. **Auto-detected** from the model (e.g. 2 for DeepSeek-V4, 4 for mixed-quant UD Qwen); only set this to override. |
 | `LLAMA_SSD_STREAM_GPU_SLRU` | bool | on | Segmented-LRU (scan resistance) for the VRAM slot cache; `=0` forces plain LRU. (Measured neutral for DeepSeek; may help more-skewed models.) |
 | `LLAMA_SSD_STREAM_GPU_PROTECTED_PCT` | 0-100 | 80 | Protected-segment size for the VRAM SLRU. |
-| `GGML_OP_OFFLOAD_MIN_BATCH` | count | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload to the GPU. **Not needed for GPU landing** - streamed-expert matmuls auto-offload at batch-1 when `LLAMA_SSD_STREAM_GPU=1`. |
+| `GGML_OP_OFFLOAD_MIN_BATCH` | count | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload to the GPU. **Not needed for GPU landing** - streamed-expert matmuls auto-offload at batch-1 when `LLAMA_SSD_STREAM_GPU=1`. The MoE expert cache (2b) clamps `LLAMA_MOE_CACHE_MAX_BATCH` to one below this width. |
 
 ## 2b. MoE expert cache (TASKS #151, docs/moe-cache-plan.md)
 
@@ -77,10 +77,16 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 | `LLAMA_MOE_CACHE_INSERTS` | count | 2 | Max uploads scheduled per layer per decode step. |
 | `LLAMA_MOE_CACHE_STEP_MB` | MiB | 96 | Max upload bytes scheduled per decode step over all layers (PCIe share of the fill worker). |
 | `LLAMA_MOE_CACHE_HOT_USES` | count | 4 | Slots with more resident hits than this are evicted last (heat halves every 64 steps). |
-| `LLAMA_MOE_CACHE_STATS` | count | 0 | Log `moe-cache: step N hit/fills/evict/resident` every N steps (INFO, needs `-v`/`-lv`). |
+| `LLAMA_MOE_CACHE_STATS` | count | 0 | Log `moe-cache: step N hit/fills/evict/resident` every N steps (libllama INFO: `-v`, or `-lv 4` on llama-server - `-lv 3` shows tool-level info only). |
 | `LLAMA_MOE_CACHE_STATIC` | count | 0 | Gate instrument: pre-fill experts [0, N) of every layer at create. |
 | `LLAMA_MOE_CACHE_FORCE_CPU` | bool | off | Gate instrument: allocate the pools on the host buffer type (CPU-only byte-identity wiring gate). |
 | `LLAMA_MOE_CACHE_DEBUG` | bool | off | Per-layer eligibility reasons and pool sizes at create; counters at teardown. |
+
+## 2c. Model loading (mmap)
+
+| Env | Type | Default | Meaning |
+|---|---|---|---|
+| `LLAMA_MMAP_RANDOM` | off / `1` / `drop` | off | **(#143)** After load, advise the model's gather tables (today: the `qwen4exp` per-layer-embedding table, ~97 GiB on Qwen3.8-Flash-Next) for random access (`MADV_RANDOM`) and skip the loader's eager pull-in for those ranges only; `drop` additionally releases the pages the load touched (`MADV_DONTNEED`). Sparse gathers then prefetch their rows in a batch (not separately switchable: `MADV_RANDOM` disables kernel readahead and the gather runs 2.6x slower without the batch). Off by default because the hints cost a large cold-prefill slowdown on models whose host tensors are read sequentially. `=0` / empty = off. One INFO line per advised tensor. |
 
 ## 3. Speculative decoding / MTP (tasks 1, 20)
 
@@ -186,6 +192,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_FLEET_KV_RESERVE_MB` | MiB | 20480 | Headroom the capacity gate adds on top of the model weight bytes (KV + compute buffers + fragmentation margin). |
 | `LLAMA_FLEET_LOCAL_BENCH` | bool | on | (server, TASKS #136) The #131b load-time local-device bench (same matmul bench the workers run for `--score`; fills the `/fleet/status` score column for local devices). `=0` disables it. Even when on, a device reporting < 192 MiB free is auto-skipped (another serve may hold it near-full), and the bench runs behind scoped CUDA error containment: a failed bench costs only its score row, never the load. |
 | `LLAMA_RPC_NO_SURGICAL` | bool | off (surgical ON) | With `--rpc-reload`: disable the surgical re-provision (returned worker's share replayed from its own cache, ~2min for a 48GB share vs ~10+min reload; falls back to the reload on any failure) and always do the full in-process reload. `LLAMA_RPC_SURGICAL_WAIT_S` (120) = how long to wait for a dead endpoint to return; `GGML_RPC_JOURNAL_MAX_MIB` (4096) = small-write spill cap; `GGML_RPC_REPROVISION_VERIFY=1` = read back and hash-verify every replayed region. |
+| `GGML_RPC_REPROVISION_VERIFY` | presence | off | Surgical re-provision diagnostic: after replaying a worker's set-tensor journal, read every replayed region back and compare hashes (adds a full read of the share). PRESENCE-gated (`=0` is ON); measurement-only. |
 | `LLAMA_ARG_RPC_RELOAD` | bool | off | (= `--rpc-reload`, server only) On RPC worker loss: fail in-flight requests, then reload the model IN-PROCESS across the workers reachable at that moment (dead workers drop with their positional `-ts` shares; a returned worker is re-included by the next failure-triggered reload; all-dead degrades to local-only loudly; a load that fails - fleet-sized models - retries every 10s). Default off = #29b behavior: exit 42 for the restart policy. |
 | `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | bool | off | (= `--rpc-skip-unavailable`) Drop unreachable `--rpc` servers with a warning and split the model across the remaining devices, instead of exiting with an error. Load-time; a worker dying mid-session is handled separately (29b: requests error cleanly, server exits for restart+rediscovery). |
 | `LLAMA_ARG_RPC_DISCOVER` | bool | off | (= `--rpc-discover`) Discover RPC workers announcing themselves on the LAN (`rpc-server --announce`) and use them; composes with `--rpc`, duplicates skipped. Trusted networks only. |

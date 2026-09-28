@@ -1,6 +1,6 @@
 ---
 name: llamacpp-v100-fleet-serve
-description: Launch, watch, and stop the llamacpp-v100 true-parallel-inference fleet serves (hy3 record roster and DeepSeek-V4-Flash production shapes) - env gate stacks, load-time expectations, stale-manifest wedge handling, and health-watcher patterns. Use when starting/stopping any fleet serve or diagnosing a load that will not come up.
+description: Launch, watch, and stop the llamacpp-v100 true-parallel-inference fleet serves (hy3 record roster, DeepSeek-V4-Flash production shapes, and the single-box Qwen3.8-Flash-Next MoE-cache + MTP shape) - env gate stacks, load-time expectations, stale-manifest wedge handling, and health-watcher patterns. Use when starting/stopping any fleet serve or diagnosing a load that will not come up.
 ---
 
 # Fleet serves: launch, watch, recover
@@ -39,6 +39,23 @@ as a NON-owner expert member (`n_local > n_owners` + `ALLOW_MULTI_LOCAL`) CRASHE
 at first decode on V4 (ret -3, bug filed) — don't use that shape. Lean rosters
 beat wide ones (every member adds gather legs; dropping .15 GAINED throughput).
 `-np 2` is production default: no idle-stream penalty, +40% aggregate under load.
+
+**Flash-Next single-box production shape** (X99 launcher, 1x V100, #151,
+measured 2026-09-07..28): `-ngl 99 -ncmoe 48 -c 32768 -fa on -t 40
+--moe-cache 15000 --spec-type draft-mtp --model-draft
+/models/Qwen3.8-FLash-Next/mtp-Qwen3.8-Flash-Next-Mtp-Q8_0.gguf -ngld 99
+--spec-draft-n-max 3 --cache-reuse 256` + env `LLAMA_MOE_CACHE_STATS=200`,
+mmap (NOT `--load-mode none`: -20% on the dual-socket host), and the wizard
+MTP-head template's `LLAMA_SPEC_DRAFT_NO_PAD=1` / `GGML_CUDA_DISABLE_GRAPHS=1`
+turned OFF (-25% with them). 28-39 t/s warm short prompts, 28.3 GiB at rest,
+acceptance 82-100%. Saved wizard config "Flash-Next ncmoe48 + MoE cache 15000
++ MTP n3". **Budget rule**: 32k ctx -> 15000, 262k -> ~11000 (17000 OOMs the
+first long request); since image 58dacccec-151b an oversized N is clamped to
+free-minus-reserve with a WARN. Cache counters need `-lv 4` (or `-v`).
+**Before ANY unload/relaunch of a launcher serve, check the child's `/slots`
+for `is_processing`** - an unload killed a user's 6000-token generation.
+Images: `:latest` = e117ee884-widefix (2026-09-28); older images lack the
+MAX_BATCH clamp (keep `LLAMA_MOE_CACHE_MAX_BATCH` <= 31 there).
 
 ## Gate stacks
 

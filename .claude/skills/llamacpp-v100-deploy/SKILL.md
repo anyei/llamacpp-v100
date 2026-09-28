@@ -22,6 +22,9 @@ check `git status` first; uncommitted changes ship.
 must pass before any coordinator image build — a stale FLAGS catalog vs arg.cpp
 fails the build here, not silently in the shipped wizard. On drift: run the
 generator, `cp tools/ui/static/wizard.html tools/ui/dist/wizard.html`, commit.
+After any `docs/env-gates.md` edit also run `python3 scripts/gen-wizard-gates.py`
+(GATES catalog, same file + same cp); it WARNs on rows missing from its CLASS
+map - add them, an unclassified row ships as "diag (unclassified)".
 
 ```bash
 nohup docker build -f .devops/cuda.Dockerfile --target server \
@@ -34,6 +37,26 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
 - Verify features in the built image before rolling:
   `docker run --rm --entrypoint bash <img> -c 'grep -l GGML_RPC_WIRE_Q8 /app/libggml-rpc.so'`
   (the `libcuda.so.1` error without `--gpus` is expected noise).
+
+## Kepler (sm_37, K80 box) image variant
+
+```bash
+nohup docker build -f .devops/cuda.Dockerfile --target server \
+  --build-arg CUDA_VERSION=11.8.0 --build-arg UBUNTU_VERSION=22.04 --build-arg GCC_VERSION=11 \
+  --build-arg CUDA_DOCKER_ARCH=37 --build-arg PURGE_CUDA_COMPAT=1 \
+  -t llamacpp-local-v100:$(git rev-parse --short HEAD)-kepler . > /tmp/build-kepler.log 2>&1 & disown
+```
+- ~7 min, 5.1 GB. `PURGE_CUDA_COMPAT=1` removes the base image's cuda-compat
+  libcuda: it outranks the host driver in ldconfig order and on driver 470
+  (K80) CUDA then enumerates ZERO devices while nvidia-smi still works.
+- Alias `:kepler` (local + registry) mirrors `:latest` for the K80 box; the
+  local K80 launcher runs `llamacpp-local-v100:<sha>-kepler` with `MODELS_DIR`
+  re-passed (compose reverts it otherwise). The worker image needs no Kepler
+  variant. The harness classifies launcher recreates as production deploys -
+  expect one denial, re-run after the user's explicit go.
+- State 2026-09-28: `:latest` = e117ee884-widefix, `:kepler` =
+  e117ee884-widefix-kepler (rollbacks 58dacccec-151b / e117ee884-kepler).
+  cc 3.7 has no dp4a: the MoE cache is speed-neutral there (correctness only).
 
 ## Registry (10.5.5.1:5000)
 
@@ -136,3 +159,8 @@ so a serve picks up changes after `cmake --build /work/build-cuda75`, no image
 rebuild needed. Images matter for: the launcher/wizard, compose-based production
 serves, and worker boxes. Rebuild the image when server/common/UI changes should
 reach those.
+Gate legs on the X99 without an image build: ship `build-cuda75/bin` there
+(the `devbins151` pattern) and run inside the launcher image with
+`-v <devbins dir>:/devbins:ro -e LD_LIBRARY_PATH=/devbins --entrypoint
+/devbins/llama-perplexity` - dev libs == image libs on the stock path was
+verified 0.000000 KLD (moe-cache-plan 12.14).

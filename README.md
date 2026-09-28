@@ -132,6 +132,21 @@ them is V100-specific.
   `LLAMA_SPEC_ADAPTIVE=1`) — caps each draft round near the measured acceptance
   EMA to skip cold draft passes. Measured tg-neutral on the MTP config here (the
   confidence gate already captures the value), so it ships **off by default**.
+- **MoE expert cache** (`src/llama-moe-cache`, `--moe-cache off|N|auto`,
+  TASKS #151) — for `-ncmoe` serves, the hottest CPU-resident routed experts
+  are kept in per-layer VRAM slot pools; a second GPU `mul_mat_id` chain
+  computes the cached lanes while the stock CPU chain computes the misses
+  (skip sentinel), and a miss is never fetched on the current token's path.
+  Async fill worker, LRU + heat eviction, budget clamped to free VRAM minus a
+  reserve. Measured on Qwen3.8-Flash-Next, 1x V100: +23-38% decode at 12-18 GB
+  of slots, quality inside the batch-width noise floor. Design + gate log:
+  [`docs/moe-cache-plan.md`](docs/moe-cache-plan.md).
+- **Qwen3.8-Flash-Next (`qwen4exp`) support** (`src/models/qwen4exp.cpp`,
+  port of upstream PR 27742 audited against the transformers reference,
+  TASKS #143) — GDN + QSA + per-layer embeddings (PLE) + hyper-connections +
+  MRoPE; the converter's `--mtp` exports the MTP head as its own GGUF for
+  `draft-mtp`, and `LLAMA_MMAP_RANDOM=1` advises the ~97 GiB PLE gather
+  table for random access instead of pulling it in at load.
 - **Robustness fixes** — clean failure on unreachable `--rpc` endpoints (was a
   silent CPU fallback), on failed context/lora init (was a null-pointer crash),
   and a lora-path double-free.
@@ -310,6 +325,15 @@ containment/fault-injection knobs):
 | `LLAMA_SSD_STREAM_GPU_NO_RECLAIM` | off | Kill-switch for the `input_cpy` VRAM reclaim (default shrinks the dead-weight copy). |
 | `GGML_OP_OFFLOAD_MIN_BATCH` | 32 | *(upstream)* Min tokens for a `MUL_MAT_ID` to offload; not needed with GPU landing (auto-offloads at batch-1). |
 
+**MoE expert cache** (hot CPU-resident experts in spare VRAM; `-ncmoe` serves)
+
+| Env gate / flag | Default | What it does |
+|---|---|---|
+| `--moe-cache off\|N\|auto` *(flag)* | off | VRAM budget (MiB) for the expert slot pools; forces `--no-repack`. Env alias `LLAMA_ARG_MOE_CACHE`. |
+| `LLAMA_MOE_CACHE_RESERVE_MB` | 3072 (+ draft model) | VRAM kept free of the cache; an oversized fixed budget is clamped with a warning. |
+| `LLAMA_MOE_CACHE_MAX_BATCH` | 8 | Widest node the cache chain owns (MTP/ngram verify batches); clamped below `GGML_OP_OFFLOAD_MIN_BATCH`. |
+| `LLAMA_MOE_CACHE_STATS` | 0 | Log hit/fill/evict/resident counters every N steps (libllama INFO: `-v`, or `-lv 4` on the server). |
+
 **Speculative decoding / MTP**
 
 | Env gate | Default | What it does |
@@ -377,6 +401,12 @@ containment/fault-injection knobs):
 | [`docs/ssd-streaming-plan.md`](docs/ssd-streaming-plan.md) | SSD streaming: design, measured results, CPU + GPU-landing tiers (task 15) |
 | [`docs/env-gates.md`](docs/env-gates.md) | every fork env gate + CLI flag, grouped, with usage examples |
 | [`docs/dev-workflow.md`](docs/dev-workflow.md) | the dev image, how runs/tests are done, correctness gates, the iterative loop |
+| [`docs/moe-cache-plan.md`](docs/moe-cache-plan.md) | MoE expert cache: fork survey, dual-chain design, build log + V100/Kepler gates (task 151) |
+| [`docs/dual-drafters.md`](docs/dual-drafters.md) | speculative drafter roster, dual-drafter dispatch, measured sweet spots (#132-#142) |
+| [`docs/launcher-wizard-plan.md`](docs/launcher-wizard-plan.md) | the launch wizard / router UI: design, gate + flag catalogs, increments |
+| [`docs/parallel-decoding-plan.md`](docs/parallel-decoding-plan.md) | parallel decoding design (task 127) |
+| [`docs/fill-the-bubble-plan.md`](docs/fill-the-bubble-plan.md), [`lp-pair-fusion-plan.md`](docs/lp-pair-fusion-plan.md), [`hot-expert-replication-plan.md`](docs/hot-expert-replication-plan.md) | the three task-71 boundary-cost escape lanes (closed, with the measured negatives) |
+| [`research/`](research/) | code reviews, port audits, and engine surveys (qwen4exp port audit, ninfer-v100 survey) |
 | [`REBUILD-IMAGE.md`](REBUILD-IMAGE.md) | building the production Docker image |
 | [`TASKS.md`](TASKS.md) | full task history with measurements and open items |
 

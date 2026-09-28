@@ -14,6 +14,7 @@ description: Develop and gate changes for the llamacpp-v100 fork (true-parallel-
 | Dev container | `llama-devcuda` (long-running; `docker exec` into it). GPUs visible. `fuser` is NOT installed. |
 | Loopback gate scripts | `/work/71-*.sh` (host: `llama.cpp-work/71-*.sh`) |
 | Trunc test vehicle | `/work/hy3-trunc5-mtp.gguf` + `--override-kv hy_v3.block_count=int:5` + env `LLAMA_TRUNC_ARR=1` (reports n_layer **4** to placement validation, not 5) |
+| MoE-cache battery kits (#151) | `llama.cpp-work/151-kepler/`, `151-v100/` (pre/post/serve.sh + probes.py, `mb-gate.sh`); vehicle `/work/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` |
 
 ## Build commands
 
@@ -88,6 +89,9 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
 1. **`pkill -f` self-kill**: a `docker exec bash -c` whose cmdline mentions the
    pattern kills its own shell (exit 143). Use `pkill -x <name>` or kill by PID.
    `fuser` does not exist in llama-devcuda.
+   Same over ssh or in a chained command: `pkill -f PATTERN` kills any shell
+   whose own command line contains PATTERN - anchor it (`^bash \./x\.sh$`)
+   and never put the restart command in the same invocation.
 2. **Port squatters**: stale servers from earlier runs hold 8199/50901-3 and serve
    your curls with the OLD binary — results look like "my change did nothing".
    Before trusting a null: `pgrep -a -x llama-server` and check the cmdline.
@@ -113,6 +117,13 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
    (the member arena ignores FLAG_OUTPUT). Capture values at compute time via the
    eval-callback pattern (`llama_expert_profile_cb` / `llama_zl_ids_cb` in
    `src/llama-context.cpp`) and hand them over via a registry.
+9. **Log levels on llama-server**: fork backend/libllama INFO lines (loader,
+   moe-cache counters) need `-lv 4`; `-lv 3` shows tool-level info only,
+   `-lv 1` = errors. Trap 5's `-v` is the same maximum.
+10. **A `| tail` after a gate masks its exit code** - chain the build on the
+   gate's own status (`gate && build`), never `gate | tail -3; build`.
+11. **Editing a running bash script is unsafe** (bash reads it incrementally):
+   chain new work in a NEW file that waits on the previous log's DONE marker.
 
 ## Gate ledger discipline
 
