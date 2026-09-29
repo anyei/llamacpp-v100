@@ -235,6 +235,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 |---|---|---|---|
 | `GGML_CUDA_FA_NO_MMA` | bool | off | Never select the MMA FlashAttention kernel (tile/vec instead). For devices that pass the cc gate but can't run it — GTX 16xx (TU116/117) is cc 7.5 without tensor cores. Set on the affected *worker*; without it the first failure self-heals per device (WARN + tile fallback) instead of aborting. |
 | `GGML_CUDA_FA_MMA_FORCE_SMEM_FAIL` | bool | off | Fault injection: pretend the MMA kernel's shared-memory opt-in failed, to exercise the fallback path on healthy hardware. |
+| `GGML_CUDA_FA_NO_VOLTA_SMALL` | bool | off | (#153 T3) Route the decode/verify attention shapes (Q rows <= 8, head 64/128/256, f16 or q8_0 KV) back to the tile/vec kernels instead of the Volta small-M tensor-core kernel (`fattn-mma-volta-small.cuh`). Same-binary A/B knob; serve-safe either way. |
 
 ## 9. Instrumentation & debug
 

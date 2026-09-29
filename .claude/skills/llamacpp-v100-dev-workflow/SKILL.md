@@ -124,6 +124,16 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
    gate's own status (`gate && build`), never `gate | tail -3; build`.
 11. **Editing a running bash script is unsafe** (bash reads it incrementally):
    chain new work in a NEW file that waits on the previous log's DONE marker.
+12. **Volta warp-level instructions under lane-dependent branches deadlock**
+   (#153 T3): `mma.sync.aligned` and `__shfl_sync` need all 32 lanes in
+   convergence - a quadpair that "has nothing to do" must still issue the same
+   instructions on dummy data. The symptom is a silent 100 %-GPU hang, and a
+   block-buffered test-backend-ops log points at the WRONG case: run oracles
+   with `docker run -t` (line-buffered) and reproduce with `-p <regex>` filters.
+13. **`timeout N docker run ...` kills only the client**: the container keeps the
+   GPU; `docker rm -f <name>` it. Kernel-layout facts are cheap to PROBE on the
+   V100 before writing a kernel (`153-p0/t3probe/probe.cu` pattern: nvcc in
+   llama-devcuda, run inside the image on the X99).
 
 ## Gate ledger discipline
 

@@ -54,8 +54,13 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
   re-passed (compose reverts it otherwise). The worker image needs no Kepler
   variant. The harness classifies launcher recreates as production deploys -
   expect one denial, re-run after the user's explicit go.
-- State 2026-09-28: `:latest` = e117ee884-widefix, `:kepler` =
-  e117ee884-widefix-kepler (rollbacks 58dacccec-151b / e117ee884-kepler).
+- State 2026-09-29: `:latest` = a9885783c-t3k2 (the T3 Volta attention kernel + the
+  wizard shard-set grid fix on the a9885783c tree; rollback a9885783c-t3k), `:kepler` = e117ee884-widefix-kepler
+  (rollback e117ee884-kepler; the T3 kernel is Volta-only, no Kepler rebuild).
+  Suffixed tags (`<sha>-t3k`, `<sha>-widefix`) = built from a working tree the
+  user had not committed yet; the X99 launcher compose lives in
+  `/home/anyei/server/services/llamacpp-v100/` (defaults match the running
+  config, only `COORD_IMAGE` needs pinning).
   cc 3.7 has no dp4a: the MoE cache is speed-neutral there (correctness only).
 
 ## Registry (10.5.5.1:5000)

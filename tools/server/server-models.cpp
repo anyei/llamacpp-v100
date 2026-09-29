@@ -224,19 +224,46 @@ static json server_model_read_gguf_meta(const std::string & path) {
             const int n_split = atoi(path.substr(sh + 10, 5).c_str());
             const std::string prefix = path.substr(0, sh);
             int n_found = 1;
-            for (int i = 2; i <= n_split; i++) {
+            // member files (with the symlink target when the shard is a link): a set may be
+            // assembled from symlinks over separately named files (fork: trunk + PLE shard)
+            json shard_files = json::array();
+            json shard_canon = json::array();
+            for (int i = 1; i <= n_split; i++) {
                 char tail[64];
                 snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
-                const auto ssize = std::filesystem::file_size(prefix + tail, ec);
-                if (ec) {
-                    continue; // missing shard: report what is present
+                const std::string member = prefix + tail;
+                if (i > 1) {
+                    const auto ssize = std::filesystem::file_size(member, ec);
+                    if (ec) {
+                        continue; // missing shard: report what is present
+                    }
+                    total += (uint64_t) ssize;
+                    n_found++;
                 }
-                total += (uint64_t) ssize;
-                n_found++;
+                json sf = {{"name", std::filesystem::path(member).filename().string()}};
+                std::error_code lec;
+                if (std::filesystem::is_symlink(member, lec) && !lec) {
+                    const auto target = std::filesystem::read_symlink(member, lec);
+                    if (!lec) {
+                        sf["target"] = target.filename().string();
+                    }
+                }
+                shard_files.push_back(sf);
+                const auto canon = std::filesystem::canonical(member, lec);
+                if (!lec) {
+                    shard_canon.push_back(canon.string());
+                }
             }
-            meta["n_shards"] = n_found;
+            meta["n_shards"]    = n_found;
+            meta["shard_files"] = shard_files;
+            meta["shard_canon"] = shard_canon;
         }
         meta["size_bytes"] = total;
+        std::error_code cec;
+        const auto canon = std::filesystem::canonical(path, cec);
+        if (!cec) {
+            meta["path_canon"] = canon.string();
+        }
     }
     // reasoning support: templates that open/mention think blocks respond to
     // --reasoning-budget and the effort/enable_thinking kwargs (some default
@@ -2722,6 +2749,34 @@ void server_models_routes::init_routes() {
                 }
             }
             models_json.push_back(model_info);
+        }
+        // shard members that are also listed on their own (a symlinked set over real files): tag them
+        // with the set they belong to so the wizard can point at the launchable entry - the trunk alone
+        // does not load when its tensors continue in the other shard. Ids stay as they are.
+        {
+            std::map<std::string, std::string> member_of; // canonical file -> set id
+            for (const auto & m : models_json) {
+                if (!m.contains("metadata") || !m["metadata"].contains("shard_canon")) {
+                    continue;
+                }
+                for (const auto & c : m["metadata"]["shard_canon"]) {
+                    member_of.emplace(c.get<std::string>(), m["id"].get<std::string>());
+                }
+            }
+            for (auto & m : models_json) {
+                if (!m.contains("metadata")) {
+                    continue;
+                }
+                json & md = m["metadata"];
+                if (!md.contains("shard_canon") && md.contains("path_canon")) {
+                    const auto it = member_of.find(md["path_canon"].get<std::string>());
+                    if (it != member_of.end() && it->second != m["id"].get<std::string>()) {
+                        md["shard_member_of"] = it->second;
+                    }
+                }
+                md.erase("shard_canon");
+                md.erase("path_canon");
+            }
         }
         res_ok(res, {
             {"data", models_json},

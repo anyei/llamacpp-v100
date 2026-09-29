@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-volta-small.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -330,6 +331,78 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
+// TASKS #153 T3: Volta small-M tensor-core FlashAttention (decode/verify widths), fattn-mma-volta-small.cuh.
+// GGML_CUDA_FA_NO_VOLTA_SMALL=1 routes those shapes back to the tile/vec kernels (A/B without a rebuild).
+static bool ggml_cuda_fattn_volta_small_disabled() {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_NO_VOLTA_SMALL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// ncols2 for launch_fattn and the packed heads per block: the largest power of two whose head tiling keeps
+// Q rows x packed heads <= 32 (four m8n8k4 tiles); the kernel re-derives the packing from gridDim.z.
+static void ggml_cuda_fattn_volta_small_geometry(const ggml_tensor * dst, int & ncols2, int & ntiles) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const int n         = Q->ne[1];
+    const bool gqa_opt  = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    ncols2 = 1;
+    int pack = 1;
+    if (gqa_opt) {
+        for (int c = 32; c >= 1; c >>= 1) {
+            const int nz     = (gqa_ratio + c - 1) / c;
+            const int pack_c = (gqa_ratio + nz - 1) / nz;
+            if (n*pack_c <= 32) {
+                ncols2 = c;
+                pack   = pack_c;
+                break;
+            }
+        }
+    }
+    ntiles = (n*pack + 7) / 8;
+}
+
+static void ggml_cuda_flash_attn_ext_mma_volta_small(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    int ncols2, ntiles;
+    ggml_cuda_fattn_volta_small_geometry(dst, ncols2, ntiles);
+
+#define FATTN_VS_CASE(D, type_kv)                                                                            \
+    if (Q->ne[0] == (D)) {                                                                                   \
+        switch (ntiles) {                                                                                    \
+            case 1: ggml_cuda_flash_attn_ext_mma_volta_small_case<D, 1, type_kv, type_kv>(ctx, dst, ncols2); return; \
+            case 2: ggml_cuda_flash_attn_ext_mma_volta_small_case<D, 2, type_kv, type_kv>(ctx, dst, ncols2); return; \
+            case 3: ggml_cuda_flash_attn_ext_mma_volta_small_case<D, 3, type_kv, type_kv>(ctx, dst, ncols2); return; \
+            case 4: ggml_cuda_flash_attn_ext_mma_volta_small_case<D, 4, type_kv, type_kv>(ctx, dst, ncols2); return; \
+            default: GGML_ABORT("fatal error");                                                              \
+        }                                                                                                    \
+    }
+
+    if (K->type == GGML_TYPE_Q8_0) {
+        FATTN_VS_CASE( 64, GGML_TYPE_Q8_0)
+        FATTN_VS_CASE(128, GGML_TYPE_Q8_0)
+        FATTN_VS_CASE(256, GGML_TYPE_Q8_0)
+    } else {
+        FATTN_VS_CASE( 64, GGML_TYPE_F16)
+        FATTN_VS_CASE(128, GGML_TYPE_F16)
+        FATTN_VS_CASE(256, GGML_TYPE_F16)
+    }
+#undef FATTN_VS_CASE
+    GGML_ABORT("fatal error");
+}
+
 // See the comment on the declarations in fattn-common.cuh (GTX 16xx-class devices, TASKS.md #32).
 static std::atomic<bool> fattn_mma_disabled_flags[GGML_CUDA_MAX_DEVICES] = {};
 
@@ -350,6 +423,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_VOLTA_SMALL = 300,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -507,6 +581,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && !ggml_cuda_fattn_mma_disabled(device) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // TASKS #153 T3: decode/verify widths on the m8n8k4 small-M kernel (f16/f32 or q8_0 K/V, head 64/128/256)
+        if (!ggml_cuda_fattn_volta_small_disabled() && Q->ne[1] <= FATTN_VS_MAXCOLS && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && V->ne[0] == K->ne[0]) {
+            float logit_softcap = 0.0f;
+            memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+            const bool kv_f16 = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_F32) && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_F32)
+                && (K->type != GGML_TYPE_F16 || K->nb[1] % 16 == 0) && (V->type != GGML_TYPE_F16 || V->nb[1] % 16 == 0);
+            const bool kv_q8  = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0;
+            if ((kv_f16 || kv_q8) && (logit_softcap == 0.0f || Q->ne[0] != 64)) {
+                return BEST_FATTN_KERNEL_VOLTA_SMALL;
+            }
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             // TASKS #153 T3: at long KV the tile kernel (half2 math, GQA-packed columns) beats the vector kernel
             // on Volta for f16 K/V (Qwen3.8-27B at 64k: 24.4 vs 20.6 t/s, docs/ninfer-t3-t4-plan.md 5.4);
@@ -578,6 +664,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_VEC:
+        case BEST_FATTN_KERNEL_VOLTA_SMALL:
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
@@ -601,6 +688,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VOLTA_SMALL:
+            ggml_cuda_flash_attn_ext_mma_volta_small(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

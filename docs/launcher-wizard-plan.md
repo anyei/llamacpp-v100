@@ -277,3 +277,24 @@ Remaining polish (none blocking):
   `GGML_CUDA_DISABLE_GRAPHS` (the MTP-head template adds both, -25% on that
   serve) and flagCut `--load-mode` (the ncmoe template's `none` costs ~20% on
   the dual-socket host) - both template defaults are candidates for a change.
+
+## 10. Symlinked shard sets in the model grid (2026-09-29, user: "allow the symlinks to be listed in the grid")
+
+The Flash-Next directory on the X99 holds the GSQ-RCO trunk and the Q4_0 PLE/ngram shard as separately named real
+files plus two symlinks `qwen3.8-flash-next-0000{1,2}-of-00002.gguf` that present them as one llama.cpp split model.
+The scanner already listed the set (id `qwen3.8-flash-next`, 2 shards, 72 GiB) next to the two real files, but the grid
+labelled it with a made-up `qwen3.8-flash-next.gguf` and showed the bare trunk as a normal model - launching that row
+fails because its tensors continue in the other shard.
+
+As built (ids unchanged, so saved configs keep resolving):
+- `GET /models` metadata: `shard_files` = the set's members with the symlink target of each linked member
+  (`{"name": "...-00001-of-00002.gguf", "target": "Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf"}`), and `shard_member_of`
+  = the set id on any standalone entry whose canonical file is a member of a listed set (server-models.cpp: the gguf
+  header reader records canonical paths, the /models route cross-references them and strips the internal fields).
+- wizard grid: a split set shows its real first-shard file name and a `N shards` tag whose tooltip lists the members
+  and their targets; a member file gets a `part of <set>` warning tag and the note says so. Verified on the dev router
+  with a synthetic dir (real trunk + real PLE + symlinked -0000k-of-00002 pair + a loose model): the set reports 2
+  shards with targets, both real files carry `shard_member_of`, the loose model is untouched.
+- Not done on purpose: hiding the member files. Hiding would rename the set to the directory name under the
+  "single model in a directory" rule and break the saved config id; the tag keeps every file visible and points at
+  the launchable entry instead.

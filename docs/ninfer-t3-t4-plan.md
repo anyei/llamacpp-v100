@@ -216,3 +216,128 @@ For the user's 200k-262k q8_0-KV serves the rule does not apply: that is the T3 
 Verdict: adopted (fattn.cu, uncommitted); ships with the next coordinator image. It moves only f16
 K/V serves at >= 16k depth; quantised-KV serves (the user's 200k-262k configs) wait for the T3
 kernel (section 3), whose phase-0 prize stands at +47 % (64k) / +75 % (128k).
+
+## 6. T3 kernel: build log (2026-09-29, TASKS #153)
+
+### 6.1 Increment 1 as built: `ggml/src/ggml-cuda/fattn-mma-volta-small.cuh` (all widths <= 8 rows in one kernel)
+
+Fragment layouts were pinned first with a 6-test probe on the V100 (`llama.cpp-work/153-p0/t3probe/probe.cu`, run inside
+the a9885783c image): for `mma.sync.m8n8k4` lane t = (lane&3) + 4*(lane>>4) holds A row t (a0 = k 0..1, a1 = k 2..3);
+B `.col`: lane t holds B[k 0..3][n = t]; B `.row`: lane holds B[k = lane&3][n = 4*(lane>>4) + 0..3]; the fp32 D register i
+sits at row 4*(lane>>4) + (lane&1) + (i&2), column (lane&2) + (i&5). These match the tested `mma.cuh` Volta tiles
+(un-permuted) and `mmsmt.cu`; the design's "flip" is that the upstream Volta MMA kernel stacks 32 query columns in the
+A tile (hence ncols >= 32) while this kernel mirrors the 8-row Q tile across the four quadpairs and gives each
+quadpair its own K positions.
+
+Geometry (one template `<D, NT, type_K, type_V, softcap>`, D in {64, 128, 256}, NT = 1..4 m8n8k4 M tiles, K/V in
+{f16 (f32 converted), q8_0}): a block owns <= 8 query rows x `pack` heads of one KV head (`pack` = the largest head
+tiling with rows x pack <= 32, derived in-kernel from gridDim.z; the 27B at width 1 packs its 6 heads into one tile,
+width 5 x 6 = 30 rows in four tiles), 4 warps, CTA step = 128 KV positions:
+
+- phase 1: warp w streams K rows 32w..32w+31, one row per lane (f16: 16-byte loads; q8_0: 17 words per block pair,
+  `byte_perm` into the fp16 mantissa, minus 1152, times the block scale in fp16 - the T1 reader), the Q tile is fp16
+  in shared memory (`scale` folded, 16-byte padded rows) and mirrored across quadpairs; S in fp32 per quadpair
+  (8 regs per tile); softcap, mask, ALiBi on the D layout; row max over the warp with three xor shuffles, CTA-wide
+  through shared memory (one `__syncthreads`); P = exp(S - max) to fp16, the D -> A remap costs two xor-2 shuffles,
+  and P lands in shared memory as A fragments (row stride 144 halves: conflict-free 16-byte stores).
+- phase 2 (after the second `__syncthreads`): warp w owns dims [w*D/4, (w+1)*D/4); quadpair = (M tile, position slice)
+  with NQ_T x NQ_P = 4; each lane streams V[pos][its D/8 dims] as B `.row` fragments (the dims of the 8-wide n-tiles are
+  permuted so a lane's fragments are one contiguous run: 64 bytes of f16 or exactly one q8_0 block per position at
+  D = 256), O += P V in fp32 (64 accumulator registers per lane at every D/NT combination).
+- epilogue: position slices summed with xor-4/8 shuffles, row sums reduced through shared memory, sinks as one extra
+  logit per row, O staged in shared memory and written normalised (gridDim.y == 1) or raw + `dst_meta` for
+  `launch_fattn`'s split-KV combine (`parallel_blocks`, unchanged).
+
+Selection (fattn.cu, Volta branch, before the tile/vec rules): Q rows <= 8, head 64/128/256 with DV == DKQ,
+KV length % 256 == 0, K/V both f16/f32 (16-byte row strides) or both q8_0, softcap only at head 128/256; the
+kill switch `GGML_CUDA_FA_NO_VOLTA_SMALL=1` (docs/env-gates.md 8b, wizard catalog 134) restores the previous routing
+in the same binary. Instances: `template-instances/fattn-mma-volta-small-instance-{f16-f16,q8_0-q8_0}-d{64,128,256}.cu`
+(generator updated). Compiler report (sm_70): 254-255 registers, 0 stack, 0 spills for every D = 256 instance ->
+`__launch_bounds__(128, 2)` = 2 CTAs / 8 warps per SM; dynamic shared memory 4.9 KB (NT 1, D 64) .. 34.4 KB (NT 4, D 256).
+
+Oracle additions (tests/test-backend-ops.cpp): the upstream FLASH_ATTN_EXT matrix never reaches 3-4 M tiles or q8_0 at
+head 256, so the 27B geometry (256, GQA 6, kv 1024, nb 1/2/3/4/5/8, f16 + q8_0) and a head-128 GQA-4 twin were added,
+plus sinks / softcap / ALiBi variants at width 5.
+
+First oracle (devbins-t3k1, before the new cases): 1492 passed / 156 failed - every failure had > 1 packed row
+(nb 3, or nb 1 with 4 packed heads), every 1-row case passed: the output staging read the second D row's
+accumulators with the wrong register offset (4h instead of 2h). Fixed in t3k1c together with a q8_0 V reader
+over-read (one word past the last block of a row when the quants are word-aligned).
+
+Second oracle (t3k1c): 1985+ passed, 0 failed, then a HANG (GPU at 100 % for 30 min) on the first NT = 3 shape
+(head 128, GQA 12, 3 query rows -> 18 rows in three tiles): quadpair 3 has no tile there and skipped the phase-2 loop
+while its warp-mates issued `mma.sync` - a warp-level `mma.sync.aligned` needs all 32 lanes in convergence, so the
+warp deadlocked. Fixed in t3k1d: the spare quadpair computes a discarded copy of tile 0 (same instruction stream);
+the oracle runs now use a pseudo-TTY so the log is line-buffered (the block-buffered log had hidden the real case).
+Trap for the ledger: never put `mma.sync` or `__shfl_sync` under a lane-dependent branch on Volta.
+
+### 6.2 Increment 1 gate (devbins-t3k1d = a9885783c tree + the kernel, `153-p0/t3k-gate.sh t3k1d`, 2026-09-29)
+
+- Oracle: test-backend-ops FLASH_ATTN_EXT on the V100, kernel ON 2911/2911 passed (4.5 min), kernel OFF
+  (`GGML_CUDA_FA_NO_VOLTA_SMALL=1`, same binary) 2911/2911 - the 27 added cases (27B geometry nb 1-8 f16/q8_0,
+  head-128 GQA-4 twin, sinks/softcap/ALiBi at width 5) pass on both paths, so the fallback routing is intact.
+- Speed (Qwen3.8-27B UD-Q4_K_XL, V100 at the 1380 MHz lock, `-b/-ub 2048 -fa on -r 2`, arms interleaved ON / OFF / ON in
+  one run so the drift is visible; ON = the kernel, OFF = `GGML_CUDA_FA_NO_VOLTA_SMALL=1` in the same binary = the
+  a9885783c routing: f16 -> tile rule at >= 16k, q8_0 -> VEC at width 1, TILE + whole-cache f16 conversion at width 5).
+
+  Width 1 (tg32, t/s; ms per token in parentheses):
+
+  | KV | arm | d 0 | d 16384 | d 65536 | d 131072 |
+  |---|---|---|---|---|---|
+  | f16 | ON | 35.39 (28.3) | 34.31 (29.1) | 30.59 (32.7) | 27.03 (37.0) |
+  | f16 | OFF | 35.31 (28.3) | 32.17 (31.1) | 27.03 (37.0) | 22.36 (44.7) |
+  | f16 | ON (repeat) | 35.18 | 33.27 | 30.41 | 27.09 |
+  | q8_0 | ON | 34.63 (28.9) | 32.10 (31.2) | 29.40 (34.0) | 26.54 (37.7) |
+  | q8_0 | OFF | 34.57 (28.9) | 29.59 (33.8) | 22.56 (44.3) | 16.62 (60.2) |
+  | q8_0 | ON (repeat) | 34.57 | 31.53 | 29.55 | 26.07 |
+
+  Reading: f16 +4..7 % at 16k, +13 % at 64k, +21 % at 128k over the tile rule (+48 % / +89 % over the VEC numbers of
+  5.2); the attention cost per token at 128k is 8.7 +- 1.5 ms for 8.6 GB of KV (16 full-attention layers x 4 KV heads x
+  256 x 2 x 2 B = 64 KB per position, GGUF metadata checked), i.e. the HBM rate (phase-0 floor 9.5 ms at 900 GB/s)
+  within the noise of the depth-0 baseline. q8_0 +8 % at 16k, +30 % at 64k, +60 % at 128k over VEC and now within 3 %
+  of the f16 path (it was slower than f16 at width 5 before); it does NOT beat f16: the in-register dequant is ~1.5 ALU
+  ops per value (byte_perm + hsub2 + hmul2 per pair; the fused hfma2 form is inexact because 1152*d does not round to
+  fp16) and the kernel runs issue-bound at ~60 % of the q8_0 byte rate (37.7 - 28.9 = 8.8 ms at 128k vs a 5.1 ms floor).
+  On Volta q8_0 KV therefore buys capacity, not speed - the speed penalty is gone, the prize is not there.
+
+  Width 5 (the MTP verify step, `-p 5 -n 0`, t/s; ms per step in parentheses):
+
+  | KV | arm | d 0 | d 16384 | d 65536 | d 131072 |
+  |---|---|---|---|---|---|
+  | f16 | ON | 96.9 (51.6) | 85.4 (58.5) | 78.9 (63.3) | 70.3 (71.1) |
+  | f16 | OFF | 97.4 (51.4) | 81.5 (61.4) | 64.1 (78.0) | 47.4 (105.5) |
+  | q8_0 | ON | 94.6 (52.8) | 82.8 (60.4) | 76.3 (65.5) | 69.0 (72.5) |
+  | q8_0 | OFF | 95.4 (52.4) | 77.4 (64.6) | 57.2 (87.5) | 42.2 (118.6) |
+
+  Reading: the verify step at 64k / 128k costs 63 / 71 ms instead of 78 / 106 (f16, +23 % / +48 % t/s); attention at
+  128k is ~20 ms of the step for 30 rows (four M tiles: each quadpair re-issues the V loads of its warp, L1-served, and
+  P goes through shared memory) against ~9 ms at width 1 - room left, but the MTP round at 64k drops from ~83 to ~68 ms.
+  q8_0 at width 5 tracks f16 within 2 % (the whole-cache f16 conversion is gone): 65 / 73 ms instead of 88 / 119
+  at 64k / 128k (+33 % / +64 % t/s), and it stops being slower than f16.
+
+- KL at 32k context (wiki.test, one 32768-token chunk, `-b/-ub 2048`), kernel ON vs the OFF base from the same binary:
+  f16 mean KLD 0.000000, 99.9 % KLD 5.1e-5, top-1 100.000 %, PPL ratio 1.0003 (base PPL 6.0034); q8_0 mean KLD
+  0.000000, 99.9 % KLD 4.9e-5, top-1 99.988 %, PPL ratio 1.0003 (base 6.0039) - the exact class on both KV types,
+  the same bar the tile rule passed in 5.5 (byte identity across kernels is not expected: different summation order).
+
+- MTP serve legs at depth (`153-p0/t3k-serve.sh`, the rolled image, llama-server `-c 131072 -b/-ub 2048 -fa on`, MTP head
+  n-max 3, one 56568-token wiki prompt through the chat template, 160 greedy tokens, ON / OFF / ON per KV type):
+
+  | KV | arm | prefill t/s | generation t/s (ms/tok) | acceptance | text |
+  |---|---|---|---|---|---|
+  | f16 | ON | 510 | 42.07 (23.8) | 100/176 = 57 % | correct summary (Boulter, Du Fu, ...) |
+  | f16 | OFF | 509 | 35.41 (28.2) | 100/176 | identical |
+  | f16 | ON (repeat) | 499 | 41.90 (23.9) | 100/176 | identical |
+  | q8_0 | ON | 514 | 41.28 (24.2) | 100/176 | identical |
+  | q8_0 | OFF | 511 | 33.51 (29.8) | 100/176 | identical |
+  | q8_0 | ON (repeat) | 509 | 40.75 (24.5) | 100/176 | identical |
+
+  Reading: the MTP round at 56k depth gains +19 % (f16) and +23 % (q8_0); all six legs produce the same 160 greedy tokens
+  and the same acceptance counts, prefill is unchanged (it keeps the upstream MMA kernel). The first attempt used the raw
+  `/completion` endpoint and got an immediate EOS from the instruct model - serve legs go through the chat template.
+
+Verdict (2026-09-29 13:20): adopted; selected by default on Volta for the decode/verify shapes, kill switch kept.
+Ships in `llamacpp-local-v100:a9885783c-t3k` (working tree on a9885783c, commit = user). Open after this increment:
+the MTP serve legs at depth (d7-gates.sh pattern, `-c 131072`), the width-5 attention share (NT = 4 re-issues each
+warp's V loads per quadpair and moves P through shared memory: ~20 ms at 128k vs ~9 ms at width 1), and the q8_0 issue
+bound (~1.5 ALU ops per dequantised value; the fused hfma2 form is not exact).
