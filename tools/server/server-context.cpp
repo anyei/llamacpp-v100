@@ -266,6 +266,14 @@ struct server_batch {
     }
 };
 
+// a sampler chain whose rows can be sampled on the device independently of each other
+static bool sampling_is_stateless_greedy(const common_params_sampling & p) {
+    const bool penalties_off = p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f);
+    return p.temp <= 0.0f && p.n_probs == 0 && p.mirostat == 0 && p.dry_multiplier == 0.0f && penalties_off &&
+           p.grammar.empty() && p.typ_p >= 1.0f && p.xtc_probability <= 0.0f && p.top_n_sigma < 0.0f &&
+           !common_speculative_tree_enabled();
+}
+
 struct server_slot {
     int id;
 
@@ -3156,8 +3164,10 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            // speculative decoding samples n_draft + 1 rows of one sequence per batch; the context samples
+            // every output row (F4 step 2), exact only for a history-free chain: greedy, no penalties / DRY /
+            // mirostat / grammar / probs, and not the spec tree
+            backend_sampling &= !(slot.can_speculate()) || sampling_is_stateless_greedy(task.params.sampling);
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;

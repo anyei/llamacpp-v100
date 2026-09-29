@@ -343,6 +343,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
+                    if (params.backend_sampling && params.dry_multiplier == 0.0f) {
+                        break; // identity sampler without a device implementation: keep the device prefix intact
+                    }
                     {
                         std::vector<const char *> c_breakers;
                         c_breakers.reserve(params.dry_sequence_breakers.size());
@@ -359,15 +362,24 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_top_p(params.top_p, params.min_keep));
                     break;
                 case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    if (params.backend_sampling && params.top_n_sigma < 0.0f) {
+                        break;
+                    }
                     samplers.push_back(llama_sampler_init_top_n_sigma(params.top_n_sigma));
                     break;
                 case COMMON_SAMPLER_TYPE_MIN_P:
                     samplers.push_back(llama_sampler_init_min_p(params.min_p, params.min_keep));
                     break;
                 case COMMON_SAMPLER_TYPE_XTC:
+                    if (params.backend_sampling && params.xtc_probability <= 0.0f) {
+                        break;
+                    }
                     samplers.push_back(llama_sampler_init_xtc(params.xtc_probability, params.xtc_threshold, params.min_keep, params.seed));
                     break;
                 case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                    if (params.backend_sampling && params.typ_p >= 1.0f) {
+                        break;
+                    }
                     samplers.push_back(llama_sampler_init_typical(params.typ_p, params.min_keep));
                     break;
                 case COMMON_SAMPLER_TYPE_TEMPERATURE:
@@ -377,6 +389,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
                     samplers.push_back(llama_sampler_init_infill(vocab));
                     break;
                 case COMMON_SAMPLER_TYPE_PENALTIES:
+                    if (params.backend_sampling && (params.penalty_last_n == 0 ||
+                            (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f))) {
+                        break;
+                    }
                     samplers.push_back(llama_sampler_init_penalties(params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
                     break;
                 case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
@@ -393,6 +409,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+        } else if (params.backend_sampling && params.temp <= 0.0f) {
+            // greedy on the device: the temp sampler leaves one candidate, and `dist` would need one
+            // uniform input per sampled row (speculative verify batches sample several rows per sequence)
+            samplers.push_back(llama_sampler_init_greedy());
         } else {
             // default: sample from distribution
             samplers.push_back(llama_sampler_init_dist(params.seed));

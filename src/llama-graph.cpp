@@ -3554,17 +3554,6 @@ void llm_graph_context::build_sampling() const {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
-    std::map<llama_seq_id, int32_t> seq_to_logit_row;
-    int32_t logit_row_idx = 0;
-
-    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-        if (ubatch.output[i]) {
-            llama_seq_id seq_id = ubatch.seq_id[i][0];
-            seq_to_logit_row[seq_id] = logit_row_idx;
-            logit_row_idx++;
-        }
-    }
-
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
@@ -3573,18 +3562,14 @@ void llm_graph_context::build_sampling() const {
     // this is important in order to minimize graph reallocations
     ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
 
-    for (const auto & [seq_id, sampler] : samplers) {
-        const auto it = seq_to_logit_row.find(seq_id);
-
-        // inactive samplers always work on the first row
-        const auto row_idx = it != seq_to_logit_row.end() ? it->second : 0;
-        const int i_out    = it != seq_to_logit_row.end() ? 1          : 0;
-
-        ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row_idx * logits_t->nb[1]);
-        ggml_format_name(logits_seq, "logits_seq_%d", seq_id);
+    // apply a sequence's chain to one logits row; key = output row (>= 0) or -1 - seq_id for the
+    // inactive dummy-row application that keeps the node set static
+    auto apply = [&](llama_sampler * sampler, const int32_t row, const int i_out, const int32_t key) {
+        ggml_tensor * logits_row = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
+        ggml_format_name(logits_row, "logits_row_%d", key);
 
         struct llama_sampler_data data = {
-            /*.logits      =*/ logits_seq,
+            /*.logits      =*/ logits_row,
             /*.probs       =*/ nullptr,
             /*.sampled     =*/ nullptr,
             /*.candidates  =*/ nullptr,
@@ -3594,41 +3579,57 @@ void llm_graph_context::build_sampling() const {
         sampler->iface->backend_apply(sampler, ctx0, gf, &data);
 
         if (data.sampled != nullptr) {
-            res->t_sampled[seq_id] = data.sampled;
+            res->t_sampled[key] = data.sampled;
             outs[1] = data.sampled;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.probs != nullptr) {
-            res->t_sampled_probs[seq_id] = data.probs;
+            res->t_sampled_probs[key] = data.probs;
             outs[1] = data.probs;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.logits != nullptr) {
-            res->t_sampled_logits[seq_id] = data.logits;
+            res->t_sampled_logits[key] = data.logits;
             outs[1] = data.logits;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
 
         if (data.candidates != nullptr) {
-            res->t_candidates[seq_id] = data.candidates;
+            res->t_candidates[key] = data.candidates;
             outs[1] = data.candidates;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
+    };
+
+    // every output row of a sequence with a sampler (a speculative verify batch has n_draft + 1
+    // rows of one sequence; the chain must be history-free for the rows to be exact - the caller gates that)
+    std::map<llama_seq_id, bool> active;
+    int32_t row = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        const int32_t cur = row++;
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const auto it = samplers.find(seq_id);
+        if (it == samplers.end()) {
+            continue;
+        }
+        active[seq_id] = true;
+        apply(it->second, cur, 1, cur);
+    }
+
+    // inactive samplers work on the dummy row
+    for (const auto & [seq_id, sampler] : samplers) {
+        if (active.count(seq_id)) {
+            continue;
+        }
+        apply(sampler, 0, 0, -1 - seq_id);
     }
 
     // TODO: Call llama_sampler_accept_ggml after all samplers have been applied.
-    /*
-    for (const auto & [seq_id, sampler] : samplers) {
-        if (auto it = res->t_sampled.find(seq_id); it != res->t_sampled.end()) {
-            ggml_tensor * selected_token = it->second;
-            if (selected_token != nullptr) {
-                llama_sampler_accept_ggml(sampler, ctx0, gf, selected_token);
-            }
-        }
-    }
-    */
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

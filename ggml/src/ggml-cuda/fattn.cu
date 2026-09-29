@@ -508,6 +508,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (volta_mma_available(cc) && !ggml_cuda_fattn_mma_disabled(device) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+            // TASKS #153 T3: at long KV the tile kernel (half2 math, GQA-packed columns) beats the vector kernel
+            // on Volta for f16 K/V (Qwen3.8-27B at 64k: 24.4 vs 20.6 t/s, docs/ninfer-t3-t4-plan.md 5.4);
+            // quantized K/V stays on the vector kernel - the tile path converts the whole cache to f16 per call
+            if (gqa_opt_applies && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type) && K->ne[1] >= 16384) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {

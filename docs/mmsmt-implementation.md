@@ -500,6 +500,269 @@ t/s); kernel timer at width 5 on the routed tensors 493 GB/s; serve MTP n-max 2 
 and the sync instrument; `:latest` re-pointed, X99 launcher recreated (no serve was loaded),
 rollback `1c63c03a1-smt`, `e117ee884-widefix` pruned locally and on the X99.
 
+### 4.11 T5 config item: `-ub 2048` (2026-09-29 00:43, image 39fe2889a bins, X99 V100 at 250 W)
+
+llama-bench on the UD-Q4_K_XL, `-b 2048`, arms interleaved because the card drifts >10% cold-to-hot
+within a minute even at the 1380 MHz lock (pair 1 then pair 2 below are the same commands, ~40 s
+apart): pp2048 512/2048 = 760 / 966 then 681 / 791 t/s (+27 % / +16 %); pp4096 744 / 820 (+10 %);
+pp512 unchanged (the ubatch is the whole prompt either way); tg64 35.97 / 35.38 then 31.93 / 30.12
+(the ub-2048 arm always ran second inside a falling drift: decode is neutral within the band).
+Decision: `--ubatch-size 2048 --batch-size 2048` folded into the saved 27B wizard config
+(id 55853436557 replaces 53382003705). Cost: a larger compute buffer, irrelevant at 8k on one V100.
+Lesson for every A/B on this card: interleave the arms or the second arm loses ~10 % to drift.
+
+### 4.12 T1 leftovers: where each type's crossover really comes from (analysis, 2026-09-29)
+
+The 4.9 table gave ratios; the bench logs (`153-p0/devbench-pertype-*`) also give the absolute
+weight stream of each arm. Converting t/s at width w to GiB of weights per second (steps/s = t/s / w,
+times the model's bytes) makes the two mechanisms visible:
+
+| type (GiB) | route on, widths 3-8 | MMVQ off w3 / w4 / w5 | MMVQ w1 (tg16) | route / MMVQ w4 |
+|---|---|---|---|---|
+| Q4_K_S (14.73) | 340-347 flat | 346 / 289 / 248 | 582 | 1.19 |
+| Q5_K_S (17.66) | 375 flat | 387 / 315 / 290 | 625 | 1.19 |
+| Q6_K (20.88) | 350-358 flat | 438 / 375 / 342 | 551 | 0.95 |
+| IQ4_XS (14.35) | 250-256 flat | 407 / 362 / 340 | 583 | 0.71 |
+| Q3_K_S (11.40) | 239-240 flat | 200 / 180 / 174 | 283 | 1.33 |
+| Q2_K (10.11) | 227-228 flat | 208 / 165 / 148 | 335 | 1.38 |
+
+(GiB/s at the bench level, i.e. including attention, norms and the unrouted ops; the kernel timer
+reads ~1.25x higher: 439-493 GB/s on Q4_K.)
+
+Two different problems hide behind "min width 6":
+
+1. **Ceiling-bound types (Q4_K, Q5_K, Q6_K, and Q8_0 from 4.6)**: the route delivers the same
+   ~340-375 GiB/s whatever the decode complexity (Q6_K's 6-bit unpack costs nothing visible next to
+   Q4_K), so the limit is the staging path, not the readers. MMVQ sweeps whole rows and still runs
+   at 438 (Q6_K) / 375 / 342 GiB/s at widths 3 / 4 / 5. The crossover moves only if the route's
+   ceiling moves: Q6_K from width 4 needs >= 386 GiB/s (+8 %), Q8_0 from 5 about +15 %, Q4_K / Q5_K
+   from width 3 about +5 %. The copy-only ablation measured 653 GB/s (~608 GiB/s) in 4.5, so ~40 %
+   of the step is exposed compute or barrier time (two `__syncthreads`, the register->shared store,
+   the activation refill) that the register prefetch does not hide.
+2. **Decode-bound types (IQ4_XS, Q3_K, Q2_K)**: the route sits at 227-256 GiB/s because their
+   decodes cost 3x Q4_K's per word (IQ4_XS: 16-entry table via two `__byte_perm` + selector build
+   + mask; Q3_K / Q2_K: sub-4-bit planes, more values per byte). Q3_K / Q2_K still win from width 3
+   because MMVQ is even weaker there (dp4a unpack). IQ4_XS loses to MMVQ's fast table path: from
+   width 5 it would need 350 GiB/s (+37 %), which no reader tweak alone delivers (the ceiling of the
+   cheap-decode types is 340-375).
+
+Levers, ranked by what they move:
+
+- **A. Raise the staging ceiling (every type)**. Measure first with the runtime ablation env
+  (`GGML_CUDA_SMT_ABLATE=1` copy only / `=2` compute only, no rebuild) at width 4 on Q4_K_S, Q6_K,
+  IQ4_XS: if t(both) ~ t(copy) + t(compute) the phases do not overlap and a 3-CTA/SM occupancy
+  (register budget <= 85/thread; V5 sits at ~128 with the prefetch) or a double-buffered stage
+  (two shared slots per row, the next step's pieces land while the current one decodes) is the
+  build; if t(both) ~ max(t(copy), t(compute)) the ceiling is the DRAM access pattern itself
+  (64 rows x 16-byte pieces per CTA step) and the lever is more bytes in flight per row per
+  instruction (wider pieces, NSB 3 where the shared budget allows: Q4_K stage 19 KB + slices).
+  Expected if the ceiling gains ~10 %: Q6_K and Q8_0 route from width 4-5, Q4_K / Q5_K from 3
+  (MTP n-max 2 stops losing), IQ4_XS from 5 only together with B.
+- **B. Cheaper IQ4_XS decode (contained)**: fold `(u - bias) * scale` into one `HFMA2` with a
+  precomputed `-bias*scale` (saves 2 of ~20 ops per word; changes rounding of the constant term by
+  one fp16 ulp of the bias product - comparator + KL gate decide), and build the `__byte_perm`
+  selector with two `LOP3`-friendly steps instead of four shift-and-or pairs. Realistic: -10..-15 %
+  decode ops; on its own it moves IQ4_XS from 0.71 to ~0.80 at width 4, not across 1.03.
+- **C. Not a lever**: the Q6_K / Q8_0 readers (already at the ceiling), and the mixed-type serve
+  gains are bounded: in the UD-Q4_K_XL mix at MTP widths 4-5 the unrouted tensors are 110 Q8_0 +
+  70 IQ4_XS + 56 Q6_K of 496; routing them at the ~1.2 ratio the K-quants show would take the
+  verify step from ~1.6 to ~1.45 T=1 steps, i.e. a further +8-10 % on the MTP serve.
+
+Decision rule: run the ablation legs; build A only if the overlap gap is >= 25 % of the step
+(otherwise the ceiling is the memory system and T1 is closed at the current table); B rides along
+with A's rebuild if A is built. Every build: oracle route-on (1179/1179), comparator, KL ub 8/4/3,
+the 4.9 per-type bench, serve MTP n-max 2/3/4.
+
+### 4.13 Ablation result and design D7: warp-specialised staging (2026-09-29 00:52-00:59)
+
+`153-p0/ablate.sh` (image 39fe2889a libs, requantised pure copies in /dev/shm/153, `-r 5`, two reps
+each, arms interleaved; `GGML_CUDA_SMT_ABLATE=1` = copy only, `=2` = compute only). Per width-4
+step in ms (4 / t/s), whole-model bench level:
+
+| type | route on | copy only | compute only | MMVQ off | reading |
+|---|---|---|---|---|---|
+| Q4_K_S | 42.4 | 39.1 | 35.6 | 51.9 | copy-bound; on = copy + 8 % |
+| Q6_K | 62.6 | 55.2 | 42.3 | 56.4 | copy-bound; on = copy + 13 % |
+| IQ4_XS | 51.5 | 36.3 | 46.0 | 40.5 | DECODE-bound; on = compute + 12 % |
+
+Copy-only in GiB/s of weights: Q4_K_S 377, Q6_K 378, IQ4_XS 395 - the same ceiling for every
+format, independent of the decode. Compute-only: Q4_K_S 414, Q6_K 494, IQ4_XS 312 GiB/s.
+MMVQ at width 1 streams 551-625 GiB/s on the same models (tg16 of 4.12).
+
+The 4.12 decision rule asked whether copy and compute overlap; they do (on is 8-13 % above the
+slower arm), so "exposed compute" is not the problem. The copy arm ITSELF is: one step of NSB
+super-blocks per CTA in flight (64 rows x 288 B = 18 KB for Q4_K), two CTAs per SM (105-128
+registers, `__launch_bounds__(256, 2)`), and the next step's loads are issued only after the
+store + barrier of the current one. That is a latency-bound pipeline of depth one: 160 CTAs x
+18 KB per DRAM round trip. It explains the 653 GB/s copy-only microbench of 4.5 as well as the
+~410 GB/s whole-model figure (small-N tensors get 1-5 steps per CTA and never fill the pipeline).
+
+**D7: split the CTA into copy warps and decode warps.** One CTA per SM, 16 warps
+(`__launch_bounds__(512, 1)` = 128 registers each):
+
+- 8 copy warps hold a THREE-deep register pipeline (pf[3], 32 words per step per lane for
+  Q4_K at NRG 2 = 96 registers; Q8_0 NJ 3 -> 48/step, depth 2) and stream steps back to back:
+  wait FREE(buf), store step s into stage buffer s % 2, arrive READY(buf), issue the loads of
+  step s + 3 into the freed registers. Bytes in flight per SM: 3 x 18 KB = 55 KB (today 37 KB
+  across two CTAs), and continuously, not in bursts.
+- 8 decode warps = today's two 32-row halves x MMSMT_KW, unchanged readers and mma path,
+  minus the copy role: wait READY(buf), decode from stage buffer s % 2, arrive FREE(buf). They
+  keep the activation refill (apf, 8 registers) exactly as today, into a double-buffered slice.
+- Barriers: PTX `bar.arrive` (producer side, non-blocking) / `bar.sync` (consumer side) on ids
+  1-4 (READY x 2, FREE x 2), count 512; `__syncthreads` (id 0) only before the final
+  cross-warp reduce, which stays decode-warps-only. FREE is pre-satisfied for the first two
+  steps.
+- Shared memory: two stage buffers + two activation slice sets. Q4_K 2 x 19.5 KB + 2 x 8.7 KB
+  = 56 KB, Q6_K 2 x 31.7 + 2 x 8.7 = 81 KB, Q2_0 2 x 20 + 2 x 17 = 74 KB, Q8_0 48 KB: above
+  the 48 KB static limit, so the kernel moves to dynamic shared memory with the
+  `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in (`smpbo` = 96 KB on the V100), set once
+  per instantiation.
+- Grid: `ksplit` now targets `nsm` CTAs (one per SM) instead of `2*nsm`; the reduce path is
+  unchanged.
+
+Expected (from the ablation arms): the copy ceiling rises toward the DRAM limit and every
+format becomes compute-bound at its compute-only figure: Q4_K ~414 GiB/s (from 347, +19 %),
+Q6_K ~494 (from 355, +39 %), IQ4_XS ~312 (from 256, +22 %), Q8_0 copy-bound at the new ceiling.
+Against MMVQ at widths 3 / 4 / 5 that routes Q4_K, Q5_K, Q6_K (494 vs 438 / 375 / 342) and
+Q8_0 from width 3, IQ4_XS from 5 (with lever B) or 6. On the UD-Q4_K_XL mix that is the whole
+tensor set at MTP widths 4-5, at 1.2-1.4x the current routed speed: verify step ~1.6 -> ~1.3
+T=1 steps, MTP n-max 3-4 round ~68 -> ~57 ms, serve +15-20 % (the F4 round costs stay).
+
+Gates for v12 (D7): oracle route-on 1179/1179 (`oracle-smt.sh`), comparator on the real mix,
+ablation arms again (copy-only must move; if it does not, the DRAM access pattern is the wall
+and D7 is closed), the 4.9 per-type bench route on/off at widths 2-8 (new table), KL ub 8/4/3,
+serve MTP n-max 2/3/4 interleaved. Register budget check on every build
+(`cuobjdump -res-usage`, 128 cap, 0 stack). Fallbacks if the copy warps spill: depth 2 with
+NSB 3 (Q4_K stage 29.7 KB x 2 + slices = 83 KB), or 4 copy warps at NRG 4 depth 2.
+
+### 4.14 D7 v12 result (2026-09-29 01:06-01:30, dev bins devbins-d7a, X99 V100 at 250 W)
+
+Built as designed in 4.13 (`MMSMT_DEPTH 3`, 8 copy + 8 decode warps, dynamic shared 47-81 KB,
+named barriers); registers 93-128, stack 0 for all nine formats. Oracle route-on 1179/1179 on the
+first build; comparator on the real mix identical to V5 (NMSE 5.43e-8 at ub 8 and 3); KL at ub 8
+identical to V5 (mean KLD 0.001655, top-1 98.19 %, control 0.001775 / 97.99 %). Speed (per-type
+bench, route on, t/s at widths 2/3/4/5/6/8; V5 in brackets):
+
+| type | v12 route on | V5 route on | copy-only w4 v12 / V5 |
+|---|---|---|---|
+| Q4_K_S | 45.1 / 68.1 / 90.6 / 110.9 / 133.2 / 175.6 | 46.9 / 70.6 / 93.3 / 115.5 / 138.0 / 182.2 | 114.3 / 102.2 |
+| Q6_K | 34.0 / 51.2 / 68.1 / 84.2 / 100.8 / 133.1 | 34.2 / 51.4 / 68.4 / 84.7 / 101.3 / 134.0 | 83.7 / 72.5 |
+| IQ4_XS | 36.8 / 55.6 / 73.8 / 91.0 / 109.0 / 143.6 | 35.7 / 53.6 / 71.3 / 88.4 / 105.9 / 139.6 | 115.2 / 110.2 |
+
+Reading: the copy path DID move (+12 % on Q4_K_S, +15 % on Q6_K: the pipeline depth was a real
+term), but the whole kernel is 0-4 % slower on the ceiling-bound types and only +3 % on IQ4_XS,
+because the decode side lost half its warps per SM (8 decode warps in one CTA vs 2 CTAs x 8 in V5):
+v12 route-on at width 4 (44.2 ms per step on Q4_K_S) sits above both its own copy-only (35.0) and
+V5's compute-only (35.6) arms - the decode warps, not the hand-over, now bound the step. Decision
+after the isolation legs (`153-p0/isolate-d7.sh`: on / copy / compute arms, V5 vs v12
+interleaved): a v12 variant needs 16 decode warps per SM again, which at one CTA per SM means 16
+decode + N copy warps inside 64K registers - feasible only if the decode role fits ~96 registers
+(measured with a DEPTH 1 compile, see the ledger) and the copy warps run a shallower pipeline at
+half-step granularity. If that budget does not close, T1 stays on V5 (the tree is reverted to the
+snapshot `153-p0/mmsmt.cu.v11-v5-39fe2889a`) with the copy-path ceiling recorded as the wall.
+
+Serve legs (v12, `d7-gates.sh`, Phase 0 prompts, hot card - the route-off arms read 46.3 / 45.5 /
+43.1 at n-max 2 / 3 / 4 vs 52.8 / 47.7 / 44.7 in 4.10): route on 46.0-46.7 / 53.3-53.5 / 54.3-54.4
+= on/off 1.00 / 1.17 / 1.26 vs V5's 0.96 / 1.18 / 1.27. Same ratios within the drift band: v12 is
+neither a serve-level win nor a loss; closed as above.
+
+Isolation legs (`isolate-d7.sh`, V5 = devbins-t5 vs v12 = devbins-d7a, width-3 t/s, two reps agree
+within 0.3): Q4_K_S on 70.2 / copy 76.2 / compute 83.4 (V5) vs 67.2 / 86.3 / 77.5 (v12); Q6_K
+47.6 / 54.0 / 70.2 vs 50.8 / 63.2 / 67.9. So v12's copy path is +13-17 % and its compute side only
+-3..-7 % (8 decode warps hide latency nearly as well as 16), but the combined kernel lands 13-15 %
+BELOW its slower arm: with one CTA per SM the three named barriers per step (~1 us each against a
+~1.6 us data step of 18 KB) have no second CTA to overlap them. Bigger steps (NSB 4) would halve
+the barrier count per byte but force depth 1 (pf 64 registers) and 76-93 KB of shared memory -
+at best ~+10 % over V5 by the arithmetic (on -> max(copy, compute)), not pursued: the register
+wall and the ~+10 % bound do not justify a third kernel generation for T1.
+
+### F4 step 2: device sampling of the verify rows - implementation plan (2026-09-29 01:20)
+
+What exists (mapped 01:15; anchors in src/llama-context.cpp, src/llama-graph.cpp, common/sampling.cpp,
+tools/server/server-context.cpp): the context already offloads a per-sequence sampler chain
+(`llama_set_sampler`), the host buffers `sampling.sampled/probs/logits/candidates` are sized PER
+OUTPUT ROW (`n_outputs_max`) and the getters `llama_get_sampled_*_ith(idx)` resolve a batch index
+through `output_ids` - so the readback side is row-addressed already. Three places pin it to one row
+per sequence: `build_sampling` keeps the LAST output row of each seq (`seq_to_logit_row` overwritten),
+`decode()` refuses a batch with more than one output per sampler seq ("backend sampling requires at
+most one output token per sequence"), and the readback `build_seq_to_output_row` + the three
+`copy_tensor_async_*` copy one row per seq. The server therefore switches device sampling off for any
+slot that speculates (`backend_sampling &= !slot.can_speculate()`), and every verify row is sampled
+on the host from a 248k-float logits copy (`common_sampler_sample_and_accept_n`).
+
+Step 2 (greedy first, byte-identical by construction):
+
+1. `llm_graph_context::build_sampling`: iterate the ubatch's output rows; for every row whose seq
+   has a sampler, apply the chain on that row's 1-row view and store the results keyed by the LOCAL
+   output row (`std::map<int32_t, ggml_tensor*>` replaces the seq-keyed maps in llama-graph.h).
+   Inactive samplers keep the dummy-row `ggml_build_forward_select` trick.
+2. `llm_graph_input_sampling::set_input`: `backend_set_input` per (sampler, row) - a no-op for
+   greedy/top-k/top-p/min-p/temp; `dist` keeps ONE uniform tensor per sampler, so a dist chain
+   stays on the old one-row path (the server gate below excludes it).
+3. `llama_context::decode`: drop the one-output-per-seq refusal; readback iterates the row-keyed
+   maps (`copy_tensor_async_*` get the global row = `n_outputs_prev + local row`).
+4. Server (slot launch): keep device sampling on for a speculating slot iff the chain is stateless
+   and fully backend-capable: temp <= 0 (greedy tail, no RNG), no penalties (`penalty_last_n == 0`
+   or repeat 1.0 / freq 0 / presence 0), no DRY, no mirostat, no grammar, no reasoning budget,
+   `n_probs == 0`, no typical / xtc / top-n-sigma, spec tree (#132) off, not SPLIT_MODE_TENSOR.
+   `common_sampler_sample` already returns the device token early (sampling.cpp ~597) and
+   `set_logits` reads the device candidates, so `common_sampler_sample_and_accept_n` needs no
+   change; `common_sampler_accept` still updates the host ring buffer for the accepted tokens.
+5. Raw logits: `needs_raw_logits` turns false for a fully device-sampled batch, so nothing in the
+   verify path may call `llama_get_logits_ith` on those rows (audit: server 1120/1130 argmax
+   helpers, `LLAMA_SPEC_ALT_STATS`, n_probs = excluded by the gate).
+
+Graph shape: with the fork's default draft padding (`LLAMA_SPEC_DRAFT_NO_PAD` unset) the verify
+batch is always n_max + 1 rows, so the per-row views keep the graph static and the decode-graph
+cache keeps hitting; with padding off the sampler node set changes with the draft length and the
+graph is rebuilt per step (correct, slower host side) - the fixed-lane gather (index tensor pointing
+missing lanes at the pad row) is the follow-up if that path matters.
+
+Gates: (1) byte-identity: 6 Phase 0 prompts x 200 tokens greedy, MTP n-max 3 and 4, device sampling
+on vs off (same binary, env/param toggle) -> identical sha per prompt; (2) `LLAMA_SPEC_TIMING_SYNC=1`
+accept + decode phase ms per round before/after; (3) probe.py t/s interleaved. Prize bound: the
+accept phase (~2.0 ms) plus the verify logits D2H (~5 MB per round) of a ~68 ms round = ~3-4 %.
+
+#### F4 step 2 result (2026-09-29 01:39-01:42, `153-p0/t2-gate.sh`, dev bins devbins-t2a, MTP head Q4_0, greedy)
+
+Built as planned (graph: per-output-row chain application keyed by output row; context: guard
+dropped, row readback; common: identity samplers skipped under `-bs` so the device prefix reaches
+the dist tail; server: `sampling_is_stateless_greedy` gate). Engagement confirmed in the child log
+(`setting backend sampler for seq_id 0 (n = 5)`). MTP n-max 3, Phase 0 prompts, arms bs / host /
+bs interleaved:
+
+| arm | t/s (6 prompts) | spec timing per 64 rounds: draft / decode / accept ms | outputs |
+|---|---|---|---|
+| device (-bs) | 56.6, 55.6 | 427-445 / 3080-3221 / **3.3** | byte-identical to host, 6/6 |
+| host | 56.1 | 429 / 2945 / 85.5 | reference |
+
+The accept phase drops from 1.34 ms to 0.05 ms per round as predicted, but the verify `decode`
+phase grows by 2-4 ms per round (the sampler graph runs inside it, and the falling drift of the
+hot card lands on the later arms), so the end-to-end t/s is flat within noise. **Speed verdict:
+neutral on this shape** - the round is verify-bound (83 %) and the host accept was only 2 % of it,
+exactly the bound stated above. Correctness verdict: exact (greedy byte-identity 6/6).
+
+n-max 4 (5 verify rows) fails with HTTP 500 under `-bs` on both attempts while the host arm runs
+(56.3 t/s): see the ledger for the cause and the decision (fix vs revert).
+
+n-max 4 cause and the two fixes (02:45): the `dist` tail keeps ONE uniform input tensor per sampler,
+overwritten by each per-row application, so only the last row's uniform is set and the other rows
+read an uninitialised input (a garbage index, hence the `vector::_M_range_check` 500). First fix -
+a `greedy` tail when `backend_sampling && temp <= 0` - removed the crash but produced WRONG tokens
+at -35 % speed (re-gate `t2-gate2.sh`: 0/6 identical, 33-37 t/s): the greedy device sampler runs
+`ggml_argmax` over the truncated logits row and never maps the index back through the candidate
+list that top-k left behind (dist does, via `ggml_get_rows(candidates, idx)`), so it emitted
+candidate positions 0..39 as token ids - a latent bug of the device greedy sampler for any chain
+with a truncating sampler in front of it. Second fix: the same candidate mapping in
+`llama_sampler_greedy_backend_apply`; re-gate `t2-gate3.sh` (devbins-t2c).
+
+Final gate (`t2-gate3.sh`, devbins-t2c, 02:59-03:03): n-max 3 device / host / device = 57.4 / 55.1 /
+54.8 t/s, n-max 4 = 55.4 / 55.2 / 55.1; byte-identity 6/6 at both widths; accept 3.0-3.2 ms vs
+81-86 ms per 64 rounds; the verify decode phase reads +0..+170 ms per 64 rounds on the device arms
+(within the night's drift). **F4 step 2 verdict: exact and speed-neutral on this shape; kept as
+an opt-in (`-bs`, off by default); side effect: the device greedy sampler's candidate-mapping bug
+is fixed for every chain that truncates before it.**
+
 ## 5. Diagnostic ablations (small changes, run before/alongside D6)
 
 Compile-time `MMSMT_ABLATE` (default 0; dev builds only, never in an image):

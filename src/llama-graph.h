@@ -861,10 +861,13 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor *> t_candidates;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+    // backend sampling results keyed by the row's index among this ubatch's outputs (every output
+    // row of a sequence with a sampler is sampled: speculative verify batches carry n_draft + 1 rows
+    // of one sequence); negative keys hold the inactive samplers' dummy-row applications
+    std::map<int32_t, ggml_tensor *> t_sampled_logits;
+    std::map<int32_t, ggml_tensor *> t_candidates;
+    std::map<int32_t, ggml_tensor *> t_sampled;
+    std::map<int32_t, ggml_tensor *> t_sampled_probs;
 
     // TASKS #151: (layer, flat routed ids) of every cache-engaged MoE layer, read back after compute
     std::vector<std::pair<int, ggml_tensor *>> t_moe_cache_ids;
