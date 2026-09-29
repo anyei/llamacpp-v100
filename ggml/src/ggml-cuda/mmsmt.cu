@@ -19,9 +19,10 @@
 
 void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-#define MMSMT_COLS 32 // output rows per CTA (= mma N per warp; every warp decodes all 32 rows)
+#define MMSMT_COLS 64 // output rows per CTA: two 32-row halves (V5), each decoded by MMSMT_KW warps splitting K
+#define MMSMT_KW   4  // warps per 32-row half (they split the staged K range)
 #define MMSMT_TILE  8 // tokens per activation tile (mma M)
-#define MMSMT_NWARPS 4 // warps per CTA; they split the staged K range (docs/mmsmt-implementation.md 4.3)
+#define MMSMT_NWARPS 8 // warps per CTA = 2 halves x MMSMT_KW (docs/mmsmt-implementation.md V5)
 
 // f32 [T][K] -> f16 [T][K]; rows >= nrows (tile padding) are written as zeros
 static __global__ void mmsmt_prep_act(const float * __restrict__ x, const int64_t stride_x,
@@ -297,8 +298,8 @@ template <> struct mmsmt_layout<T> {                                            
     static constexpr int  SB_BYTES = SB_, SLOT = SLOT_, NSB = NSB_, NCH = NCH_, GW = GW_, RW = RW_;  \
     static constexpr bool PARITY = PAR_;                                                            \
     static constexpr int  K_PER_CH = QK_K/NCH_;                                                     \
-    static constexpr int  UNITS = NSB_*NCH_, U = UNITS/MMSMT_NWARPS;                                \
-    static_assert(UNITS % MMSMT_NWARPS == 0, "chunk units must split evenly over the warps");       \
+    static constexpr int  UNITS = NSB_*NCH_, U = UNITS/MMSMT_KW;                                    \
+    static_assert(UNITS % MMSMT_KW == 0, "chunk units must split evenly over the K-split warps");   \
     static constexpr int  SEG_BYTES = SB_ + (PAR_ ? 2 : 0);   /* bytes copied per super-block row */ \
     static constexpr int  NPIECE = (SEG_BYTES + 15)/16;       /* 16-byte pieces per super-block row */ \
     static constexpr int  NJ = (NPIECE + MMSMT_LPR - 1)/MMSMT_LPR; /* copy instructions per row group */ \
@@ -751,13 +752,13 @@ static __device__ __forceinline__ void mmsmt_piece_st(uint32_t * __restrict__ s,
 }
 
 template <ggml_type type, int NWARPS, int NTILES>
-static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
+static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 2) mmsmt_kernel(
         const char * __restrict__ src0, const int64_t nb01, const half2 * __restrict__ x16,
         float * __restrict__ out, const int64_t ne00, const int64_t ne01, const int64_t ne11, const int sb_per_split, const int ablate) {
 #if defined(VOLTA_MMA_AVAILABLE)
     using L = mmsmt_layout<type>;
     static_assert(NWARPS == MMSMT_NWARPS, "the layouts split chunk-units over MMSMT_NWARPS warps");
-    static_assert((NWARPS - 1)*WARP_SIZE*NTILES*8 <= MMSMT_COLS*L::STRIDE, "stage buffer too small for the cross-warp reduce");
+    static_assert(2*(MMSMT_KW - 1)*WARP_SIZE*NTILES*8 <= MMSMT_COLS*L::STRIDE, "stage buffer too small for the cross-warp reduce");
     __shared__ __align__(16) uint32_t stage[MMSMT_COLS*L::STRIDE];
     // per-warp activation slices: U units x NTILES*8 token rows x K_PER_CH fp16, row stride + 16 B
     // keeps the 8 rows of an mma slice-pair on distinct bank groups (docs/mmsmt-implementation.md 4.5)
@@ -765,16 +766,18 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
     constexpr int ACT_UNIT = NTILES*MMSMT_TILE*ACT_ROW;
     constexpr int APL      = NTILES*L::K_PER_CH/32;   // 16-byte activation pieces per lane per unit
     static_assert(APL*32 == NTILES*MMSMT_TILE*(L::K_PER_CH/8), "activation pieces must split evenly over the lanes");
-    __shared__ __align__(16) uint8_t act[NWARPS][L::U*ACT_UNIT];
+    __shared__ __align__(16) uint8_t act[MMSMT_KW][L::U*ACT_UNIT];   // one slice set per K-split lane, shared by the two halves
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int qp   = (lane >> 2) & 3;                      // quadpair
     const int r    = (lane & 3) + ((lane & 16) ? 4 : 0);   // token row of the A fragment and row-in-quadpair of B
-    const int lrow = qp*8 + r;                             // this lane's decode row within the CTA
+    const int half = warp / MMSMT_KW;                      // which 32-row half this warp decodes
+    const int kw   = warp % MMSMT_KW;                      // its K-split lane within the half
+    const int lrow = half*32 + qp*8 + r;                   // this lane's decode row within the CTA
 
     const int64_t colw = (int64_t) blockIdx.x*MMSMT_COLS;
-    const int64_t col0 = colw + qp*8;
+    const int64_t col0 = colw + half*32 + qp*8;
     const int64_t col  = col0 + r;
     const bool    good = col < ne01;
 
@@ -815,13 +818,13 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
 
     uint32_t pf[L::NPF];
     uint4    apf[L::U*APL];
-    uint8_t * act_w = act[warp];
+    uint8_t * act_w = act[kw];
 
     // this warp's activation slices for the units of the step at sb: token row / k-piece of piece p
     auto load_act = [&](const int sb) {
 #pragma unroll
         for (int i = 0; i < L::U; ++i) {
-            const int u   = warp*L::U + i;
+            const int u   = kw*L::U + i;
             const int sbl = u / L::NCH;
             const int c   = u % L::NCH;
             if (sb + sbl < sb1) {
@@ -887,7 +890,9 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
 
     if (sb0 < sb1) {
         load_tile(sb0);
-        load_act(sb0);
+        if (half == 0) {
+            load_act(sb0);
+        }
     }
     for (int sb = sb0; sb < sb1; sb += L::NSB) {
         __syncthreads();                 // every warp is done reading the previous step
@@ -895,7 +900,9 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
         if (ablate != 2 || sb == sb0) {
             store_tile();
         }
-        store_act();
+        if (half == 0) {
+            store_act();
+        }
         __syncthreads();                 // the step is visible
         if (ablate != 2 && sb + L::NSB < sb1) {
             load_tile(sb + L::NSB);
@@ -904,7 +911,7 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
             const int nsb_step = min(L::NSB, sb1 - sb);
 #pragma unroll
             for (int i = 0; i < L::U; ++i) {
-                const int u   = warp*L::U + i;
+                const int u   = kw*L::U + i;
                 const int sbl = u / L::NCH;
                 const int c   = u % L::NCH;
                 if (sbl < nsb_step) {
@@ -914,33 +921,33 @@ static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 4) mmsmt_kernel(
                 }
             }
         }
-        __syncwarp();                    // this warp's activation reads are done: refill its private slice
-        if (sb + L::NSB < sb1) {
+        // the slice is shared by the two halves: the next refill waits for the first barrier of the next step
+        if (half == 0 && sb + L::NSB < sb1) {
             load_act(sb + L::NSB);
         }
     }
 
-    // cross-warp reduce: warps 1.. park their partials in the (now free) stage buffer, warp 0 sums in order
+    // cross-warp reduce per half: K lanes 1.. park their partials in the (now free) stage buffer, lane 0 sums in order
     __syncthreads();
     float * red = reinterpret_cast<float *>(stage);
-    if (warp > 0) {
+    if (kw > 0) {
 #pragma unroll
         for (int t = 0; t < NTILES; ++t) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                red[((warp - 1)*WARP_SIZE + lane)*(NTILES*8) + t*8 + i] = crun[t][i];
+                red[((half*(MMSMT_KW - 1) + kw - 1)*WARP_SIZE + lane)*(NTILES*8) + t*8 + i] = crun[t][i];
             }
         }
     }
     __syncthreads();
-    if (warp == 0) {
+    if (kw == 0) {
 #pragma unroll
-        for (int w = 1; w < NWARPS; ++w) {
+        for (int w = 1; w < MMSMT_KW; ++w) {
 #pragma unroll
             for (int t = 0; t < NTILES; ++t) {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    crun[t][i] += red[((w - 1)*WARP_SIZE + lane)*(NTILES*8) + t*8 + i];
+                    crun[t][i] += red[((half*(MMSMT_KW - 1) + w - 1)*WARP_SIZE + lane)*(NTILES*8) + t*8 + i];
                 }
             }
         }
@@ -984,8 +991,9 @@ static void mmsmt_launch_tiles(const int ntiles, const dim3 grid, cudaStream_t s
         const int64_t ne00, const int64_t ne01, const int64_t ne11, const int sb_per_split, const int ablate) {
     const dim3 block(NWARPS*WARP_SIZE);
     switch (ntiles) {
+        // one tile only (T <= 8): the two-tile kernels lost to MMQ at widths 12-16 (docs/mmsmt-implementation.md F2)
+        // and their doubled activation slices exceed the static shared limit for Q2_0 at 64-row CTAs
         case 1: mmsmt_kernel<type, NWARPS, 1><<<grid, block, 0, stream>>>(src0, nb01, x16, out, ne00, ne01, ne11, sb_per_split, ablate); break;
-        case 2: mmsmt_kernel<type, NWARPS, 2><<<grid, block, 0, stream>>>(src0, nb01, x16, out, ne00, ne01, ne11, sb_per_split, ablate); break;
         default: GGML_ABORT("mmsmt: bad tile count");
     }
 }
@@ -1031,25 +1039,33 @@ static bool mmsmt_type_supported(const ggml_type type) {
 
 bool ggml_cuda_should_use_mmsmt(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
     static const bool enabled = [] {
-        // opt-in while the kernel is at parity with MMVQ/MMQ (TASKS #153 T1, docs/volta-smallt-gemm-plan.md)
+        // ON by default since 2026-09-28 (KL gate + serve A/B passed, docs/mmsmt-implementation.md 4.7);
+        // GGML_CUDA_SMT=0 disables the route
         const char * e = getenv("GGML_CUDA_SMT");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     if (!enabled || !volta_mma_available(cc) || !mmsmt_type_supported(src0->type)) {
         return false;
     }
-    // per-type minimum width (docs/mmsmt-implementation.md 4.6): MMVQ stays ahead below it. Measured on
-    // the X99 V100: Q4_K wins from width 3, Q8_0 from width 6 (MMVQ Q8_0 streams ~715 GB/s at width 2).
-    // Other K-quants / IQ4_XS decode at Q4_K cost or more (same crossover assumed); Q4_0 / Q2_0 are
-    // cheap decodes with a strong MMVQ like Q8_0. GGML_CUDA_SMT_MIN overrides for experiments.
+    // per-type minimum width: MMVQ (or MMQ) stays ahead below it. GGML_CUDA_SMT_MIN overrides for experiments.
     static const int min_env = getenv("GGML_CUDA_SMT_MIN") ? atoi(getenv("GGML_CUDA_SMT_MIN")) : 0;
-    int min_width = 3;
+    // measured per type on requantised 27B copies (docs/mmsmt-implementation.md 4.9, 2026-09-28):
+    // first width where route on >= 1.03 x route off. Q4_0 / Q2_0 unmeasured: grouped with Q8_0.
+    int min_width = 6;
     switch (src0->type) {
-        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q2_K:
+            min_width = 3;   // 1.20 / 1.10 at width 3, 1.5 at 6-8
+            break;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            min_width = 4;   // width 3 is a tie (1.00 / 0.97), 1.19 at 4
+            break;
+        case GGML_TYPE_Q6_K:    // 0.95 / 1.03 / 1.19 at 4 / 5 / 6
+        case GGML_TYPE_IQ4_XS:  // 0.75 at 5 (MMVQ's table path is fast), 1.13 at 6
+        case GGML_TYPE_Q8_0:    // 0.93 at 5, 1.08 at 6
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q2_0:
-            min_width = 6;
-            break;
         default:
             break;
     }
@@ -1112,7 +1128,7 @@ void ggml_cuda_mul_mat_smt(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int     nsb     = (int) (ne00/QK_K);
     const int     nsbstep = mmsmt_nsb(src0->type);
     const int     nsteps  = (nsb + nsbstep - 1)/nsbstep;
-    int ksplit = (int) ((4*ggml_cuda_info().devices[ctx.device].nsm + ncolgrp - 1)/ncolgrp);
+    int ksplit = (int) ((2*ggml_cuda_info().devices[ctx.device].nsm + ncolgrp - 1)/ncolgrp);
     ksplit = std::max(1, std::min(ksplit, nsteps));
     static const int ablate = getenv("GGML_CUDA_SMT_ABLATE") ? atoi(getenv("GGML_CUDA_SMT_ABLATE")) : 0; // dev only
     const int sb_per_split = ((nsteps + ksplit - 1)/ksplit)*nsbstep;

@@ -71,6 +71,16 @@ constexpr int CTX_GUARD_HOLD_TIMEOUT_MS = 30000;
 // env LLAMA_SPEC_TIMING: coarse per-phase timing of the speculative decode loop
 struct server_spec_timing {
     bool    enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    // LLAMA_SPEC_TIMING_SYNC=1 (dev): wait for the GPU at every phase boundary so the host clocks
+    // become GPU-inclusive per phase (serialises the pipeline; never a baseline)
+    bool    sync_on = getenv("LLAMA_SPEC_TIMING_SYNC") != nullptr;
+    void sync(llama_context * tgt, llama_context * dft) {
+        if (!sync_on) {
+            return;
+        }
+        if (tgt) { llama_synchronize(tgt); }
+        if (dft) { llama_synchronize(dft); }
+    }
     int64_t n_iter  = 0;
     int64_t t_draft = 0, t_ckpt = 0, t_decode = 0, t_accept = 0;
 
@@ -4426,8 +4436,10 @@ private:
 
         // generate the actual drafts (if any)
         {
+            g_spec_timing.sync(ctx_tgt, ctx_dft);
             const int64_t t0 = ggml_time_us();
             common_speculative_draft(spec.get());
+            g_spec_timing.sync(ctx_tgt, ctx_dft);
             g_spec_timing.t_draft += ggml_time_us() - t0;
         }
 
@@ -4484,6 +4496,7 @@ private:
             });
         }
 
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         const int64_t t_ckpt_0 = ggml_time_us();
 
         // make checkpoints if needed
@@ -4542,6 +4555,7 @@ private:
             }
         });
 
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         g_spec_timing.t_ckpt += ggml_time_us() - t_ckpt_0;
 
         // PEARL (#108): launch the draft-ahead worker now that every main-thread
@@ -5153,10 +5167,12 @@ private:
             n_empty_consecutive = 0;
         }
 
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         const int64_t t_decode_0 = ggml_time_us();
 
         const int ret = llama_decode(ctx_tgt, batch_view);
 
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         g_spec_timing.t_decode += ggml_time_us() - t_decode_0;
         g_spec_timing.report();
 
@@ -5449,6 +5465,7 @@ private:
         spec_ahead.join();
 
         // speculative decoding - main model sample and accept
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         const int64_t t_accept_0 = ggml_time_us();
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
@@ -5695,6 +5712,7 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
         });
+        g_spec_timing.sync(ctx_tgt, ctx_dft);
         g_spec_timing.t_accept += ggml_time_us() - t_accept_0;
     }
 

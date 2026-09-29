@@ -144,3 +144,24 @@ Then the `mul_mat_id` sibling (experts see 1-8 rows each at top-k routing; compo
   n-max-2 loss is the extra prep/reduce launches per routed matmul (fold the f32->f16 conversion
   into the kernel = next tuning item, documented first). Decision points for the user: default flip
   (quality-neutral; loses 5% at n-max 2, wins 9-19% at 3-4), commit, image roll.
+- 2026-09-28 (late night, cont.): user decisions: **route ON by default** (`GGML_CUDA_SMT=0` opts out) and
+  **image roll** (`llamacpp-local-v100:1c63c03a1-smt`, rollback e117ee884-widefix). env-gates.md rows
+  added. Dev binaries for the gates: devbins-smt24 on the X99.
+- 2026-09-28 17:05: **ROLLED**. `llamacpp-local-v100:1c63c03a1-smt` = `:latest` (local + registry), X99
+  launcher recreated on it; shipped-image checks: bench pp4/pp8 89.8/177.2 default vs 75.9/135.4 with
+  `GGML_CUDA_SMT=0`, 1-chunk PPL 4.3517 at -ub 4. Rollback e117ee884-widefix, or `GGML_CUDA_SMT=0`.
+- 2026-09-28 17:25: X99 power cap lifted by the user (250 W, SM clock locked 1380 MHz, no throttle
+  reasons). Shipped-image bench at full power: pp4/pp8 90.7/178.6 default vs 76.6/136.3 with
+  `GGML_CUDA_SMT=0` (short benches never throttled; the cap matters for sustained serves). Cleanup:
+  27 X99 dev-binary dirs (2.5 GB) and the 42 GB tmpfs model copies removed; scripts and logs stay
+  in `/home/anyei/153-p0`.
+- 2026-09-28 (evening): follow-up program F1-F4 (details in `docs/mmsmt-implementation.md` 4.8-4.9):
+  F1 rejected (in-kernel f32 conversion = net loss), F2 closed (V5 = 64-row CTAs with shared
+  activation slices WINS +5-7% over v11; two-tile and deeper prefetch lose), F3 not built (Volta
+  mul_mat_id already MMVQ-id at T <= 8; ~1 row per expert), F4 measured (verify = 83% of the round;
+  fused chain worth 0; GPU-resident round <= ~12%). Per-type route table measured on requantised
+  copies: Q3_K/Q2_K from 3, Q4_K/Q5_K from 4, Q6_K/IQ4_XS/Q8_0 from 6. Roll candidate V5 + table =
+  devbins-smt33, gates queued.
+- 2026-09-28 18:50: **ROLL 2** = V5 + per-type table, `llamacpp-local-v100:1c63c03a1-smt2` (= :latest,
+  rollback 1c63c03a1-smt). Mix bench route on/off widths 1-8 = 1.00/1.00/1.00/1.17/1.24/1.34/1.34/1.33;
+  serve n-max 2/3/4 = 50.8/56.1/56.9 vs 52.8/47.7/44.7; KL + comparator + oracle green.

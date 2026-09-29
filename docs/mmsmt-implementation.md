@@ -27,7 +27,7 @@ V100 (sm_70) facts that shape the design: fp16 tensor cores via `mma.sync.m8n8k4
 no `cp.async`, no `ldmatrix`); 64K registers and 96 KB shared per SM; 4 schedulers; HBM2 ~900 GB/s
 peak, ~250-300 GB/s for scattered 32-64 B accesses.
 
-## 2. What exists (v9, `ggml/src/ggml-cuda/mmsmt.cu`, route opt-in via `GGML_CUDA_SMT=1`)
+## 2. What exists (v9 at the time of writing; `ggml/src/ggml-cuda/mmsmt.cu`; the route is ON by default since v11, `GGML_CUDA_SMT=0` disables)
 
 - Route: `ggml_cuda_should_use_mmsmt` — Volta, 2 <= ne11 <= 16, ne00 % 256 == 0, 2-D contiguous
   f32 in/out, supported quant type. Hooked in `ggml_cuda_mul_mat` before MMVQ.
@@ -250,7 +250,7 @@ Q8_0 is unusually strong at widths 2-5 (~715 GB/s at width 2), so the route need
 width: K-quants / IQ4_XS / Q3_K / Q2_K -> from width 3 (measured on Q4_K; the other K-quant decodes
 cost the same or more per byte, so the same crossover is assumed until measured); Q8_0 / Q4_0 / Q2_0
 (cheap decodes, strong MMVQ) -> from width 6. Env `GGML_CUDA_SMT_MIN` overrides the minimum for
-experiments. The route stays opt-in until the KL gate and a serve-level MTP A/B pass.
+experiments. The route is ON by default since 2026-09-28 (user decision after the KL gate and the serve A/B, 4.7); `GGML_CUDA_SMT=0` disables it.
 
 **Gate finding**: the oracle script never set `GGML_CUDA_SMT=1`, so from the moment the route became
 opt-in (v6) every "1179/1179" ran the stock kernels; the no-activation ablation build passing the
@@ -300,6 +300,205 @@ activation staging cost (copy-only 653 -> 494 when it was added: 8 KB of L2 read
   is the extra launches per routed matmul (f32->f16 prep and, for narrow N, the K-split reduce) on
   steps that are only ~1.06x faster in the bench; folding the conversion into the kernel's activation
   staging removes the prep launch and the x16 buffer (follow-up, needs its section here first).
+
+## 4.8 Follow-up program (user go 2026-09-28: items F1-F4, "analysis and development unless a real problem")
+
+### F1. Fold the f32 -> f16 activation conversion into the kernel
+
+Analysis. Every routed matmul today launches `mmsmt_prep_act` (f32 rows -> f16 tile `x16[tpad][K]`,
+a pool allocation) before the main kernel, and for narrow N a `mmsmt_reduce` after it. The serve A/B
+showed a 5% loss at MTP n-max 2 (verify width <= 3, where the bench gain is only 1.06x) that these
+extra launches explain: ~450 routed matmuls per step on the 27B, each with 1-2 extra graph nodes
+(~2-3 us each in replay) = 1-3 ms on a ~43 ms step. The conversion itself is trivial work.
+
+Design. `load_act` reads the f32 activation rows directly: per 16-byte f16 piece (8 values) it loads
+two `float4` from `src1 + row*nb11 + k` and converts with `__floats2half2_rn` into the same `apf`
+uint4 register, so the register budget is unchanged; rows >= ne11 (tile padding) are zeroed in
+registers (no memory read). The kernel gets `src1`, `nb11` (floats) instead of `x16`; the pool
+buffer and the prep launch disappear; the timer's "prep" phase becomes 0. L2 traffic for
+activations doubles (f32), still far below the weight stream (8 KB -> 16 KB per CTA step vs 9 KB of
+weights) and it is L2-resident. The K-split reduce stays (needed for determinism; N = 1024
+projections only). Gates: oracle route-on, comparator, KL at ub 3/4/8, width bench, serve A/B n-max
+2 (the target: >= parity with route off).
+
+### F2. Overlap, width 2, two-tile budget (experiment matrix, one build each, timer + bench)
+
+- E-ov1: `__launch_bounds__(128, 3)` (170 registers, 12 warps/SM) with a two-step register
+  prefetch (NPF x 2) - tests whether deeper prefetch beats occupancy.
+- E-ov2: NSB 4 for Q4_K-class with 4 lanes per row (prefetch 48 words) - longer per-row streams.
+- E-ov3: activation slice loaded for step s+1 during the decode of step s (16 more live registers)
+  vs the current end-of-decode load.
+- Width 2: re-bench after F1; if the route still trails MMVQ at width 2 the per-type minimum stays 3
+  (no code).
+- Two-tile (T 9-16): NACC 1 for NTILES 2 (cpart 16 instead of 32) + half-chunk decode words (w[8])
+  to fit 128 registers; bench widths 12/16 vs MMQ (221 t/s at 16 today). If it does not beat MMQ the
+  cap stays at 8.
+
+F2 results (2026-09-28 18:13, real UD-Q4_K_XL, route forced from width 2, t/s at widths 3/4/8/12/16;
+off reference 69.4/78.1/118.4/151.5/199.1):
+
+| variant | 3 | 4 | 8 | 12 | 16 | timer w4 |
+|---|---|---|---|---|---|---|
+| F1 as built (4 CTAs/SM, one tile in flight; V1 bound was a no-op at 128 regs) | 60.1 | 80.0 | 142.7 | unrouted | unrouted | 369 GB/s |
+| V4: two-tile kernels with one chain, cap 16 | 57.6 | 76.8 | 137.6 | 134.6 | 168.8 | 351 |
+| V3: V4 + two weight tiles in flight, 160 regs, 3 CTAs/SM | 56.9 | 75.7 | 137.4 | 146.1 | 183.6 | 342 |
+
+Verdict: occupancy beats prefetch depth on this kernel (V3 loses 7%); the two-tile path still loses
+11-15% to MMQ at 12/16 even without spills (3 CTAs/SM from the doubled activation slice) - the cap
+stays at 8. Width 3 on the MIXED model is a loss (0.87) even for F1: not an overlap problem but a
+per-type one (section 4.9). E-ov2 (NSB 4) is not worth a build after V3: it needs the same
+register/occupancy trade.
+
+### F1 verdict: rejected (2026-09-28 18:17)
+
+Back-to-back on the real UD-Q4_K_XL (route forced from width 2, widths 3/4/8): v11 58.7 / 78.7 /
+150.8 t/s, kernel timer 396 GB/s (prep 9 us per call); F1 57.7 / 76.7 / 137.8, timer 352. The
+in-kernel conversion doubles the activation bytes each CTA pulls from L2 (f32 instead of f16), and
+with 32-row CTAs the activation traffic is already ~90% of the weight stream (320 CTAs x 80 KB tile
+= 26 MB per 29 MB matmul), so the extra L2/LSU work costs more than the 9 us prep launch it saved.
+The comparator/KL/oracle gates passed (numerically identical), so F1 is correct but slower: not
+shipped; source kept as `mmsmt.cu.f1-final`. The activation-traffic observation is the lead for V5.
+
+### V5: 64-row CTAs (halve the activation re-read), same occupancy
+
+- CTA = 8 warps, 64 output rows: warps 0-3 decode rows 0-31, warps 4-7 rows 32-63; within a half the
+  4 warps split the step's chunk-units as today (`kw = warp % 4`). Each warp still copies 8 rows
+  (8 x 8 = 64), so the copy code is unchanged with `row base = warp*8`.
+- Activation slices are per K-unit, shared by the two warps with the same `kw`: loaded and stored by
+  the `half == 0` warp only, read by both after the second barrier (the first barrier already
+  orders the previous step's reads before the overwrite). Activation L2 traffic per row halves
+  (13 MB per matmul instead of 26).
+- Shared per CTA: weights 64 x stride (Q4_K 19.5 KB) + 4 activation slices (8.7 KB) = 28 KB -> 2
+  CTAs/SM by registers (128 x 256 threads x 2 = the file), i.e. the same 16 warps/SM as today, 56 KB
+  of shared. Cross-warp reduce per half (3 x 32 lanes x 8 floats each, fits in the stage buffer).
+- Grid (ceil(N/64), ksplit) with ksplit aimed at 2 CTAs/SM (N 5120 -> 80 groups x 2).
+- Expected: the activation staging cost the copy side 24% when it was added (653 -> 494 GB/s in the
+  v10 ablation); halving that traffic should return roughly half of it (~+8-12%), at no occupancy
+  cost. Gates: oracle route-on, comparator, bench vs v11 back to back, KL if it wins.
+- Result (2026-09-28 18:32, real UD-Q4_K_XL, route forced from width 2, back to back): **V5 61.7 /
+  82.7 / 157.8 t/s at widths 3/4/8, timer 423 GB/s; v11 58.6 / 78.7 / 151.2, timer 396** -> +5% bench,
+  +7% kernel. Oracle route-on 1179/1179. The two-tile instantiation was dropped in the same change
+  (its doubled activation slices put Q2_0 over the 48 KB static shared limit at 64 rows, and it had
+  lost to MMQ anyway). V5 + the 4.9 table = the roll candidate (devbins-smt33); comparator, KL, bench
+  and serve legs queued.
+
+### 4.9 Per-type route table from measurement (the width-3 finding)
+
+On the real UD-Q4_K_XL mix, F1 route on vs off = 0.83 / 0.98 / 1.16 at widths 3/4/8, far below the
+pure-Q4_K copy (1.06 / 1.28 / 1.31), and the serve loss at MTP n-max 2 (-12%) survived F1. The mix is
+191 Q5_K, 110 Q8_0, 70 IQ4_XS, 69 Q4_K, 56 Q6_K tensors; only Q4_K and Q8_0 were ever measured, and
+the table assumed the other K-quants cross over where Q4_K does. Their decodes are heavier (Q5_K:
+high-bit plane merge; Q6_K: 6-bit unpack from two planes; IQ4_XS: table lookup, ~3x Q4_K's
+per-word work), so their compute ceilings sit lower and they can lose to MMVQ at widths 3-4 while
+Q4_K wins. Measurement: requantised pure copies (Q4_K_S, Q5_K_S, Q6_K, IQ4_XS, Q3_K_S, Q2_K) benched
+route off vs on (min width forced to 2) at widths 2-8; the per-type minimum width is the first width
+where on >= 1.03 x off, or "never" (type excluded from the route).
+
+Results (2026-09-28 18:22-18:30, v11 build, X99 at 250 W, `-r 8`; route on / route off):
+
+| type | w2 | w3 | w4 | w5 | w6 | w8 | min width |
+|---|---|---|---|---|---|---|---|
+| Q3_K | 0.98 | 1.20 | 1.33 | 1.36 | 1.50 | 1.50 | 3 |
+| Q2_K | 0.89 | 1.10 | 1.38 | 1.51 | 1.54 | 1.53 | 3 |
+| Q4_K | 0.81 | 1.00 | 1.19 | 1.37 | 1.31 | 1.30 | 4 |
+| Q5_K | 0.86 | 0.97 | 1.19 | 1.28 | 1.41 | 1.41 | 4 |
+| Q6_K | 0.72 | 0.82 | 0.95 | 1.03 | 1.19 | 1.19 | 6 |
+| IQ4_XS | 0.54 | 0.63 | 0.71 | 0.75 | 1.13 | 1.13 | 6 |
+| Q8_0 (4.6) | 0.77 | 0.81 | 0.87 | 0.93 | 1.08 | 1.08 | 6 |
+
+Reading: the kernel is flat in width (weight-stream bound) so the crossover is set by how strong
+the incumbent is for that type. MMVQ's IQ4_XS path (table via a fast dp4a lookup) and Q8_0 are the
+strongest, Q3_K/Q2_K the weakest (their dp4a unpack is costly), K-quants in between. On the GSQ-RCO
+fleet's DENSE tensors this means: Q8_0 attention from width 6 only, but any Q3_K/Q2_K dense tensor
+(shared experts, MTP heads) from width 3. Applied to `ggml_cuda_should_use_mmsmt`; Q4_0/Q2_0 are
+grouped with Q8_0 until measured. The width-3 loss on the UD-Q4_K_XL mix is now explained by
+Q5_K (0.97), Q6_K (0.82) and IQ4_XS (0.63) all routing at width 3; with the table the mix routes
+Q4_K/Q5_K from 4 and Q6_K/IQ4_XS/Q8_0 from 6, so MTP n-max 2 (verify width 3) falls back to the
+stock kernels entirely (no loss, no gain) and n-max 3-4 keep their gains.
+
+### F3. `mul_mat_id` sibling - analysis says: not for the models in this fleet
+
+The CUDA expert matmul already has expert-aware fused kernels: MMVQ-id up to
+`get_mmvq_mmid_max_batch` rows and MMQ-id above it (both on Volta), plus the generic sorted path
+(the #151 bug site). What a tensor-core sibling would change is the per-EXPERT width regime: the
+m8n8k4 tile is 8 activation rows, and the kernel's time is flat in the width (weight-stream bound),
+so it only pays when an expert sees >= 3 rows in one call. With fine-grained MoE routing (E experts,
+top-k) at decode/verify width T the expected rows per used expert is T*k / (E*(1-(1-k/E)^T)):
+Flash-Next / DeepSeek-V4-class (E 256, k 8) at T 4 -> 1.05 rows per expert; at T 8 -> 1.1. Those
+experts run at width 1-2 where MMVQ-id (~590 GB/s single column) beats this kernel (~440 GB/s at
+any width) by ~35%. Per-expert widths >= 3 only appear at T >= ~24 (prefill chunks, where MMQ-id is
+already the right tool) or for coarse MoE (E <= 16, Mixtral-style) which the fleet does not run.
+The MoE models' dense parts (attention projections, shared experts, the MTP head) are plain
+`mul_mat` and already take the route. Decision: measure instead of build - a route-on/off bench on
+a MoE model (dense parts) and a rows-per-expert histogram from a MoE decode; build the sibling only
+if a model with wide experts appears. This is the "real problem" clause: the sibling as designed
+would not pay for the current fleet. Confirmed in code: on Volta `get_mmvq_mmid_max_batch` returns
+`MMVQ_MAX_BATCH_SIZE` (8), i.e. every expert matmul at T <= 8 already runs the fused expert-aware
+MMVQ, the right kernel for width-1..2 experts.
+
+Second finding for the GSQ-RCO fleet (Flash-Next, GLM-5.3, MiMo-2.6 on the X99: Q3_K/Q2_K/Q2_0
+experts, Q8_0 + BF16 attention): at MTP verify widths 3-5 the dense route contributes ~nothing
+there either - Q8_0 routes only from width 6 (MMVQ wins below), BF16 is not a routed type, and the
+experts are width-1 MMVQ-id. T1 is a dense-model win (Qwen3.8-27B UD-Q4_K_XL and any K-quant dense
+model); for the MoE fleet the levers are the round overhead (F4) and expert bytes (#151), not this
+kernel. A route-on/off bench on Flash-Next would show ~0 by construction; run it only if the user
+wants the number on record.
+
+### F4. GPU-resident speculative round (T2) - what exists, what remains
+
+What exists in the fork: #140 fused in-graph draft chain (`LLAMA_SPEC_MTP_FUSED=1`): a single-seq
+MTP round runs all n draft steps in ONE decode with in-graph argmax (the drafted ids come back as one
+packed row), i.e. the per-draft-step decode round trips (~11.6 ms each on a V100 per its note) are
+already gone when it is on. It is off unless the env is set, disabled for row/tensor split and
+shared-memory drafters; none of today's Phase 0 or A/B legs set it, so every MTP number in this
+document has the per-step host loop in it.
+
+What remains per round with the chain on: (1) the verify decode; (2) the target logits crossing to
+the host for `common_sampler_sample_and_accept_n` on n+1 rows (n+1 x vocab x 4 B = up to 3 MB at
+n 4) and the host sampler chain per row; (3) the KV rollback of rejected positions (host-side memory
+metadata); (4) the accepted token's hidden state (`pending_h`, n_embd floats) copied D2H then H2D as
+the drafter's input; (5) the fused draft decode and its id row D2H. NInfer does 1-5 in one graph.
+
+Plan: measure first, then build the contained pieces. Step 1 (no code): MTP n-max 2/3/4 with the
+fused chain on x route on/off, with `LLAMA_SPEC_TIMING` (draft / ckpt / decode / accept ms per
+round).
+
+Step 1 result (2026-09-28 17:46-17:54, shipped image, 250 W, Phase 0 prompts, t/s): n-max 2: route on
+46.6 fused / 46.5 unfused, off 53.0 / 52.0; n-max 3: on 51.3 / 51.7, off 48.7 / 48.6; n-max 4: on
+52.7 / 53.2, off 44.7 / 45.6. **The fused chain changes nothing (within 1 t/s) at any n-max, with or
+without the route**, confirming #140's own note: the draft phase is not the round's cost. The host
+timer (per 64 rounds) reads draft 290-790 ms, decode 45-355 ms, accept 76-130 ms, but these are host
+clocks around asynchronous launches and cannot place the GPU time; a per-round GPU timeline needs
+CUDA events inside the decode/sample path (F4 instrument, to build before step 2). What the matrix
+does show: the route's n-max-2 loss (-12%) is real and width-3-specific, consistent with the
+prep/reduce launch overhead (~6 ms of a 45 ms step by the kernel timer) that F1 removes. Step 1b result, GPU-inclusive timeline (`LLAMA_SPEC_TIMING_SYNC=1`, 2026-09-28 18:18, per round =
+per-64-iteration sums / 64): n-max 2: route on verify decode 50.4 ms, draft 4.6, accept 1.5; route
+off verify 46, draft 5.0, accept 1.5. n-max 4: route on verify 56.5, draft 9.2 (2.3 ms per MTP step),
+accept 2.0; route off verify 64.5, draft 10.3, accept 1.9. **The verify decode is 83% of the round;
+draft + accept are ~11 ms at n-max 4**, so a fully GPU-resident round (NInfer-style) can return at
+most ~12% here - real but second-order next to the verify kernel on the mixed-type model (route on
+is still slower than off at width 3 on the mix: 50.4 vs 46 ms). F4 continues after the kernel work
+(V5, per-type table); the contained piece stays as designed:
+
+Step 2 (contained): backend sampling for the target rows when the sampler chain is
+greedy/top-k (the fork already offloads the drafter's sampling with `llama_set_sampler`), so (2)
+shrinks to n+1 token ids. Step 3 (engine): device-resident handoff of the accepted hidden state to
+the drafter (removes (4)); fusing verify + draft into one graph needs the acceptance count on the
+device to select the draft input, i.e. a device-side batch - the deep end, to be sized after steps
+1-2 show what is left.
+
+### 4.10 Roll 2 (2026-09-28 18:50): V5 + per-type table = `llamacpp-local-v100:1c63c03a1-smt2`
+
+Gates on devbins-smt33 (same source as the image): comparator NMSE 5.4e-8 / 3.7e-14 (identical to
+v11); KL vs the route-off base at ubatch 8 / 4 / 3 = 0.001655 / 0.001718 / 0.001844 mean KLD with
+top-1 98.16 / 98.24 / 98.06 % (control 0.001775 / 97.99 %); oracle route-on 1179/1179; bench on the
+real UD-Q4_K_XL mix, route on / off at widths 1..8 = **1.00 / 1.00 / 1.00 / 1.17 / 1.24 / 1.34 / 1.34
+/ 1.33** (34.0/54.6/70.7/92.6/111.9/121.2/141.2/160.2 vs 34.1/54.6/70.9/79.4/90.5/90.5/105.5/120.1
+t/s); kernel timer at width 5 on the routed tensors 493 GB/s; serve MTP n-max 2 / 3 / 4 route on
+50.8 / 56.1 / 56.9 vs off 52.8 / 47.7 / 44.7 (the n-max 2 pair is inside the drift band; best point
+56.9 vs the stock 52.8, +8%). Image verified to carry V5 (8 warps per CTA, 28 KB shared for Q4_K)
+and the sync instrument; `:latest` re-pointed, X99 launcher recreated (no serve was loaded),
+rollback `1c63c03a1-smt`, `e117ee884-widefix` pruned locally and on the X99.
 
 ## 5. Diagnostic ablations (small changes, run before/alongside D6)
 

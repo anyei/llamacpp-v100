@@ -2933,6 +2933,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
+        model.arch == LLM_ARCH_MIMO2 ||   // #152: 48 MoE layers x SWA/global KV pattern + the MoE-cache GPU/CPU split overflow 8x
         model.arch == LLM_ARCH_DFLASH) { // DSpark drafters may reuse the deepseek4-style MLA/MoE/HC graph
         uint32_t res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
         // DFlash2 selector lattice builds ~32 extra nodes per draft position

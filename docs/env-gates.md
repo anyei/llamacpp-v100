@@ -110,6 +110,12 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 | `GGML_CUDA_ALLREDUCE` | `p2p` | NCCL | `=p2p` uses a one-shot P2P NVLink AllReduce for 2 GPUs (falls back to NCCL). |
 | `GGML_CUDA_AR_P2P_MAX_BYTES` | bytes | 4 MB | Size cap above which the P2P path defers to NCCL. |
 | `GGML_CUDA_AR_COPY_THRESHOLD` | bytes | tuned | Byte threshold for the P2P AllReduce copy path (tuning knob). |
+| `GGML_CUDA_SMT` | `0`/`1` | `1` | Volta small-batch tensor-core matmul route (`mmsmt`, TASKS #153 T1): quantized weights x 2-8 activation rows on `mma.sync.m8n8k4`; `=0` falls back to MMVQ/MMQ. Per-type minimum width (K-quants/IQ4_XS 3, Q8_0/Q4_0/Q2_0 6), cap 8. Design + gates: `docs/mmsmt-implementation.md`. |
+| `GGML_CUDA_SMT_MIN` | width | per type | Overrides the route's per-type minimum width (experiments). |
+| `GGML_CUDA_SMT_TIME` | `1` | off | Event timer per routed matmul (prints every 512 calls; needs `GGML_CUDA_DISABLE_GRAPHS=1`). Dev only. |
+| `GGML_CUDA_SMT_CHECK` | `1` | off | Compares every routed matmul against the dequant + cuBLAS route (NMSE per row / column group). Dev only, slow. |
+| `GGML_CUDA_SMT_ABLATE` | `1`/`2` | off | Dev ablations: 1 = copy only, 2 = compute only (wrong results, timing only). |
+| `LLAMA_SPEC_TIMING_SYNC` | `1` | off | Dev: with `LLAMA_SPEC_TIMING`, calls `llama_synchronize` on both contexts at every spec-phase boundary so the printed draft/ckpt/decode/accept times are GPU-inclusive (serialises the pipeline; never a baseline). |
 | `GGML_CUDA_AR_COPY_CHUNK_BYTES` | bytes | 0 (off) | Chunk size for the P2P copy path; 0 keeps it unchunked. |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | count | 1 | Element threshold above which the reduce runs in bf16. |
 | `GGML_CUDA_GRAPH_TRACE` | bool (value-parsed) | off | **(#140)** One log line per CUDA-graph compute (key/uid/n_nodes/compat/changed/warmup/use/capture) + the first differing node on a property change. The instrument that proved every drafter shape captures and replays under spec decode (the DISABLE_GRAPHS null was split-boundary cost, not launch storms; the old ARGMAX/CAST/PAD graph-blocker suspects are dead in current ggml-cuda — only MUL_MAT_ID can block compatibility). |

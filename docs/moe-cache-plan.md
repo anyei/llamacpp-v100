@@ -1010,3 +1010,44 @@ image binary, cache off, -ub 64):
 
 Artifacts `llama.cpp-work/151-v100/x99-mb/`. Not in the rolled images yet (env-only trap; rides
 the next build).
+
+### 12.15 First serve of the GSQ-RCO 3.5bit Flash-Next on the fork (2026-09-28, image 1c63c03a1-smt2)
+
+The user replaced the UD-Q4_K_XL on the X99 with `Qwen3.8-Flash-Next-GSQ-RCO-3.5bit.gguf` (44.6 GiB,
+file type Q3_K-S: 642 q8_0 attention/dense tensors, 72 q3_K + 62 q2_0 + 10 q2_K expert tensors, 97
+bf16) plus the PLE table as a second shard (`Qwen3.8-Flash-Next-ngram-embeddings-Q4_0.gguf`, 27.5
+GiB), joined by `qwen3.8-flash-next-0000N-of-00002.gguf` symlinks; the launcher lists the set as
+`qwen3.8-flash-next`. The 12.9 production shape was transplanted as-is (ncmoe 48, cache 15000, MTP
+head Q8_0 n-max 3 p-min 0.75, 32k f16, mmap, template envs off, `--model-draft` pinned to the
+Flash-Next head because the wizard's `draftMatches` still cross-matches the 27B head, #149) and
+launched through the launcher (`POST /models/load`, 1 V100, `-lv 4` + `LLAMA_MOE_CACHE_STATS=200`
+for the read-out only).
+
+Load 40 s cold page cache / 10 s warm. Placement: CPU_Mapped 44976 + 28110 MiB, CUDA0 model 4380
+MiB, KV 768 + 288 MiB, RS 1801 MiB, compute 726 MiB; `MoE cache on: 48 layers, 15056 MiB of slots`
+(no clamp); draft 3290 MiB. VRAM 26.9 GiB at rest, 28.6 GiB after requests (n-max 4: 29.1 GiB).
+`--cache-reuse 256` is refused on this context (`cache_reuse is not supported by this context`) -
+harmless no-op on qwen4exp.
+
+| leg (Phase 0 prompts, 6 x 200 tokens, greedy, thinking off) | cold mean | warm mean | acceptance | cache hit |
+|---|---|---|---|---|
+| n-max 3 (saved shape) | 26.7 (20.0-31.7) | **27.6** (21.5-31.7) | 34-87 % | 81 -> 84 % |
+| n-max 4 | 26.6 (21.0-32.0) | 27.3 (21.6-31.7) | 30-84 % | 81 -> 83 % |
+
+n-max 4 is inside the noise band with lower acceptance and +0.5 GiB VRAM: n-max 3 stays. Quality:
+the 12.12 exact-answer battery (17 greedy probes, `/home/anyei/151-v100/probes.py`) = 16/17; the
+one miss is the keyword check (the story says "beacon" for the lighthouse; the text is on topic).
+All six Phase 0 outputs read coherent and correct (LRU class, C binary search with the invariant,
+train setup, planets). Greedy run-to-run: 1/6 byte-identical between the two n-max 3 passes, the
+other five diverge at near-tie wording points 82-149 chars in ("hazardous rocks, shoals" vs "hidden
+dangers") = the cached-lane GPU-vs-CPU arithmetic class of 12.13, but denser than the Q4_K_XL
+battery's 3/17 - consistent with flatter logits at 3.5 bpw. A KL battery against the UD-Q4_K_XL
+base (skill quality-battery) is the way to say whether the quant is "good enough"; it needs the
+Q4_K_XL back on the X99 (user: "I will bring the UD Q4_K_XL later").
+
+Saved wizard config: **id 55366197782 "GSQ-RCO 3.5bit: ncmoe48 + MoE cache 15000 + MTP head n3
+(27.6 t/s warm avg, hit 84%, 16/17 exact, 1 V100, 32k f16, mmap) 2026-09-28"** on model
+`qwen3.8-flash-next`; serve left UP in that shape. The 27B dense counterpart from 4.10 of the
+mmsmt doc is id 53382003705 (`Qwen3.8-27B-UD-Q4_K_XL`, gpu1 + MTP n-max 4 + T1 route, 56.9 t/s).
+Artifacts: X99 `/home/anyei/153-p0/probe-gsq-{rep1,rep2,n4-rep1,n4-rep2}.json`,
+`probes-gsq-exact.json`.
