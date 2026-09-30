@@ -11,8 +11,9 @@
 //   phase 1: warp w streams K rows 32w..32w+31, one row per lane (B .col fragment = 4 dims of the lane's row),
 //            S = Q K^T in fp32, softcap/mask/ALiBi, CTA-wide row max through shared memory,
 //            P = exp(S - max) as fp16 A fragments in shared memory;
-//   phase 2: warp w owns dims [w*D/4, (w+1)*D/4): quadpairs split the M tiles and the positions, each lane streams
-//            V[pos][its D/8 dims] as B .row fragments, O += P V in fp32.
+//   phase 2: warp w owns dims [w*D/4, (w+1)*D/4), the quadpairs split those dims (8-wide n-tiles; at D = 64 the
+//            remaining factor splits positions) and loop over the M tiles, so each lane streams V[pos][its 4*NJ dims]
+//            once per position as B .row fragments and O += P V in fp32 for every tile (increment 2, plan 7.2).
 // q8_0 K/V are dequantised in registers (byte_perm into the fp16 mantissa, block scale folded in fp16); f16 K/V are
 // raw 16-byte loads. Split-KV across CTAs and the final combine are launch_fattn's (parallel_blocks + dst_meta).
 // Fragment layouts (probed on the V100, 153-p0/t3probe): lane t = (lane&3) + 4*(lane>>4) holds A row t;
@@ -138,17 +139,18 @@ static __device__ __forceinline__ void fattn_vs_kq_row(float (&S)[NT][8], const 
     }
 }
 
-// phase 2 V readers: the lane's DL = D/8 dims of one V row as DL/4 B .row fragment pairs (n-tile j = dims 4j..4j+3)
-template <int D, ggml_type type_V>
-static __device__ __forceinline__ void fattn_vs_v_row(uint32_t (&b)[D/8/4][2], const char * __restrict__ Vrow, const int dim0) {
-    constexpr int DL = D/8;
+// phase 2 V readers: the lane's DL contiguous dims of one V row as DL/4 B .row fragment pairs (n-tile j = dims 4j..4j+3)
+template <int DL, ggml_type type_V>
+static __device__ __forceinline__ void fattn_vs_v_row(uint32_t (&b)[DL/4][2], const char * __restrict__ Vrow, const int dim0) {
+    static_assert(DL == 4 || DL == 8, "lane V run must be 8 or 16 bytes of f16");
     if constexpr (type_V == GGML_TYPE_F16) {
-        const uint4 * V4 = (const uint4 *) (Vrow + 2*dim0);
-#pragma unroll
-        for (int i = 0; i < DL/8; ++i) {
-            const uint4 w = V4[i];
-            b[2*i + 0][0] = w.x; b[2*i + 0][1] = w.y;
-            b[2*i + 1][0] = w.z; b[2*i + 1][1] = w.w;
+        if constexpr (DL == 8) {
+            const uint4 w = *(const uint4 *) (Vrow + 2*dim0);
+            b[0][0] = w.x; b[0][1] = w.y;
+            b[1][0] = w.z; b[1][1] = w.w;
+        } else {
+            const uint2 w = *(const uint2 *) (Vrow + 2*dim0);
+            b[0][0] = w.x; b[0][1] = w.y;
         }
     } else {
         static_assert(type_V == GGML_TYPE_Q8_0, "unsupported V type");
@@ -221,11 +223,13 @@ static __global__ void flash_attn_ext_mma_volta_small(
     constexpr int NROWS = 8*NT;          // M rows (Q rows x packed heads, padded)
     constexpr int QST   = D + 8;         // Q row stride in halves (16-byte pad: conflict-free fragment loads)
     constexpr int QST4  = QST/8;         // ... in uint4
-    constexpr int DL    = D/8;           // V dims per lane in phase 2
-    constexpr int NJ    = DL/4;          // O n-tiles per lane (8 dims each: 4 from each half of the quadpair)
-    constexpr int NQ_T  = NT == 3 ? 4 : NT;  // quadpairs per M tile split
-    constexpr int NQ_P  = 4/NQ_T;            // position slices per warp in phase 2
-    constexpr int NCH   = 16/NQ_P;           // 8-position chunks per slice
+    constexpr int NJW   = D/32;          // 8-wide n-tiles per warp (the warp owns D/4 dims)
+    constexpr int NQ_D  = NJW < 4 ? NJW : 4; // quadpairs splitting the warp's n-tiles
+    constexpr int NJ    = NJW/NQ_D;      // n-tiles per quadpair (its lanes hold 4*NJ contiguous dims each)
+    constexpr int DL    = 4*NJ;          // V dims per lane in phase 2
+    constexpr int NQ_P  = 4/NQ_D;        // position slices per warp (only D = 64 splits positions)
+    constexpr int NCH   = 16/NQ_P;       // 8-position chunks per slice
+    constexpr int PST4  = FATTN_VS_PST/8;    // P row stride in uint4
     constexpr int OST   = D + 4;         // output staging row stride in floats
 
     extern __shared__ char fattn_vs_smem[];
@@ -297,12 +301,15 @@ static __global__ void flash_attn_ext_mma_volta_small(
         }
     }
 
-    float O[NJ][8];
+    float O[NT][NJ][8];
 #pragma unroll
-    for (int j = 0; j < NJ; ++j) {
+    for (int m = 0; m < NT; ++m) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            O[j][i] = 0.0f;
+        for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                O[m][j][i] = 0.0f;
+            }
         }
     }
     float M[NT][2], L[NT][2];
@@ -312,14 +319,13 @@ static __global__ void flash_attn_ext_mma_volta_small(
         L[m][0] = L[m][1] = 0.0f;
     }
 
-    // phase 2 geometry: quadpair qp -> M tile and position slice; lane -> its D/8 dims of the warp's D/4
-    const int otile = qp % NQ_T;
-    const int oslice = qp / NQ_T;
-    const int dim0  = warp*(D/4) + (lane >> 4)*DL;   // physical dim of the lane's n-tile 0, element 0
-    const uint4 * Qs4  = (const uint4 *) (Qs + t*QST);
-    // NT == 3: quadpair 3 has no tile but must issue the same mma.sync instructions as its warp (all 32 lanes
-    // have to execute a warp-level mma in convergence), so it computes a discarded copy of tile 0
-    const uint4 * Ps4  = (const uint4 *) (Ps + (8*(otile < NT ? otile : 0) + t)*FATTN_VS_PST);
+    // phase 2 geometry: quadpair qp -> its n-tiles (qd) and position slice; lane -> 4*NJ contiguous dims
+    // (n-tile j, column n <-> dim Wd + 8*NJ*qd + 4*NJ*(n/4) + 4*j + n%4); every quadpair covers every M tile
+    const int qd     = qp % NQ_D;
+    const int oslice = qp / NQ_D;
+    const int dim0   = warp*(D/4) + 8*NJ*qd + DL*(lane >> 4);
+    const uint4 * Qs4 = (const uint4 *) (Qs + t*QST);
+    const uint4 * Ps4 = (const uint4 *) (Ps + t*FATTN_VS_PST);   // tile m: + m*8*PST4
 
     const int k_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
 
@@ -406,13 +412,11 @@ static __global__ void flash_attn_ext_mma_volta_small(
             }
             L[m][0] += (P[0] + P[1]) + (P[4] + P[5]);
             L[m][1] += (P[2] + P[3]) + (P[6] + P[7]);
-            if (m == otile) {
 #pragma unroll
-                for (int j = 0; j < NJ; ++j) {
+            for (int j = 0; j < NJ; ++j) {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        O[j][i] *= sc[(i >> 1) & 1];
-                    }
+                for (int i = 0; i < 8; ++i) {
+                    O[m][j][i] *= sc[(i >> 1) & 1];
                 }
             }
             // D layout -> A layout: lanes 2 apart exchange the half of their rows they do not keep
@@ -432,34 +436,37 @@ static __global__ void flash_attn_ext_mma_volta_small(
         }
         __syncthreads();
 
-        // ---- phase 2: O += P V over this quadpair's chunks; chunk kc = warp kc/4, quadpair kc%4 of phase 1 ----
+        // ---- phase 2: O += P V over this quadpair's chunks for every tile; chunk kc = warp kc/4, quadpair kc%4 of phase 1 ----
 #pragma unroll
         for (int ch = 0; ch < NCH; ++ch) {
             const int kc = oslice*NCH + ch;
             const int pv = k0 + 32*(kc >> 2) + 4*(kc & 3) + (lane & 3);  // mma 0 position; mma 1 = pv + 16
             uint32_t b0[NJ][2], b1[NJ][2];
-            fattn_vs_v_row<D, type_V>(b0, V + (int64_t) pv*nb21, dim0);
-            fattn_vs_v_row<D, type_V>(b1, V + (int64_t) (pv + 16)*nb21, dim0);
-            const uint4 a = Ps4[kc];
+            fattn_vs_v_row<DL, type_V>(b0, V + (int64_t) pv*nb21, dim0);
+            fattn_vs_v_row<DL, type_V>(b1, V + (int64_t) (pv + 16)*nb21, dim0);
 #pragma unroll
-            for (int j = 0; j < NJ; ++j) {
-                fattn_vs_mma_rr(O[j], a.x, a.y, b0[j][0], b0[j][1]);
-                fattn_vs_mma_rr(O[j], a.z, a.w, b1[j][0], b1[j][1]);
+            for (int m = 0; m < NT; ++m) {
+                const uint4 a = Ps4[m*8*PST4 + kc];
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    fattn_vs_mma_rr(O[m][j], a.x, a.y, b0[j][0], b0[j][1]);
+                    fattn_vs_mma_rr(O[m][j], a.z, a.w, b1[j][0], b1[j][1]);
+                }
             }
         }
     }
 
     // ---- epilogue ----
-    // position slices of the same M tile: sum the partial O across quadpairs (lane bits 2/3)
-    if (NQ_P >= 2) {
+    // position slices (D = 64 only): sum the partial O across the two slices (lane bit 3)
+    if (NQ_P == 2) {
 #pragma unroll
-        for (int j = 0; j < NJ; ++j) {
+        for (int m = 0; m < NT; ++m) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                if (NQ_P == 4) {
-                    O[j][i] += __shfl_xor_sync(0xFFFFFFFF, O[j][i], 4, WARP_SIZE);
+            for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    O[m][j][i] += __shfl_xor_sync(0xFFFFFFFF, O[m][j][i], 8, WARP_SIZE);
                 }
-                O[j][i] += __shfl_xor_sync(0xFFFFFFFF, O[j][i], 8, WARP_SIZE);
             }
         }
     }
@@ -500,14 +507,12 @@ static __global__ void flash_attn_ext_mma_volta_small(
                 const float sc = expf(M[m][h] - Mn);
                 l = l*sc + expf(sink - Mn);
                 M[m][h] = Mn;
-                if (m == otile) {
 #pragma unroll
-                    for (int j = 0; j < NJ; ++j) {
+                for (int j = 0; j < NJ; ++j) {
 #pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            if (((i >> 1) & 1) == h) {
-                                O[j][i] *= sc;
-                            }
+                    for (int i = 0; i < 8; ++i) {
+                        if (((i >> 1) & 1) == h) {
+                            O[m][j][i] *= sc;
                         }
                     }
                 }
@@ -519,16 +524,19 @@ static __global__ void flash_attn_ext_mma_volta_small(
         }
     }
 
-    // stage O rows: lane holds rows r0/r0+2 of tile otile, dims dim0 + 4j + {c0, c0+1} (i&4 -> the other half-lane's 32)
-    if (oslice == 0 && (NT != 3 || otile < NT)) {
+    // stage O rows: lane holds rows r0/r0+2 of every tile; column n of n-tile j -> dim Wd + 8*NJ*qd + 4*NJ*(n/4) + 4*j + n%4
+    if (oslice == 0) {
 #pragma unroll
-        for (int j = 0; j < NJ; ++j) {
+        for (int m = 0; m < NT; ++m) {
 #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const int r = 8*otile + r0 + 2*h;
-                float * Or = Os + r*OST + warp*(D/4) + 4*j + c0;
-                *(float2 *) (Or     ) = make_float2(O[j][2*h + 0], O[j][2*h + 1]);
-                *(float2 *) (Or + DL) = make_float2(O[j][2*h + 4], O[j][2*h + 5]);
+            for (int j = 0; j < NJ; ++j) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int r = 8*m + r0 + 2*h;
+                    float * Or = Os + r*OST + warp*(D/4) + 8*NJ*qd + 4*j + c0;
+                    *(float2 *) (Or     ) = make_float2(O[m][j][2*h + 0], O[m][j][2*h + 1]);
+                    *(float2 *) (Or + DL) = make_float2(O[m][j][2*h + 4], O[m][j][2*h + 5]);
+                }
             }
         }
     }

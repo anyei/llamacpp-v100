@@ -54,8 +54,8 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
   re-passed (compose reverts it otherwise). The worker image needs no Kepler
   variant. The harness classifies launcher recreates as production deploys -
   expect one denial, re-run after the user's explicit go.
-- State 2026-09-29: `:latest` = a9885783c-t3k2 (the T3 Volta attention kernel + the
-  wizard shard-set grid fix on the a9885783c tree; rollback a9885783c-t3k), `:kepler` = e117ee884-widefix-kepler
+- State 2026-09-29 eve: `:latest` = a9885783c-t3k3 (T3 Volta attention kernel increment 2 +
+  the wizard shard-set grid fix on the a9885783c tree; rollback a9885783c-t3k2), `:kepler` = e117ee884-widefix-kepler
   (rollback e117ee884-kepler; the T3 kernel is Volta-only, no Kepler rebuild).
   Suffixed tags (`<sha>-t3k`, `<sha>-widefix`) = built from a working tree the
   user had not committed yet; the X99 launcher compose lives in

@@ -341,3 +341,63 @@ Ships in `llamacpp-local-v100:a9885783c-t3k` (working tree on a9885783c, commit 
 the MTP serve legs at depth (d7-gates.sh pattern, `-c 131072`), the width-5 attention share (NT = 4 re-issues each
 warp's V loads per quadpair and moves P through shared memory: ~20 ms at 128k vs ~9 ms at width 1), and the q8_0 issue
 bound (~1.5 ALU ops per dequantised value; the fused hfma2 form is not exact).
+
+## 7. T3 kernel increment 2: the verify-width (multi-tile) phase 2 (2026-09-29, user: "sure go ahead")
+
+### 7.1 Where the width-5 time goes
+
+Measured (6.2): width 1 pays ~8.7 ms of attention per token at 128k (the byte rate); width 5 (30 rows = four M tiles)
+pays ~19.5 ms per step for the same K/V bytes. Phase 1 scales cleanly (K is streamed once per lane, the four tiles
+only add mma issues). Phase 2 does not: with quadpair = (M tile, position slice) and NT = 4 every quadpair has to
+cover all 16 chunks of the CTA step, so each warp re-issues its V loads four times (the LSU serves the same 16-byte
+addresses to four lanes of one instruction, so HBM traffic is unchanged, but the LDG count, the register traffic and -
+for q8_0 - the dequant ALU are all 4x), and at NT = 4 the S tiles (32 registers) push the kernel to the 255-register cap,
+which shortens the load pipeline the compiler can build. Budget per warp and CTA step (128 positions, D = 256, f16):
+memory floor ~31k clocks per SM step (8 warps x 32 KB at the SM's share of 900 GB/s); tensor cores 512 warp-mma x 8 clk
+= 4k per warp (~26 % of the floor spread over 2 warps per sub-partition); the 4x LDG re-issue adds ~3k LSU clocks
+per warp - none of these alone explains 2x, the register cap + the serialised phases (no load in flight across the two
+barriers) do: at width 1 the same structure still reaches the byte rate because its phase-2 body is 4x shorter.
+
+### 7.2 Design: dims across quadpairs, M tiles looped (V read once per warp)
+
+Phase 2 becomes: warp w keeps its D/4 dims; the D/32 8-wide n-tiles of the warp are split across the quadpairs
+(NQ_D = min(4, D/32): 4 at D >= 128, 2 at D = 64 where the remaining factor splits positions as today), each quadpair
+loops over ALL M tiles for its n-tiles. A lane then streams V[pos][4*NJ dims] once per position (16 bytes of f16 at
+D = 256: a contiguous 8-dim run under the n-tile permutation dim = Wd + 16q + 8h + 4j + e), pulls the P fragment of
+every tile from shared memory (NT LDS.128 per chunk, broadcast across quadpairs) and issues 2*NJ mma per tile.
+Accumulators: O[NT][NJ][8] = 16*NT registers at D = 256 (64 at NT = 4 as before, but 16 at NT = 1 instead of 64),
+8*NT at D = 128/64. The V loads per step drop to the width-1 count for every NT, the q8_0 dequant with them; the
+mma count is unchanged; the P reads grow from 4 to 16 LDS.128 per lane per step at NT = 1 (negligible). The
+epilogue loses the position-slice reduction except at D = 64 (xor-8 sum over lane bit 3). Output staging: lane row
+r0/r0+2 of tile m, columns {c0, c0+1} -> dims Wd + 16q + 4j + c0, {c0+4, c0+5} -> + 8. Nothing changes in phase 1,
+the softmax, the P remap or the launch plumbing; the selector and the instances stay.
+
+Expected: the width-5 step at 128k from ~71 ms toward ~62 (attention ~11 ms instead of ~20) and NT = 1 unchanged or
+slightly better (lighter registers). Gate = the 6.2 protocol (oracle ON/OFF, width 1 + width 5 sweeps, KL 32k, the MTP
+serve legs) against devbins-t3k1d and the a9885783c-t3k2 image.
+
+### 7.3 Increment 2 gate (devbins-t3k2a vs devbins-t3k1d as the interleaved reference, `153-p0/t3k-chain.sh`, 2026-09-29)
+
+- Compiler: D = 256 registers 242 (NT 4), 216 (NT 3), 204 (NT 2), 218 (NT 1), 0 spills (increment 1: 254-255 at every NT).
+- Oracle: FLASH_ATTN_EXT 2911/2911 with the kernel ON and OFF, first build.
+- Width 1 (tg32 t/s at 0 / 16k / 64k / 128k; arms new / reference / new-repeat in one run): f16 35.5 / 34.4 / 30.6 / 27.0,
+  ref 35.2 / 33.0 / 30.3 / 26.9, repeat 35.2 / 33.3 / 30.0 / 26.8; q8_0 34.6 / 31.7 / 29.4 / 26.0, ref 34.6 / 30.1 / 28.9 / 26.1,
+  repeat 34.6 / 31.6 / 28.7 / 26.5 - neutral, as designed (width 1 was already at the byte rate).
+- Width 5 (`-p 5 -n 0`, t/s; ms per step in parentheses): f16 new 97.1 / 86.3 / 81.4 / 73.1 (51.5 / 57.9 / 61.4 / 68.4),
+  ref 97.1 / 85.7 / 79.3 / 70.4 (51.5 / 58.3 / 63.1 / 71.0), repeat 97.2 / 86.6 / 81.6 / 73.4 -> **+2.6 % at 64k, +3.8 % at
+  128k** (-1.7 / -2.6 ms per verify step); q8_0 new 95.2 / 83.3 / 79.0 / 71.5 (52.5 / 60.0 / 63.3 / 70.0), ref 94.5 / 82.0 / 77.0 / 69.0 (52.9 / 61.0 / 65.0 / 72.4), repeat 95.1 / 84.2 / 78.4 / 71.2 -> **+2.6 % at 64k,
+  +3.5 % at 128k**.
+- KL at 32k, kernel ON vs OFF (same binary): f16 mean 0.000000 / 99.9 % 5.1e-5 / top-1 100.000 % / PPL ratio 1.0003,
+  q8_0 0.000000 / 4.9e-5 / 99.988 % / 1.0003 - the same figures as increment 1 (6.2). The MTP serve legs were skipped
+  on the user's call (the width-5 sweep is the same shape; the 6.2 legs stand for the path).
+
+Reading: the gain is real but a third of the 7.2 estimate. Attention at 128k / width 5 is now ~17 ms per step
+(was ~19.5) against ~9 ms at width 1 and a 9.5 ms byte floor: the V re-issue was not the dominant cost. What is left is
+the four-tile compute that does not overlap the memory stream inside a CTA - per warp step at NT = 4: 512 warp-mma
+(phase 1 + 2, ~8k tensor-core clocks per SM step spread over the sub-partitions), ~190 LDS.128 of Q and P fragments
+(~6k shared-memory clocks per SM step), the exp/softmax of 32 S values per lane, and two barriers per step - against a
+~31k-clock memory floor per SM step; with two CTAs per SM the phases of the two CTAs overlap only partially. The next
+lever would be a deeper restructure (software-pipelined K/V prefetch across the barriers, or a 256-position step to
+halve the barrier count), not a mapping change; it is not part of this increment.
+
+Verdict: adopted (strictly better or equal on every leg, lighter registers); ships in `a9885783c-t3k3`.
