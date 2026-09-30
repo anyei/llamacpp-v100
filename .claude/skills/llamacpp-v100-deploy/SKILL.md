@@ -54,9 +54,12 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
   re-passed (compose reverts it otherwise). The worker image needs no Kepler
   variant. The harness classifies launcher recreates as production deploys -
   expect one denial, re-run after the user's explicit go.
-- State 2026-09-29 eve: `:latest` = a9885783c-t3k3 (T3 Volta attention kernel increment 2 +
-  the wizard shard-set grid fix on the a9885783c tree; rollback a9885783c-t3k2), `:kepler` = e117ee884-widefix-kepler
-  (rollback e117ee884-kepler; the T3 kernel is Volta-only, no Kepler rebuild).
+- State 2026-09-30: `:latest` = 99b3c21ee-q2avx2 (sha256:9020e764, #154 item 1 AVX2 Q2_0 CPU kernel on the
+  99b3c21ee tree = T3 increments 1+2 committed; rollback a9885783c-t3k3; t3k2 removed locally, still in the registry),
+  `:kepler` = e117ee884-widefix-kepler (rollback e117ee884-kepler; no Kepler rebuild for this roll - the K80 box
+  gets the Q2_0 kernel only with a Kepler image build). X99 launcher recreated on the pinned tag, verified.
+  TRAP (2026-09-30): the coordinator box's / was at 96 % before this build (build cache 88 GB, 23 GB reclaimable);
+  check `df -h /` before any image build.
   Suffixed tags (`<sha>-t3k`, `<sha>-widefix`) = built from a working tree the
   user had not committed yet; the X99 launcher compose lives in
   `/home/anyei/server/services/llamacpp-v100/` (defaults match the running
