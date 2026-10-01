@@ -22,6 +22,12 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1601,6 +1607,220 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// ---- TASKS #154 item 6 (#155 item 4): double-buffered prefill streaming of offloaded expert weights ----
+// GGML_SCHED_PREFILL_STREAM=<slots> (1 = 3 slots): for MUL_MAT_ID splits whose expert weights live in host memory
+// and whose ubatch has >= GGML_SCHED_PREFILL_STREAM_MIN tokens (default 1024, i.e. ~all experts used), the whole weight
+// tensor is copied into a ring of dedicated device slots by a helper thread on its own backend (own stream), up to
+// <slots> weights ahead, instead of the per-split used-expert copy on the compute stream; the matmul is pointed at its
+// slot. Events order the copy of slot k after the last reader of slot k and the reader after its copy. Single GPU only.
+namespace {
+struct pstream_job   { int64_t seq; int slot; const void * src; size_t size; bool wait_free; };
+struct pstream_entry { int split_id; int input_id; ggml_tensor * input; ggml_tensor * cpy; size_t size; int64_t seq; int slot; };
+struct pstream_state {
+    ggml_backend_dev_t                dev          = nullptr;
+    ggml_backend_t                    copy_backend = nullptr;
+    ggml_backend_buffer_t             buf          = nullptr;
+    ggml_context *                    ctx          = nullptr;
+    size_t                            slot_size    = 0;
+    int                               n_slots      = 0;
+    bool                              failed       = false;
+    std::vector<ggml_tensor *>        slot_t;
+    std::vector<ggml_backend_event_t> ev_copy, ev_free;
+    std::vector<uint8_t>              free_recorded;
+    std::vector<int64_t>              done_seq;
+    std::vector<pstream_entry>     entries;
+    std::thread                       th;
+    std::mutex                        mtx;
+    std::condition_variable           cv, cv_done;
+    std::deque<pstream_job>        q;
+    bool                              stop = false;
+    int                               in_flight = 0; // jobs popped by the worker and not finished (under mtx)
+    int64_t                           seq  = 0;
+    uint64_t                          n_streamed = 0, n_graphs = 0;
+
+    void worker() {
+        while (true) {
+            pstream_job j;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&] { return stop || !q.empty(); });
+                if (q.empty()) {
+                    return;
+                }
+                j = q.front();
+                q.pop_front();
+                in_flight++;
+            }
+            if (j.wait_free) {
+                ggml_backend_event_wait(copy_backend, ev_free[j.slot]);
+            }
+            ggml_backend_tensor_set_async(copy_backend, slot_t[j.slot], j.src, 0, j.size);
+            ggml_backend_event_record(ev_copy[j.slot], copy_backend);
+            ggml_backend_event_synchronize(ev_copy[j.slot]);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                done_seq[j.slot] = j.seq;
+                in_flight--;
+            }
+            cv_done.notify_all();
+        }
+    }
+    void release_device() {
+        for (auto e : ev_copy) if (e) ggml_backend_event_free(e);
+        for (auto e : ev_free) if (e) ggml_backend_event_free(e);
+        ev_copy.clear(); ev_free.clear(); slot_t.clear();
+        if (ctx) { ggml_free(ctx); ctx = nullptr; }
+        if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+    }
+    ~pstream_state() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+        if (copy_backend) ggml_backend_synchronize(copy_backend);
+        release_device();
+        if (copy_backend) ggml_backend_free(copy_backend);
+    }
+};
+std::unordered_map<ggml_backend_sched_t, std::unique_ptr<pstream_state>> g_pstream;
+std::mutex g_pstream_mtx;
+
+int pstream_slots() {
+    static const int v = [] { const char * e = getenv("GGML_SCHED_PREFILL_STREAM"); const int n = e ? atoi(e) : 0; return n <= 0 ? 0 : (n == 1 ? 3 : n); }();
+    return v;
+}
+int64_t pstream_min_tokens() {
+    static const int64_t v = [] { const char * e = getenv("GGML_SCHED_PREFILL_STREAM_MIN"); return (int64_t) (e ? atoi(e) : 1024); }();
+    return v;
+}
+} // namespace
+
+// builds this graph's stream entries and primes the first <slots> copies; returns the state or nullptr (feature off)
+static pstream_state * pstream_prepare(ggml_backend_sched_t sched) {
+    const int n_slots = pstream_slots();
+    if (n_slots == 0 || sched->callback_eval != nullptr || ggml_backend_sched_n_gpu(sched) != 1) {
+        return nullptr;
+    }
+    std::vector<pstream_entry> entries;
+    size_t max_alloc = 0;
+    int backend_id = -1;
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        ggml_backend_sched_split * split = &sched->splits[split_id];
+        // cheap checks first: ggml_backend_dev_type() on a CUDA device calls cudaGetDeviceProperties(), which is far
+        // too slow to run for every split of every graph (it cost ~5 % of decode when it did)
+        if (split->graph.n_nodes == 0 || split->backend_id == sched->n_backends - 1) {
+            continue; // the last backend is always the CPU
+        }
+        ggml_tensor * node = split->graph.nodes[0];
+        if (node->op != GGML_OP_MUL_MAT_ID || node->src[2] == nullptr || node->src[2]->ne[1] < pstream_min_tokens()) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            ggml_tensor * input = split->inputs[input_id];
+            ggml_tensor * cpy   = tensor_copy(input, split->backend_id, sched->cur_copy);
+            if (node->src[0] != cpy || input->buffer == nullptr || input->data == nullptr ||
+                    !ggml_backend_buffer_is_host(input->buffer) ||
+                    ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    ggml_ssd_stream_is_streamed(input)) {
+                continue;
+            }
+            if (backend_id >= 0 && backend_id != split->backend_id) {
+                return nullptr; // one device only
+            }
+            backend_id = split->backend_id;
+            max_alloc = std::max(max_alloc, ggml_backend_buft_get_alloc_size(sched->bufts[split->backend_id], cpy));
+            entries.push_back({ split_id, input_id, input, cpy, ggml_nbytes(input), 0, 0 });
+        }
+    }
+    if (entries.empty()) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> glock(g_pstream_mtx);
+    auto & up = g_pstream[sched];
+    if (!up) {
+        up = std::make_unique<pstream_state>();
+    }
+    pstream_state & st = *up;
+    if (st.failed) {
+        return nullptr;
+    }
+    const size_t slot_size = GGML_PAD(max_alloc + 512, 256);
+    if (st.buf == nullptr || st.slot_size < slot_size) {
+        if (st.th.joinable()) {
+            // drain before reallocating: nothing queued AND nothing the worker already popped
+            std::unique_lock<std::mutex> lock(st.mtx);
+            st.cv_done.wait(lock, [&] { return st.q.empty() && st.in_flight == 0; });
+        }
+        if (st.copy_backend) ggml_backend_synchronize(st.copy_backend);
+        ggml_backend_synchronize(sched->backends[backend_id]);
+        st.release_device();
+        st.dev = ggml_backend_get_device(sched->backends[backend_id]);
+        if (st.copy_backend == nullptr) {
+            st.copy_backend = ggml_backend_dev_init(st.dev, nullptr);
+        }
+        st.buf = st.copy_backend ? ggml_backend_buft_alloc_buffer(sched->bufts[backend_id], slot_size * n_slots) : nullptr;
+        if (st.buf == nullptr) {
+            GGML_LOG_WARN("%s: prefill stream off: could not allocate %d x %zu MiB\n", __func__, n_slots, slot_size >> 20);
+            st.failed = true;
+            return nullptr;
+        }
+        ggml_backend_buffer_clear(st.buf, 0);
+        ggml_init_params ip = { (size_t) n_slots * ggml_tensor_overhead() + 1024, nullptr, true };
+        st.ctx = ggml_init(ip);
+        char * base = (char *) ggml_backend_buffer_get_base(st.buf);
+        for (int k = 0; k < n_slots; k++) {
+            ggml_tensor * t = ggml_new_tensor_1d(st.ctx, GGML_TYPE_I8, (int64_t) slot_size);
+            ggml_backend_tensor_alloc(st.buf, t, base + (size_t) k * slot_size);
+            st.slot_t.push_back(t);
+            st.ev_copy.push_back(ggml_backend_event_new(st.dev));
+            st.ev_free.push_back(ggml_backend_event_new(st.dev));
+        }
+        st.slot_size = slot_size;
+        st.n_slots   = n_slots;
+        st.free_recorded.assign(n_slots, 0);
+        st.done_seq.assign(n_slots, -1);
+        if (!st.th.joinable()) {
+            st.th = std::thread(&pstream_state::worker, &st);
+        }
+        GGML_LOG_INFO("%s: prefill stream on: %d slots x %zu MiB on %s, %zu streamed weights per graph (min %lld tokens)\n",
+                __func__, n_slots, slot_size >> 20, ggml_backend_dev_name(st.dev), entries.size(), (long long) pstream_min_tokens());
+    }
+    st.entries = std::move(entries);
+    st.n_graphs++;
+    // prime the ring
+    {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        for (size_t e = 0; e < st.entries.size() && (int) e < st.n_slots; e++) {
+            pstream_entry & en = st.entries[e];
+            en.slot = (int) (e % st.n_slots);
+            en.seq  = ++st.seq;
+            const char * hb = (const char *) ggml_backend_buffer_get_base(en.input->buffer);
+            const size_t hs = ggml_backend_buffer_get_size(en.input->buffer);
+            const size_t after = (size_t) (hb + hs - ((const char *) en.input->data + en.size));
+            const size_t extra = std::min<size_t>({ (size_t) 512, st.slot_size - en.size, after });
+            st.q.push_back({ en.seq, en.slot, en.input->data, en.size + extra, (bool) st.free_recorded[en.slot] });
+        }
+    }
+    st.cv.notify_one();
+    return &st;
+}
+
+static std::vector<size_t> pstream_entries_of(pstream_state * st, int split_id) {
+    std::vector<size_t> r;
+    if (st) {
+        for (size_t e = 0; e < st->entries.size(); e++) {
+            if (st->entries[e].split_id == split_id) r.push_back(e);
+        }
+    }
+    return r;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1609,13 +1829,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    pstream_state * ps_st = pstream_prepare(sched); // prefill stream (nullptr = off)
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const std::vector<size_t> ps_mine = pstream_entries_of(ps_st, split_id);
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            bool ps_streamed = false;
+            for (size_t e : ps_mine) {
+                ps_streamed = ps_streamed || ps_st->entries[e].input_id == input_id;
+            }
+            if (ps_streamed) {
+                continue; // prefill stream: this weight arrives through the stream ring
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1778,10 +2008,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // prefill stream: wait for this split's streamed weights and point the matmul at their slots
+        std::vector<void *> ps_saved;
+        for (size_t e : ps_mine) {
+            pstream_entry & en = ps_st->entries[e];
+            {
+                std::unique_lock<std::mutex> lock(ps_st->mtx);
+                ps_st->cv_done.wait(lock, [&] { return ps_st->done_seq[en.slot] >= en.seq; });
+            }
+            ggml_backend_event_wait(split_backend, ps_st->ev_copy[en.slot]);
+            ps_saved.push_back(en.cpy->data);
+            en.cpy->data = ps_st->slot_t[en.slot]->data;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                for (size_t i = 0; i < ps_mine.size(); i++) {
+                    ps_st->entries[ps_mine[i]].cpy->data = ps_saved[i]; // prefill stream: undo the redirect
+                }
                 return ec;
+            }
+            // prefill stream: release the slots to the next weights of the ring
+            for (size_t i = 0; i < ps_mine.size(); i++) {
+                pstream_entry & en = ps_st->entries[ps_mine[i]];
+                ggml_backend_event_record(ps_st->ev_free[en.slot], split_backend);
+                ps_st->free_recorded[en.slot] = 1;
+                en.cpy->data = ps_saved[i];
+                ps_st->n_streamed++;
+                const size_t nx = ps_mine[i] + ps_st->n_slots;
+                if (nx < ps_st->entries.size()) {
+                    pstream_entry & nxt = ps_st->entries[nx];
+                    nxt.slot = en.slot;
+                    {
+                        std::lock_guard<std::mutex> lock(ps_st->mtx);
+                        nxt.seq = ++ps_st->seq;
+                        const char * hb = (const char *) ggml_backend_buffer_get_base(nxt.input->buffer);
+                        const size_t hs = ggml_backend_buffer_get_size(nxt.input->buffer);
+                        const size_t after = (size_t) (hb + hs - ((const char *) nxt.input->data + nxt.size));
+                        const size_t extra = std::min<size_t>({ (size_t) 512, ps_st->slot_size - nxt.size, after });
+                        ps_st->q.push_back({ nxt.seq, nxt.slot, nxt.input->data, nxt.size + extra, true });
+                    }
+                    ps_st->cv.notify_one();
+                }
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1907,6 +2176,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    // prefill stream: release the stream ring while the backends are still alive
+    {
+        std::unique_ptr<pstream_state> st;
+        {
+            std::lock_guard<std::mutex> glock(g_pstream_mtx);
+            auto it = g_pstream.find(sched);
+            if (it != g_pstream.end()) {
+                st = std::move(it->second);
+                g_pstream.erase(it);
+            }
+        }
+        if (st) {
+            GGML_LOG_INFO("%s: prefill stream: %llu weights streamed over %llu graphs\n", __func__,
+                    (unsigned long long) st->n_streamed, (unsigned long long) st->n_graphs);
+        }
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {

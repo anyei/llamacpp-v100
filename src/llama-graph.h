@@ -23,6 +23,7 @@ struct llama_memory_context_i;
 
 struct llama_expert_placement_tables; // TASKS #75
 class  llama_moe_cache;               // TASKS #151
+class  llama_moe_doorbell;            // TASKS #154 item 3
 struct llama_expert_mask;             // TASKS #84 probe 2
 
 class llama_kv_cache_context;
@@ -168,6 +169,21 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+};
+
+// TASKS #154 item 3: the MoE doorbell's per-graph step (the rings publish it), set from the job begin() queued
+class llm_graph_input_moe_db : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_db(const llama_moe_doorbell * db) : db(db) {}
+    virtual ~llm_graph_input_moe_db() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * step = nullptr; // I32 [1]
+
+    const llama_moe_doorbell * db;
 };
 
 // temperature tuning, used by llama4
@@ -719,6 +735,8 @@ struct llm_graph_params {
 
     // TASKS #151: MoE expert cache (null = off); a different cache is a different graph
     const llama_moe_cache * moe_cache = nullptr;
+    // TASKS #154 item 3: the MoE doorbell (null = off)
+    const llama_moe_doorbell * moe_doorbell = nullptr;
 
     llm_graph_cb cb;
 
@@ -762,7 +780,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (moe_cache != other.moe_cache) {
+        if (moe_cache != other.moe_cache || moe_doorbell != other.moe_doorbell) {
             return false;
         }
 
@@ -871,6 +889,9 @@ public:
 
     // TASKS #151: (layer, flat routed ids) of every cache-engaged MoE layer, read back after compute
     std::vector<std::pair<int, ggml_tensor *>> t_moe_cache_ids;
+    // TASKS #154 item 3: the doorbell slots this graph rings (graph order) and its step input
+    std::vector<int32_t> t_moe_doorbell;
+    ggml_tensor *        t_moe_db_step = nullptr;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -962,6 +983,7 @@ struct llm_graph_context {
     const llama_expert_placement_tables * expert_tables = nullptr;
     const llama_expert_mask             * expert_mask   = nullptr; // TASKS #84 probe 2
     const llama_moe_cache               * moe_cache     = nullptr; // TASKS #151
+    const llama_moe_doorbell            * moe_doorbell  = nullptr; // TASKS #154 item 3
 
     llm_graph_result * res;
 

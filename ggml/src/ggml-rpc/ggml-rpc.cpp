@@ -3399,6 +3399,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
     }
 
+    // an op id this build does not know (a newer client's op set) must not be cast into the enum
+    if (tensor->op >= GGML_OP_COUNT) {
+        GGML_LOG_ERROR("%s: unknown op id %u (this worker knows %d ops) - rebuild the worker from the client's tree\n",
+                __func__, (unsigned) tensor->op, (int) GGML_OP_COUNT);
+        return nullptr;
+    }
     result->op = (ggml_op) tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
         result->op_params[i] = tensor->op_params[i];
@@ -6085,7 +6091,11 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // TASKS #154: the MoE doorbell ops talk to the coordinator's pinned host memory - local CUDA only, never sent
+    // (this is also why they did not change the op-set fingerprint, see ggml-rpc.h)
+    if (op->op == GGML_OP_MOE_RING || op->op == GGML_OP_MOE_JOIN) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

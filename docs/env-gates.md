@@ -82,6 +82,19 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 | `LLAMA_MOE_CACHE_FORCE_CPU` | bool | off | Gate instrument: allocate the pools on the host buffer type (CPU-only byte-identity wiring gate). |
 | `LLAMA_MOE_CACHE_DEBUG` | bool | off | Per-layer eligibility reasons and pool sizes at create; counters at teardown. |
 
+### MoE doorbell + prefill stream (TASKS #154, docs/strata-port-plan.md sections 7-10)
+
+Both default off and parse VALUES (`=0` is off). The doorbell needs `--moe-cache` with the pools on a CUDA device.
+
+| Env | Type | Default | Meaning |
+|---|---|---|---|
+| `LLAMA_MOE_DOORBELL` | `0` / `1` / `2` | off | **(#154 item 3)** Decode/verify graphs (at most the cache's max batch wide) stop computing the cache's misses in a CPU split per layer: `GGML_OP_MOE_RING` hands each layer's rows, miss ids and gating weights to a host executor through a pinned mailbox, the GPU runs the cache hits meanwhile, `GGML_OP_MOE_JOIN` adds the executor's weighted sum. The decode graph stays one GPU split. Flash-Next GSQ-RCO, MTP production shape: 84.7 -> 63.5 ms per verify step (+33 % decode); plain decode +30 %; KLD vs the CPU chain 0.021 (float-order class). `=2` = timing only: the executor answers zeros (WRONG TEXT, dev instrument). Serve-safe at `=1`. Off for training graphs. |
+| `LLAMA_MOE_DOORBELL_THREADS` | count | `-t` | Executor threads. |
+| `LLAMA_MOE_DOORBELL_SPIN_US` | us | 1000 | How long idle executor threads spin before they sleep. `0` = sleep at once (~10 instead of ~23 cores busy while decoding, ~+6 ms per MTP step); `< 0` = never sleep. |
+| `LLAMA_MOE_DOORBELL_STATS` | count | 0 | Log `moe-doorbell: jobs / layers / misses / wait / work` every N jobs (libllama INFO: `-lv 4` on llama-server). |
+| `GGML_SCHED_PREFILL_STREAM` | slots | off | **(#154 item 6 / #155 item 4)** Prompt ubatches at least `_MIN` tokens wide: expert weights held in host memory are copied whole into a ring of device slots by a helper thread on its own stream, ahead of their matmuls, instead of the per-split copy on the compute stream (`1` = 3 slots). Flash-Next at `-ub 4096`: 253 -> 328 t/s prefill, PPL identical, no decode cost. Single GPU only. Serve-safe. |
+| `GGML_SCHED_PREFILL_STREAM_MIN` | tokens | 1024 | Ubatch width from which the stream ring engages. |
+
 ## 2c. Model loading (mmap)
 
 | Env | Type | Default | Meaning |

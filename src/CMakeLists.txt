@@ -19,6 +19,8 @@ add_library(llama
             llama-cparams.cpp
             llama-expert-placement.cpp
             llama-moe-cache.cpp
+            llama-moe-doorbell.cpp
+            llama-moe-doorbell-compute.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

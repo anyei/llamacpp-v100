@@ -2,6 +2,7 @@
 
 #include "llama-expert-placement.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-doorbell.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -121,6 +122,16 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_moe_db::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const int32_t s = (int32_t) db->current_step();
+    ggml_backend_tensor_set(step, &s, 0, sizeof(s));
+}
+
+bool llm_graph_input_moe_db::can_reuse(const llm_graph_params & params) {
+    return params.moe_doorbell == db;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1205,6 +1216,8 @@ void llm_graph_result::reset() {
     t_sampled_logits.clear();
     t_candidates.clear();
     t_moe_cache_ids.clear();
+    t_moe_doorbell.clear();
+    t_moe_db_step = nullptr;
 
     params = {};
 
@@ -1365,6 +1378,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     expert_tables    (params.expert_tables),
     moe_cache        (params.moe_cache),
     expert_mask      (params.expert_mask),
+    moe_doorbell     (params.moe_doorbell),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2072,6 +2086,69 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         res->t_moe_cache_ids.emplace_back(il, ids_flat);
     }
     ggml_tensor * chain_inp = cur;
+
+    // TASKS #154 item 3: the MoE doorbell. The misses leave the graph: MOE_RING hands the rows, the miss ids and the
+    // weights to the host executor, the GPU runs the cache hits meanwhile, MOE_JOIN adds the executor's weighted sum.
+    const int32_t db_slot = mcl != nullptr && moe_doorbell != nullptr && n_expert_used == moe_doorbell->n_used() &&
+            n_tokens <= moe_doorbell->max_tokens() ? moe_doorbell->slot_of(mcl) : -1;
+    if (db_slot >= 0) {
+        if (res->t_moe_db_step == nullptr) {
+            auto inp = std::make_unique<llm_graph_input_moe_db>(moe_doorbell);
+            inp->step = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+            ggml_set_input(inp->step);
+            ggml_set_name(inp->step, "moe_db_step");
+            res->t_moe_db_step = inp->step;
+            res->add_input(std::move(inp));
+        }
+        ggml_tensor * w2   = ggml_reshape_2d(ctx0, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), n_expert_used, n_tokens);
+        ggml_tensor * ring = moe_doorbell->build_ring(ctx0, db_slot, ggml_reshape_2d(ctx0, chain_inp, n_embd, n_tokens), ids_cpu, w2, res->t_moe_db_step);
+        cb(ring, "ffn_moe_db_ring", il);
+        ggml_build_forward_expand(gf, ring); // before the hits chain, so the host works while the GPU does
+
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcl->up_c,   chain_inp, ids_gpu);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcl->gate_c, chain_inp, ids_gpu);
+        cb(up_g,   "ffn_moe_cache_up",   il);
+        cb(gate_g, "ffn_moe_cache_gate", il);
+        ggml_tensor * act_g = nullptr;
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        if (limit > 1e-6f) {
+            up_g = ggml_clamp(ctx0, up_g, -limit, limit);
+            if (arch == LLM_ARCH_DEEPSEEK4) {
+                gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
+                act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
+            } else {
+                ggml_tensor * ga = ggml_silu(ctx0, gate_g);
+                ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
+                act_g = ggml_mul(ctx0, ga, up_g);
+            }
+        } else {
+            act_g = ggml_swiglu_split(ctx0, gate_g, up_g);
+        }
+        cb(act_g, "ffn_moe_cache_act", il);
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcl->down_c, act_g, ids_gpu); // [n_embd, n_expert_used, n_tokens], zero on miss lanes
+        cb(down_g, "ffn_moe_cache_down", il);
+
+        ggml_tensor * hits = ggml_mul(ctx0, down_g, weights);
+        cb(hits, "ffn_moe_weighted", il);
+        ggml_build_forward_expand(gf, hits);
+        ggml_tensor * hv[LLAMA_MAX_EXPERTS] = { nullptr };
+        for (int64_t i = 0; i < n_expert_used; ++i) {
+            hv[i] = ggml_view_2d(ctx0, hits, n_embd, n_tokens, hits->nb[2], i*hits->nb[1]);
+            ggml_build_forward_expand(gf, hv[i]);
+        }
+        ggml_tensor * hsum = hv[0];
+        for (int64_t i = 1; i < n_expert_used; ++i) {
+            hsum = ggml_add(ctx0, hsum, hv[i]);
+            ggml_build_forward_expand(gf, hsum);
+        }
+        if (n_expert_used == 1) {
+            hsum = ggml_cont(ctx0, hsum);
+        }
+        ggml_tensor * moe_out = moe_doorbell->build_join(ctx0, db_slot, hsum, ring);
+        cb(moe_out, "ffn_moe_out", il);
+        res->t_moe_doorbell.push_back(db_slot);
+        return moe_out;
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]

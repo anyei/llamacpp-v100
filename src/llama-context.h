@@ -16,6 +16,7 @@
 
 struct llama_model;
 class  llama_moe_cache; // TASKS #151
+class  llama_moe_doorbell; // TASKS #154 item 3
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -361,6 +362,7 @@ private:
 
     // TASKS #151: MoE expert cache; declared after the backends so it is freed first
     std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<llama_moe_doorbell> moe_doorbell; // TASKS #154 item 3; declared after the cache: destroyed first
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

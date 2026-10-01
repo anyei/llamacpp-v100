@@ -28,8 +28,11 @@ extern "C" {
 #define RPC_PROTO_MINOR_VERSION    16
 #define RPC_PROTO_PATCH_VERSION    3
 
+// op count 101 -> 103 (TASKS #154): GGML_OP_MOE_RING / GGML_OP_MOE_JOIN were APPENDED at the enum's end, so no
+// existing op id moved, and they never travel: the RPC client refuses them in supports_op (they need the local CUDA
+// device and its pinned mailbox). The op-set fingerprint (patch) therefore stays and deployed workers keep working.
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

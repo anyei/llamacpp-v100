@@ -95,6 +95,7 @@ public:
 
     int32_t max_batch() const { return params.max_batch; }
     size_t  n_layers()  const { return layers.size(); }
+    const llama_moe_cache_layer * layer_at(size_t i) const { return layers[i].get(); } // TASKS #154 item 3 (doorbell)
 
     // enqueue the async copy of this graph's routed ids (call right after the graph was computed)
     void observe(ggml_backend_sched_t sched, const std::vector<std::pair<int, ggml_tensor *>> & ids);

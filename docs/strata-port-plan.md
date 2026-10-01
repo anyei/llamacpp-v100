@@ -482,3 +482,64 @@ texts identical. What they change is correctness and safety (V4 clamp order, no 
 error-path hang, clean teardown, bounds checks, the stream-ring race) plus a test that proves the executor bit-exact
 against ggml's CPU chain. The doorbell does not raise CPU use: the baseline's own CPU threadpool keeps ~27 cores busy
 while decoding, the doorbell build ~23.
+
+## 10. Port into the official tree (2026-09-30, user: "yes go ahead with the port") - PORTED + ROLLED (10.1-10.2)
+
+What goes in (from the experiment clone, bins-e15, with the review fixes): the D2 doorbell, the prefill stream ring, the
+executor unit test. What stays out: every closed experiment (lookahead, MTP-aware, global pool, SOL switch, probes,
+the CUDA-graph shape key and field trace, the fused draft chain / reduced vocabulary). Nothing committed (commit =
+user); everything default OFF behind env gates.
+
+- ggml: `GGML_OP_MOE_RING` / `GGML_OP_MOE_JOIN` appended at the END of the op enum (no existing id moves) - `ggml.h`,
+  `ggml.c`; CPU backend refuses them; CUDA implements them (`ggml-cuda/moe-doorbell.{cu,cuh}` + dispatch + supports_op).
+- **RPC (decision flagged to the user before any roll)**: the RPC patch version is an op-set fingerprint checked at
+  HELLO - bumping it would reject every deployed worker until the whole fleet (incl. the user-only .15 box) is rebuilt.
+  The two ops never travel: the RPC client's `supports_op` now refuses them (the scheduler cannot place them on a remote
+  device) and new workers reject out-of-range op ids instead of casting them. With ids unchanged and the ops local-only
+  the fingerprint stays (patch 3; the static_assert moves to 103 with the reason). Bumping instead = one line.
+- Scheduler: the prefill stream ring in `ggml-backend.cpp`, envs `GGML_SCHED_PREFILL_STREAM=<slots>` (1 = 3 slots) and
+  `GGML_SCHED_PREFILL_STREAM_MIN` (tokens, default 1024).
+- llama: `src/llama-moe-doorbell{,-compute}.{h,cpp}`, the `build_moe_ffn` branch + `llm_graph_input_moe_db`, context
+  hooks (create before the reserve, job before the inputs, sync + abandon on a failed compute, sync in the destructor,
+  training without it), `llama_moe_cache::layer_at`. Envs `LLAMA_MOE_DOORBELL` (=1 on, =2 timing only: wrong text),
+  `LLAMA_MOE_DOORBELL_THREADS`, `LLAMA_MOE_DOORBELL_SPIN_US` (default 1000), `LLAMA_MOE_DOORBELL_STATS`.
+- tests: `tests/test-moe-doorbell.cpp`. Docs: `docs/env-gates.md` rows + the wizard gates catalog.
+- Gates: G0 build (build-cpu with tests, build-cuda75); G1 unit test; G2 OFF-gate identity on the X99 (the port build
+  with the envs unset vs the rolled image: identical greedy texts, same ms/step and prefill); G3 ON-gate (the plan-9.1
+  numbers, KLD vs the CPU chain, 3,000-token stress, back-to-back ubatches); G4 RPC: the loopback harness on the port
+  build (reference sha) and a port-build client against a deployed (older) worker.
+
+### 10.1 Port results (2026-09-30)
+
+- Applied on HEAD 063bdc2a0 (the user's "strata port plan" commit), uncommitted: 16 files changed + 7 new
+  (`ggml-cuda/moe-doorbell.{cu,cuh}`, `src/llama-moe-doorbell{,-compute}.{h,cpp}`, `tests/test-moe-doorbell.cpp`). The
+  experiment clone's closed experiments were not carried; the clone's `ggml-cuda.cu` was not copied (only the dispatch +
+  supports_op hunks).
+- G0: build-cpu (with tests) and build-cuda75 clean; the only `-Wreorder` warning left is the pre-existing
+  `moe_cache` / `expert_mask` one.
+- G1: `test-moe-doorbell` - all 8 cases bit-identical to ggml's CPU chain, the V4-wrong-order control caught (0.33).
+- G4 RPC (`llama.cpp-work/154/rpc-gate{,-old}.sh`, loopback trunc vehicle, the #71 off-leg stack): port-build client +
+  port-build workers **sha c80261ff** (the reference), stable 6/6; port-build client + the DEPLOYED worker image
+  (`llamacpp-cpu:rpc-worker-latest`, 2026-08-19) **sha c80261ff**, stable 6/6 - the kept op-set fingerprint works
+  across the fleet with no worker rebuild.
+- Docs: `docs/env-gates.md` section "MoE doorbell + prefill stream" (6 rows), wizard gates catalog 134 -> 140 (tick
+  values: doorbell 1, stream 1, threads 40, spin 0, stats 128), `gen-wizard-flags.py --check` clean.
+- G2 OFF (switches unset) vs the rolled image 99b3c21ee-q2avx2, arms image / port / port / image
+  (`X99:/home/anyei/bench154/port154.sh`): greedy texts **IDENTICAL** on all three prompts in both port runs; ms/step
+  image 82.6-85.5, port 82.6-86.4 (mean +0.7 %, inside the V100 drift - the off path is an early return); 16k
+  prefill 81.9 / 80.9 vs 81.1 / 80.9 t/s.
+- G3 ON (`LLAMA_MOE_DOORBELL=1 GGML_SCHED_PREFILL_STREAM=1`, `-ub 4096 -b 4096`): **63.7-65.0 ms per MTP step**
+  (50.1 / 42.8 / 35.8 t/s), **16k prefill 328.3 / 330.7 t/s**; KLD at `-ub 4` with the cache vs the CPU chain
+  0.020267 / same top 95.29 % / PPL ratio 0.996 +- 0.0096; 3,000-token MTP stress 36.02 t/s, alive, coherent;
+  back-to-back `-ub 4` prompt ubatches clean.
+
+### 10.2 Rolled (2026-09-30 evening, user: "Go ahead")
+
+- The user's idle Flash-Next serve was unloaded for the gates (launch args + env captured first).
+- `llamacpp-local-v100:063bdc2a0-db` (sha256:a47b290d; HEAD 063bdc2a0 + the uncommitted port) = `:latest` locally and in
+  the registry; rollback 99b3c21ee-q2avx2; a9885783c-t3k2 / -t3k3 removed locally and on the X99 (still in the
+  registry). X99 launcher recreated on the pinned tag: healthy, wizard (140 gates), 23 models, 27 configs, dirs, hw.
+- Saved config 55366197782: `gateOn` `LLAMA_MOE_DOORBELL=1` + `GGML_SCHED_PREFILL_STREAM=1`, `flagSet`
+  `--ubatch-size 4096 --batch-size 4096` (backup `wizard-configs.json.bak-20260930b` in the launcher volume).
+- The serve relaunched through `/models/load` with the captured args + the new ones; through the router: **decode
+  50.53 / 43.32 t/s at 64.1 / 64.9 ms per MTP step, 3.7k prefill 326.5 t/s**, texts coherent.

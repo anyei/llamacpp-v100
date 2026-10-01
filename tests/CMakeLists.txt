@@ -335,3 +335,9 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# TASKS #154 item 3 (code review G2a): the MoE doorbell executor vs ggml's CPU chain
+add_executable(test-moe-doorbell test-moe-doorbell.cpp ${PROJECT_SOURCE_DIR}/src/llama-moe-doorbell-compute.cpp)
+target_include_directories(test-moe-doorbell PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(test-moe-doorbell PRIVATE ggml)
+add_test(NAME test-moe-doorbell COMMAND $<TARGET_FILE:test-moe-doorbell>)

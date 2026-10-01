@@ -54,12 +54,16 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
   re-passed (compose reverts it otherwise). The worker image needs no Kepler
   variant. The harness classifies launcher recreates as production deploys -
   expect one denial, re-run after the user's explicit go.
-- State 2026-09-30: `:latest` = 99b3c21ee-q2avx2 (sha256:9020e764, #154 item 1 AVX2 Q2_0 CPU kernel on the
-  99b3c21ee tree = T3 increments 1+2 committed; rollback a9885783c-t3k3; t3k2 removed locally, still in the registry),
-  `:kepler` = e117ee884-widefix-kepler (rollback e117ee884-kepler; no Kepler rebuild for this roll - the K80 box
-  gets the Q2_0 kernel only with a Kepler image build). X99 launcher recreated on the pinned tag, verified.
-  TRAP (2026-09-30): the coordinator box's / was at 96 % before this build (build cache 88 GB, 23 GB reclaimable);
-  check `df -h /` before any image build.
+- State 2026-09-30 eve: `:latest` = 063bdc2a0-db (sha256:a47b290d, the #154 PORT on HEAD 063bdc2a0: MoE doorbell +
+  prefill stream ring, both env-gated default off; rollback 99b3c21ee-q2avx2; t3k2/t3k3 removed locally and on the X99,
+  still in the registry), `:kepler` = e117ee884-widefix-kepler (rollback e117ee884-kepler; no Kepler rebuild - the
+  doorbell needs a CUDA device with pinned host memory, the K80 box would need its own gate). X99 launcher recreated on
+  the pinned tag, verified; the saved Flash-Next config (55366197782) turns on `LLAMA_MOE_DOORBELL=1`,
+  `GGML_SCHED_PREFILL_STREAM=1` and `-ub 4096 -b 4096` (backup `wizard-configs.json.bak-20260930b`).
+  TRAP (2026-09-30): the coordinator box's / is at 97 % (build cache ~90 GB, ~23 GB reclaimable); check `df -h /`
+  before any image build.
+  RPC: the port kept the op-set fingerprint (patch 3) - the two new ops are appended and never sent (the RPC client
+  refuses them); deployed workers verified compatible (loopback gate sha c80261ff), no worker roll needed.
   Suffixed tags (`<sha>-t3k`, `<sha>-widefix`) = built from a working tree the
   user had not committed yet; the X99 launcher compose lives in
   `/home/anyei/server/services/llamacpp-v100/` (defaults match the running

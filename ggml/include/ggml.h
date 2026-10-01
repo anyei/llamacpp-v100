@@ -590,6 +590,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_RING, // TASKS #154 item 3 (fork): MoE doorbell handoff
+        GGML_OP_MOE_JOIN,
+
         GGML_OP_COUNT,
     };
 
@@ -2758,6 +2761,33 @@ extern "C" {
         struct ggml_tensor *  a,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
+
+    // TASKS #154 item 3 (fork; docs/strata-port-plan.md section 7): the MoE doorbell handoff through a
+    // slot of a pinned (device-addressable) host mailbox. Slot header words at fixed byte offsets:
+    #define GGML_MOE_SLOT_RING  0   // u32: step published by the GPU once x/ids/w are in the slot
+    #define GGML_MOE_SLOT_DONE  128 // u32: step echoed by the host once the partial is in the slot
+    #define GGML_MOE_SLOT_NTOK  256 // i32: rows (tokens) of the published request
+    #define GGML_MOE_SLOT_DATA  384 // first payload byte
+    // ring: copy x [n_embd, T] f32, ids [n_used, T] i32 and w [n_used, T] f32 to the slot (payload offsets off_*),
+    //       then publish step (I32 [1], this graph's step - a graph input) in the RING word; returns I32 [1] = that step.
+    GGML_API struct ggml_tensor * ggml_moe_ring(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * step,
+            void                * slot,
+            int32_t               off_x,
+            int32_t               off_ids,
+            int32_t               off_w);
+
+    // join: wait until the slot's DONE word equals ring's step, return a + the slot's partial [n_embd, T] f32 (off_partial)
+    GGML_API struct ggml_tensor * ggml_moe_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * ring,
+            void                * slot,
+            int32_t               off_partial);
 
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input

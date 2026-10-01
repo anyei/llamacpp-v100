@@ -1,5 +1,6 @@
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-doorbell.h"
 
 #include "ggml.h"
 #include "ggml-ssd-stream.h"
@@ -888,6 +889,17 @@ llama_context::llama_context(
             if (const char * e = getenv("LLAMA_MOE_CACHE_STATS"))     { mp.stats_every = std::max(0, atoi(e)); }
             moe_cache = llama_moe_cache::create(model, mp);
             if (moe_cache) {
+                // TASKS #154 item 3: the doorbell, created before the reserve so the graphs carry its ops
+                if (const char * e = getenv("LLAMA_MOE_DOORBELL"); e != nullptr && atoi(e) > 0) {
+                    llama_moe_doorbell_params dp;
+                    dp.mode       = atoi(e);
+                    dp.max_tokens = mp.max_batch;
+                    dp.n_threads  = cparams.n_threads;
+                    if (const char * t = getenv("LLAMA_MOE_DOORBELL_THREADS")) { dp.n_threads   = std::max(1, atoi(t)); }
+                    if (const char * t = getenv("LLAMA_MOE_DOORBELL_STATS"))   { dp.stats_every = std::max(0, atoi(t)); }
+                    if (const char * t = getenv("LLAMA_MOE_DOORBELL_SPIN_US")) { dp.spin_us     = atoi(t); }
+                    moe_doorbell = llama_moe_doorbell::create(*moe_cache, model, dp);
+                }
                 sched_reserve();
             }
         }
@@ -911,6 +923,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // TASKS #154 item 3: no graph may still wait on the doorbell's executor when it is destroyed
+    if (moe_doorbell) {
+        synchronize();
+    }
     if (expert_profile) {
         std::lock_guard<std::mutex> lock(expert_profile->mtx);
         expert_profile->dump();
@@ -1933,6 +1949,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     sched_active = sched_cur;
 
+    // TASKS #154 item 3: queue this graph's doorbell job BEFORE the inputs are set - the step input reads the step
+    // the job was given; the job never waits on or cancels an earlier one
+    const bool db_job = moe_doorbell && !res->t_moe_doorbell.empty();
+    if (db_job) {
+        moe_doorbell->begin(res->t_moe_doorbell);
+    }
+
     // set the input data for the input tensors
     {
         const auto t_setinp_0 = ggml_time_us();
@@ -1946,6 +1969,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto t_compute_0 = ggml_time_us();
 
     const auto status = graph_compute_on(sched_cur, res->get_gf(), ubatch.n_tokens > 1);
+    if (status != GGML_STATUS_SUCCESS && db_job) {
+        // whatever was launched finishes first, then the job's missing rings are abandoned
+        synchronize();
+        moe_doorbell->abort_pending();
+    }
 
     g_dec_timing.t_compute += ggml_time_us() - t_compute_0;
     g_dec_timing.n_splits = ggml_backend_sched_get_n_splits(sched_cur);
@@ -3014,6 +3042,7 @@ llm_graph_params llama_context::graph_params(
         /*.expert_tables =*/ model.expert_tables.get(),
         /*.expert_mask   =*/ expert_mask.get(),
         /*.moe_cache     =*/ moe_cache.get(),
+        /*.moe_doorbell  =*/ moe_doorbell.get(),
         /*.cb            =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3956,7 +3985,8 @@ void llama_context::opt_epoch_iter(
 
             auto * res = gf_res_prev.get();
 
-            const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+            gparams.moe_doorbell = nullptr; // TASKS #154 item 3: training computes through ggml_opt, never via begin()
 
             res->reset();
 

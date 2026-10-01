@@ -1138,9 +1138,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_RING",
+    "MOE_JOIN",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1253,9 +1256,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_ring(x)",
+    "moe_join(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6252,6 +6258,64 @@ struct ggml_tensor * ggml_opt_step_sgd(
     result->src[0] = a;
     result->src[1] = grad;
     result->src[2] = params;
+
+    return result;
+}
+
+// TASKS #154 item 3 (fork): MoE doorbell ops, CUDA only
+
+struct ggml_tensor * ggml_moe_ring(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * step,
+        void                * slot,
+        int32_t               off_x,
+        int32_t               off_ids,
+        int32_t               off_w) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && w->type == GGML_TYPE_F32 && step->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous_rows(x) && ggml_is_contiguous(ids) && ggml_is_contiguous(w) && ggml_nelements(step) == 1);
+    GGML_ASSERT(ids->ne[1] == x->ne[1] && w->ne[0] == ids->ne[0] && w->ne[1] == ids->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    int32_t params[5];
+    const int64_t ps = (int64_t) (intptr_t) slot;
+    memcpy(params + 0, &ps, sizeof(ps));
+    params[2] = off_x;
+    params[3] = off_ids;
+    params[4] = off_w;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_RING;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = w;
+    result->src[3] = step;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * ring,
+        void                * slot,
+        int32_t               off_partial) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ring->op == GGML_OP_MOE_RING);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[3];
+    const int64_t ps = (int64_t) (intptr_t) slot;
+    memcpy(params + 0, &ps, sizeof(ps));
+    params[2] = off_partial;
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_JOIN;
+    result->src[0] = a;
+    result->src[1] = ring;
 
     return result;
 }
