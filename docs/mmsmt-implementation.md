@@ -1,6 +1,6 @@
 # mmsmt: small-T tensor-core GEMM for Volta — implementation document
 
-Status: 2026-09-28 (TASKS #153 T1), D6 + activation staging built as v11 (section 4.6): wins at widths 3-8 on Q4_K, 6-8 on Q8_0; KL gate + MTP A/B pending. Written
+Status: **SHIPPED, default on** (`GGML_CUDA_SMT=0` disables). v11 passed the KL gate and the MTP A/B (4.7), V5 + the per-type route table rolled 2026-09-28 as `1c63c03a1-smt2` (4.10) and is in every image since; T2 step 2 (device sampling of the verify rows) is exact and speed-neutral, kept opt-in (F4 step 2). Originally 2026-09-28 (TASKS #153 T1), D6 + activation staging built as v11 (section 4.6). Written
 after kernel versions v1-v9 to freeze the analysis before the next design step, per the
 "implementation document before code" rule. Companion: the dated
 log in `docs/volta-smallt-gemm-plan.md`; Phase 0 evidence in `research/ninfer-phase0-2026-09-28.md`.

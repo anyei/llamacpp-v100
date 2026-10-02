@@ -2183,6 +2183,19 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // TASKS #156: the QSA cell maps and biases depend on the cache layout, the ratio and the bias mode only, so one
+        // input per (ratio, bias mode) serves every QSA layer instead of a host pass over all cells per layer
+        llm_graph_input_i * qsa_shared          = nullptr;
+        int64_t             qsa_shared_r        = -1;
+        bool                qsa_shared_blk_bias = false;
+
+        // TASKS #156 7.3: the tail cells of the current QSA layer when the top-k ranks whole blocks, else null;
+        // the mask template (one spare cell column) and the zero rows, shared by all QSA layers of the graph
+        ggml_tensor * qsa_tail       = nullptr;
+        ggml_tensor * qsa_mask_tmpl  = nullptr;
+        ggml_tensor * qsa_zeros_tail = nullptr;
+        ggml_tensor * qsa_zeros_sel  = nullptr;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

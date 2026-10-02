@@ -1028,6 +1028,20 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
+// TASKS #156 7.4: keep the previous plan only when every tensor has exactly the planned size. With the plain "fits"
+// rule a graph runs on the plan of an earlier, larger graph (e.g. the worst-case reserve), so the same graph is placed
+// differently depending on what ran before - and the CUDA fusion checks test memory overlap, so the kernels and the
+// rounding follow that history (the decode-graph cache vs the main scheduler: KLD 0.015). Buffers still only grow.
+// GGML_ALLOC_EXACT_PLAN=0 restores the "fits" rule.
+static bool ggml_gallocr_exact_plan(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_ALLOC_EXACT_PLAN");
+        v = e == NULL || atoi(e) != 0;
+    }
+    return v != 0;
+}
+
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
@@ -1036,6 +1050,9 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
             return false;
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
+    }
+    if (ggml_gallocr_exact_plan()) {
+        return talloc->size_max == node_size;
     }
     return talloc->size_max >= node_size;
 }

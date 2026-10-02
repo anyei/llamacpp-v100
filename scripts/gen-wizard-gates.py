@@ -31,7 +31,7 @@ CLASS = {
     "serve": [
         "GGML_META_BCAST_FUSE", "GGML_RPC_WIRE_F16", "GGML_RPC_WIRE_Q8",
         "GGML_META_TILED_UPLOAD",
-        "LLAMA_MOE_DOORBELL", "GGML_SCHED_PREFILL_STREAM",
+        "LLAMA_MOE_DOORBELL", "GGML_SCHED_PREFILL_STREAM", "LLAMA_QSA_BLOCK_TOPK",
         "GGML_META_EXPERT_DEFER", "GGML_META_EXPERT_DEFER_WAIT_US",
         "GGML_META_EXPERT_DEFER_SYNC_EDGE", "LLAMA_META_EP_ONLY",
         "LLAMA_META_ATTN_OWNER", "LLAMA_META_ALLOW_MULTI_LOCAL",
@@ -41,7 +41,7 @@ CLASS = {
         "LLAMA_SSD_STREAM_VRAM_BUDGET", "LLAMA_SSD_STREAM_SERIAL",
     ],
     "tune": [
-        "GGML_CUDA_FA_NO_VOLTA_SMALL",
+        "GGML_CUDA_FA_NO_VOLTA_SMALL", "GGML_CUDA_FA_SKIP_MASKED", "GGML_ALLOC_EXACT_PLAN",
         "LLAMA_SSD_STREAM_READ_THREADS", "LLAMA_SSD_STREAM_PREFETCH",
         "LLAMA_SSD_STREAM_SLRU", "LLAMA_SSD_STREAM_PROTECTED_PCT",
         "LLAMA_SSD_STREAM_NO_ODIRECT", "LLAMA_SSD_STREAM_GPU_NO_RECLAIM",
@@ -51,6 +51,7 @@ CLASS = {
         "LLAMA_FLEET_CAPACITY_CHECK", "LLAMA_FLEET_KV_RESERVE_MB",
         "LLAMA_FLEET_LOCAL_BENCH",
         "LLAMA_RPC_NO_SURGICAL", "LLAMA_RPC_AUTO_WEIGHT_RESERVE_MB",
+        "LLAMA_RPC_SURGICAL_WAIT_S", "GGML_RPC_JOURNAL_MAX_MIB",
         "GGML_RPC_NO_W2W", "GGML_RPC_NO_SRC_HINT", "GGML_META_MAX_GRAPHS",
         "GGML_META_SURGICAL_MAX_STATE_MIB", "GGML_META_FUSED_BCAST",
         "GGML_META_PARTIAL_MERGE", "LLAMA_LP_SYNC_EDGE",
@@ -110,6 +111,9 @@ CLASS = {
 }
 NAME_CLASS = {n: c for c, names in CLASS.items() for n in names}
 
+# envs the wizard sets from a dedicated control (the #134 spec panel), not the gate list
+PANEL_ENVS = {"LLAMA_SPEC_DRAFT2_TYPE", "LLAMA_SPEC_DRAFT2_DEVICE"}
+
 # gates whose danger lives in a specific VALUE, not in enabling them
 DANGER_VALUES = {
     "GGML_META_EXPERT_DEFER": ["2"],  # v1 defer-all: coherence fail, never serve
@@ -128,6 +132,8 @@ VAL_OVERRIDE = {
     "LLAMA_MOE_DOORBELL_THREADS": "40",     # the X99 serve's -t
     "LLAMA_MOE_DOORBELL_SPIN_US": "0",      # ticked to save CPU: sleep at once
     "LLAMA_MOE_DOORBELL_STATS": "128",
+    "GGML_CUDA_FA_SKIP_MASKED": "0",        # default on: the toggle exists to turn it off
+    "GGML_ALLOC_EXACT_PLAN": "0",           # default on: the toggle exists to turn it off
 }
 
 UNIT_TYPES = {"us", "mib", "count", "bytes", "width", "int"}
@@ -201,7 +207,7 @@ def parse(doc_text):
         type_s, default_s = strip_md(cells[1]), strip_md(cells[2])
         desc = first_sentence(strip_md(cells[3]))
         for name in names:
-            if name.startswith("LLAMA_ARG_"):  # CLI-alias envs: flags box, not gates
+            if name.startswith("LLAMA_ARG_") or name in PANEL_ENVS:  # CLI-alias envs: flags box, not gates
                 continue
             if name in seen:
                 continue

@@ -1,6 +1,9 @@
 # NInfer follow-ups T3 (INT8 KV + decode attention) and T4 (launch fusion) - analysis and plan
 
-Status: 2026-09-29 (TASKS #153). Companion to `docs/mmsmt-implementation.md` (T1, F4/T2) and
+Status: **T3 SHIPPED, default on** - lever a (the Volta TILE rule, 5.5) and the small-width kernel increments 1-2
+(sections 6-7, `fattn-mma-volta-small.cuh`, `GGML_CUDA_FA_NO_VOLTA_SMALL=1` disables) are in every image since
+`a9885783c-t3k3` (2026-09-29). Next T3 lever (not started): overlap the width-5 attention tiles with the memory stream
+(7.3). T4: census + plan only (sections 4, 5.1). Originally 2026-09-29 (TASKS #153). Companion to `docs/mmsmt-implementation.md` (T1, F4/T2) and
 `research/ninfer-v100-survey-2026-09-27.md` (sections 1.4-1.5, 4). Both items are decode-SPEED
 items; neither changes output quality except T3's KV quantisation, which lands with a KL gate.
 

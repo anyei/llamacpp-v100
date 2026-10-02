@@ -1,7 +1,9 @@
 # True Distributed Inference: Coordinator + N Workers
 
-Status: analysis / design document. Nothing here is implemented yet beyond what is
-marked "exists today". Target deployment: 1 coordinator docker instance + N worker
+Status: the original analysis / design document (2026-07), kept for the rationale. Most of it has since been built
+(RPC protocol 4.x, TP islands, discovery, fleet UI, surgical re-provision): how to run it is in
+`docs/distributed-inference-guide.md`, the history in `TASKS.md` (item 12 onward). The "exists today" markers below
+describe the state when this was written. Target deployment: 1 coordinator docker instance + N worker
 docker instances, each bound to its own GPU(s), on one or several hosts.
 Reference hardware: Tesla V100-SXM2 (Volta, sm70, NVLink NV2 pairs), scaling from
 2 to 4+ GPUs.

@@ -6,9 +6,9 @@ Task-by-task history: `TASKS.md`. Image rebuild: `REBUILD-IMAGE.md`.
 Serving profiles: `docker-compose.mtp.yml` / `docker-compose.nospec.yml`.
 
 > Note: per-change numbers below are the historical record of each round's
-> build. The **current** reference benchmark tables live in `README.md`
-> (refreshed 2026-07-09, task 21); post-merge single-box V4 numbers are in
-> `docs/v4-single-box-benchmark.md`.
+> build. The **current** numbers live in `README.md`: "Latest results" (Qwen3.8 on
+> one V100, 2026-09-30) and the earlier Qwen3.6 tables (refreshed 2026-07-09, task
+> 21); post-merge single-box V4 numbers are in `docs/v4-single-box-benchmark.md`.
 
 Models used throughout (mounted at `/models` inside the containers):
 

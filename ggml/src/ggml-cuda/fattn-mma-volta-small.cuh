@@ -65,12 +65,18 @@ static __device__ __forceinline__ uint32_t fattn_vs_bytes_hi(const uint32_t w) {
 
 // (u - 1152) * d as half2 bit patterns: u holds 1024 + (q ^ 0x80) per lane, so the result is the exact int8 q times d
 static __device__ __forceinline__ uint32_t fattn_vs_dq8(const uint32_t u, const uint32_t d2) {
+#ifdef FP16_AVAILABLE
     half2 a, b, c;
     *reinterpret_cast<uint32_t *>(&a) = u;
     *reinterpret_cast<uint32_t *>(&b) = 0x64806480u;
     *reinterpret_cast<uint32_t *>(&c) = d2;
     const half2 r = __hmul2(__hsub2(a, b), c);
     return *reinterpret_cast<const uint32_t *>(&r);
+#else
+    GGML_UNUSED_VARS(u, d2);
+    NO_DEVICE_CODE;
+    return 0;
+#endif // FP16_AVAILABLE
 }
 
 static __device__ __forceinline__ uint32_t fattn_vs_pack(const float a, const float b) {
@@ -91,12 +97,12 @@ static __device__ __forceinline__ void fattn_vs_kq_slice(float (&S)[NT][8], cons
 
 // phase 1 K readers: the lane's K row (position) against all Q tiles. Qs4 points at row t of tile 0.
 template <int D, int NT, int QST4, ggml_type type_K>
-static __device__ __forceinline__ void fattn_vs_kq_row(float (&S)[NT][8], const uint4 * __restrict__ Qs4, const char * __restrict__ Krow) {
+static __device__ __forceinline__ void fattn_vs_kq_row(float (&S)[NT][8], const uint4 * __restrict__ Qs4, const char * __restrict__ Krow, const bool active) {
     if constexpr (type_K == GGML_TYPE_F16) {
         const uint4 * K4 = (const uint4 *) Krow;
 #pragma unroll
         for (int s8 = 0; s8 < D/8; ++s8) {
-            const uint4 w = K4[s8];
+            const uint4 w = active ? K4[s8] : make_uint4(0, 0, 0, 0);
             fattn_vs_kq_slice<NT, QST4>(S, Qs4, s8, w);
         }
     } else {
@@ -109,7 +115,7 @@ static __device__ __forceinline__ void fattn_vs_kq_row(float (&S)[NT][8], const 
             uint32_t w[17];
 #pragma unroll
             for (int i = 0; i < 17; ++i) {
-                w[i] = Kw[17*bp + i];
+                w[i] = active ? Kw[17*bp + i] : 0u;
             }
             const uint32_t d0 = (w[0] & 0xffffu) | (w[0] << 16);
             const uint32_t d1 = (w[8] >> 16)     | (w[8] & 0xffff0000u);
@@ -141,8 +147,15 @@ static __device__ __forceinline__ void fattn_vs_kq_row(float (&S)[NT][8], const 
 
 // phase 2 V readers: the lane's DL contiguous dims of one V row as DL/4 B .row fragment pairs (n-tile j = dims 4j..4j+3)
 template <int DL, ggml_type type_V>
-static __device__ __forceinline__ void fattn_vs_v_row(uint32_t (&b)[DL/4][2], const char * __restrict__ Vrow, const int dim0) {
+static __device__ __forceinline__ void fattn_vs_v_row(uint32_t (&b)[DL/4][2], const char * __restrict__ Vrow, const int dim0, const bool active) {
     static_assert(DL == 4 || DL == 8, "lane V run must be 8 or 16 bytes of f16");
+    if (!active) {
+#pragma unroll
+        for (int j = 0; j < DL/4; ++j) {
+            b[j][0] = b[j][1] = 0u;
+        }
+        return;
+    }
     if constexpr (type_V == GGML_TYPE_F16) {
         if constexpr (DL == 8) {
             const uint4 w = *(const uint4 *) (Vrow + 2*dim0);
@@ -180,7 +193,7 @@ static __device__ __forceinline__ void fattn_vs_v_row(uint32_t (&b)[DL/4][2], co
     }
 }
 
-template <int D, int NT, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int NT, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked>
 __launch_bounds__(FATTN_VS_NTHREADS, 2)
 static __global__ void flash_attn_ext_mma_volta_small(
         const char * Q_ptr,
@@ -221,6 +234,7 @@ static __global__ void flash_attn_ext_mma_volta_small(
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
     constexpr int NROWS = 8*NT;          // M rows (Q rows x packed heads, padded)
+    static_assert(NROWS >= 2*FATTN_VS_NWARPS, "the masked-position ballots borrow sL: 2 words per warp");
     constexpr int QST   = D + 8;         // Q row stride in halves (16-byte pad: conflict-free fragment loads)
     constexpr int QST4  = QST/8;         // ... in uint4
     constexpr int NJW   = D/32;          // 8-wide n-tiles per warp (the warp owns D/4 dims)
@@ -329,9 +343,30 @@ static __global__ void flash_attn_ext_mma_volta_small(
 
     const int k_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
 
-    for (int k0 = blockIdx.y*FATTN_VS_STEP; k0 < k_max; k0 += gridDim.y*FATTN_VS_STEP) {
+    // TASKS #156: a position that every query row of the block masks with -inf contributes exact zeros, so its K and V
+    // rows are not loaded (zeros enter the mma instead) and a step without any visible position is skipped. Sparse
+    // masks (qwen4exp QSA: ~2k of n_kv cells per row) then read only the selected rows. sact holds one ballot word per
+    // warp, double-buffered by step parity; sL is free until the epilogue.
+    uint32_t * sact = (uint32_t *) sL;
+    const char * mask_seq = skip_masked && mask ? mask + nb33*(sequence % ne33) + nb31*ic0 : nullptr;
+    int it = 0;
+
+    for (int k0 = blockIdx.y*FATTN_VS_STEP; k0 < k_max; k0 += gridDim.y*FATTN_VS_STEP, ++it) {
         // ---- phase 1: S = Q K^T for the warp's 32 positions, one K row per lane ----
         const int pos = k0 + 32*warp + lane;
+        bool active = true;
+        if (mask_seq) {
+            active = false;
+            for (int j = 0; j < ncols; ++j) {
+                active |= __half2float(((const half *) (mask_seq + nb31*j))[pos]) != -INFINITY;
+            }
+        }
+        if constexpr (skip_masked) {
+            const uint32_t ballot = __ballot_sync(0xFFFFFFFF, active);
+            if (lane == 0) {
+                sact[(it & 1)*FATTN_VS_NWARPS + warp] = ballot;
+            }
+        }
         float S[NT][8];
 #pragma unroll
         for (int m = 0; m < NT; ++m) {
@@ -340,7 +375,7 @@ static __global__ void flash_attn_ext_mma_volta_small(
                 S[m][i] = 0.0f;
             }
         }
-        fattn_vs_kq_row<D, NT, QST4, type_K>(S, Qs4, K + (int64_t) pos*nb11);
+        fattn_vs_kq_row<D, NT, QST4, type_K>(S, Qs4, K + (int64_t) pos*nb11, active);
 
         // softcap, mask, ALiBi; the lane's columns are positions 32*warp + 4*qp + c0 + {0,1} and + 16 + {0,1}
         const int pc0 = k0 + 32*warp + 4*qp + c0;
@@ -388,6 +423,18 @@ static __global__ void flash_attn_ext_mma_volta_small(
             }
         }
         __syncthreads();
+
+        const uint32_t * sa = sact + (it & 1)*FATTN_VS_NWARPS;
+        if constexpr (skip_masked) {
+            uint32_t any_active = 0;
+#pragma unroll
+            for (int w = 0; w < FATTN_VS_NWARPS; ++w) {
+                any_active |= sa[w];
+            }
+            if (any_active == 0) {
+                continue;
+            }
+        }
 
         // CTA-wide new max per row, rescale, P = exp(S - max) as fp16 A fragments -> Ps
 #pragma unroll
@@ -442,8 +489,10 @@ static __global__ void flash_attn_ext_mma_volta_small(
             const int kc = oslice*NCH + ch;
             const int pv = k0 + 32*(kc >> 2) + 4*(kc & 3) + (lane & 3);  // mma 0 position; mma 1 = pv + 16
             uint32_t b0[NJ][2], b1[NJ][2];
-            fattn_vs_v_row<DL, type_V>(b0, V + (int64_t) pv*nb21, dim0);
-            fattn_vs_v_row<DL, type_V>(b1, V + (int64_t) (pv + 16)*nb21, dim0);
+            const int o0 = pv - k0;
+            const int o1 = o0 + 16;
+            fattn_vs_v_row<DL, type_V>(b0, V + (int64_t) pv*nb21,        dim0, !skip_masked || ((sa[o0 >> 5] >> (o0 & 31)) & 1u));
+            fattn_vs_v_row<DL, type_V>(b1, V + (int64_t) (pv + 16)*nb21, dim0, !skip_masked || ((sa[o1 >> 5] >> (o1 & 31)) & 1u));
 #pragma unroll
             for (int m = 0; m < NT; ++m) {
                 const uint4 a = Ps4[m*8*PST4 + kc];
@@ -588,9 +637,9 @@ static __global__ void flash_attn_ext_mma_volta_small(
 #endif // defined(FLASH_ATTN_AVAILABLE) && defined(VOLTA_MMA_AVAILABLE)
 }
 
-template <int D, int NT, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int NT, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool skip_masked>
 static void ggml_cuda_flash_attn_ext_mma_volta_small_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2) {
-    fattn_kernel_t fattn_kernel = flash_attn_ext_mma_volta_small<D, NT, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_mma_volta_small<D, NT, type_K, type_V, use_logit_softcap, skip_masked>;
     constexpr size_t nbytes_shared = fattn_vs_smem_bytes<D, NT>();
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
@@ -610,10 +659,23 @@ void ggml_cuda_flash_attn_ext_mma_volta_small_case(ggml_backend_cuda_context & c
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
+    // TASKS #156: positions every query row masks are not loaded (exact); GGML_CUDA_FA_SKIP_MASKED=0 restores the dense read
+    static const bool skip = [] {
+        const char * e = getenv("GGML_CUDA_FA_SKIP_MASKED");
+        return e == nullptr || atoi(e) != 0;
+    }();
     if (logit_softcap == 0.0f) {
-        ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, false>(ctx, dst, ncols2);
+        if (skip) {
+            ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, false, true>(ctx, dst, ncols2);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, false, false>(ctx, dst, ncols2);
+        }
     } else {
-        ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, true>(ctx, dst, ncols2);
+        if (skip) {
+            ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, true, true>(ctx, dst, ncols2);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_volta_small_case_impl<D, NT, type_K, type_V, true, false>(ctx, dst, ncols2);
+        }
     }
 }
 

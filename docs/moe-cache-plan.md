@@ -1,6 +1,6 @@
 # MoE expert cache (VRAM cache for CPU-resident experts) - investigation + proposal (TASKS #151)
 
-Status: **BUILT + ROLLED 2026-09-07 (sections 12.1-12.11); K80/Kepler battery 2026-09-27 found and FIXED the wide-node gather bug (section 12.12); V100 regate 2026-09-28 GREEN, image e117ee884-widefix, the V100 was never exposed (section 12.13); MAX_BATCH >= offload-width assert fixed by a clamp (12.14)**. Originally: PROPOSAL 2026-09-07 (section 7 decision points). No code
+Status: **BUILT + ROLLED 2026-09-07 (sections 12.1-12.11); K80/Kepler battery 2026-09-27 found and FIXED the wide-node gather bug (section 12.12); V100 regate 2026-09-28 GREEN, image e117ee884-widefix, the V100 was never exposed (section 12.13); MAX_BATCH >= offload-width assert fixed by a clamp (12.14)**. Built on top (2026-09-30, TASKS #154): the MoE doorbell hands the cache's misses to a host executor without splitting the decode graph, and the prefill stream ring - `docs/strata-port-plan.md`. Originally: PROPOSAL 2026-09-07 (section 7 decision points). No code
 written. Companion lanes: docs/ssd-streaming-plan.md (Task 15, the in-tree SSD tier + its
 single-GPU slot cache), docs/expert-profiling.md (#74 profiles = warm-start source),
 docs/expert-placement-plan.md (#75 skip sentinel + remap tables, reused here).

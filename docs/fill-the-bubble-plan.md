@@ -1,6 +1,7 @@
 # Fill the bubble: overlap boundary waits with useful work (TASKS #71, escape c)
 
-Status: design v1, 2026-07-27 night. Follows the gate-5 null (#75) and the
+Status: **END-STATE 2026-08-01 (section 1b)**: escapes (a) and (b) closed, (c) banked (deferral v3 +34 %, `-np 2`
++40 % aggregate). Originally design v1, 2026-07-27 night. Follows the gate-5 null (#75) and the
 wire-format ladder (proto 4.12/4.13). Companion ledgers:
 distributed-inference-plan.md 6b (measured escapes table),
 research docs 2026-07-24-horizontal-scaling.md section 9 and

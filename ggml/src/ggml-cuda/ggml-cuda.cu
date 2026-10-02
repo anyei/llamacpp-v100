@@ -1683,7 +1683,8 @@ void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
-    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+    } else if ((compute_type == GGML_TYPE_F16 || compute_type == GGML_TYPE_BF16) && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+        // cublasGemmEx has no 16-bit path below cc 6.0 (CUBLAS_STATUS_ARCH_MISMATCH on a K80)
         compute_type = GGML_TYPE_F32;
     }
     if (dst->op_params[0] == GGML_PREC_F32) {

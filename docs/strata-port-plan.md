@@ -1,11 +1,12 @@
 # Strata port plan (TASKS #154) - MoE decode on the X99
 
-Status: 2026-09-30 - analysis re-checked (sections 1-2); item 1 (AVX2 Q2_0 CPU kernel) BUILT + GATED (section 6):
--8.3 ms per MTP verify step (+8-11 % decode at equal acceptance), +3-6 % plain decode; the fast kernel (A) picked
-by the user; uncommitted, no image rolled. Item 3 (doorbell) analysed + designed (section 7), awaiting the go;
-zero-code: `GGML_CUDA_DISABLE_GRAPHS=1` measured +4.5 % on the production MTP shape. Rolled 2026-09-30
-(99b3c21ee-q2avx2 + the config change, 6.1). Item 3 prototype (D2) in the experiment clone: MTP -25 % per verify
-step (+33 %), plain +30 %, KLD 0.022 (float-order class), 3,000-token stress clean (7.6). Items 2 and 3 get their own design sections later.
+Status: **DONE 2026-09-30 - PORTED, ROLLED, COMMITTED.** Item 1 (AVX2 Q2_0 CPU kernel, section 6), item 3 (the D2
+MoE doorbell, sections 7 and 10) and the prefill stream ring (section 8.6) are in the official tree (committed by the
+user as 063bdc2a0 + 1300d2bef), image `llamacpp-local-v100:063bdc2a0-db` = `:latest`, and the saved Flash-Next config
+runs them with `-ub 4096 -b 4096` and CUDA graphs off. Result vs the 2026-09-29 production (section 9.1): decode +43 %
+(94.6 -> 64.0 ms per MTP step), prefill 4.1x. Items 2, 3b, 4, 5, 6 (`-ub 8192`), 7a, 7b closed with numbers (8.1-8.6).
+Filed follow-ups (not started): stable CUDA graphs (KV padding, 8.3), gather-based sparse attention for long contexts
+(8.5), a CJK-aware draft vocabulary subset (8.2), a K80 gate before the Kepler image uses the doorbell.
 
 Source of the ideas: Niko1221/Strata @ a790805 (`src/kernels/cpu/q2_avx2.cpp` for item 1). Background: TASKS #154
 (two-round analysis) and #155 (the isolated experiment that measured the decode budget).

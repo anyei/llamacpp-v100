@@ -5,16 +5,93 @@ tuned for **NVIDIA Tesla V100 (Volta, sm70, NVLink)** serving, with working
 **tensor parallelism**, tuned **speculative decoding (MTP)**, and experimental
 **distributed inference** (coordinator + workers, tensor-parallel "islands").
 
-Reference hardware: 2x V100-SXM2-32GB (NVLink NV2), scaling plan for 4+2+1
-GPUs across two machines. Models used for tuning and benchmarks:
+Reference hardware: Tesla V100-SXM2-32GB. The current numbers come from the X99
+box (one V100 32 GB, 2x Xeon E5-2690 v4, 251 GB RAM); the older tables come from
+the original 2x V100 NVLink box (see Reference hardware below). Models used for
+tuning and benchmarks:
 
-- `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB) — primary serving model,
-  hybrid attention + DeltaNet with an MTP head for speculation
+- `Qwen3.8-27B` (dense, MTP head built in) - current dense serving model
+- `Qwen3.8-Flash-Next` (`qwen4exp` MoE, 177B total / 3B active, GSQ-RCO 3.5-bit,
+  72 GiB) with its Q8_0 MTP head file - current MoE serving model: experts in
+  host RAM behind a VRAM expert cache
+- `Qwen3.6-27B-UD-Q4_K_XL-MTP.gguf` (16.4 GB) and `Qwen3.6-35B-A3B` - the
+  earlier reference tables
 - `GLM-4.7-Flash-REAP-23B-A3B-UD-Q4_K_XL.gguf` (~14 GB) — MoE / MLA
   experiments, single-GPU profile
 - `Qwen3-0.6B-BF16.gguf` — small model for fast distributed/RPC iteration
 
-## Benchmarks — single stream, max t/s per config
+## Latest results (2026-09-30): Qwen3.8 on one V100
+
+One Tesla V100-SXM2-32GB (250 W) in the X99 box (2x Xeon E5-2690 v4, 251 GB RAM),
+image `llamacpp-local-v100:063bdc2a0-db` (the #154 port, committed as 1300d2bef),
+single stream, MTP self-speculation with up to 3 draft tokens per step
+(`--spec-draft-n-max 3 --spec-draft-p-min 0.75`). Decode t/s is the server's own
+`eval time` summary for the whole request.
+
+**Qwen3.8-27B** (dense, `Qwen3.8-27B-AD-IQ3_S.gguf`, 13.8 GB, MTP head built in),
+one long generation per context window:
+
+| Context window | KV cache | Tokens generated | **Decode t/s** (whole request) | Draft acceptance |
+|---|---|---:|---:|---:|
+| 64k (`-c 65536`) | f16 | 65,343 (window full) | **52.5** | 91.9 % |
+| 128k (`-c 131072`) | q8_0 | 76,280 | **47.2** | 88.0 % |
+
+The rate follows how predictable the text is: per 8k-token stretch it ranged
+46-66 t/s in the 64k run and 41-57 t/s in the 128k run. What keeps long contexts
+fast on Volta (same-binary A/Bs on Qwen3.8-27B UD-Q4_K_XL, TASKS #153):
+
+- **Small-width flash-attention kernel** (T3, default on): MTP decode at 56k depth
+  +19 % (f16 KV) and +23 % (q8_0 KV) with identical text; the verify step at 128k
+  takes 71 ms instead of 106 (f16) and 73 instead of 119 (q8_0), and the second
+  kernel increment took another ~3 % off. q8_0 KV now runs within ~2 % of f16 at
+  depth, so it halves KV memory at almost no speed cost.
+- **Small-batch tensor-core matmul route** (T1, `mmsmt`, default on): MTP verify
+  batches (3-8 rows) run on the tensor cores, 1.17-1.34x faster at widths 4-8;
+  best MTP serve setting +8 % (52.8 -> 56.9 t/s).
+
+```bash
+llama-server -m Qwen3.8-27B-AD-IQ3_S.gguf -ngl 99 -c 131072 -fa on -ctk q8_0 -ctv q8_0 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 --cache-reuse 256
+# the 64k run: -c 65536 with f16 KV (no -ctk/-ctv)
+```
+
+**Qwen3.8-Flash-Next** (`qwen4exp` MoE, 177B total / 3B active, 512 experts top-10,
+GSQ-RCO 3.5-bit, 72 GiB) on the same box: dense weights on the GPU, routed experts
+in host RAM (`-ncmoe 48`) behind a 15 GB VRAM expert cache, Q8_0 MTP head file,
+`-t 40`. Before = production on 2026-09-29, after = production now; one session,
+runs interleaved ([`docs/strata-port-plan.md`](docs/strata-port-plan.md) 9.1):
+
+| | Before | **After** | Change |
+|---|---:|---:|---|
+| Decode, mean of 3 prompts (t/s) | 28.0 | **40.0** | **+43 %** |
+| Time per MTP step (ms) | 94.6 | **64.0** | 1.48x faster |
+| Prefill, 3.7k-token prompt (t/s) | 79.5 | **326.2** | **4.1x** |
+| Prefill, 15.9k-token prompt (t/s) | 81.1 | **330.3** | **4.1x** |
+
+On the production serve after the roll: 50.5 and 43.3 t/s on two 256-token test
+prompts, and 48.9 t/s over a 6,274-token generation (81 % draft acceptance).
+Where it came from (TASKS #154): an AVX2 Q2_0 CPU kernel for the missed experts
+(-8.3 ms per step), CUDA graphs off for this serve (-3.7 ms), the MoE doorbell
+(`LLAMA_MOE_DOORBELL=1`: each layer's cache misses go to a host executor while the
+GPU computes the hits, instead of splitting the graph; -19.5 ms), and the prefill
+stream ring (`GGML_SCHED_PREFILL_STREAM=1`) with `-ub 4096 -b 4096` (4x prefill).
+Quality: KLD 0.020 against the CPU chain (the float-order class), coherent text.
+Since 2026-10-01 (TASKS #156) the decode graph is reused instead of rebuilt every
+step, which makes CUDA graphs a win again (they are back ON), and the sparse QSA
+attention got cheaper at depth (one shared input for its 12 layers, an exact skip
+of masked positions in the Volta attention kernel). Production config, same box:
+**55.7 ms per MTP step (47.6 t/s, -13 %)** on short prompts, **71.8 ms at 28k and
+107.8 ms at ~95k context (-19 %)**, prefill unchanged at ~334 t/s; every piece is
+exact (KLD 0 against the code before it). Later the same day the QSA indexer
+learned to rank whole blocks, as the reference model does (`LLAMA_QSA_BLOCK_TOPK=1`,
+now on in production): **66.3 ms per step at 28k (-7.5 %) and 89.5 ms at ~95k
+(-17 %, 24.8 -> 31.1 t/s)**, short prompts and prefill unchanged; this one changes
+the selection at the cutoff (KLD 0.0046, perplexity equal at 8k / 32k / ~95k,
+17/17 exact-answer probes).
+The exact flags and envs are under Usage examples in
+[`docs/env-gates.md`](docs/env-gates.md).
+
+## Earlier benchmarks (Qwen3.6, 2x V100 NVLink box, July 2026) — single stream, max t/s per config
 
 **2× V100-SXM2-32GB (NVLink)**, temp-0, `-n 128`, single stream, image built from this
 tree. **MTP** = the model's built-in multi-token-prediction head used for self-speculation
@@ -147,6 +224,11 @@ them is V100-specific.
   MRoPE; the converter's `--mtp` exports the MTP head as its own GGUF for
   `draft-mtp`, and `LLAMA_MMAP_RANDOM=1` advises the ~97 GiB PLE gather
   table for random access instead of pulling it in at load.
+- **AVX2 Q2_0 dot kernel** (`ggml/src/ggml-cpu/arch/x86/quants.c`, TASKS #154
+  item 1) - x86 had only the scalar Q2_0 kernel; the AVX2 one is ~6x faster on
+  one thread and reaches the memory wall at 40 threads. Flash-Next keeps 43 % of
+  its expert weights in Q2_0: -8.3 ms per MTP step. The float summation order
+  differs from the scalar kernel (KLD 0.017, the noise class).
 - **Robustness fixes** — clean failure on unreachable `--rpc` endpoints (was a
   silent CPU fallback), on failed context/lora init (was a null-pointer crash),
   and a lora-path double-free.
@@ -161,11 +243,29 @@ them is V100-specific.
   matrix-vector kernels; K-quant batch-1 decode uses `nwarps=2` (+1.8% nospec
   tg, perplexity-identical). Volta was previously served by the generic
   (untuned) path.
+- **Small-batch tensor-core matmul route** (`ggml-cuda/mmsmt.cu`, TASKS #153 T1,
+  default on, `GGML_CUDA_SMT=0` disables) - quantized weights times 3-8
+  activation rows (MTP verify batches) on `mma.sync.m8n8k4` instead of MMVQ /
+  dp4a MMQ: 1.17-1.34x at widths 4-8, quality-neutral (KL gate). Design:
+  [`docs/mmsmt-implementation.md`](docs/mmsmt-implementation.md).
+- **Small-width flash-attention kernel** (`ggml-cuda/fattn-mma-volta-small.cuh`,
+  T3, default on, `GGML_CUDA_FA_NO_VOLTA_SMALL=1` disables) - decode and verify
+  attention (up to 8 query rows, f16 or q8_0 KV) on the tensor cores at the HBM
+  rate: decode at 128k depth +21 % (f16) / +60 % (q8_0), MTP decode at 56k
+  +19-23 %. Plan + gates: [`docs/ninfer-t3-t4-plan.md`](docs/ninfer-t3-t4-plan.md).
+- **MoE doorbell + prefill stream ring** (TASKS #154, env-gated, off by default)
+  - for `-ncmoe` serves with `--moe-cache`: `LLAMA_MOE_DOORBELL=1` keeps the
+  decode graph on the GPU and hands each layer's cache misses to a host
+  executor through a pinned mailbox (Flash-Next, together with the AVX2 kernel
+  and graphs off: 95 -> 64 ms per MTP step); `GGML_SCHED_PREFILL_STREAM=1`
+  copies the host-resident expert weights of large prompt ubatches on a helper
+  thread and its own stream (4.1x prefill with `-ub 4096`). Plan + gates:
+  [`docs/strata-port-plan.md`](docs/strata-port-plan.md).
 - **Quantized KV in tensor mode** — verified lossless at q8_0 (2x); mixed K/V
   types enabled via `GGML_CUDA_FA_ALL_QUANTS`. Note (measured): on Volta,
-  quantized KV is for **capacity**, not long-context *speed* — the decode
-  flash-attention kernel is compute-bound there, so quantizing KV slightly
-  *increases* the long-context penalty.
+  quantized KV is for **capacity**, not *speed*. Before the small-width
+  attention kernel (T3), quantizing KV made long contexts slower; since then
+  q8_0 runs within ~2 % of f16 at depth.
 - **MLA tensor mode** (`deepseek2` family: GLM-4.7-Flash, DeepSeek V2/V3/R1,
   Kimi K2) — attention runs mirrored, FFN/experts split; validated by
   perplexity (statistically identical to single-GPU). Temp-0 text can diverge
@@ -290,9 +390,15 @@ benchmark (`scripts/ssd-stream-bench-odirect.cpp`) are in
 
 ## Fork knobs (env gates)
 
-Everything this fork adds is **off by default** and gated by an env var (or CLI
-flag), so a stock run behaves like upstream. The **complete, authoritative list**
-— every gate with its type, default, measured effect, and usage examples — lives
+Most of what this fork adds is **off by default** and gated by an env var (or CLI
+flag). The exceptions are measured wins that ship on, each with an opt-out: the
+Volta small-batch matmul route (`GGML_CUDA_SMT=0`), the Volta small-width
+attention kernel (`GGML_CUDA_FA_NO_VOLTA_SMALL=1`), MTP draft padding
+(`LLAMA_SPEC_DRAFT_NO_PAD=1`), the decode graph cache (`LLAMA_DECODE_GRAPH_CACHE=0`)
+and tiled RPC weight uploads (`GGML_META_TILED_UPLOAD=0`); the MMVQ sm70 table and
+the AVX2 Q2_0 kernel have no switch. The **complete, authoritative list**
+— every gate with its type, default, measured effect, and usage examples, plus
+every CLI flag the fork adds (section 10) — lives
 in [`docs/env-gates.md`](docs/env-gates.md). The tables below are a curated
 highlight of the most-used knobs (the full reference also covers the meta
 expert-parallel gates, the fleet/discovery/auto-weight family, worker
@@ -333,6 +439,16 @@ containment/fault-injection knobs):
 | `LLAMA_MOE_CACHE_RESERVE_MB` | 3072 (+ draft model) | VRAM kept free of the cache; an oversized fixed budget is clamped with a warning. |
 | `LLAMA_MOE_CACHE_MAX_BATCH` | 8 | Widest node the cache chain owns (MTP/ngram verify batches); clamped below `GGML_OP_OFFLOAD_MIN_BATCH`. |
 | `LLAMA_MOE_CACHE_STATS` | 0 | Log hit/fill/evict/resident counters every N steps (libllama INFO: `-v`, or `-lv 4` on the server). |
+| `LLAMA_MOE_DOORBELL` | off | `=1`: decode/verify graphs hand each layer's cache misses to a host executor instead of splitting the graph (Flash-Next production). Needs `--moe-cache` on a CUDA device. |
+| `GGML_SCHED_PREFILL_STREAM` | off | `=1` (3 slots): prompt ubatches of 1024+ tokens copy host-resident expert weights on a helper thread and stream; use with `-ub 4096 -b 4096`. |
+| `LLAMA_QSA_BLOCK_TOPK` | off | `=1`: the qwen4exp QSA indexer ranks whole blocks (the reference selection) instead of every cell; Flash-Next -7.5 % per MTP step at 28k, -17 % at ~95k, short prompts equal, KLD 0.0046 vs off (TASKS #156 7.3). |
+
+**Volta kernels** (on by default)
+
+| Env gate | Default | What it does |
+|---|---|---|
+| `GGML_CUDA_SMT` | 1 | Small-batch tensor-core matmul route for 3-8 activation rows (MTP verify); `=0` falls back to MMVQ/MMQ. |
+| `GGML_CUDA_FA_NO_VOLTA_SMALL` | off | `=1` routes decode/verify attention back to the tile/vec kernels instead of the small-width tensor-core kernel. |
 
 **Speculative decoding / MTP**
 
@@ -349,8 +465,8 @@ containment/fault-injection knobs):
 |---|---|---|
 | `GGML_CUDA_ALLREDUCE=p2p` | NCCL | One-shot P2P NVLink AllReduce for 2 GPUs (falls back to NCCL). |
 | `GGML_CUDA_AR_P2P_MAX_BYTES` | 4 MB | Size cap above which P2P defers to NCCL. |
-| `GGML_CUDA_FORCE_GRAPHS` | off | No-op since 601ad05a9 (upstream enables Volta graphs by default now); kept for older images. |
-| `GGML_CUDA_DISABLE_GRAPHS` | off | Disable CUDA graphs — set in the MTP compose (~5% loss with spec shape churn); leave on for plain decode. |
+| `GGML_CUDA_FORCE_GRAPHS` | - | Removed (upstream enables Volta graphs by default since 601ad05a9); setting it does nothing. |
+| `GGML_CUDA_DISABLE_GRAPHS` | off | Disable CUDA graphs — set in the MTP compose (~5% loss with spec shape churn); leave on for plain dense decode and for the Flash-Next serve (graphs ON since #156, -11.6 % per MTP step). |
 
 **Meta tensor-split backend**
 
@@ -377,6 +493,7 @@ containment/fault-injection knobs):
 |---|---|---|
 | `LLAMA_DECODE_GRAPH_CACHE` | 4 | Cached small-batch decode graphs for steady-state reuse (`=0` disables). |
 | `LLAMA_DECODE_GRAPH_CACHE_TOKENS` | 64 | Max ubatch size eligible for the cache. |
+| `GGML_ALLOC_EXACT_PLAN` | on | The graph allocator re-plans unless every tensor has exactly the planned size, so the same graph gets the same memory layout - and the same fused kernels and numbers - in every path (decode cache == main scheduler, bit for bit; TASKS #156 7.4). `=0` = the old "fits" rule. |
 | `GGML_RPC_NO_W2W` | off | Disable direct worker-to-worker tensor pull (bridge through the coordinator). |
 | `GGML_RDMA_DEV` / `GGML_RDMA_GID` | auto | RDMA device / GID selection for the RPC transport. |
 | `LLAMA_ATTN_ROT_DISABLE` | off | Opt out of Hadamard-rotated KV quantization (auto-on when KV is quantized). |
@@ -402,6 +519,9 @@ containment/fault-injection knobs):
 | [`docs/env-gates.md`](docs/env-gates.md) | every fork env gate + CLI flag, grouped, with usage examples |
 | [`docs/dev-workflow.md`](docs/dev-workflow.md) | the dev image, how runs/tests are done, correctness gates, the iterative loop |
 | [`docs/moe-cache-plan.md`](docs/moe-cache-plan.md) | MoE expert cache: fork survey, dual-chain design, build log + V100/Kepler gates (task 151) |
+| [`docs/strata-port-plan.md`](docs/strata-port-plan.md) | Flash-Next decode + prefill on one V100 (task 154): AVX2 Q2_0, MoE doorbell, prefill stream ring, the closed items with numbers, baseline-vs-after tables |
+| [`docs/mmsmt-implementation.md`](docs/mmsmt-implementation.md), [`volta-smallt-gemm-plan.md`](docs/volta-smallt-gemm-plan.md) | Volta small-batch tensor-core matmul route (task 153 T1): design, kernel versions, gates |
+| [`docs/ninfer-t3-t4-plan.md`](docs/ninfer-t3-t4-plan.md) | Volta small-width flash-attention kernel (task 153 T3) and the launch-fusion census (T4) |
 | [`docs/dual-drafters.md`](docs/dual-drafters.md) | speculative drafter roster, dual-drafter dispatch, measured sweet spots (#132-#142) |
 | [`docs/launcher-wizard-plan.md`](docs/launcher-wizard-plan.md) | the launch wizard / router UI: design, gate + flag catalogs, increments |
 | [`docs/parallel-decoding-plan.md`](docs/parallel-decoding-plan.md) | parallel decoding design (task 127) |
@@ -440,55 +560,46 @@ For multi-machine setups see the
 
 ## Pending items
 
-Tracked in detail in [`TASKS.md`](TASKS.md):
+Tracked in detail in [`TASKS.md`](TASKS.md). Open as of 2026-10-01:
 
-- **Expert-parallel hot-expert placement (#74/#75)** — the current main line.
-  Router-frequency profiling landed (`LLAMA_EXPERT_PROFILE`; hy3 coverage@25.5%
-  = 0.913 vs 0.255 uniform, cross-domain stable) and frequency-ranked placement
-  v1 is in (`LLAMA_META_EXPERT_PLACEMENT`, gates 1-4 passed: byte-exact,
-  PPL-neutral, ownership audit). Remaining: the fleet A/B measurement
-  (`run-ep-fleet-hy3-place.sh`), then GLM-5.2 profiling before its EP debut.
-- **Distributed serving, measured** — layer fleets: V4 4.6-4.8 t/s, hy3 2.74
-  t/s; EP is RTT-serialized on GbE (~2.5-2.8 t/s). V4 production answer is
-  single-box `-ngl 99 -ncmoe 37` (9.7-9.9 t/s post-merge, matches upstream);
-  the fleet remains for over-RAM models (GLM-5.2 class). Fault tolerance and
-  fleet UI are done (#29/#35: surgical re-provision, `--rpc-reload`,
-  `/fleet/*`); RPC auth/TLS still open (WireGuard covers this in practice).
-- **Parallel decoding** (branch `parallel-inference`, #71) — stage 1 landed
-  (coordinator-local MTP draft, `LLAMA_META_LOCAL_DRAFT`); stage 2
-  (draft-on-VRAM-experts) unblocked by #75. Research track: #67 iterations in
-  `docs/research/`.
-- **RDMA / fast NICs** (#60, hardware pending) — the measured EP revival
-  path (boundary RTT is the fleet's wire tax); `GGML_RPC_RDMA` plumbing is
-  already in the transport.
-- **SSD streaming** (task 15) — **beta; usable via CLI flags** (unchanged):
-  `--ssd-streaming` + `--ssd-stream-gpu`; DeepSeek-V4-Flash 81 GB runs on one
-  32 GB V100 + 46 GB RAM. GPU landing is single-GPU today; `-sm tensor` +
-  DeepSeek crashes at load (parked). See `docs/ssd-streaming-plan.md §8`.
-- **Bug queue** — #66 (two EP corners post-merge), #68 (auto-weight trusts
-  iGPU memory reports), #72 (load-path robustness cluster), #73 (worker score
-  staleness), #53 (strip reasoning from chat history).
-- Token-generation round closed 2026-07-08: **17** overlap AllReduce with
-  compute — negative, reverted (`97dffd25f`); **18** MMVQ sm70 tuning — +1.8%
-  batch-1 nospec decode, ppl-identical (`b912d1b1e`); **19** FA long-context
-  decay — sized, compute-bound, quant-KV counterproductive for speed, deep
-  kernel work deferred (`723cf9fed`); **20** adaptive speculative draft cap —
-  measured tg-neutral, ships off (`bc52cf1ea`).
+- **Decode speed follow-ups** - from #156: a block-level top-k for the QSA indexer
+  (design written, it changes which cells win ties at the cutoff, so it ships
+  opt-in after a KLD + speed review), and a look at why the decode-graph cache is
+  not bit-identical to the main scheduler. From #153: the next T3 lever (overlap
+  the width-5 attention tiles with the memory stream) and T4 launch fusion
+  (census + plan only).
+- **New models** (#152) - MiMo-V2.6-Flash-RL and GLM-5.3-Flash GSQ-RCO GGUFs:
+  analysis done, route decided, waiting for the go.
+- **Speculation** - RPC-hosted drafters (#132, in progress), the fused MTP draft
+  chain (#140; closed for `qwen4exp` in #154, no net win there), selective tree
+  arming (#141), parallel decoding for the over-VRAM models (#127).
+- **Distributed serving** - fault tolerance and the fleet UI are done; RPC
+  auth/TLS still open (WireGuard covers it in practice); RDMA / fast NICs (#60,
+  hardware).
+- **SSD streaming** (task 15) - beta, usable via CLI flags; GPU landing is
+  single-GPU; `-sm tensor` + DeepSeek crashes at load (parked).
+- **Bug queue** - #130 (launcher generations break half-way client-side,
+  backlogged), #144 (Flash-Next tensor-split mmproj OOM), #147 (fleet UI roster
+  for `qwen4exp`), #149 (wizard drafter matching), and the older #53, #68, #72,
+  #73.
 
 ## Reference hardware & platform
 
-Everything in this fork was developed, measured, and validated on one box:
+Developed, measured and validated on two GPU boxes:
 
-| Component | Detail |
-|---|---|
-| GPUs | 2x NVIDIA Tesla V100-SXM2-32GB (Volta, cc 7.0, 32 GB each) on an SXM2 carrier |
-| GPU interconnect | NVLink NV2 between the pair (`nvidia-smi topo -m`: `NV2`) — this is what makes `-sm tensor` + NCCL fast |
-| GPU driver | 580.x (CUDA 13 userspace; images build against CUDA 12.8) |
-| CPU | Intel Core i9-10850K, 10c/20t @ 3.6 GHz |
-| RAM | 46 GiB (+ zram swap) — note the 27B CPU-side config needs ~11 GiB anonymous memory beyond weights |
-| Storage | Models on a consumer NVMe (measured 1.6 GB/s O_DIRECT sequential); bulk HDDs for everything else |
-| OS / runtime | Linux (LTS kernel 6.18), Docker 29 with the NVIDIA container runtime; serving and dev builds both containerized |
-| Network | Single host — all RPC/distributed numbers are loopback; the 4+2+1 two-box topology is the planned expansion (see the deployment plan in `docs/perf-tuning-v100.md`) |
+| Component | Original box (2026-07/08: the Qwen3.6 tables) | X99 box (2026-09: the Qwen3.8 numbers) |
+|---|---|---|
+| GPUs | 2x Tesla V100-SXM2-32GB (Volta, cc 7.0) on an SXM2 carrier, NVLink NV2 between the pair (what makes `-sm tensor` + NCCL fast) | 1x Tesla V100-SXM2-32GB (PG500-216), 250 W |
+| GPU driver | 580.x (CUDA 13 userspace; images build against CUDA 12.8) | 580.173.02 |
+| CPU | Intel Core i9-10850K, 10c/20t @ 3.6 GHz | 2x Intel Xeon E5-2690 v4, 28c/56t (AVX2 + FMA, no AVX-512) |
+| RAM | 46 GiB (+ zram swap) — the 27B CPU-side config needs ~11 GiB anonymous memory beyond weights | 251 GB |
+| Storage | Models on a consumer NVMe (measured 1.6 GB/s O_DIRECT sequential); bulk HDDs for everything else | local disk + the models share |
+| OS / runtime | Linux (LTS kernel 6.18), Docker 29 with the NVIDIA container runtime; serving and dev builds both containerized | same |
+
+The original box now holds a Tesla K80 (the `:kepler` image variant) and runs the
+image registry and the dev builds. Network: the distributed numbers include
+loopback runs and real cross-host runs over GbE (since 2026-07-09); the original
+box and the X99 share a 10 GbE link.
 
 **Linux-only, and deliberately so.** This fork is developed and tested
 exclusively on Linux inside Docker. Upstream llama.cpp supports Windows and
@@ -502,8 +613,12 @@ on Windows, you are on your own — report findings, but expect breakage.
 ## Provenance and caveats
 
 - Forked from upstream llama.cpp (see git history for the merge base).
-- Tuned specifically for Volta (cc 7.0): CUDA graphs are unavailable there,
-  MMQ/MMVQ dispatch thresholds and measured curves are V100-specific.
+- Tuned specifically for Volta (cc 7.0): MMQ/MMVQ dispatch thresholds, the
+  small-batch matmul and attention kernels, and the measured curves are
+  V100-specific. CUDA graphs work on Volta since the upstream merge, but the MTP
+  compose turns them off (measured net loss); the Flash-Next serve runs them since
+  #156.
 - The RPC protocol has **no authentication or TLS** — private networks only.
-- Everything measured on the reference hardware above; your numbers will vary
-  with interconnect, model, and quantization.
+- Everything measured on the reference hardware above (the box is named with
+  each table); your numbers will vary with interconnect, model, and
+  quantization.

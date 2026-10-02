@@ -54,7 +54,31 @@ nohup docker build -f .devops/cuda.Dockerfile --target server \
   re-passed (compose reverts it otherwise). The worker image needs no Kepler
   variant. The harness classifies launcher recreates as production deploys -
   expect one denial, re-run after the user's explicit go.
-- State 2026-09-30 eve: `:latest` = 063bdc2a0-db (sha256:a47b290d, the #154 PORT on HEAD 063bdc2a0: MoE doorbell +
+- State 2026-10-01 ~19:00 (#156 7.4 roll): `:latest` = 1300d2bef-156p4 (sha256:57d5bf36; 156p3 + the exact-plan
+  allocator rule GGML_ALLOC_EXACT_PLAN default on; rollback 1300d2bef-156p3), `:kepler` = 1300d2bef-156p4-kepler
+  (sha256:9b1ba57b; rollback 1300d2bef-156p3-kepler). Both launchers recreated and verified (X99: 23 models, V100,
+  wizard 145 gates, Flash-Next config gateOn keeps LLAMA_QSA_BLOCK_TOPK=1; K80 box: 74 models, both dies). Old tags
+  1300d2bef-156p (both boxes) and 1300d2bef-156p2-kepler removed (registry keeps them). Build-cache prune after the
+  builds (16.2 GB, user's OK); / at 94 %. X99 bench156/arm.sh now uses 1300d2bef-156p3 as its runtime image.
+- State 2026-10-01 ~17:50 (#156 7.3 roll): `:latest` = 1300d2bef-156p3 (sha256:7591b92b; #156 port + PR #26385 + 7.5 +
+  the 7.3 block-level QSA top-k, uncommitted tree; rollback 1300d2bef-156p), `:kepler` = 1300d2bef-156p3-kepler
+  (sha256:7d3cf363; rollback 1300d2bef-156p2-kepler). Both launchers recreated on the pinned tags and verified (X99: 23
+  models, V100, wizard knows LLAMA_QSA_BLOCK_TOPK; K80 box: 74 models, both dies). X99 saved Flash-Next config
+  55366197782 gateOn += LLAMA_QSA_BLOCK_TOPK=1 (backup wizard-configs.json.bak-20261001-qsa). Old tags removed:
+  063bdc2a0-db (coordinator + X99), e117ee884-widefix-kepler (registry copies kept). Disk: two user-approved
+  build-cache prunes around the two builds (16.4 + 12.8 GB); / at 94 % after. Each coordinator + Kepler build pair
+  adds ~13 GB of build cache - prune (with the user's OK) before and after.
+- State 2026-10-01 (#156 roll): `:latest` = 1300d2bef-156p (sha256:26ed6b8d; the #156 port + upstream PR #26385
+  softmax-race fix on HEAD 1300d2bef, uncommitted tree; rollback 063bdc2a0-db), `:kepler` = 1300d2bef-156p2-kepler
+  (same tree + the 7.5 BF16->F32 cuBLAS fix for cc < 6.0, which makes MTP work on the K80; rollback
+  e117ee884-widefix-kepler). Both launchers recreated on the pinned tags and verified (X99: 23 models, V100 visible;
+  K80 box: 74 models, both dies). X99 saved Flash-Next config 55366197782 now runs CUDA graphs ON (gateOff
+  GGML_CUDA_DISABLE_GRAPHS; backup wizard-configs.json.bak-20261001). The V100 image predates the 7.5 line (no effect
+  at cc 7.0). Old tags removed: 99b3c21ee-q2avx2 (coordinator + X99), e117ee884-kepler, test images keplerfix /
+  156p-kepler. Disk: / still 97 % after two Kepler builds (build cache pruned once, 25 GB, user's call).
+  The harness REFUSES launcher recreates (production deploy) until the user says go in the conversation - even a
+  `docker ps | grep llama-launcher` was refused once the recreate had been denied.
+- State 2026-09-30 eve: `:latest` = 063bdc2a0-db (sha256:a47b290d, the #154 PORT on HEAD 063bdc2a0, committed by the user as 1300d2bef: MoE doorbell +
   prefill stream ring, both env-gated default off; rollback 99b3c21ee-q2avx2; t3k2/t3k3 removed locally and on the X99,
   still in the registry), `:kepler` = e117ee884-widefix-kepler (rollback e117ee884-kepler; no Kepler rebuild - the
   doorbell needs a CUDA device with pinned host memory, the K80 box would need its own gate). X99 launcher recreated on

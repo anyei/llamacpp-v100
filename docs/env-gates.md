@@ -3,7 +3,8 @@
 This fork adds a number of **environment-variable gates** to enable, tune, and
 debug its features (tensor parallelism, MTP speculation, SSD streaming, the meta
 tensor-split backend, distributed inference, and instrumentation). This page
-consolidates them.
+consolidates them, and section 10 lists the serve parameters (CLI flags of
+`llama-server` and `ggml-rpc-server`) the fork adds.
 
 Conventions:
 - **Boolean** gates are "set = on" unless noted: any non-empty value (often `=1`)
@@ -72,6 +73,7 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 
 | Env | Type | Default | Meaning |
 |---|---|---|---|
+| `LLAMA_ARG_MOE_CACHE` | `off` / N / `auto` | off | (= `--moe-cache`) Slot budget: N MiB total, split evenly across the cached layers; `auto` = free VRAM minus the reserve. |
 | `LLAMA_MOE_CACHE_RESERVE_MB` | MiB | 3072 (+ draft model size + 512 when a draft model is configured) | VRAM kept free of the cache on its device; a fixed `--moe-cache N` above free-minus-reserve is CLAMPED with a warning, `auto` = free-minus-reserve. |
 | `LLAMA_MOE_CACHE_MAX_BATCH` | count | 8 | Nodes wider than this (prompt processing) stay on the stock path; MTP/ngram verify batches up to 8 use the cache. Values at or above `GGML_OP_OFFLOAD_MIN_BATCH` (default 32) are clamped to one below it with a warning: the sched offloads the expert weights of such nodes to the GPU and its used-expert scan cannot see the cache's skip sentinels. |
 | `LLAMA_MOE_CACHE_INSERTS` | count | 2 | Max uploads scheduled per layer per decode step. |
@@ -85,6 +87,8 @@ but `off` forces `--no-repack` (repacked bytes cannot be copied into slots). Ser
 ### MoE doorbell + prefill stream (TASKS #154, docs/strata-port-plan.md sections 7-10)
 
 Both default off and parse VALUES (`=0` is off). The doorbell needs `--moe-cache` with the pools on a CUDA device.
+Production since 2026-09-30: the Qwen3.8-Flash-Next serve runs both, with `-ub 4096 -b 4096` (recipe under Usage
+examples).
 
 | Env | Type | Default | Meaning |
 |---|---|---|---|
@@ -114,7 +118,18 @@ Both default off and parse VALUES (`=0` is off). The doorbell needs `--moe-cache
 | `LLAMA_SPEC_MTP_FUSED` | bool (value-parsed) | off | (#140) Fused in-graph MTP draft chain: ONE `llama_decode` runs the whole greedy chain (iterated-graph fixed point, selective-row head+argmax per iteration) instead of n per-step micro-forwards; p_min/entropy/alt/adaptive draft gates are bypassed (greedy fixed-n). qwen35-class single-head MTP only (chain-heads / mem-shared gemma4 excluded); single-drafting-seq rounds only — others fall back per-step; toggled around the draft submit only (mirror/ingestion decodes stay unfused). Auto-DISABLED on row/tensor-split models: the in-graph ARGMAX needs a single-owner logits row and vocab-split lm_head aborts the meta backend (guarded at init since 40198f1c0 — WARN + per-step fallback). **MEASURED parity everywhere it runs (byte-identical, draft-stream-identical; 47.3 vs 47.4 n2, layer-split 2-GPU also parity): the draft phase was never the cost — verify rows are (~+9.2 ms/row on the MoE target, #140 corrected calibration). Kept opt-in.** |
 | `LLAMA_SPEC_DUMP` | path | off | (#132) Append one record per fresh verify round (`anchor_pos;draft_tokens;accepted_tokens`) for offline cross-drafter/stream analysis. TRAP: temp-0 streams from different batch shapes fork at near-ties - never join dumps by absolute position; use per-request sequence alignment (xdraft-join3.py pattern). |
 | `LLAMA_SPEC_DRAFT2` | path | off | (#132, experimental) Register a SECOND drafter (own model+context) behind the primary in the priority-fallback dispatch: later impls only draft sequences the earlier ones left empty. With `LLAMA_SPEC_DRAFT2_TYPE` (draft-simple/eagle3/mtp/dflash/dspark; default draft-simple) and optional `LLAMA_SPEC_DRAFT2_DEVICE` (e.g. `RPC0` = a remote worker). draft-simple secondary owns its mirror hygiene (self-trims, survives ckpt restores); mtp/eagle3 as secondary UNGATED on ckpt-class targets (their process may desync after restores - gate before trusting). Verified: ngram primary + remote draft-simple secondary drafts 35/35 on fresh prose, byte-stable. |
+| `LLAMA_SPEC_DRAFT2_TYPE` | type name | `draft-simple` | (#132, with `LLAMA_SPEC_DRAFT2`) Speculation type of the second drafter: `draft-simple`, `draft-eagle3`, `draft-mtp`, `draft-dflash` or `draft-dspark`; an unknown name disables the second drafter with a warning. The launch wizard sets it from its spec panel (#134), not from the gate list. |
+| `LLAMA_SPEC_DRAFT2_DEVICE` | device list | the primary drafter's devices | (#132, with `LLAMA_SPEC_DRAFT2`) Comma-separated devices for the second drafter, e.g. `RPC0` for a remote worker; unknown names are skipped with a warning. Set from the wizard's spec panel (#134). |
 | `LLAMA_SPEC_TIMING` | bool | off | Log server speculation phase timings (draft/verify/accept). |
+| `LLAMA_ARG_SPEC_DRAFT_ENTROPY_MAX` | bits | 0 (off) | (= `--spec-draft-entropy-max H`) Stop drafting when the draft candidate distribution's entropy exceeds H bits (high entropy predicts rejection). |
+| `LLAMA_ARG_SPEC_DRAFT_CONF_MIN` | 0-1 | 0 (off) | (= `--spec-draft-conf-min P`, DSpark drafters; carried with upstream PR #25683) Keep a drafted token only while the drafter's confidence head predicts acceptance >= P; the block is cut at the first position below it. |
+
+## 3b. Reasoning budget (#139)
+
+| Env | Type | Default | Meaning |
+|---|---|---|---|
+| `LLAMA_ARG_THINK_BUDGET_WARN_AT` | tokens | -1 (off) | (= `--reasoning-budget-warn-at N`; per request `reasoning_budget_warn_at`) When N thinking tokens remain, inject the warning message into the reasoning stream WITHOUT an end tag and keep counting, so the model can close the block itself; the hard `--reasoning-budget` cut still applies at 0. Fires once per thinking block; the injected tokens do not count against the budget. |
+| `LLAMA_ARG_THINK_BUDGET_WARN_MESSAGE` | text | none | (= `--reasoning-budget-warn-message MSG`; per request `reasoning_budget_warn_message`) The text injected when the warning fires. |
 
 ## 4. Tensor-parallel AllReduce over NVLink (task 4)
 
@@ -136,7 +151,7 @@ Both default off and parse VALUES (`=0` is off). The doorbell needs `--moe-cache
 | `GGML_CUDA_MMID_NO_DST_ZERO` | bool | off | **(task 75)** Skip the dst pre-zeroing in `mul_mat_id`. Measurement aid only - the zeroing exists so skip-sentinel lanes cannot surface recycled garbage, so this is ONLY valid where no sentinel can appear (expert placement off). Measured cost on the MTP spec-decode config (Qwen3.6-27B, 2x V100, -c 32768): tg 73.61 t/s with vs 73.79 without, i.e. 0.24% against a ~2.8% run-to-run spread - no detectable regression. |
 | `GGML_CUDA_CHECK_IDS` | bool | off | **(task 75)** Bounds-check `mul_mat_id` expert ids against `src0->ne[2]` at the point of use and report node/device/offending value. Note it only checks the VALUES; the #75 crash was in-range ids that were not DISTINCT per token. **Combine with `GGML_CUDA_DISABLE_GRAPHS=1` for full coverage, same as `GGML_CUDA_SYNC_NODES`:** the check does a D2H `cudaMemcpyAsync` + `cudaStreamSynchronize` at the top of `ggml_cuda_mul_mat_id`, which is illegal while a CUDA graph is capturing — and graphs stay ENABLED for quantized MoE decode (the very case this gate exists to debug). Since 2026-08-23 (review #23 fix) the check auto-SKIPS while a capture is active instead of aborting the process; captured decode graphs are therefore UNCHECKED unless graphs are disabled. |
 | `GGML_CUDA_NO_CONCURRENT_STREAMS` | bool | off | **(task 75)** Keep every node on the main stream (no fork/join across the concurrent-stream scheduler). A/B switch for isolating cross-stream ordering bugs. |
-| `GGML_CUDA_DISABLE_GRAPHS` | bool | off | *(upstream)* Disable CUDA graphs. **Set in the MTP production compose**: draft/verify shape churn makes graph re-capture a ~5% net loss for spec decode (measured 75-78 t/s off vs 70-73 on). Leave ON (default) for plain decode - Volta graph coverage is part of the upstream V4 win (#65). |
+| `GGML_CUDA_DISABLE_GRAPHS` | bool | off | *(upstream)* Disable CUDA graphs. **Set in the MTP production compose**: draft/verify shape churn makes graph re-capture a ~5% net loss for spec decode (measured 75-78 t/s off vs 70-73 on). Leave ON (default) for plain decode - Volta graph coverage is part of the upstream V4 win (#65). Flash-Next history: #154 turned them off for that serve (its decode graph was rebuilt every step, so graphs re-captured: +3.3 ms per MTP step); since #156 (graph reuse for the qwen4exp QSA/PLE inputs) the graph stays stable and graphs ON are -11.6 % per MTP step - the saved Flash-Next config runs them ON again (2026-10-01). |
 
 > **Removed:** `GGML_CUDA_FORCE_GRAPHS` no longer exists in the code (the getenv
 > is gone; setting it does nothing on current builds). Volta CUDA graphs are
@@ -197,6 +212,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | Gate | Type | Default | What it does |
 |---|---|---|---|
 | `LLAMA_DECODE_GRAPH_CACHE` | count | 4 | Number of small-batch decode graphs to cache (each with its own scheduler). `=0` disables. |
+| `GGML_ALLOC_EXACT_PLAN` | bool | **on** | (#156 7.4) The graph allocator keeps a previous allocation plan only when every tensor has exactly the planned size, else it plans again (buffers still only grow). Under the old "fits" rule a graph ran on the plan of an earlier, larger graph; CUDA fusions test memory overlap, so the kernels and the rounding followed the allocation history - the decode-graph cache and the main scheduler differed by KLD 0.015 on Flash-Next. On: the same graph gives the same numbers in every path (decode cache == main scheduler, bit for bit). Speed-neutral on the Flash-Next production config. Value-parsed: `=0` restores the "fits" rule (the numerics before 2026-10-01). |
 | `LLAMA_DECODE_GRAPH_CACHE_TOKENS` | count | 64 | Max ubatch size eligible for the cache. |
 
 ## 7. Distributed inference / RPC (task 12)
@@ -211,6 +227,8 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_FLEET_KV_RESERVE_MB` | MiB | 20480 | Headroom the capacity gate adds on top of the model weight bytes (KV + compute buffers + fragmentation margin). |
 | `LLAMA_FLEET_LOCAL_BENCH` | bool | on | (server, TASKS #136) The #131b load-time local-device bench (same matmul bench the workers run for `--score`; fills the `/fleet/status` score column for local devices). `=0` disables it. Even when on, a device reporting < 192 MiB free is auto-skipped (another serve may hold it near-full), and the bench runs behind scoped CUDA error containment: a failed bench costs only its score row, never the load. |
 | `LLAMA_RPC_NO_SURGICAL` | bool | off (surgical ON) | With `--rpc-reload`: disable the surgical re-provision (returned worker's share replayed from its own cache, ~2min for a 48GB share vs ~10+min reload; falls back to the reload on any failure) and always do the full in-process reload. `LLAMA_RPC_SURGICAL_WAIT_S` (120) = how long to wait for a dead endpoint to return; `GGML_RPC_JOURNAL_MAX_MIB` (4096) = small-write spill cap; `GGML_RPC_REPROVISION_VERIFY=1` = read back and hash-verify every replayed region. |
+| `LLAMA_RPC_SURGICAL_WAIT_S` | seconds | 120 | With `--rpc-reload` and surgical re-provision on: how long to wait for a lost worker to come back before falling back to the full in-process reload. |
+| `GGML_RPC_JOURNAL_MAX_MIB` | MiB | 4096 | Cap on the per-buffer spill file of the surgical re-provision journal (small set-tensor writes are journaled to an anonymous temp file); past the cap, surgical re-provision is disabled for that buffer and a lost worker gets the full reload. |
 | `GGML_RPC_REPROVISION_VERIFY` | presence | off | Surgical re-provision diagnostic: after replaying a worker's set-tensor journal, read every replayed region back and compare hashes (adds a full read of the share). PRESENCE-gated (`=0` is ON); measurement-only. |
 | `LLAMA_ARG_RPC_RELOAD` | bool | off | (= `--rpc-reload`, server only) On RPC worker loss: fail in-flight requests, then reload the model IN-PROCESS across the workers reachable at that moment (dead workers drop with their positional `-ts` shares; a returned worker is re-included by the next failure-triggered reload; all-dead degrades to local-only loudly; a load that fails - fleet-sized models - retries every 10s). Default off = #29b behavior: exit 42 for the restart policy. |
 | `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | bool | off | (= `--rpc-skip-unavailable`) Drop unreachable `--rpc` servers with a warning and split the model across the remaining devices, instead of exiting with an error. Load-time; a worker dying mid-session is handled separately (29b: requests error cleanly, server exits for restart+rediscovery). |
@@ -233,7 +251,7 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_ARG_RPC_AUTO_WEIGHT` | bool | off | (= `--rpc-auto-weight`) Fill an unset `-ts` by each device's measured bandwidth score instead of by free memory, water-filled against capacity; local GPUs are benchmarked at startup. Also applies to `-sm tensor` EP splits (task 28 increment 3). Explicit `-ts` always wins. |
 | `GGML_RPC_SCORE` | bool | off | Worker-side (= `rpc-server --score`): run a ~1s matvec benchmark at startup (effective memory bandwidth, the decode-bound quantity) and publish the score in the discovery beacon + over RPC, for `--rpc-auto-weight`. Benched ONCE at startup — restart the worker when the box is idle if a busy start under-read it (TASKS.md #42). |
 | `GGML_RPC_ALLOW_SHUTDOWN` | bool | off | Worker-side (= `rpc-server --allow-shutdown`): permit the coordinator to restart this worker over RPC (`POST /fleet/worker/restart`). Off = the worker refuses shutdown commands. |
-| `LLAMA_ARG_FLEET_ADMIN` | bool | off | (= `--fleet-admin`, server) Enable `POST /fleet/worker/restart` and `POST /fleet/reload`. Requires an `--api-key` (these are remote-kill/reload primitives on an unauthenticated RPC fabric). |
+| `LLAMA_ARG_FLEET_ADMIN` | bool | off | (= `--fleet-admin`, server) Enable `POST /fleet/worker/restart`, `POST /fleet/worker/rescore` and `POST /fleet/reload`. Requires an `--api-key` (these are remote-kill/reload primitives on an unauthenticated RPC fabric). |
 | `LLAMA_ARG_FLEET_PREFLIGHT` | path | off | (= `--fleet-preflight <gguf>`, server) Before the main load, benchmark a small model across the SAME devices/split (times single-token decodes) and publish the result in `/fleet/status`. A small dense model's compute is negligible, so the number is the fleet's per-token boundary/latency floor — an upper bound for any model on this topology, not a throughput estimate. Never runs on a resume/failure reload. |
 
 ## 8. KV cache (task 10)
@@ -249,6 +267,13 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `GGML_CUDA_FA_NO_MMA` | bool | off | Never select the MMA FlashAttention kernel (tile/vec instead). For devices that pass the cc gate but can't run it — GTX 16xx (TU116/117) is cc 7.5 without tensor cores. Set on the affected *worker*; without it the first failure self-heals per device (WARN + tile fallback) instead of aborting. |
 | `GGML_CUDA_FA_MMA_FORCE_SMEM_FAIL` | bool | off | Fault injection: pretend the MMA kernel's shared-memory opt-in failed, to exercise the fallback path on healthy hardware. |
 | `GGML_CUDA_FA_NO_VOLTA_SMALL` | bool | off | (#153 T3) Route the decode/verify attention shapes (Q rows <= 8, head 64/128/256, f16 or q8_0 KV) back to the tile/vec kernels instead of the Volta small-M tensor-core kernel (`fattn-mma-volta-small.cuh`). Same-binary A/B knob; serve-safe either way. |
+| `GGML_CUDA_FA_SKIP_MASKED` | bool | **on** | (#156) In the Volta small-M kernel, a KV position that every query row of the block masks with `-inf` is not loaded (zeros enter the mma, exact) and a 128-position step with no visible position is skipped. Pays off with sparse masks (qwen4exp QSA: ~2k selected cells of n_kv per row): -1.3 ms per MTP step at 28k, -2.3 ms at ~95k. FLASH_ATTN_EXT oracle 3924/3924, KLD 0. `=0` restores the dense read. |
+
+## 8c. QSA sparse attention (qwen4exp, TASKS #156)
+
+| Gate | Type | Default | What it does |
+|---|---|---|---|
+| `LLAMA_QSA_BLOCK_TOPK` | bool | off | (#156 7.3) The QSA indexer ranks whole blocks - the top `indexer_top_k / ratio` complete blocks plus the query's own incomplete block, the reference selection - instead of ranking every cell (a sort over n_kv keys after a per-cell expansion). The selection changes only at the cutoff: KLD 0.0046 vs off, PPL equal at 8k / 32k / ~95k, exact-answer probes 16/17 both. Flash-Next production config: -7.5 % per MTP step at 28k, -17 % at ~95k (24.8 -> 31.1 t/s), short prompts and prefill equal, compute buffer -96 MiB. Serve-safe. Value-parsed: unset or `=0` = the cell-level top-k, bit for bit. |
 
 ## 9. Instrumentation & debug
 
@@ -261,6 +286,46 @@ The meta backend wraps N GPUs as one device for tensor parallelism.
 | `LLAMA_DSV4_COMPRESS_DEBUG` | bool | off | DeepSeek-V4 KV-compression debug logging. |
 | `GGML_SCHED_DEBUG` | 1 / 2 | off | *(upstream)* Scheduler split/backend-assignment dump. |
 | `LLAMA_EXPERT_PROFILE` | path | off | **(task 74)** Per-layer router expert-selection profiler: hooks the MoE top-k tensor per layer, accumulates `counts[layer][expert]`, refreshes the JSON every ~500 decode tokens. Works in ANY split mode (the router runs everywhere), so profile on a cheap serve. Costs ~1.5 t/s while on - profile runs are not benchmarks. Feeds `scripts/expert-placement.py` (task 75); procedure: `docs/expert-profiling.md`. |
+
+## 10. Serve parameters: CLI flags this fork adds
+
+Every flag below is fork-only (`common/arg.cpp` and `tools/rpc/rpc-server.cpp` diffed against upstream
+9b2a08881, the last upstream merge, plus the absorbed upstream PR #25683). The sections above hold the
+details; the stock upstream flags are documented by `llama-server --help`.
+
+**`llama-server`** (and the other tools that take the common arguments):
+
+| Flag | Default | Env alias | What it does | Details |
+|---|---|---|---|---|
+| `--moe-cache off\|N\|auto` | off | `LLAMA_ARG_MOE_CACHE` | Keep the hottest CPU-resident MoE experts in VRAM (`-ncmoe` serves): N MiB of slots, or `auto` = free VRAM minus the reserve; forces `--no-repack`. | 2b |
+| `--ssd-streaming` | off | sets `LLAMA_SSD_STREAM_BUFFER` | Stream MoE expert weights from SSD into a bounded RAM cache; implies `--no-mmap`. | 1 |
+| `--ssd-stream-budget MiB` | 8192 | sets `LLAMA_SSD_STREAM_BUDGET` | RAM expert-cache budget for `--ssd-streaming`. | 1 |
+| `--ssd-stream-gpu` | off | sets `LLAMA_SSD_STREAM_GPU` | Compute streamed experts on the GPU through a VRAM slot cache. | 2 |
+| `--ssd-stream-vram-budget MiB` | 4096 | sets `LLAMA_SSD_STREAM_VRAM_BUDGET` | VRAM budget of that slot cache. | 2 |
+| `--spec-draft-entropy-max H` | 0 (off) | `LLAMA_ARG_SPEC_DRAFT_ENTROPY_MAX` | Stop drafting when the draft distribution's entropy exceeds H bits. | 3 |
+| `--spec-draft-conf-min P` | 0 (off) | `LLAMA_ARG_SPEC_DRAFT_CONF_MIN` | DSpark: cut the draft block at the first position whose predicted acceptance is below P (upstream PR #25683). | 3 |
+| `--reasoning-budget-warn-at N` | -1 (off) | `LLAMA_ARG_THINK_BUDGET_WARN_AT` | Soft warning when N thinking tokens remain, before the hard budget cut. | 3b |
+| `--reasoning-budget-warn-message MSG` | none | `LLAMA_ARG_THINK_BUDGET_WARN_MESSAGE` | The warning text. | 3b |
+| `--rpc-skip-unavailable` | off | `LLAMA_ARG_RPC_SKIP_UNAVAILABLE` | Drop unreachable `--rpc` servers with a warning instead of exiting. | 7 |
+| `--rpc-discover` | off | `LLAMA_ARG_RPC_DISCOVER` | Use the workers that announce themselves on the LAN; composes with `--rpc`. | 7 |
+| `--rpc-discover-group ADDR:PORT` | built-in group | `LLAMA_ARG_RPC_DISCOVER_GROUP` | Multicast group for discovery; must match the workers' `--announce-group`. | 7 |
+| `--rpc-auto-weight` | off | `LLAMA_ARG_RPC_AUTO_WEIGHT` | Fill an unset `-ts` by each device's measured bandwidth score, capped by free memory. | 7 |
+| `--rpc-reload` | off | `LLAMA_ARG_RPC_RELOAD` | On worker loss, fail the in-flight requests and reload in-process across the reachable workers (server only). | 7 |
+| `--fleet-admin` | off | `LLAMA_ARG_FLEET_ADMIN` | Enable the fleet restart / rescore / reload endpoints; needs `--api-key` (server only). | 7 |
+| `--fleet-preflight FNAME` | off | `LLAMA_ARG_FLEET_PREFLIGHT` | Benchmark a small GGUF over the same devices before the main load; shown in the fleet UI (server only). | 7 |
+
+**`ggml-rpc-server`** (the worker):
+
+| Flag | Default | Env alias | What it does | Details |
+|---|---|---|---|---|
+| `-tp`, `--tensor-parallel` | off | - | Expose all local GPUs as one tensor-parallel device (a TP island); the coordinator uploads the split states. | 7, `docs/distributed-inference-guide.md` |
+| `-a`, `--announce` | off | - | Announce the worker on the LAN (UDP multicast) so `--rpc-discover` finds it. Trusted networks only. | 7 |
+| `--announce-group ADDR:PORT` | built-in group | - | Multicast group for `--announce` (implies `--announce`). | 7 |
+| `-md`, `--model-dir DIR` | off | - | Serve tensors from local GGUF files in DIR when the coordinator's model matches (skips the first-load network stream). | 7 |
+| `-sc`, `--score` | off | `GGML_RPC_SCORE` | Benchmark memory bandwidth at startup (~1 s) and publish the score for `--rpc-auto-weight`. | 7 |
+| `--allow-shutdown` | off | `GGML_RPC_ALLOW_SHUTDOWN` | Let the coordinator restart the worker over RPC (the process exits; run it under a supervisor). | 7 |
+
+Production serve settings (flags + envs) for the current models are under Usage examples.
 
 ---
 
@@ -320,6 +385,34 @@ kill-switch and the timing log:
 ```sh
 -e LLAMA_SPEC_DRAFT_NO_PAD=1 -e LLAMA_SPEC_TIMING=1   # baseline (padding off)
 ```
+
+### Qwen3.8-Flash-Next on one V100 + host RAM (production, 2026-10-01)
+
+Routed experts in host RAM (`-ncmoe 48`), a 15 GB VRAM expert cache, the MoE doorbell, the prefill stream ring with
+4096-token ubatches, block-level QSA top-k, and the Q8_0 MTP head file. Same settings as the wizard's saved "GSQ-RCO 3.5bit" config:
+
+```sh
+-e LLAMA_MOE_DOORBELL=1 -e GGML_SCHED_PREFILL_STREAM=1 -e LLAMA_QSA_BLOCK_TOPK=1 \
+  ... -m qwen3.8-flash-next-00001-of-00002.gguf -ngl 99 -ncmoe 48 -c 32768 -fa on \
+  --moe-cache 15000 -t 40 -ub 4096 -b 4096 --cache-reuse 256 \
+  --spec-type draft-mtp --model-draft mtp-Qwen3.8-Flash-Next-Mtp-Q8_0.gguf --n-gpu-layers-draft 99 \
+  --spec-draft-device CUDA0 --spec-draft-n-max 3 --spec-draft-p-min 0.75
+```
+
+CUDA graphs stay ON (default) since #156. Measured 2026-10-01 (image 1300d2bef-156p): 55.7 ms per MTP step (47.6 t/s
+mean over four prompts), 71.8 ms per step at 28k context, 107.8 ms at ~95k, ~334 t/s prefill
+(docs/strata-followups-plan.md 8.2). With `LLAMA_QSA_BLOCK_TOPK=1` (image 1300d2bef-156p3, in the saved config since
+2026-10-01): 66.3 ms per step at 28k, 89.5 ms at ~95k (31.1 t/s), short prompts and prefill unchanged (plan 9.1).
+
+### Qwen3.8-27B with a long context on one V100 (2026-09-30)
+
+```sh
+... -m Qwen3.8-27B-AD-IQ3_S.gguf -ngl 99 -c 131072 -fa on -ctk q8_0 -ctv q8_0 --cache-reuse 256 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75
+```
+
+No env is needed: the Volta small-batch matmul route (`GGML_CUDA_SMT`) and the small-width attention kernel are on
+by default. Measured: 47.2 t/s over a 76k-token generation; with `-c 65536` and f16 KV, 52.5 t/s over 65k tokens.
 
 ### Reproduce a 2-GPU tensor-split on one physical GPU (validation)
 

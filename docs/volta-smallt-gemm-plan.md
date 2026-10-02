@@ -1,6 +1,7 @@
 # Volta small-T tensor-core GEMM for quantized weights (TASKS #153 T1)
 
-Status: BUILDING (2026-09-28). Phase 0 (`research/ninfer-phase0-2026-09-28.md`) measured the
+Status: **SHIPPED 2026-09-28, default on** - the route is `ggml-cuda/mmsmt.cu`; the as-built design, the gates and
+the rolls are in `docs/mmsmt-implementation.md` (4.7, 4.10). This file is the dated build log. Phase 0 (`research/ninfer-phase0-2026-09-28.md`) measured the
 problem: on a V100 a forward of T=2..8 tokens costs 1.3-3.1x a single-token step because the
 multi-column MMVQ kernel (dp4a, SIMT) does not use Volta's tensor cores, so a speculative
 verify of width 4-5 costs two target steps instead of ~1.1. NInfer's kernel origin

@@ -64,11 +64,17 @@ static __device__ __forceinline__ uint32_t mmsmt_bytes_lo(const uint32_t w) { re
 static __device__ __forceinline__ uint32_t mmsmt_bytes_hi(const uint32_t w) { return __byte_perm(w, 0x64006400u, 0x5352); }
 
 static __device__ __forceinline__ uint32_t mmsmt_h2sub(const uint32_t h, const uint32_t bias) {
+#ifdef FP16_AVAILABLE
     half2 a, b;
     *reinterpret_cast<uint32_t *>(&a) = h;
     *reinterpret_cast<uint32_t *>(&b) = bias;
     const half2 r = __hsub2(a, b);
     return *reinterpret_cast<const uint32_t *>(&r);
+#else
+    GGML_UNUSED_VARS(h, bias);
+    NO_DEVICE_CODE;
+    return 0;
+#endif // FP16_AVAILABLE
 }
 
 #define MMSMT_BIAS_1024 0x64006400u // half2 {1024, 1024}: unsigned nibbles/bytes ORed into the mantissa
@@ -151,8 +157,13 @@ static __device__ __forceinline__ uint32_t mmsmt_h2mul(const uint32_t u, const u
     *reinterpret_cast<uint32_t *>(&a) = u;
     *reinterpret_cast<uint32_t *>(&b) = bias;
     *reinterpret_cast<uint32_t *>(&c) = scale;
+#ifdef FP16_AVAILABLE
     const half2 r = __hmul2(__hsub2(a, b), c);
     return *reinterpret_cast<const uint32_t *>(&r);
+#else
+    NO_DEVICE_CODE;
+    return 0;
+#endif // FP16_AVAILABLE
 }
 
 // (u - bias) * scale - mr
@@ -162,8 +173,13 @@ static __device__ __forceinline__ uint32_t mmsmt_h2fma(const uint32_t u, const u
     *reinterpret_cast<uint32_t *>(&b) = bias;
     *reinterpret_cast<uint32_t *>(&c) = scale;
     *reinterpret_cast<uint32_t *>(&m) = mr;
+#ifdef FP16_AVAILABLE
     const half2 r = __hfma2(__hsub2(a, b), c, __hneg2(m));
     return *reinterpret_cast<const uint32_t *>(&r);
+#else
+    NO_DEVICE_CODE;
+    return 0;
+#endif // FP16_AVAILABLE
 }
 
 // 4 quantized values in the byte lanes of u -> the two B registers of one mma slice

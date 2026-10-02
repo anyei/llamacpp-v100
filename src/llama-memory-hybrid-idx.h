@@ -140,9 +140,13 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]. The caller then
     // adds the attention mask itself, which is the only part of the bias that varies within a block.
+    // blk_cells_x non-null selects the block-level top-k (blk_bias only, cell_blk may be null):
+    //   blk_cells_x I32 [ratio*n_blocks, ns] as blk_cells, but a missing member reads n_kv
+    //   tail_idx    I32 [ratio, n_tokens/ns, ns] cells of the query's incomplete block, padded with n_kv
+    //   bias        0 for a complete block wholly at or before the query, -inf otherwise
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * blk_cells_x = nullptr, ggml_tensor * tail_idx = nullptr) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

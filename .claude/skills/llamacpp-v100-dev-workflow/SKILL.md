@@ -131,9 +131,21 @@ for i in $(seq 1 90); do grep -q "model loaded" /work/srv.log && break; sleep 2;
    block-buffered test-backend-ops log points at the WRONG case: run oracles
    with `docker run -t` (line-buffered) and reproduce with `-p <regex>` filters.
 13. **`timeout N docker run ...` kills only the client**: the container keeps the
-   GPU; `docker rm -f <name>` it. Kernel-layout facts are cheap to PROBE on the
+   GPU; `docker rm -f <name>` it. Same when you kill a bench SCRIPT: its current
+   unnamed `docker run --rm` (e.g. a perplexity leg) keeps running and shares the
+   GPU with the next queue - `docker ps` after every kill (2026-10-01: an orphaned
+   95k perplexity leg made a whole A/B look 2x slower and OOM). Kernel-layout facts are cheap to PROBE on the
    V100 before writing a kernel (`153-p0/t3probe/probe.cu` pattern: nvcc in
    llama-devcuda, run inside the image on the X99).
+
+14. **Garbage-text vehicles trip the server's output parser** (#156 7.4): the trunc vehicle writes nonsense, and both
+   `/v1/chat/completions` and `/completion` can answer HTTP 500 "model produced output that does not match the expected
+   ... format" AFTER the computation finished. A churn/robustness run on it must classify failures (`llama.cpp-work/
+   churn-loopback.sh`): format rejections are not RPC failures; grep the server + worker logs for compute/recompute/
+   connection errors instead.
+15. **Tag hygiene vs bench scripts**: X99 `bench156/arm.sh` runs the dev bins inside an image used only as the CUDA
+   runtime (`IMG=` line 7). Removing that tag makes the next arm silently re-pull it from the registry; point `IMG=` at
+   the current image before deleting old tags.
 
 ## Gate ledger discipline
 
